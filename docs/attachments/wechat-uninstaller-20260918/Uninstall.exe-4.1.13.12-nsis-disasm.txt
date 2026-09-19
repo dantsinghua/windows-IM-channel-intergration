@@ -1,0 +1,814 @@
+block pages: off=300 num=3
+block sections: off=492 num=1
+block entries: off=16900 num=791
+block strings: off=39048 num=0
+block langtables: off=46924 num=3
+block ctlcolors: off=47758 num=0
+block bgfont: off=0 num=0
+block data: off=0 num=0
+callback onInit -> entry 468
+callback onInstSuccess -> entry -1
+callback onInstFailed -> entry -1
+callback onUserAbort -> entry -1
+callback onGUIInit -> entry -1
+callback onGUIEnd -> entry -1
+callback onMouseOverSection -> entry -1
+callback onVerifyInstDir -> entry -1
+callback onSelChange -> entry -1
+callback onRebootFailed -> entry -1
+page0: id=0 wndproc=6 dlg=90 pre=-1 show=-1 leave=6 flags=0x0 caption=''
+page1: id=3 wndproc=-1 dlg=738 pre=-1 show=8 leave=-61 flags=-0x3a caption='?'
+page2: id=-1 wndproc=-1 dlg=-1 pre=10 show=-66 leave=-58 flags=-0x43 caption=''
+section0: name='Uninstall' insttypes=0 flags=0x1 code_entry=0 code_size=89 size_kb=0
+   0: SetFlag all_user_var = 1
+   1: Delete $DESKTOP\$VAR36.lnk (flags 0)
+   2: Delete $APPDATA\$VAR36.lnk (flags 0)
+   3: Delete $SMPROGRAMS\$VAR36\$VAR36.lnk (flags 0)
+   4: Delete $SMPROGRAMS\$VAR36\$VAR37$VAR36.lnk (flags 0)
+   5: RMDir $SMPROGRAMS\$VAR36 (flags 5)
+   6: SetFlag all_user_var = 0
+   7: Delete $DESKTOP\$VAR36.lnk (flags 0)
+   8: Delete $APPDATA\$VAR36.lnk (flags 0)
+   9: Delete $SMPROGRAMS\$VAR36\$VAR36.lnk (flags 0)
+  10: Delete $SMPROGRAMS\$VAR36\$VAR37$VAR36.lnk (flags 0)
+  11: RMDir $SMPROGRAMS\$VAR36 (flags 5)
+  12: SetFlag all_user_var = 1
+  13: Delete $DESKTOP\$VAR38.lnk (flags 0)
+  14: Delete $APPDATA\$VAR38.lnk (flags 0)
+  15: Delete $SMPROGRAMS\$VAR38\$VAR38.lnk (flags 0)
+  16: Delete $SMPROGRAMS\$VAR38\$VAR37$VAR38.lnk (flags 0)
+  17: RMDir $SMPROGRAMS\$VAR38 (flags 5)
+  18: SetFlag all_user_var = 0
+  19: Delete $DESKTOP\$VAR38.lnk (flags 0)
+  20: Delete $APPDATA\$VAR38.lnk (flags 0)
+  21: Delete $SMPROGRAMS\$VAR38\$VAR38.lnk (flags 0)
+  22: Delete $SMPROGRAMS\$VAR38\$VAR37$VAR38.lnk (flags 0)
+  23: RMDir $SMPROGRAMS\$VAR38 (flags 5)
+  24: StrCmp $VAR54 == 0 ? jmp0 : jmp66
+  25: Call entry 773
+  26: File  (flags 196)
+  27: SetFlag status_update = 
+  28: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetWeChatConfigPath  (nounload=0)
+  29: Pop 
+  30: StrCmp $0 == error ? jmp65 : jmp0
+  31: StrCpy $VAR62 = $0\Tencent\xwechat\config\51a1fffea11325a1e4104c6b3de47af7.ini [,]
+  32: Push $VAR62
+  33: Call entry 773
+  34: File  (flags 196)
+  35: SetFlag status_update = 
+  36: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ReadFileOneLine  (nounload=0)
+  37: Pop ogramFilesDir
+  38: StrCmp $3 == error ? jmp58 : jmp0
+  39: StrCmp $3 == MyDocument: ? jmp0 : jmp48
+  40: Call entry 773
+  41: File  (flags 196)
+  42: SetFlag status_update = 
+  43: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetWeChatDataPath  (nounload=0)
+  44: Pop gramFilesDir
+  45: StrCpy $VAR61 = $4\xwechat_files [,]
+  46: Goto 51
+  47: StrCmp $3 == Appdata: ? jmp0 : jmp50
+  48: Goto 51
+  49: StrCpy $VAR61 = $3\xwechat_files [,]
+  50: Call entry 773
+  51: File  (flags 196)
+  52: SetFlag status_update = 
+  53: Push BackupFiles
+  54: Push QQBrowser Plugin
+  55: Push $VAR61
+  56: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: DeleteWeChatDir  (nounload=0)
+  57: Call entry 773
+  58: File  (flags 196)
+  59: SetFlag status_update = 
+  60: Push QQBrowser Plugin
+  61: Push $0\Tencent\xwechat
+  62: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: DeleteWeChatDir  (nounload=0)
+  63: RMDir $0\Tencent\xwechat (flags 3)
+  64: Goto 73
+  65: Call entry 773
+  66: File  (flags 196)
+  67: SetFlag status_update = 
+  68: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetWeChatConfigPath  (nounload=0)
+  69: Pop 
+  70: StrCmp $0 == error ? jmp73 : jmp0
+  71: RMDir $0\Tencent\xwechat\update (flags 3)
+  72: SetFlag reboot = 0
+  73: ReadRegStr root0 ? \ SOFTWARE\Tencent\Weixin = 
+  74: StrCmp $0 ==  ? jmp0 : jmp78
+  75: ReadRegStr root1 ? \ Software\Microsoft\Windows\CurrentVersion\Uninstall\Weixin = 
+  76: StrCpy $0 = $1 [,]
+  77: StrCmp $0 ==  ? jmp87 : jmp0
+  78: Delete $0\$VAR38.lnk (flags 0)
+  79: Delete $0\$VAR36.lnk (flags 0)
+  80: Call entry 773
+  81: File  (flags 196)
+  82: SetFlag status_update = 
+  83: Push 1.0.0.0
+  84: Push $0
+  85: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: cleanInstallDir  (nounload=0)
+  86: DeleteReg root0 ? \ SOFTWARE\Tencent\Weixin = 
+  87: DeleteReg root0 ? \ Software\Microsoft\Windows\CurrentVersion\Uninstall\Weixin = 
+  88: DeleteReg root0 ? \ Software\Microsoft\Windows\CurrentVersion\Run = 
+  89: Return [0, 0, 0, 0, 0, 0]
+  90: Call entry 773
+  91: File  (flags 196)
+  92: SetFlag status_update = 
+  93: Push minbtn
+  94: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+  95: Pop 
+  96: StrCmp $0 == -1 ? jmp0 : jmp107
+  97: Call entry 773
+  98: File  (flags 196)
+  99: SetFlag status_update = 
+ 100: Push ?
+ 101: Push ?
+ 102: Push ?
+ 103: Push $VAR34
+ 104: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 105: Goto 114
+ 106: StrCpy $0 = 665 [,]
+ 107: Call entry 773
+ 108: File  (flags 196)
+ 109: SetFlag status_update = 
+ 110: Push $0
+ 111: Push minbtn
+ 112: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 113: Call entry 773
+ 114: File  (flags 196)
+ 115: SetFlag status_update = 
+ 116: Push closebtn
+ 117: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 118: Pop 
+ 119: StrCmp $0 == -1 ? jmp0 : jmp130
+ 120: Call entry 773
+ 121: File  (flags 196)
+ 122: SetFlag status_update = 
+ 123: Push ?
+ 124: Push ?
+ 125: Push ?
+ 126: Push $VAR34
+ 127: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 128: Goto 137
+ 129: StrCpy $0 = 672 [,]
+ 130: Call entry 773
+ 131: File  (flags 196)
+ 132: SetFlag status_update = 
+ 133: Push $0
+ 134: Push closebtn
+ 135: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 136: Call entry 773
+ 137: File  (flags 196)
+ 138: SetFlag status_update = 
+ 139: Push first_option
+ 140: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 141: Pop 
+ 142: StrCmp $0 == -1 ? jmp0 : jmp153
+ 143: Call entry 773
+ 144: File  (flags 196)
+ 145: SetFlag status_update = 
+ 146: Push ?
+ 147: Push ?
+ 148: Push ?
+ 149: Push $VAR34
+ 150: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 151: Goto 160
+ 152: StrCpy $0 = 761 [,]
+ 153: Call entry 773
+ 154: File  (flags 196)
+ 155: SetFlag status_update = 
+ 156: Push $0
+ 157: Push first_option
+ 158: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 159: Call entry 773
+ 160: File  (flags 196)
+ 161: SetFlag status_update = 
+ 162: Push qa_btn
+ 163: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 164: StrCmp $0 == -1 ? jmp0 : jmp175
+ 165: Call entry 773
+ 166: File  (flags 196)
+ 167: SetFlag status_update = 
+ 168: Push ?
+ 169: Push ?
+ 170: Push ?
+ 171: Push $VAR34
+ 172: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 173: Goto 182
+ 174: StrCpy $0 = 657 [,]
+ 175: Call entry 773
+ 176: File  (flags 196)
+ 177: SetFlag status_update = 
+ 178: Push $0
+ 179: Push qa_btn
+ 180: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 181: Call entry 773
+ 182: File  (flags 196)
+ 183: SetFlag status_update = 
+ 184: Push install_btn_1
+ 185: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 186: StrCmp $0 == -1 ? jmp0 : jmp197
+ 187: Call entry 773
+ 188: File  (flags 196)
+ 189: SetFlag status_update = 
+ 190: Push ?
+ 191: Push ?
+ 192: Push ?
+ 193: Push $VAR34
+ 194: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 195: Goto 204
+ 196: StrCpy $0 = 231 [,]
+ 197: Call entry 773
+ 198: File  (flags 196)
+ 199: SetFlag status_update = 
+ 200: Push $0
+ 201: Push install_btn_1
+ 202: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 203: Call entry 773
+ 204: File  (flags 196)
+ 205: SetFlag status_update = 
+ 206: Push install_btn_2
+ 207: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 208: StrCmp $0 == -1 ? jmp0 : jmp219
+ 209: Call entry 773
+ 210: File  (flags 196)
+ 211: SetFlag status_update = 
+ 212: Push ?
+ 213: Push ?
+ 214: Push ?
+ 215: Push $VAR34
+ 216: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 217: Goto 226
+ 218: StrCpy $0 = 734 [,]
+ 219: Call entry 773
+ 220: File  (flags 196)
+ 221: SetFlag status_update = 
+ 222: Push $0
+ 223: Push install_btn_2
+ 224: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 225: Call entry 773
+ 226: File  (flags 196)
+ 227: SetFlag status_update = 
+ 228: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ShowPage  (nounload=0)
+ 229: Return [0, 0, 0, 0, 0, 0]
+ 230: Pop ilesDir
+ 231: StrCmp $VAR54 == 0 ? jmp0 : jmp245
+ 232: Call entry 773
+ 233: File  (flags 196)
+ 234: SetFlag status_update = 
+ 235: Push ?
+ 236: Push ?
+ 237: Push ?
+ 238: Push ?
+ 239: Push $VAR34
+ 240: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ConfirmBoxNew  (nounload=0)
+ 241: Pop esDir
+ 242: StrCmp $R1 == 1 ? jmp0 : jmp245
+ 243: Return [0, 0, 0, 0, 0, 0]
+ 244: Call entry 773
+ 245: File  (flags 196)
+ 246: SetFlag status_update = 
+ 247: Push 0
+ 248: Push $LANGUAGE
+ 249: Push 1
+ 250: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: InitTBCIASkinEngine  (nounload=1)
+ 251: Pop \Program Files
+ 252: StrCmp $VAR34 == -1 ? jmp0 : jmp255
+ 253: Quit [0, 0, 0, 0, 0, 0]
+ 254: StrCpy $VAR55 = 1 [,]
+ 255: Call entry 773
+ 256: File  (flags 196)
+ 257: SetFlag status_update = 
+ 258: Push minbtn
+ 259: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 260: Pop 
+ 261: StrCmp $0 == -1 ? jmp0 : jmp272
+ 262: Call entry 773
+ 263: File  (flags 196)
+ 264: SetFlag status_update = 
+ 265: Push ?
+ 266: Push ?
+ 267: Push ?
+ 268: Push $VAR34
+ 269: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 270: Goto 279
+ 271: StrCpy $0 = 665 [,]
+ 272: Call entry 773
+ 273: File  (flags 196)
+ 274: SetFlag status_update = 
+ 275: Push $0
+ 276: Push minbtn
+ 277: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 278: Call entry 773
+ 279: File  (flags 196)
+ 280: SetFlag status_update = 
+ 281: Push closebtn
+ 282: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 283: Pop 
+ 284: StrCmp $0 == -1 ? jmp0 : jmp295
+ 285: Call entry 773
+ 286: File  (flags 196)
+ 287: SetFlag status_update = 
+ 288: Push ?
+ 289: Push ?
+ 290: Push ?
+ 291: Push $VAR34
+ 292: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 293: Goto 302
+ 294: StrCpy $0 = 672 [,]
+ 295: Call entry 773
+ 296: File  (flags 196)
+ 297: SetFlag status_update = 
+ 298: Push $0
+ 299: Push closebtn
+ 300: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 301: Call entry 773
+ 302: File  (flags 196)
+ 303: SetFlag status_update = 
+ 304: Push first_option
+ 305: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 306: Pop 
+ 307: StrCmp $0 == -1 ? jmp0 : jmp318
+ 308: Call entry 773
+ 309: File  (flags 196)
+ 310: SetFlag status_update = 
+ 311: Push ?
+ 312: Push ?
+ 313: Push ?
+ 314: Push $VAR34
+ 315: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 316: Goto 325
+ 317: StrCpy $0 = 695 [,]
+ 318: Call entry 773
+ 319: File  (flags 196)
+ 320: SetFlag status_update = 
+ 321: Push $0
+ 322: Push first_option
+ 323: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 324: Call entry 773
+ 325: File  (flags 196)
+ 326: SetFlag status_update = 
+ 327: Push second_option
+ 328: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 329: Pop 
+ 330: StrCmp $0 == -1 ? jmp0 : jmp341
+ 331: Call entry 773
+ 332: File  (flags 196)
+ 333: SetFlag status_update = 
+ 334: Push ?
+ 335: Push ?
+ 336: Push ?
+ 337: Push $VAR34
+ 338: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 339: Goto 348
+ 340: StrCpy $0 = 703 [,]
+ 341: Call entry 773
+ 342: File  (flags 196)
+ 343: SetFlag status_update = 
+ 344: Push $0
+ 345: Push second_option
+ 346: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 347: Call entry 773
+ 348: File  (flags 196)
+ 349: SetFlag status_update = 
+ 350: Push third_option
+ 351: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 352: Pop 
+ 353: StrCmp $0 == -1 ? jmp0 : jmp364
+ 354: Call entry 773
+ 355: File  (flags 196)
+ 356: SetFlag status_update = 
+ 357: Push ?
+ 358: Push ?
+ 359: Push ?
+ 360: Push $VAR34
+ 361: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 362: Goto 371
+ 363: StrCpy $0 = 711 [,]
+ 364: Call entry 773
+ 365: File  (flags 196)
+ 366: SetFlag status_update = 
+ 367: Push $0
+ 368: Push third_option
+ 369: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 370: Call entry 773
+ 371: File  (flags 196)
+ 372: SetFlag status_update = 
+ 373: Push edit_dir
+ 374: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 375: Pop 
+ 376: StrCmp $0 == -1 ? jmp0 : jmp387
+ 377: Call entry 773
+ 378: File  (flags 196)
+ 379: SetFlag status_update = 
+ 380: Push ?
+ 381: Push ?
+ 382: Push ?
+ 383: Push $VAR34
+ 384: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 385: Goto 394
+ 386: StrCpy $0 = 719 [,]
+ 387: Call entry 773
+ 388: File  (flags 196)
+ 389: SetFlag status_update = 
+ 390: Push $0
+ 391: Push edit_dir
+ 392: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 393: Call entry 773
+ 394: File  (flags 196)
+ 395: SetFlag status_update = 
+ 396: Push install_btn_2
+ 397: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 398: StrCmp $0 == -1 ? jmp0 : jmp409
+ 399: Call entry 773
+ 400: File  (flags 196)
+ 401: SetFlag status_update = 
+ 402: Push ?
+ 403: Push ?
+ 404: Push ?
+ 405: Push $VAR34
+ 406: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 407: Goto 416
+ 408: StrCpy $0 = 727 [,]
+ 409: Call entry 773
+ 410: File  (flags 196)
+ 411: SetFlag status_update = 
+ 412: Push $0
+ 413: Push install_btn_2
+ 414: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: OnControlBindNSISScript  (nounload=0)
+ 415: ReadRegStr root71 ? \ SOFTWARE\Tencent\Weixin = 
+ 416: StrCmp $VAR71 ==  ? jmp424 : jmp0
+ 417: Call entry 773
+ 418: File  (flags 196)
+ 419: SetFlag status_update = 
+ 420: Push $INSTDIR
+ 421: Push $VAR71
+ 422: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: clearAppletLnk  (nounload=0)
+ 423: Call entry 773
+ 424: File  (flags 196)
+ 425: SetFlag status_update = 
+ 426: Push WM_TBCIASTARTUNINSTALL
+ 427: Push $VAR34
+ 428: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: TBCIASendMessage  (nounload=0)
+ 429: Call entry 773
+ 430: File  (flags 196)
+ 431: SetFlag status_update = 
+ 432: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ShowPage  (nounload=0)
+ 433: Return [0, 0, 0, 0, 0, 0]
+ 434: Pop 
+ 435: Call entry 773
+ 436: File  (flags 196)
+ 437: SetFlag status_update = 
+ 438: Push $0
+ 439: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindAllProcAndKill  (nounload=0)
+ 440: Pop lesDir
+ 441: IntCmp $R0 vs 1 eq460 lt0 gt0
+ 442: IntCmp $R0 vs 0 eq444 lt0 gt0
+ 443: Call entry 773
+ 444: File  (flags 196)
+ 445: SetFlag status_update = 
+ 446: Push ?
+ 447: Push ?
+ 448: Push ?
+ 449: Push $VAR34
+ 450: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 451: Call entry 773
+ 452: File  (flags 196)
+ 453: SetFlag status_update = 
+ 454: Push 1
+ 455: Push 7
+ 456: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: onError  (nounload=0)
+ 457: Sleep [1009, 0, 0, 0, 0, 0]
+ 458: Quit [0, 0, 0, 0, 0, 0]
+ 459: Sleep [1030, 0, 0, 0, 0, 0]
+ 460: Call entry 773
+ 461: File  (flags 1034)
+ 462: SetFlag status_update = 
+ 463: Push $0
+ 464: Plugin $PLUGINSDIR\FindProcDLL.dll :: FindProc  (nounload=0)
+ 465: Pop lesDir
+ 466: IntCmp $R0 vs 1 eq444 lt0 gt0
+ 467: Return [0, 0, 0, 0, 0, 0]
+ 468: Call entry 773
+ 469: File  (flags 1062)
+ 470: SetFlag status_update = 
+ 471: Push kernel32::CreateMutexA(i 0, i 0, t "Weinxin_install_20110121" ) i.r1 ?e
+ 472: Plugin $PLUGINSDIR\System.dll :: Call  (nounload=0)
+ 473: StrCpy $9 = $1 [,]
+ 474: Pop 
+ 475: StrCmp $0 == 0 ? jmp480 : jmp0
+ 476: Abort [0, 0, 0, 0, 0, 0]
+ 477: StrLen [0, -3, 0, 0, 0, 0]
+ 478: IntOp var0 = $0 op0 1
+ 479: StrCpy $VAR54 = 0 [,]
+ 480: Call entry 483
+ 481: Goto 516
+ 482: StrCmp $CMDLINE ==  ? jmp0 : jmp486
+ 483: Push 
+ 484: Return [0, 0, 0, 0, 0, 0]
+ 485: Push $0
+ 486: Push $1
+ 487: Push $2
+ 488: Push $3
+ 489: StrLen [1, 1153, 0, 0, 0, 0]
+ 490: StrCpy $2 = 2 [,]
+ 491: StrCpy $3 = $CMDLINE [1,]
+ 492: StrCmp $3 == " ? jmp495 : jmp0
+ 493: StrCpy $3 =   [,]
+ 494: IntCmp $2 vs $1 eq499 lt0 gt499
+ 495: StrCpy $0 = $CMDLINE [1,$2]
+ 496: IntOp var2 = $2 op0 1
+ 497: StrCmp $3 == $0 ? jmp0 : jmp495
+ 498: IntCmp $2 vs $1 eq504 lt0 gt504
+ 499: StrCpy $0 = $CMDLINE [1,$2]
+ 500: StrCmp $0 ==   ? jmp0 : jmp504
+ 501: IntOp var2 = $2 op0 1
+ 502: Goto 499
+ 503: StrCpy $0 = $CMDLINE [,$2]
+ 504: StrCpy $1 = $0 [1,-1]
+ 505: StrCmp $1 ==   ? jmp0 : jmp509
+ 506: StrCpy $0 = $0 [-1,]
+ 507: Goto 505
+ 508: Pop ogramFilesDir
+ 509: Pop rogramFilesDir
+ 510: Pop ProgramFilesDir
+ 511: Push $0
+ 512: Exch
+ 513: Pop 
+ 514: Return [0, 0, 0, 0, 0, 0]
+ 515: Pop mmonFilesDir
+ 516: SetFlag errors = 0
+ 517: StrCmp $R9 == /S ? jmp0 : jmp562
+ 518: Call entry 773
+ 519: File  (flags 196)
+ 520: SetFlag status_update = 
+ 521: Push 1
+ 522: Push $LANGUAGE
+ 523: Push 2
+ 524: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: InitTBCIASkinEngine  (nounload=1)
+ 525: Call entry 773
+ 526: File  (flags 1034)
+ 527: SetFlag status_update = 
+ 528: Push Weixin.exe
+ 529: Plugin $PLUGINSDIR\FindProcDLL.dll :: FindProc  (nounload=0)
+ 530: Pop lesDir
+ 531: StrCmp $R0 == 1 ? jmp0 : jmp555
+ 532: Call entry 773
+ 533: File  (flags 196)
+ 534: SetFlag status_update = 
+ 535: Push xWechatWindow
+ 536: Push Chrome_MessageWindow
+ 537: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: IsWindowExisted  (nounload=0)
+ 538: Pop sDir
+ 539: StrCmp $R2 == 0 ? jmp547 : jmp0
+ 540: Call entry 773
+ 541: File  (flags 196)
+ 542: SetFlag status_update = 
+ 543: Push $R2
+ 544: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: NotifyProcessDestroy  (nounload=0)
+ 545: Goto 552
+ 546: Call entry 773
+ 547: File  (flags 196)
+ 548: SetFlag status_update = 
+ 549: Push Weixin.exe exist but the wnd not exist
+ 550: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: MMLogE  (nounload=0)
+ 551: Sleep [1301, 0, 0, 0, 0, 0]
+ 552: Push Weixin.exe
+ 553: Call entry 435
+ 554: Push WeixinUpdate.exe
+ 555: Call entry 435
+ 556: Push WeChatBackup.exe
+ 557: Call entry 435
+ 558: Push WeChatXFile.exe
+ 559: Call entry 435
+ 560: Goto 656
+ 561: Pop ilesDir
+ 562: Call entry 773
+ 563: File  (flags 196)
+ 564: SetFlag status_update = 
+ 565: Push 0
+ 566: Push $LANGUAGE
+ 567: Push 2
+ 568: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: InitTBCIASkinEngine  (nounload=1)
+ 569: Pop \Program Files
+ 570: StrCmp $VAR34 == -1 ? jmp0 : jmp573
+ 571: Quit [0, 0, 0, 0, 0, 0]
+ 572: StrCpy $VAR55 = 2 [,]
+ 573: Call entry 773
+ 574: File  (flags 196)
+ 575: SetFlag status_update = 
+ 576: Push Weixin.exe
+ 577: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetAllProcessIdFromProcessName  (nounload=0)
+ 578: Pop lesDir
+ 579: StrCmp $R0 == -1 ? jmp0 : jmp582
+ 580: Goto 650
+ 581: StrCmp $R0 == 0 ? jmp0 : jmp584
+ 582: Goto 650
+ 583: IntCmp $R0 vs 5000 eq0 lt595 gt0
+ 584: Call entry 773
+ 585: File  (flags 196)
+ 586: SetFlag status_update = 
+ 587: Push ?
+ 588: Push ?
+ 589: Push ?
+ 590: Push $VAR34
+ 591: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 592: Quit [0, 0, 0, 0, 0, 0]
+ 593: Goto 650
+ 594: IntOp var68 = $R0 op0 0
+ 595: StrCmp $R0 == 1 ? jmp0 : jmp599
+ 596: Pop 
+ 597: Goto 603
+ 598: StrCmp $R0 == 2 ? jmp0 : jmp603
+ 599: Pop 
+ 600: Pop ProgramFilesDir
+ 601: Goto 603
+ 602: Call entry 773
+ 603: File  (flags 196)
+ 604: SetFlag status_update = 
+ 605: Push ?
+ 606: Push ?
+ 607: Push ?
+ 608: Push ?
+ 609: Push $VAR34
+ 610: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ConfirmBox  (nounload=0)
+ 611: Pop esDir
+ 612: StrCmp $R1 == 1 ? jmp0 : jmp642
+ 613: IntCmp $VAR68 vs 0 eq639 lt639 gt0
+ 614: Call entry 773
+ 615: File  (flags 196)
+ 616: SetFlag status_update = 
+ 617: Push xWechatWindow
+ 618: Push Chrome_MessageWindow
+ 619: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: IsWindowExisted  (nounload=0)
+ 620: Pop sDir
+ 621: StrCmp $R2 == 0 ? jmp629 : jmp0
+ 622: Call entry 773
+ 623: File  (flags 196)
+ 624: SetFlag status_update = 
+ 625: Push $R2
+ 626: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: NotifyProcessDestroy  (nounload=0)
+ 627: Goto 634
+ 628: Call entry 773
+ 629: File  (flags 196)
+ 630: SetFlag status_update = 
+ 631: Push Weixin.exe exist but the wnd not exist
+ 632: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: MMLogE  (nounload=0)
+ 633: IntOp var68 = $VAR68 op1 1
+ 634: Sleep [1301, 0, 0, 0, 0, 0]
+ 635: Goto 614
+ 636: Goto 614
+ 637: Goto 639
+ 638: Push Weixin.exe
+ 639: Call entry 435
+ 640: Goto 650
+ 641: Call entry 773
+ 642: File  (flags 196)
+ 643: SetFlag status_update = 
+ 644: Push 0
+ 645: Push 11
+ 646: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: onError  (nounload=0)
+ 647: Sleep [1009, 0, 0, 0, 0, 0]
+ 648: Quit [0, 0, 0, 0, 0, 0]
+ 649: Push WeixinUpdate.exe
+ 650: Call entry 435
+ 651: Push WeChatBackup.exe
+ 652: Call entry 435
+ 653: Push WeChatXFile.exe
+ 654: Call entry 435
+ 655: Return [0, 0, 0, 0, 0, 0]
+ 656: Call entry 773
+ 657: File  (flags 196)
+ 658: SetFlag status_update = 
+ 659: Push link
+ 660: Push 
+ 661: Push qa_btn
+ 662: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: SetControlData  (nounload=0)
+ 663: Return [0, 0, 0, 0, 0, 0]
+ 664: Call entry 773
+ 665: File  (flags 196)
+ 666: SetFlag status_update = 
+ 667: Push WM_TBCIAMIN
+ 668: Push $VAR34
+ 669: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: TBCIASendMessage  (nounload=0)
+ 670: Return [0, 0, 0, 0, 0, 0]
+ 671: StrCmp $VAR55 == 2 ? jmp0 : jmp689
+ 672: Call entry 773
+ 673: File  (flags 196)
+ 674: SetFlag status_update = 
+ 675: Push ?
+ 676: Push ?
+ 677: Push ?
+ 678: Push ?
+ 679: Push $VAR34
+ 680: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ConfirmBox  (nounload=0)
+ 681: Pop 
+ 682: StrCmp $0 == 0 ? jmp0 : jmp688
+ 683: Call entry 773
+ 684: File  (flags 196)
+ 685: SetFlag status_update = 
+ 686: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ExitTBCIASkinEngine  (nounload=0)
+ 687: Goto 694
+ 688: StrCmp $VAR55 == 1 ? jmp0 : jmp694
+ 689: Call entry 773
+ 690: File  (flags 196)
+ 691: SetFlag status_update = 
+ 692: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ExitTBCIASkinEngine  (nounload=0)
+ 693: Return [0, 0, 0, 0, 0, 0]
+ 694: Call entry 773
+ 695: File  (flags 196)
+ 696: SetFlag status_update = 
+ 697: Push check
+ 698: Push first_option
+ 699: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetControlData  (nounload=0)
+ 700: Pop iles
+ 701: Return [0, 0, 0, 0, 0, 0]
+ 702: Call entry 773
+ 703: File  (flags 196)
+ 704: SetFlag status_update = 
+ 705: Push check
+ 706: Push second_option
+ 707: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetControlData  (nounload=0)
+ 708: Pop les
+ 709: Return [0, 0, 0, 0, 0, 0]
+ 710: Call entry 773
+ 711: File  (flags 196)
+ 712: SetFlag status_update = 
+ 713: Push check
+ 714: Push third_option
+ 715: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetControlData  (nounload=0)
+ 716: Pop es
+ 717: Return [0, 0, 0, 0, 0, 0]
+ 718: Call entry 773
+ 719: File  (flags 196)
+ 720: SetFlag status_update = 
+ 721: Push text
+ 722: Push edit_dir
+ 723: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetControlData  (nounload=0)
+ 724: Pop s
+ 725: Return [0, 0, 0, 0, 0, 0]
+ 726: Call entry 773
+ 727: File  (flags 196)
+ 728: SetFlag status_update = 
+ 729: Push WM_TBCIAFINISHEDINSTALL
+ 730: Push $VAR34
+ 731: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: TBCIASendMessage  (nounload=0)
+ 732: Return [0, 0, 0, 0, 0, 0]
+ 733: Call entry 773
+ 734: File  (flags 196)
+ 735: SetFlag status_update = 
+ 736: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: ExitTBCIASkinEngine  (nounload=0)
+ 737: Return [0, 0, 0, 0, 0, 0]
+ 738: Call entry 773
+ 739: File  (flags 196)
+ 740: SetFlag status_update = 
+ 741: Push process_bar
+ 742: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: FindControl  (nounload=0)
+ 743: Pop 
+ 744: StrCmp $0 == -1 ? jmp0 : jmp755
+ 745: Call entry 773
+ 746: File  (flags 196)
+ 747: SetFlag status_update = 
+ 748: Push ?
+ 749: Push ?
+ 750: Push ?
+ 751: Push $VAR34
+ 752: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: AlertBox  (nounload=0)
+ 753: Goto 760
+ 754: Call entry 773
+ 755: File  (flags 196)
+ 756: SetFlag status_update = 
+ 757: Push process_bar
+ 758: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: StartUninstall  (nounload=0)
+ 759: Return [0, 0, 0, 0, 0, 0]
+ 760: Call entry 773
+ 761: File  (flags 196)
+ 762: SetFlag status_update = 
+ 763: Push check
+ 764: Push first_option
+ 765: Plugin $PLUGINSDIR\WeChatInstallDll.dll :: GetControlData  (nounload=0)
+ 766: Pop 
+ 767: StrCmp $0 == 1 ? jmp0 : jmp771
+ 768: StrCpy $VAR54 = 1 [,]
+ 769: Goto 772
+ 770: StrCpy $VAR54 = 0 [,]
+ 771: Return [0, 0, 0, 0, 0, 0]
+ 772: SetFlag status_update = 6
+ 773: StrCmp $PLUGINSDIR ==  ? jmp0 : jmp786
+ 774: Push $0
+ 775: Push $1
+ 776: StrCpy $1 = $0 [,?]
+ 777: SetFlag errors = 
+ 778: GetTempFileName [0, 1546, 0, 0, 0, 0]
+ 779: Delete $0 (flags 8)
+ 780: CreateDirectory $0 (flags 0)
+ 781: IfFlag autoclose -> jump 787 else fall
+ 782: StrCpy $PLUGINSDIR = $0 [,]
+ 783: Pop ProgramFilesDir
+ 784: Pop 
+ 785: Return [0, 0, 0, 0, 0, 0]
+ 786: IntOp var1 = $1 op0 1
+ 787: StrCmp $1 == 9 ? jmp0 : jmp778
+ 788: MessageBox  flags=0x60f ret1=0->jmp0 ret2=0
+ 789: Quit [0, 0, 0, 0, 0, 0]
+ 790: Return [0, 0, 0, 0, 0, 0]
+--- pages ---

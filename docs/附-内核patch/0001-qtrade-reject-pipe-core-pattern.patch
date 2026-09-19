@@ -1,0 +1,42 @@
+diff --git a/fs/coredump.c b/fs/coredump.c
+index d3a4f5dc2..622a3e0ee 100644
+--- a/fs/coredump.c
++++ b/fs/coredump.c
+@@ -1018,13 +1018,36 @@ void validate_coredump_safety(void)
+ 	}
+ }
+ 
++/*
++ * QTrade: 拒绝管道模式 core_pattern。
++ *
++ * WSL 的用户态 /init 在启动时把 core_pattern 设成
++ * "|/wsl-capture-crash %t %E %p %s"。该捕获器绕过 RLIMIT_CORE,
++ * 即使进程的 core 限额是 0 也照样把整个进程内存写成转储
++ * (实测单个 16GB;redroid 里企点的 arm64 翻译层每小时崩一次,
++ *  一天堆出 11 个 / 147GB,把 C 盘吃干)。
++ *
++ * 只有在非管道模式下 RLIMIT_CORE=0 才会生效,所以这里把管道模式
++ * 静默改写成文件模式。刻意不返回错误 —— 返回错误可能让 WSL init
++ * 启动失败;静默降级既保住了容器侧 ulimits: core=0,又不影响
++ * 用户自己用文件模式 core dump 调试。
++ */
++#define QTRADE_CORE_PATTERN "/var/lib/qtrade/cores/core.%e.%p"
++
+ static int proc_dostring_coredump(struct ctl_table *table, int write,
+ 		  void *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int error = proc_dostring(table, write, buffer, lenp, ppos);
+ 
+-	if (!error)
++	if (!error) {
++		if (write && core_pattern[0] == '|') {
++			pr_warn_once("qtrade: pipe core_pattern rejected, forced to %s\n",
++				     QTRADE_CORE_PATTERN);
++			strscpy(core_pattern, QTRADE_CORE_PATTERN,
++				CORENAME_MAX_SIZE);
++		}
+ 		validate_coredump_safety();
++	}
+ 	return error;
+ }
+ 
