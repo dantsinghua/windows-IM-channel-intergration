@@ -77,6 +77,22 @@ foreach ($f in $patched) {
         $noBom += $f
     }
 }
+# 🔴 反过来:resource.rc 与清单**必须没有 BOM**。给 resource.rc 加了 BOM 之后,
+#    rc.exe 不再展开第 1 行 #include 进来的宏,直接
+#    `error RC2135: file not found: MY_VERSION_INFO_APP`(实测踩过)。
+#    这两个文件本来就是纯 ASCII,加 BOM 只有坏处。
+$mustNotHaveBom = @('resource.rc', 'qtrade-sfx.manifest')
+$badBom = @()
+foreach ($f in $mustNotHaveBom) {
+    $fp = Join-Path $projDir $f
+    if (-not (Test-Path -LiteralPath $fp)) { continue }
+    $head = [byte[]](Get-Content -LiteralPath $fp -Encoding Byte -TotalCount 3)
+    if ($head.Length -eq 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF) { $badBom += $f }
+}
+if ($badBom.Count -gt 0) {
+    throw ("这些文件不该有 UTF-8 BOM:{0}`n" -f ($badBom -join ', ')) +
+          "rc.exe 遇到带 BOM 的 .rc 就不再展开 #include 进来的宏(RC2135)。"
+}
 if ($noBom.Count -gt 0) {
     throw ("这些打过补丁的源文件缺 UTF-8 BOM:{0}`n" -f ($noBom -join ', ')) +
           "补丁里有中文注释,无 BOM 时 cl.exe 按系统 ANSI 解析,在非中文机上会触发 C4819," +

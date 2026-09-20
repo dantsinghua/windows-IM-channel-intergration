@@ -111,9 +111,11 @@ function ConvertFrom-QtUnifiedDiff {
             $parts = $raw -split '[\\/]'
             if ($parts.Count -le $StripComponents) { throw "补丁里的路径层级不够剥:$raw" }
             $rel = ($parts[$StripComponents..($parts.Count - 1)]) -join '\'
+            # `--- /dev/null` = 新增文件(补丁第三处的 qtrade-sfx.manifest 就是)
             $current = [pscustomobject]@{
-                Path  = $rel
-                Hunks = (New-Object System.Collections.Generic.List[object])
+                Path    = $rel
+                IsNew   = ($line.Substring(4).Trim() -split "`t")[0].Trim() -in @('/dev/null', 'NUL', 'nul')
+                Hunks   = (New-Object System.Collections.Generic.List[object])
             }
             $files.Add($current)
             $hunk = $null
@@ -154,13 +156,21 @@ function ConvertFrom-QtUnifiedDiff {
 function Invoke-QtUnifiedDiff {
     <#  把补丁应用到 $Root 下。严格匹配:任何一行上下文对不上就抛。
 
-        输出文件一律写成 **CRLF + UTF-8 with BOM**:
-          * CRLF —— SDK 源码本来就是 CRLF,保持一致;
-          * BOM  —— 🔴 补丁往源码里加了中文注释。cl.exe 读到**没有 BOM** 的 UTF-8
-            源码时,会按系统 ANSI 代码页解析(中文机 = GBK),中文注释立刻变乱码;
-            更糟的是 GBK 双字节里可能出现 0x5C(反斜杠),落在 `//` 注释行尾就会把
-            下一行代码一起吞进注释。加 BOM 后 cl.exe 无条件按 UTF-8 解析,这条路堵死。
-            (等价做法是给 cl 传 /utf-8,但那要改 makefile;BOM 是自包含的,更小。)
+        输出一律 CRLF(SDK 源码本来就是 CRLF)。BOM 则**按内容判**:
+
+          * 内容含非 ASCII -> **加 BOM**。🔴 补丁往 .cpp/.h 里加了中文注释,
+            cl.exe 读到没有 BOM 的 UTF-8 源码时会按系统 ANSI 代码页解析
+            (中文机 = GBK),中文注释立刻乱码;更糟的是 GBK 双字节里可能出现
+            0x5C(反斜杠),落在 `//` 行尾会把下一行代码一起吞进注释。
+            加 BOM 后 cl.exe 无条件按 UTF-8 解析。
+            (等价做法是给 cl 传 /utf-8,但那要改 makefile;BOM 自包含,更小。)
+
+          * 纯 ASCII -> **不加 BOM**。🔴 不是洁癖,是踩过:给 `resource.rc` 加 BOM 之后
+            rc.exe 不再展开第 1 行 `#include` 进来的宏,直接
+            `error RC2135: file not found: MY_VERSION_INFO_APP`。
+            清单(.manifest)同理 —— 它是被 rc.exe 原样嵌进资源、再交给 Windows
+            清单解析器的,少一个编码变量就少一类事故。
+            本来就没有非 ASCII 的文件,加 BOM 只有坏处。
     #>
     [CmdletBinding()]
     param(
@@ -176,23 +186,35 @@ function Invoke-QtUnifiedDiff {
     $patchText = [System.IO.File]::ReadAllText($PatchPath, [System.Text.Encoding]::UTF8)
     $files = ConvertFrom-QtUnifiedDiff -PatchText $patchText -StripComponents $StripComponents
 
-    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    $utf8Bom   = New-Object System.Text.UTF8Encoding($true)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $changed = New-Object System.Collections.Generic.List[string]
 
     foreach ($file in $files) {
         $target = Join-Path $Root $file.Path
-        if (-not (Test-Path -LiteralPath $target)) {
+        $exists = Test-Path -LiteralPath $target
+        if ($file.IsNew) {
+            # 新增文件:目标**不该**已经存在 —— 存在就说明补丁已经打过一遍,
+            # 或者源码版本对不上。两种都必须当场炸,不能默默覆盖。
+            if ($exists) {
+                throw "补丁要新建的文件已经存在:$($file.Path)(补丁打过两遍?)"
+            }
+            $src = @()
+        }
+        elseif (-not $exists) {
             throw "补丁要改的文件不在源码树里:$($file.Path)(源码版本对不上?)"
         }
-
-        $srcText = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8)
-        $src = ConvertTo-QtDiffLines -Text $srcText
+        else {
+            $srcText = [System.IO.File]::ReadAllText($target, [System.Text.Encoding]::UTF8)
+            $src = ConvertTo-QtDiffLines -Text $srcText
+        }
 
         $out = New-Object System.Collections.Generic.List[string]
         $cur = 0   # 0-based,已消费到 $src 的哪一行
 
         foreach ($h in $file.Hunks) {
-            $start = $h.OldStart - 1
+            # 新增文件的 hunk 头是 `@@ -0,0 +1,N @@`,OldStart = 0 -> 起点就是 0
+            $start = [Math]::Max(0, $h.OldStart - 1)
             if ($start -lt $cur) {
                 throw "补丁 hunk 顺序错乱:$($file.Path) @@ -$($h.OldStart)"
             }
@@ -223,12 +245,21 @@ function Invoke-QtUnifiedDiff {
         for ($k = $cur; $k -lt $src.Count; $k++) { $out.Add($src[$k]) }
 
         if (-not $DryRun) {
+            if ($file.IsNew) {
+                $parent = Split-Path -Parent $target
+                if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                }
+            }
             # 🔴 LZMA SDK 归档里的源文件**带只读属性**(7z 会把属性一起还原),
             #    直接 WriteAllText 会 UnauthorizedAccessException。先摘掉只读位。
             $fi = New-Object System.IO.FileInfo($target)
-            if ($fi.IsReadOnly) { $fi.IsReadOnly = $false }
+            if ($fi.Exists -and $fi.IsReadOnly) { $fi.IsReadOnly = $false }
             $text = ($out -join "`r`n") + "`r`n"
-            [System.IO.File]::WriteAllText($target, $text, $utf8Bom)
+            # 含非 ASCII 才加 BOM(理由见函数头注释)
+            $needsBom = $false
+            foreach ($ch in $text.ToCharArray()) { if ([int]$ch -gt 127) { $needsBom = $true; break } }
+            [System.IO.File]::WriteAllText($target, $text, $(if ($needsBom) { $utf8Bom } else { $utf8NoBom }))
         }
         $changed.Add($file.Path)
     }
@@ -315,13 +346,63 @@ function Get-QtMsvcMissingMessage {
 
 # ── 产物验货 ──────────────────────────────────────────────────────────────
 
+function Get-QtPeManifestLevel {
+    <#
+    .SYNOPSIS
+        读 PE 里 CREATEPROCESS_MANIFEST_RESOURCE_ID(1)/RT_MANIFEST(24) 的
+        requestedExecutionLevel;没有清单回空串。
+    .NOTES
+        用 LoadLibraryEx + LOAD_LIBRARY_AS_DATAFILE 读资源,而不是在文件里
+        grep `<assembly` —— 资源可能不是紧邻的纯文本,grep 会漏(实测漏过)。
+    #>
+    [CmdletBinding()][OutputType([string])]
+    param([Parameter(Mandatory)][string] $Path)
+
+    if (-not ('QTradeNativeRes' -as [type])) {
+        Add-Type -Namespace QTrade -Name NativeRes -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern IntPtr LoadLibraryExW(string f, IntPtr h, uint flags);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeLibrary(IntPtr h);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr FindResourceW(IntPtr h, IntPtr name, IntPtr type);
+[DllImport("kernel32.dll")] public static extern uint SizeofResource(IntPtr h, IntPtr r);
+[DllImport("kernel32.dll")] public static extern IntPtr LoadResource(IntPtr h, IntPtr r);
+[DllImport("kernel32.dll")] public static extern IntPtr LockResource(IntPtr d);
+'@ -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    $h = [QTrade.NativeRes]::LoadLibraryExW($full, [IntPtr]::Zero, 0x00000002)  # LOAD_LIBRARY_AS_DATAFILE
+    if ($h -eq [IntPtr]::Zero) { return '' }
+    try {
+        $r = [QTrade.NativeRes]::FindResourceW($h, [IntPtr]1, [IntPtr]24)
+        if ($r -eq [IntPtr]::Zero) { return '' }
+        $size = [QTrade.NativeRes]::SizeofResource($h, $r)
+        if ($size -le 0) { return '' }
+        $ptr = [QTrade.NativeRes]::LockResource([QTrade.NativeRes]::LoadResource($h, $r))
+        if ($ptr -eq [IntPtr]::Zero) { return '' }
+        $bytes = New-Object byte[] $size
+        [System.Runtime.InteropServices.Marshal]::Copy($ptr, $bytes, 0, $size)
+        $xml = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $m = [regex]::Match($xml, 'requestedExecutionLevel[^>]*level\s*=\s*"([^"]+)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return ''
+    } finally {
+        [void][QTrade.NativeRes]::FreeLibrary($h)
+    }
+}
+
 function Test-QtSfxStubBinary {
     <#  对重编出来的存根做三项自证,任何一项不过就不该拿去出包:
           1. PE 机器类型 = x86(0x014C)—— §2.4.1 要求 32 位外壳,任何 Windows 都能跑;
           2. 二进制里出现字符串 `InstallPath` —— 证明补丁 (a) 真的编进去了
              (这正是第四批打哑 EXE 才发现官方存根**没有**的那个键);
           3. 没有对 msvcr*/vcruntime* DLL 的导入 —— 证明是静态 CRT,
-             目标机上没装 VC++ 运行库也能跑。
+             目标机上没装 VC++ 运行库也能跑;
+          4. 嵌了 RT_MANIFEST 且 `level="requireAdministrator"` —— 证明补丁第三处编进去了。
+             🔴 没有清单时,提权是靠 Windows 的「安装程序检测」启发式撞上的
+             (未签名 + 版本信息含 "Setup"),而那依赖文件名关键词与
+             EnableInstallerDetection 策略,一旦不触发 EXE 根本起不来。
+             这一项把提权从「猜出来的」变成「声明的」,并且**可验证**。
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $Path)
@@ -354,10 +435,19 @@ function Test-QtSfxStubBinary {
         }
     }
 
+    # --- RT_MANIFEST(资源 id 1,类型 24)
+    $manifestLevel = Get-QtPeManifestLevel -Path $Path
+    if (-not $manifestLevel) {
+        $problems.Add('没有嵌 RT_MANIFEST —— 提权只能靠 UAC 的安装程序检测启发式撞上,非提权上下文里 EXE 根本起不来')
+    } elseif ($manifestLevel -ne 'requireAdministrator') {
+        $problems.Add(('清单里的 requestedExecutionLevel = {0},应为 requireAdministrator' -f $manifestLevel))
+    }
+
     return [pscustomobject]@{
-        Path     = $Path
-        Ok       = ($problems.Count -eq 0)
-        Machine  = $machine
+        Path          = $Path
+        Ok            = ($problems.Count -eq 0)
+        Machine       = $machine
+        ManifestLevel = $manifestLevel
         Problems = @($problems.ToArray())
         Size     = $bytes.Length
         Sha256   = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
@@ -366,4 +456,5 @@ function Test-QtSfxStubBinary {
 
 Export-ModuleMember -Function `
     Get-QtSfxSdkInfo, Assert-QtSha256, ConvertTo-QtDiffLines, ConvertFrom-QtUnifiedDiff, `
-    Invoke-QtUnifiedDiff, Find-QtMsvcToolchain, Get-QtMsvcMissingMessage, Test-QtSfxStubBinary
+    Invoke-QtUnifiedDiff, Find-QtMsvcToolchain, Get-QtMsvcMissingMessage, `
+    Get-QtPeManifestLevel, Test-QtSfxStubBinary

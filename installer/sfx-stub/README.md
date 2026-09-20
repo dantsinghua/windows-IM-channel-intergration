@@ -77,6 +77,30 @@ QTrade 安装包的**外壳**(两段式的外层,docs/03 §2.1)。
 否则等于在专门消灭「假 0」的这个补丁里又留了一条假 0。
 启动失败的几条路径沿用原本的 `return 1`,不动。
 
+### (c) 嵌一份显式清单 —— 把提权从「猜出来的」变成「声明的」
+
+新增 `qtrade-sfx.manifest`,`resource.rc` 加一行 `1 24 "qtrade-sfx.manifest"`
+(`CREATEPROCESS_MANIFEST_RESOURCE_ID` / `RT_MANIFEST`)。内容:
+
+| 段 | 值 | 为什么 |
+|---|---|---|
+| `requestedExecutionLevel` | `requireAdministrator` | 引擎本来就是 `PrivilegesRequired=admin`,安装要写 `%ProgramData%`、HKLM、服务、防火墙 |
+| `uiAccess` | **不声明** | 要它就得签名 + 放进安全目录,而我们从不驱动别人的 UI |
+| `supportedOS` | Win7 / 8 / 8.1 / **10-11** | 不声明的话 `GetVersionEx()` 在 Win10/11 上会谎报 6.2 |
+| `dpiAware` | `true`(系统级) | 进度对话框是普通 Win32 对话框,**不处理 `WM_DPICHANGED`** —— 声明 PerMonitorV2 反而会在跨显示器时错缩放 |
+| `longPathAware` | **不声明**(裁决里是「可选」) | 补丁里的代码用的是固定 `MAX_PATH` 大小的缓冲区,而安装根本来就短;开了只多一类截断风险 |
+
+🔴 **清单与 `resource.rc` 必须是纯 ASCII 且不带 BOM**。给 `resource.rc` 加 BOM 之后,
+rc.exe 不再展开第 1 行 `#include` 进来的宏,直接
+`error RC2135: file not found: MY_VERSION_INFO_APP`(实测踩过)。
+所以补丁应用器的 BOM 规则是**按内容判**:含非 ASCII 才加(那三个 .cpp/.h),纯 ASCII 不加。
+
+验货第四项会把「RT_MANIFEST 存在且 level=requireAdministrator」当成硬判据。
+
+> 🔴 **回退路径的官方存根没法嵌清单**(我们不重编它,它是现成二进制)。
+> 所以官方存根那条路的提权**只能继续靠启发式** —— 它**仅作应急回退**
+> (自编存根被 EDR/AppLocker 拦、来不及重签时),不是常规出包路径。
+
 ### 附带的两处小改(都是评审提出、成本极低)
 
 * 子进程起来后,把**存根自身**的当前目录挪到系统目录。进程的当前目录会钉住该目录
@@ -250,9 +274,7 @@ monotonic near 6GiB / no overflow at 10TiB
 `EnableInstallerDetection` 策略没被关掉。一旦不触发,静默安装会以一个
 很难懂的错误挂掉。
 
-建议(已提交裁决):给存根嵌一份显式清单
-`<requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>`,
-让提权变成**声明的**而不是**猜出来的**。这是资源级改动,不碰 `SfxSetup.cpp` 的任何逻辑。
+**总控已裁决同意**,于是有了补丁第三处(见 §3)。
 
 > 哑 EXE 实验因此用的是 `QTradeSD.sfx` 的**副本**(`mt.exe` 注入 `asInvoker`),
 > 好让它能在非提权上下文里跑。清单只决定「要不要提权」,

@@ -91,13 +91,19 @@ Describe 'ConvertFrom-QtUnifiedDiff（解析真补丁）' {
         $script:RealPatch = [System.IO.File]::ReadAllText((Join-Path $script:StubDir 'qtrade-sfx.patch'))
         $script:Parsed = ConvertFrom-QtUnifiedDiff -PatchText $script:RealPatch
     }
-    It '正好三个文件段' {
-        $script:Parsed.Count | Should -Be 3
+    It '正好五个文件段(三处改动:两处行为 + 一处清单)' {
+        $script:Parsed.Count | Should -Be 5
     }
     It '剥掉 a/ b/ 前缀后是 SDK 内的相对路径' {
-        $script:Parsed.Path | Should -Contain 'CPP\7zip\Bundles\SFXSetup\SfxSetup.cpp'
-        $script:Parsed.Path | Should -Contain 'CPP\7zip\Bundles\SFXSetup\ExtractEngine.cpp'
-        $script:Parsed.Path | Should -Contain 'CPP\7zip\Bundles\SFXSetup\ExtractEngine.h'
+        foreach ($f in @('SfxSetup.cpp', 'ExtractEngine.cpp', 'ExtractEngine.h', 'resource.rc', 'qtrade-sfx.manifest')) {
+            $script:Parsed.Path | Should -Contain ('CPP\7zip\Bundles\SFXSetup\' + $f)
+        }
+    }
+    It '🔴 清单那段是「新增文件」(--- /dev/null),不是改已有文件' {
+        $man = @($script:Parsed | Where-Object { $_.Path -like '*qtrade-sfx.manifest' })[0]
+        $man.IsNew | Should -BeTrue
+        $rc = @($script:Parsed | Where-Object { $_.Path -like '*resource.rc' })[0]
+        $rc.IsNew | Should -BeFalse
     }
     It '每个文件段都至少有一个 hunk' {
         foreach ($f in $script:Parsed) { $f.Hunks.Count | Should -BeGreaterThan 0 }
@@ -132,8 +138,21 @@ Describe 'Invoke-QtUnifiedDiff' {
         $crlf | Should -Be $lf
     }
 
-    It '🔴 输出带 UTF-8 BOM —— 否则 cl.exe 会按 GBK 解析补丁里的中文注释' {
-        Invoke-QtUnifiedDiff -PatchPath $script:Patch -Root (Join-Path $script:Root 'sdk') | Out-Null
+    It '🔴 含非 ASCII 的产物带 UTF-8 BOM —— 否则 cl.exe 会按 GBK 解析中文注释' {
+        # BOM 是**按内容判**的:这里的补丁往文件里塞了中文,所以必须带 BOM。
+        # (纯 ASCII 不加 BOM 的那一面,由下面 plain.rc 那条用例守 —— 带 BOM 的 .rc
+        #  会让 rc.exe 报 RC2135,两个方向都踩过。)
+        $cn = Join-Path $script:Root 'cn.patch'
+        [System.IO.File]::WriteAllText($cn, @"
+--- a/sub/a.txt
++++ b/sub/a.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++// 中文注释
+ line3
+"@, (New-Object System.Text.UTF8Encoding($false)))
+        Invoke-QtUnifiedDiff -PatchPath $cn -Root (Join-Path $script:Root 'sdk') | Out-Null
         $bytes = [System.IO.File]::ReadAllBytes($script:File)
         $bytes[0..2] | Should -Be @(0xEF, 0xBB, 0xBF)
     }
@@ -153,6 +172,46 @@ Describe 'Invoke-QtUnifiedDiff' {
         Remove-Item -LiteralPath $script:File -Force
         { Invoke-QtUnifiedDiff -PatchPath $script:Patch -Root (Join-Path $script:Root 'sdk') } |
             Should -Throw -ExpectedMessage '*不在源码树里*'
+    }
+
+    It '🔴 新增文件的 hunk(--- /dev/null)能创建出文件' {
+        $np = Join-Path $script:Root 'newfile.patch'
+        [System.IO.File]::WriteAllText($np, @"
+--- /dev/null
++++ b/sub/brand-new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+"@)
+        Invoke-QtUnifiedDiff -PatchPath $np -Root (Join-Path $script:Root 'sdk') | Out-Null
+        $f = Join-Path $script:Root 'sdk\sub\brand-new.txt'
+        Test-Path -LiteralPath $f | Should -BeTrue
+        [System.IO.File]::ReadAllText($f) | Should -BeExactly "hello`r`nworld`r`n"
+    }
+
+    It '🔴 新增文件已经存在时必须抛(补丁打过两遍),不能默默覆盖' {
+        $np = Join-Path $script:Root 'newfile.patch'
+        [System.IO.File]::WriteAllText($np, @"
+--- /dev/null
++++ b/sub/a.txt
+@@ -0,0 +1,1 @@
++x
+"@)
+        { Invoke-QtUnifiedDiff -PatchPath $np -Root (Join-Path $script:Root 'sdk') } |
+            Should -Throw -ExpectedMessage '*已经存在*'
+    }
+
+    It '🔴 纯 ASCII 的产物**不加** BOM —— 带 BOM 的 .rc 会让 rc.exe 报 RC2135' {
+        $np = Join-Path $script:Root 'ascii.patch'
+        [System.IO.File]::WriteAllText($np, @"
+--- /dev/null
++++ b/sub/plain.rc
+@@ -0,0 +1,1 @@
++IDI_ICON ICON "x.ico"
+"@)
+        Invoke-QtUnifiedDiff -PatchPath $np -Root (Join-Path $script:Root 'sdk') | Out-Null
+        $b = [System.IO.File]::ReadAllBytes((Join-Path $script:Root 'sdk\sub\plain.rc'))
+        ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) | Should -BeFalse
     }
 
     It '-DryRun 不落盘' {
@@ -181,6 +240,24 @@ Describe 'Find-QtMsvcToolchain / Get-QtMsvcMissingMessage' {
     }
 }
 
+Describe 'Get-QtPeManifestLevel —— 读 PE 里的 RT_MANIFEST' {
+    It '🔴 官方 7zSD.sfx 没有嵌清单(它的提权靠 UAC 启发式撞)' {
+        $official = Join-Path $script:BuildDir '7zSD.sfx'
+        if (-not (Test-Path -LiteralPath $official)) { Set-ItResult -Skipped -Because '本机没放官方存根'; return }
+        Get-QtPeManifestLevel -Path $official | Should -BeExactly ''
+    }
+    It '自编存根声明 requireAdministrator(补丁第三处)' {
+        $mine = Join-Path $script:BuildDir 'QTradeSD.sfx'
+        if (-not (Test-Path -LiteralPath $mine)) { Set-ItResult -Skipped -Because '本机还没编出自编存根'; return }
+        Get-QtPeManifestLevel -Path $mine | Should -BeExactly 'requireAdministrator'
+    }
+    It '不是 PE 的文件不崩,回空串' {
+        $f = Join-Path $TestDrive 'x.bin'
+        [System.IO.File]::WriteAllBytes($f, [byte[]](1..64))
+        Get-QtPeManifestLevel -Path $f | Should -BeExactly ''
+    }
+}
+
 Describe 'Test-QtSfxStubBinary' {
     It '不是 PE 的文件直接判不合格' {
         $f = Join-Path $TestDrive 'notpe.bin'
@@ -200,6 +277,8 @@ Describe 'Test-QtSfxStubBinary' {
         $v = Test-QtSfxStubBinary -Path $official
         $v.Ok | Should -BeFalse
         ($v.Problems -join ' ') | Should -BeLike '*InstallPath*'
+        # 第四项自检:官方存根同样没有清单
+        ($v.Problems -join ' ') | Should -BeLike '*RT_MANIFEST*'
     }
 
     It '官方存根本身是 x86 —— 确认机器类型这一项没有误判' {

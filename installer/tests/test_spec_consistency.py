@@ -1009,11 +1009,10 @@ def test_patch_touches_only_the_sfxsetup_bundle() -> None:
     否则下次升 SDK 版本就是一场灾难。"""
     patch = _read_bytes_text(SFX_PATCH)
     files = sorted(set(re.findall(r"^\+\+\+ b/(.+?)\s*$", patch, re.M)))
-    assert files == [
-        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp",
-        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.h",
-        "CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp",
-    ], f"补丁碰了计划外的文件:{files}"
+    assert files, "补丁里一个文件都没解析到"
+    outside = [f for f in files if not f.startswith("CPP/7zip/Bundles/SFXSetup/")]
+    assert not outside, f"补丁碰了 SFXSetup 目录之外的文件:{outside}"
+    # 逐文件的白名单由 test_patch_embeds_explicit_manifest 守
 
 
 def test_sdk_source_is_pinned_by_sha256() -> None:
@@ -1304,3 +1303,79 @@ def test_stub_build_is_reproducible_from_repo_alone() -> None:
     # 已知缺口必须写明,不能装作全验过了
     assert "已知缺口" in readme, "README 没有写明验证缺口"
     assert "requireAdministrator" in readme, "没有记录清单/提权那条待裁决"
+
+
+# ── 补丁第三处:显式清单(总控 2026-09-20 裁决)────────────────────────────
+def _patch_added_lines() -> str:
+    patch = _read_bytes_text(SFX_PATCH)
+    return "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
+
+
+def test_patch_embeds_explicit_manifest() -> None:
+    """🔴 没有清单时,提权是靠 Windows 的「安装程序检测」启发式撞上的
+    (未签名 + 版本信息含 "Setup")。那依赖文件名关键词,也依赖
+    EnableInstallerDetection 策略没被关掉 —— 一旦不触发,非提权上下文里
+    `CreateProcess` 直接 ERROR_ELEVATION_REQUIRED,EXE 根本起不来。
+    把提权从「猜出来的」变成「声明的」。"""
+    added = _patch_added_lines()
+    assert '1 24 "qtrade-sfx.manifest"' in added, "resource.rc 没有嵌 RT_MANIFEST"
+    assert 'level="requireAdministrator"' in added, "清单没有声明 requireAdministrator"
+    # 新增文件必须走「--- /dev/null」的 hunk
+    patch = _read_bytes_text(SFX_PATCH)
+    assert re.search(r"^--- /dev/null\s*$", patch, re.M), "清单不是以新增文件的形式进补丁的"
+    files = sorted(set(re.findall(r"^\+\+\+ b/(.+?)\s*$", patch, re.M)))
+    assert files == [
+        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp",
+        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.h",
+        "CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp",
+        "CPP/7zip/Bundles/SFXSetup/qtrade-sfx.manifest",
+        "CPP/7zip/Bundles/SFXSetup/resource.rc",
+    ], f"补丁碰了计划外的文件:{files}"
+
+
+def test_manifest_omits_uiaccess_and_longpathaware() -> None:
+    """裁决明说不要 `uiAccess`(要它就得签名 + 放安全目录,而我们从不驱动别人的 UI)。
+    `longPathAware` 是「可选」—— 这里**故意不要**:补丁里的代码用的是固定
+    MAX_PATH 大小的缓冲区,而安装根本来就短,开了只会多一类截断风险。"""
+    added = _patch_added_lines()
+    # 🔴 先剥掉 XML 注释再断言:清单里专门解释了「为什么不要 uiAccess / 为什么不用
+    #    PerMonitorV2」,照原文找关键词会命中**说明文字**而不是真正的声明 —— 这个坑
+    #    在 run-step.ps1 那边已经踩过一次了。
+    markup = re.sub(r"<!--.*?-->", "", added, flags=re.S)
+    assert "uiAccess" not in markup, "清单里出现了 uiAccess 属性"
+    assert "longPathAware" not in markup, "longPathAware 不该被声明(补丁用的是固定 MAX_PATH 缓冲区)"
+    assert "PerMonitorV2" not in markup, "进度对话框不处理 WM_DPICHANGED,不该声明 PerMonitorV2"
+    assert "<dpiAware " in markup, "缺 dpiAware(系统级感知)"
+    # supportedOS:至少要有 Win10/11 那个 GUID,否则 GetVersionEx 会被谎报成 6.2
+    assert "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" in markup, "supportedOS 缺 Win10/11"
+
+
+def test_rc_and_manifest_must_not_have_bom() -> None:
+    r"""🔴 给 `resource.rc` 加 UTF-8 BOM 之后,rc.exe 不再展开第 1 行 `#include`
+    进来的宏,直接 `error RC2135: file not found: MY_VERSION_INFO_APP`(实测踩过)。
+    这两个文件本来就是纯 ASCII,加 BOM 只有坏处 —— 应用器按内容判,构建脚本再卡一道。"""
+    build = read(SFX_STUB_DIR / "build.ps1")
+    assert "RC2135" in build, "构建脚本没有点名 RC2135,下一个人看不懂为什么禁 BOM"
+    assert "qtrade-sfx.manifest" in build and "resource.rc" in build
+    psm1 = read(SFX_STUB_PSM1)
+    assert "$needsBom" in psm1, "应用器不是按内容判 BOM"
+
+
+def test_stub_selfcheck_covers_manifest() -> None:
+    """验货第四项:RT_MANIFEST 存在且 level=requireAdministrator。
+    防的是「编出来的存根忘了带清单」—— 那会退回靠启发式,而且只在
+    非提权环境里才暴露。"""
+    psm1 = read(SFX_STUB_PSM1)
+    assert "function Get-QtPeManifestLevel" in psm1
+    assert "requireAdministrator" in psm1
+    assert "FindResourceW" in psm1, "要按 PE 资源读,不能在文件里 grep(会漏)"
+
+
+def test_official_stub_fallback_is_documented_as_emergency_only() -> None:
+    """回退路径的官方存根**没法嵌清单**(它是二进制,我们不重编它),
+    所以它的提权只能靠启发式 —— 必须写明「仅作应急回退」。"""
+    readme = read(SFX_STUB_DIR / "README.md")
+    assert "应急" in readme, "README 没写明官方存根仅作应急回退"
+    build_readme = read(INSTALLER_ROOT / "build" / "README.md")
+    assert "真机验证清单" in build_readme, "build/README 缺「须真机验证清单」"
+    assert "小盘" in build_readme, "真机清单里没写小盘 VM 那条"

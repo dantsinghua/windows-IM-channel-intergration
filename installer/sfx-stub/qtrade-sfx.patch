@@ -365,3 +365,59 @@
 +    bool showProgress, bool checkSpace, bool &isCorrupt, bool &noSpace, UString &errorMessage);
  
  #endif
+--- a/CPP/7zip/Bundles/SFXSetup/resource.rc
++++ b/CPP/7zip/Bundles/SFXSetup/resource.rc
+@@ -5,6 +5,11 @@
+ 
+ IDI_ICON  ICON "setup.ico"
+ 
++/* [QTrade] CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24).
++   Declares requireAdministrator explicitly instead of relying on the
++   Windows Installer Detection heuristic.  See installer/sfx-stub/README.md. */
++1 24 "qtrade-sfx.manifest"
++
+ STRINGTABLE
+ BEGIN
+   IDS_EXTRACTION_ERROR_TITLE  "Extraction Failed"
+--- /dev/null
++++ b/CPP/7zip/Bundles/SFXSetup/qtrade-sfx.manifest
+@@ -0,0 +1,39 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <assemblyIdentity type="win32" name="QTrade.Setup.Sfx" version="1.0.0.0"
++                    processorArchitecture="x86" />
++
++  <!-- The engine requires administrator (Inno: PrivilegesRequired=admin) and the
++       installer writes to %ProgramData%, HKLM, services and the firewall.
++       Declare it instead of relying on UAC Installer Detection heuristics.
++       uiAccess is intentionally omitted (defaults to false): it would require a
++       signed binary in a secure location and we never drive another app's UI. -->
++  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
++    <security>
++      <requestedPrivileges>
++        <requestedExecutionLevel level="requireAdministrator" />
++      </requestedPrivileges>
++    </security>
++  </trustInfo>
++
++  <!-- Without this, GetVersionEx() reports 6.2 on Windows 10/11. -->
++  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
++    <application>
++      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" /><!-- Win 10 / 11 -->
++      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" /><!-- Win 8.1 -->
++      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" /><!-- Win 8 -->
++      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" /><!-- Win 7 -->
++    </application>
++  </compatibility>
++
++  <application xmlns="urn:schemas-microsoft-com:asm.v3">
++    <windowsSettings>
++      <!-- System DPI aware only.  The progress dialog is a plain Win32 dialog that
++           does not handle WM_DPICHANGED, so declaring PerMonitorV2 would make it
++           mis-scale when the window moves between monitors.
++           longPathAware is deliberately NOT declared: the patched code uses fixed
++           MAX_PATH-sized buffers and the install root is short. -->
++      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++    </windowsSettings>
++  </application>
++</assembly>
