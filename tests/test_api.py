@@ -162,30 +162,30 @@ def test_messages_query_fts_like_cursor_and_view(rig):
     t0 = clock.now_ms
     _seed_messages(st, t0)
     j = c.get("/api/v1/messages?account_id=qd01&limit=3", headers=H()).json()
-    assert len(j["items"]) == 3 and j["next_cursor"] and "slow_match" not in j
-    m = j["items"][0]
+    assert len(j["data"]) == 3 and j["next_cursor"] and "slow_match" not in j
+    m = j["data"][0]
     assert set(m) >= {"id", "ext_msg_id", "session", "dir", "type", "state", "text", "text_len", "fingerprint", "media", "sender", "self", "ts", "received_at", "source", "revoked"}
     assert "lag_s" not in m and "late" not in m and "origin" not in m and m["ts"].endswith("+08:00")     # R6-49:三字段不落库
     assert m["session"] == {"id": f"qd01:{PEER}", "name": PEER, "kind": "private"}
     j2 = c.get(f"/api/v1/messages?account_id=qd01&limit=3&cursor={j['next_cursor']}", headers=H()).json()
-    assert len(j2["items"]) == 1 and j2["next_cursor"] is None and j2["items"][0]["id"] not in {x["id"] for x in j["items"]}
+    assert len(j2["data"]) == 1 and j2["next_cursor"] is None and j2["data"][0]["id"] not in {x["id"] for x in j["data"]}
     j3 = c.get("/api/v1/messages?q=报价&account_id=qd01", headers=H()).json()
-    assert len(j3["items"]) == 2 and j3.get("slow_match") is True                                          # 2 字走 LIKE
+    assert len(j3["data"]) == 2 and j3.get("slow_match") is True                                          # 2 字走 LIKE
     j4 = c.get("/api/v1/messages?q=1.70 报价&account_id=qd01", headers=H()).json()
-    assert len(j4["items"]) == 1 and j4.get("slow_match") is True                                            # 混合:≥3 字走 FTS + 2 字 LIKE,AND;有 LIKE 词即 slow
+    assert len(j4["data"]) == 1 and j4.get("slow_match") is True                                            # 混合:≥3 字走 FTS + 2 字 LIKE,AND;有 LIKE 词即 slow
     j4b = c.get("/api/v1/messages?q=1.70&account_id=qd01", headers=H()).json()
-    assert len(j4b["items"]) == 1 and "slow_match" not in j4b                                               # 纯 ≥3 字 FTS
+    assert len(j4b["data"]) == 1 and "slow_match" not in j4b                                               # 纯 ≥3 字 FTS
     j4c = c.get("/api/v1/messages?q=1.70 2Y&account_id=qd01", headers=H()).json()
-    assert len(j4c["items"]) == 0                                                                           # AND:两词不在同一条
+    assert len(j4c["data"]) == 0                                                                           # AND:两词不在同一条
     j5 = c.get("/api/v1/messages?account_id=qd01&dir=out", headers=H()).json()
-    assert [x["text"] for x in j5["items"]] == ["收到"]
+    assert [x["text"] for x in j5["data"]] == ["收到"]
     j6 = c.get(f"/api/v1/messages?account_id=qd01&since={t0 + 2000}", headers=H()).json()
-    assert len(j6["items"]) == 2
+    assert len(j6["data"]) == 2
     from qtrade_agent.events import iso8601
     j6b = c.get("/api/v1/messages", params={"account_id": "qd01", "since": iso8601(t0 + 2000), "until": iso8601(t0 + 3000)}, headers=H()).json()
-    assert len(j6b["items"]) == 1                                                                           # ISO 8601 也接受(秒级,t0 有毫秒尾)
+    assert len(j6b["data"]) == 1                                                                           # ISO 8601 也接受(秒级,t0 有毫秒尾)
     j6c = c.get(f"/api/v1/messages?account_id=qd01&since={iso8601(t0 + 2000)}", headers=H()).json()        # 未编码的 + 被当空格:容忍
-    assert len(j6c["items"]) == 2
+    assert len(j6c["data"]) == 2
     one = c.get(f"/api/v1/messages/{m['id']}", headers=H()).json()["data"]
     assert one["id"] == m["id"]
     assert c.get("/api/v1/messages?cursor=@@", headers=H()).status_code == 400

@@ -110,11 +110,12 @@ def stored_result_view(row: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def encode_cursor(ts_ms: int, id: str) -> str:
-    return base64.urlsafe_b64encode(f"{ts_ms}:{id}".encode()).decode().rstrip("=")
+    """02 §3.4 通用 G-16:``cursor = base64url(JSON{"ts_ms":…,"id":…})``(R6-53:R6-52 曾写 "ts_ms:id",按 G-16 改回)。"""
+    raw = json.dumps({"ts_ms": int(ts_ms), "id": id}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def decode_cursor(cur: str) -> tuple[int, str]:
     pad = "=" * (-len(cur) % 4)
-    raw = base64.urlsafe_b64decode(cur + pad).decode()
-    ts, id = raw.split(":", 1)
-    return int(ts), id
+    obj = json.loads(base64.urlsafe_b64decode(cur + pad).decode())
+    return int(obj["ts_ms"]), str(obj["id"])

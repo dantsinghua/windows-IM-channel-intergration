@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from .. import __version__ as AGENT_VERSION
 from ..config import WS_PING_INTERVAL_S
+from ..events import iso8601
 from ..ids import ulid
 from ..models import Command, CommandOrigin, RESULT_CODES
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
@@ -112,6 +114,7 @@ def create_api(agent) -> FastAPI:
     def _with_version_headers(resp: Response) -> Response:
         resp.headers["X-QT-Api-Version"] = cfg.api.api_version
         resp.headers["X-QT-Agent-Version"] = AGENT_VERSION
+        resp.headers["X-QT-Capabilities-Version"] = caps_version     # 02 §3.10:三处下发(/capabilities、/system/version、响应头)
         return resp
 
     @app.exception_handler(ApiError)
@@ -154,10 +157,16 @@ def create_api(agent) -> FastAPI:
             db_mb, wal_mb = agent.store.db_size_mb()
             running = agent.store.con.execute("SELECT COUNT(*) FROM accounts WHERE state='running' AND deleted_ms IS NULL").fetchone()[0]
             total = agent.store.con.execute("SELECT COUNT(*) FROM accounts WHERE deleted_ms IS NULL").fetchone()[0]
+            data_dir = os.path.dirname(os.path.abspath(agent.store.path)) if agent.store.path != ":memory:" else os.getcwd()
+            try:
+                disk_free_mb = shutil.disk_usage(data_dir).free // 1048576      # 02 #72 / B-35:agent.db 所在盘剩余
+            except OSError:
+                disk_free_mb = None
             return {"ok": True, "agent": {"version": AGENT_VERSION, "api_version": cfg.api.api_version, "uptime_s": agent.health.uptime_s(),
                                           "db_mb": db_mb, "wal_mb": wal_mb},
                     "dockerd": agent.health.dockerd_ok, "winagent": {"online": agent.health.winagent_online, "version": None, "user_agent": agent.health.user_agent_online},
-                    "accounts": {"running": running, "n": total}, "checks": {"H13": "firing" if agent.health.h13_firing() else "ok"},
+                    "accounts": {"running": running, "n": total}, "disk_free_mb": disk_free_mb,
+                    "checks": {"H13": "firing" if agent.health.h13_firing() else "ok"},       # {Hxx: ok|firing|unknown},其余健康项待 health 探测接入
                     "alerts": [{"code": a.code, "subject": a.subject, "severity": a.severity, "count": a.count} for a in agent.alerts.active.values()],
                     "scheduler": agent.scheduler.snapshot()}
         if is_unauth_health_source(host, cfg.api.unauth_health_sources, agent.wsl_gateway):
@@ -168,7 +177,7 @@ def create_api(agent) -> FastAPI:
     async def capabilities(request: Request, channel: Optional[str] = None):
         _principal(request, "read")
         items = caps if not channel else [c for c in caps if c["channels"].get(channel) == "supported"]
-        return {"ok": True, "capabilities_version": caps_version, "items": items}
+        return {"ok": True, "capabilities_version": caps_version, "data": items}      # §3.4 通用:列表一律 data(R6-53)
 
     # ------------------------------------------------------------------ accounts
     def _acct_caps(row: dict[str, Any]) -> list[str]:
@@ -290,7 +299,7 @@ def create_api(agent) -> FastAPI:
         rows, slow = agent.store.query_messages(account_id=account_id, session_id=session_id, dir=dir, type=type, state=state, since_ms=since_ms,
                                                 until_ms=until_ms, sender=sender, q=q, limit=limit, before=before)
         rows = [r for r in rows if p.allows_account(r["account_id"])]
-        out: dict[str, Any] = {"ok": True, "items": [message_view(r) for r in rows],
+        out: dict[str, Any] = {"ok": True, "data": [message_view(r) for r in rows],          # §3.4 通用 C-42:{ok, data, next_cursor}(R6-53)
                                "next_cursor": encode_cursor(rows[-1]["ts_ms"], rows[-1]["id"]) if len(rows) == limit else None}
         if slow:
             out["slow_match"] = True
@@ -341,7 +350,10 @@ def create_api(agent) -> FastAPI:
         except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
             await ws.close(code=4400)
             return
-        sub = first.get("subscribe") or {}
+        if not isinstance(first, dict) or not isinstance(first.get("subscribe"), dict):   # R6-53:首帧必须是含 subscribe 对象的 JSON
+            await ws.close(code=4400)
+            return
+        sub = first["subscribe"]
         events_f = set(sub.get("events") or [])
         accounts_f = set(sub.get("accounts") or ["*"])
         channels_f = set(sub.get("channels") or [])
@@ -377,8 +389,8 @@ def create_api(agent) -> FastAPI:
                 rows = agent.store.replay_outbox(last_seq, 500)
                 for r in rows:
                     last_seq = r["seq"]
-                    frame = {"event": r["event"], "seq": r["seq"], "ts": r["ts_ms"], "trace_id": r["trace_id"], "account_id": r["account_id"],
-                             "channel": r["channel"], "payload": r["payload"]}
+                    frame = {"event": r["event"], "seq": r["seq"], "ts": iso8601(r["ts_ms"]), "trace_id": r["trace_id"], "account_id": r["account_id"],
+                             "channel": r["channel"], "payload": r["payload"]}       # 00 §7.5 Event:ts ISO 8601(00 §6)
                     if allowed(frame):
                         await ws.send_json(frame)
                 if time.monotonic() - last_ping >= WS_PING_INTERVAL_S:
