@@ -83,6 +83,39 @@ def test_init_db_idempotent_when_current(tmp_path):
         s.close()
 
 
+def test_init_db_rerun_keeps_main_db_bytes(tmp_path):
+    """D-05 / 03 §8b.3 M1-12b ①:已是最新 ⇒ 一条语句都不写 ⇒ **主库文件** sha256 连跑不变(判据是字节,不是 .dump)。"""
+    db = str(tmp_path / "agent.db")
+    assert init_db(AgentConfig(), db) == EXIT_OK
+    first = sha256(db)
+    for _ in range(2):
+        assert init_db(AgentConfig(), db) == EXIT_OK
+        assert sha256(db) == first
+
+
+def test_normal_open_keeps_main_db_bytes(tmp_path):
+    """常规 ``Store.open()/close()`` 对已最新库同样不改库头(变更计数 = 偏移 24 不动)。"""
+    db = str(tmp_path / "agent.db")
+    Store(db).open().close()
+    first = sha256(db)
+    Store(db).open().close()
+    assert sha256(db) == first
+
+
+def test_existing_db_still_gets_runtime_pragmas(tmp_path):
+    """跳过 ``auto_vacuum`` 的重设不得连带运行期 PRAGMA:已有库重开后 WAL / foreign_keys / auto_vacuum 仍生效。"""
+    db = str(tmp_path / "agent.db")
+    Store(db).open().close()
+    s = Store(db).open()
+    try:
+        assert s.con.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+        assert s.con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert s.con.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert s.con.execute("PRAGMA synchronous").fetchone()[0] == 1          # NORMAL
+    finally:
+        s.close()
+
+
 # ────────────────────────────────────────────── ③ 版本落后 ⇒ 跑迁移
 def test_init_db_applies_pending_migrations(tmp_path, monkeypatch):
     db = str(tmp_path / "agent.db")
@@ -185,8 +218,11 @@ def test_subprocess_init_db_smoke(tmp_path):
     assert r.returncode == 0, r.stderr
     assert db.exists()
     assert table_count(str(db)) >= 27
-    r2 = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)   # 幂等重跑
-    assert r2.returncode == 0, r2.stderr
+    first = sha256(str(db))
+    for _ in range(2):                                                               # 幂等重跑:主库字节不变(D-05)
+        r2 = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        assert r2.returncode == 0, r2.stderr
+        assert sha256(str(db)) == first
 
 
 def test_subprocess_help_mentions_init_db():

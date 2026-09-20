@@ -64,10 +64,13 @@ def code_schema_version() -> int:
     scripts = migration_scripts()
     return scripts[-1][0] if scripts else BASELINE_VERSION
 
+#: 02 §2.8.4:库开 auto_vacuum=INCREMENTAL(**建库时设定,之后改不了**)⇒ 必须排在建表之前、journal_mode 之前。
+#: 🔴 D-05:这条 PRAGMA 即使值不变也会提交一次写(库头偏移 24/92 变更计数 +1)⇒ 已是 2 的库**不再执行**,
+#: 否则 ``--init-db`` 重跑时主库 sha256 会变(03 §8b.3 M1-12b ①「幂等 = 一条语句都不写」)。见 ``Store.open``。
+AUTO_VACUUM_PRAGMA = "PRAGMA auto_vacuum=INCREMENTAL"
+AUTO_VACUUM_INCREMENTAL = 2
+
 PRAGMAS = (
-    # 02 §2.8.4:库开 auto_vacuum=INCREMENTAL(**建库时设定,之后改不了**)⇒ 必须排在建表之前;
-    # 对已存在的库是静默 no-op(SQLite 语义),不改也不报错。放在 journal_mode 之前:WAL 下它对已有库同样无效。
-    "PRAGMA auto_vacuum=INCREMENTAL",
     "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000",
     "PRAGMA foreign_keys=ON", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-65536", "PRAGMA wal_autocheckpoint=2000",
 )
@@ -140,7 +143,11 @@ class Store:
         if preexisting:
             self._quick_check(con)
             self._check_supported(con)      # 02 §3.8:库比代码新 ⇒ 在动 PRAGMA/写任何一页之前就拒绝,库文件一字不改
-        for p in PRAGMAS:
+        # 读 ``PRAGMA auto_vacuum`` 不写库;只有不是 INCREMENTAL(新建库读回 0)时才设,已是 2 的库字节不动(D-05)
+        pragmas = PRAGMAS
+        if con.execute("PRAGMA auto_vacuum").fetchone()[0] != AUTO_VACUUM_INCREMENTAL:
+            pragmas = (AUTO_VACUUM_PRAGMA,) + PRAGMAS
+        for p in pragmas:
             try:
                 con.execute(p)
             except sqlite3.OperationalError:
