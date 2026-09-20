@@ -1,0 +1,23 @@
+# 03 分册:控制台只出目录产物(app.asar + 资源目录),NSIS 由安装器外壳承载
+appId: xin.greydan.qtrade.console
+productName: QTrade 控制台
+copyright: QTrade
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/renderer/**/*
+  - dist/electron/**/*
+  - package.json
+asar: true
+asarUnpack: []
+win:
+  target:
+    - target: dir
+      arch:
+        - x64
+  artifactName: qtrade-console-${version}-${arch}.${ext}
+# 明确不产出 NSIS / MSI:安装引导归 03 的 7z-SFX + Inno 引擎
+nsis: null
+extraMetadata:
+  main: dist/electron/main/index.cjs

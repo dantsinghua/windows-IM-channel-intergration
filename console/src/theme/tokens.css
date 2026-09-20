@@ -1,0 +1,61 @@
+/* 设计令牌全表(01 §2.9;基线 §9 给定的色值为准) */
+:root {
+  /* 品牌与状态 */
+  --qt-primary: #2F54EB;
+  --qt-state-running: #52C41A;  --qt-state-login_required: #FAAD14;
+  --qt-state-starting: #1677FF; --qt-state-stopped: #8C8C8C;
+  --qt-state-error: #F5222D;    --qt-state-degraded: #FA8C16;
+  /* 通道 */
+  --qt-ch-qidian: #13C2C2;  --qt-ch-qq: #1677FF;  --qt-ch-wechat: #07C160;
+  /* 结果码语义 */
+  --qt-code-ok: var(--qt-state-running);  --qt-code-pending: #FAAD14;
+  --qt-code-fail: var(--qt-state-error);  --qt-code-blocked: #722ED1;  --qt-code-na: #BFBFBF;
+  /* 告警级别:复用状态色,不新增色值 */
+  --qt-sev-info: var(--qt-state-starting);  --qt-sev-warn: var(--qt-state-login_required);
+  --qt-sev-crit: var(--qt-state-error);
+  /* 中性色(浅色) */
+  --qt-bg: #F5F6F8;  --qt-bg-elevated: #FFFFFF;  --qt-border: #E5E6EB;
+  --qt-text: #1F1F1F;  --qt-text-secondary: #595959;  --qt-text-disabled: #BFBFBF;
+  /* 间距 / 字号 / 圆角 / 阴影 */
+  --qt-space-1: 4px; --qt-space-2: 8px; --qt-space-3: 12px; --qt-space-4: 16px;
+  --qt-space-6: 24px; --qt-space-8: 32px;
+  --qt-font-xs: 12px; --qt-font-sm: 13px; --qt-font-md: 14px; --qt-font-lg: 16px;
+  --qt-font-xl: 20px; --qt-font-xxl: 24px;
+  --qt-font-mono: "Cascadia Mono","JetBrains Mono",Consolas,monospace;
+  --qt-radius-sm: 4px; --qt-radius-md: 6px; --qt-radius-lg: 8px;
+  --qt-shadow-1: 0 1px 2px rgba(0,0,0,.06);  --qt-shadow-2: 0 4px 12px rgba(0,0,0,.10);
+  /* 布局 */
+  --qt-nav-w: 200px; --qt-nav-w-collapsed: 56px; --qt-header-h: 48px;
+}
+
+/* 深色留 M5;状态色深浅同值(状态灯是跨页面的语义信号) */
+:root[data-theme="dark"] {
+  --qt-bg: #141414; --qt-bg-elevated: #1F1F1F; --qt-border: #303030;
+  --qt-text: #E6E6E6; --qt-text-secondary: #A6A6A6; --qt-text-disabled: #595959;
+  --qt-shadow-1: 0 1px 2px rgba(0,0,0,.4);  --qt-shadow-2: 0 4px 12px rgba(0,0,0,.5);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--qt-bg);
+  color: var(--qt-text);
+  font-size: var(--qt-font-md);
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+.qt-mono { font-family: var(--qt-font-mono); }
+.qt-muted { color: var(--qt-text-secondary); }
+.qt-small { font-size: var(--qt-font-xs); }
+.qt-card { background: var(--qt-bg-elevated); border: 1px solid var(--qt-border); border-radius: var(--qt-radius-md); }
+.qt-section-title { font-size: var(--qt-font-lg); font-weight: 600; margin-bottom: var(--qt-space-3); }
+.qt-row { display: flex; align-items: center; gap: var(--qt-space-2); }
+.qt-col { display: flex; flex-direction: column; gap: var(--qt-space-2); }
+.qt-grow { flex: 1 1 auto; min-width: 0; }
+.qt-danger { color: var(--qt-state-error); }
+.qt-warn { color: var(--qt-sev-warn); }
+.qt-ok { color: var(--qt-state-running); }
+.qt-page { padding: var(--qt-space-4); }
+.qt-stack > * + * { margin-top: var(--qt-space-4); }
