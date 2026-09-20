@@ -35,7 +35,7 @@ def test_levels_alert_and_lru_order(rig3):
     assert ev["lru_suggest"][0]["last_active_at"] is None and ev["lru_suggest"][1]["last_active_at"].endswith("+08:00")
     assert set(ev["lru_suggest"][0]) == {"account_id", "last_active_at", "rss_mb"}
     assert pr.evaluate(2500) == "ok" and not alerts.is_firing(MEM_PRESSURE, "host")
-    sev = [e["payload"]["severity"] + ":" + e["payload"]["state"] for e in st.list_events(event="alert") if e["payload"]["code"] == MEM_PRESSURE]
+    sev = [e["payload"]["severity"] + ":" + e["payload"]["state"] for e in st.list_events(event="resource") if e["payload"]["code"] == MEM_PRESSURE]   # 02 §3.7:MEM_PRESSURE 事件族 resource
     assert sev == ["warn:firing", "crit:firing", "crit:resolved"]
     assert pr.evaluate(None) == "unknown" and pr.blocked() is False
 

@@ -44,10 +44,17 @@ def message_payload(msg: Message, *, late_after_s: int, origin: Optional[str] = 
 
 
 class Events:
-    def __init__(self, store, *, queue_max: int = 10000):
+    """``on_emit(event_id, event, payload, account_id, channel, trace_id, now_ms)`` = 落 ``target='ws'`` 行之后的扇出钩子。
+
+    装配方(``app.py``)把 ``WebhookDispatcher.fanout`` 挂上去,``emit`` 就同时给每个订阅的 webhook 写一行
+    ``target='webhook:<id>'``(02 §2.2.7)。钩子里的异常**不影响** WS 侧:ws 行已落库、内存队列照推。
+    """
+
+    def __init__(self, store, *, queue_max: int = 10000, on_emit=None):
         self._store = store
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
         self.dropped = 0
+        self.on_emit = on_emit
 
     def emit(self, event: str, *, payload: dict[str, Any], account_id: Optional[str] = None,
              channel: Optional[str] = None, trace_id: Optional[str] = None, now_ms: Optional[int] = None) -> int:
@@ -58,6 +65,12 @@ class Events:
         seq = self._store.insert_outbox_event(event_id=event_id, target="ws", event=event, trace_id=trace_id,
                                               account_id=account_id, channel=channel,
                                               payload_json=json.dumps(payload, ensure_ascii=False), now_ms=now_ms)
+        if self.on_emit is not None:
+            try:
+                self.on_emit(event_id=event_id, event=event, payload=payload, account_id=account_id,
+                             channel=channel, trace_id=trace_id, now_ms=now_ms)
+            except Exception as e:                  # 扇出失败不拖垮 WS:ws 行已落库
+                log.exception("events 扇出钩子异常(event=%s): %s", event, e)
         frame = {"event": event, "seq": seq, "trace_id": trace_id, "account_id": account_id, "channel": channel,
                  "payload": payload}
         try:

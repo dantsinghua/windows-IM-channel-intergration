@@ -20,17 +20,20 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
-from ..ids import message_id
+from ..ids import message_id, ulid
 from ..models import Message
 from ..text import norm
 
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_agent.sql")
 
 PRAGMAS = (
+    # 02 §2.8.4:库开 auto_vacuum=INCREMENTAL(**建库时设定,之后改不了**)⇒ 必须排在建表之前;
+    # 对已存在的库是静默 no-op(SQLite 语义),不改也不报错。放在 journal_mode 之前:WAL 下它对已有库同样无效。
+    "PRAGMA auto_vacuum=INCREMENTAL",
     "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000",
     "PRAGMA foreign_keys=ON", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-65536", "PRAGMA wal_autocheckpoint=2000",
 )
@@ -351,9 +354,110 @@ class Store:
             return c.execute("UPDATE resource_pools SET slot_holder='', updated_ms=? WHERE pool='windows' AND slot_holder=?",
                              (now_ms or self._clock(), holder)).rowcount
 
-    # ------------------------------------------------------------------ ingest
-    def ingest(self, msg: Message, *, now_ms: Optional[int] = None) -> IngestResult:
+    def wechat_slot_promote(self, target: str, *, now_ms: Optional[int] = None) -> bool:
+        """02 §2.2.5「成功才把 ``pending`` 转 ``holder``」—— 规格原句是**一条** UPDATE,rowcount==1 判成功。
+
+        单条语句同时置 ``slot_holder`` 并清三列,天然绕开 ``resource_pools`` 第二条 CHECK(「没有 pending 就不该有
+        过期时刻/残留尝试 id」)对多条 UPDATE 的写入顺序要求。"""
         with self._tx() as c:
+            cur = c.execute("UPDATE resource_pools SET slot_holder=slot_pending, slot_pending='', "
+                            "slot_pending_expires_ms=NULL, slot_pending_login_session_id='', updated_ms=? "
+                            "WHERE pool='windows' AND slot_holder='' AND slot_pending=?", (now_ms or self._clock(), target))
+            return cur.rowcount == 1
+
+    def wechat_slot_renew_pending(self, target: str, expires_ms: int, *, now_ms: Optional[int] = None) -> bool:
+        """T-11(`.omc/handoffs/wechat-channel.md`):登录流在世期间续期 ``slot_pending_expires_ms``,
+        免得 ``[wechat] slot_pending_ttl_s``(600)先于 ``[accounts] qr_max_wait_s``(1800)到点被 reaper 误杀。"""
+        with self._tx() as c:
+            cur = c.execute("UPDATE resource_pools SET slot_pending_expires_ms=?, updated_ms=? "
+                            "WHERE pool='windows' AND slot_pending=?", (int(expires_ms), now_ms or self._clock(), target))
+            return cur.rowcount == 1
+
+    def wechat_merge_account(self, temp_id: str, old_id: str, wxid: str, *,
+                             create_template: Optional[dict[str, Any]] = None, now_ms: Optional[int] = None) -> None:
+        """05 §2.4.2.1 第 3 步 b) / 回滚表末行的合并事务。
+
+        ⚠️ 语句顺序被两条库约束夹住:① ``ux_accounts_wxid`` 是「未软删且未合并」的部分唯一索引 ⇒ **必须先软删临时行**
+        才能把同一 ``wxid`` 落到老行;② ``merged_into REFERENCES accounts(id)`` ⇒ **老行必须先存在**。
+        故顺序 = 软删临时行 → 重建老行(如缺)→ 写墓碑指针 → 回填老行 → 槽位改指。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("UPDATE accounts SET deleted_ms=?, state='stopped', updated_ms=? WHERE id=?", (now, now, temp_id))
+            if create_template is not None:
+                c.execute("INSERT INTO accounts(id, channel, seq, label, host, state, login_mode, remember, quota_mb, wxid, self_uid, "
+                          "identity_json, settings_json, created_ms, updated_ms) "
+                          "VALUES (?,'wechat',?,?,'windows','created','qrcode',0,?,?,?,'{}','{}',?,?)",
+                          (old_id, int(old_id[2:]), create_template["label"], create_template["quota_mb"], wxid, wxid, now, now))
+                c.execute("INSERT OR IGNORE INTO account_runtime(account_id, kind, desired_state, updated_ms) VALUES (?,?,'stopped',?)",
+                          (old_id, self.RUNTIME_KIND["wechat"], now))
+            c.execute("UPDATE accounts SET merged_into=?, updated_ms=? WHERE id=?", (old_id, now, temp_id))
+            c.execute("UPDATE accounts SET wxid=COALESCE(wxid, ?), self_uid=COALESCE(self_uid, ?), updated_ms=? WHERE id=?",
+                      (wxid, wxid, now, old_id))
+            c.execute("UPDATE resource_pools SET slot_pending=?, updated_ms=? WHERE pool='windows' AND slot_pending=?", (old_id, now, temp_id))
+
+    def bind_out_by_trace_id(self, trace_id: str, ext_msg_id: str, confirmed_by: str, *, now_ms: Optional[int] = None) -> Optional[str]:
+        """06 §2.12 QQ 行「``get_msg`` 存在 ⇒ **直接绑定该行** ``ext_msg_id``」的唯一入口。
+
+        QQ 是三通道里唯一手里有**确定** ``message_id`` 的,走 ``store.ingest`` 的模糊合并(fingerprint / 同会话
+        同 ``norm(text)`` + 时间窗)会把确定性降级:``capture_text=false`` 且出向行 ``ts`` 与 ``get_msg.time`` 跨秒时
+        两支判据都不成立 ⇒ 该行恒 ``UNCONFIRMED``。返回被绑定的 ``messages.id``;没有该 trace 的 ``SENDING`` 出向行回 ``None``。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            r = c.execute("SELECT id FROM messages WHERE trace_id=? AND dir='out' AND state='SENDING' ORDER BY ts_ms DESC LIMIT 1",
+                          (trace_id,)).fetchone()
+            if r is None:
+                return None
+            c.execute("UPDATE messages SET ext_msg_id=?, state='DELIVERED', confirmed_by=?, confirmed_ms=? WHERE id=?",
+                      (ext_msg_id, confirmed_by, now, r["id"]))
+            return str(r["id"])
+
+    # ------------------------------------------------------------------ jobs(02 §3.1;§3.4.9 R-21:凡 202 {job_id} 的端点统一走这张表)
+    def job_create(self, *, kind: str, actor: str, params: Optional[dict[str, Any]] = None,
+                   account_id: Optional[str] = None, now_ms: Optional[int] = None) -> str:
+        now = now_ms or self._clock()
+        job_id = ulid(now)
+        with self._tx() as c:
+            c.execute("INSERT INTO jobs(job_id, kind, account_id, actor, state, params_json, created_ms, updated_ms) "
+                      "VALUES (?,?,?,?,'queued',?,?,?)",
+                      (job_id, kind, account_id, actor, json.dumps(params or {}, ensure_ascii=False), now, now))
+        return job_id
+
+    def job_start(self, job_id: str, *, now_ms: Optional[int] = None) -> None:
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("UPDATE jobs SET state='running', attempt_count=attempt_count+1, updated_ms=? WHERE job_id=? AND state='queued'",
+                      (now, job_id))
+
+    def job_finish(self, job_id: str, *, ok: bool, result: Optional[dict[str, Any]] = None,
+                   error: Optional[dict[str, Any]] = None, now_ms: Optional[int] = None) -> None:
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("UPDATE jobs SET state=?, progress=?, result_json=?, error_json=?, updated_ms=? WHERE job_id=?",
+                      ("succeeded" if ok else "failed", 100 if ok else 0,
+                       json.dumps(result, ensure_ascii=False) if result is not None else None,
+                       json.dumps(error, ensure_ascii=False) if error is not None else None, now, job_id))
+
+    def job_get(self, job_id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        return dict(r) if r else None
+
+    def job_inflight(self, kind: str) -> Optional[dict[str, Any]]:
+        """#109 的 60 s 防重判据之一:同 kind 还有 queued/running 的行。"""
+        r = self.con.execute("SELECT * FROM jobs WHERE kind=? AND state IN ('queued','running') ORDER BY created_ms DESC LIMIT 1",
+                             (kind,)).fetchone()
+        return dict(r) if r else None
+
+    def job_last(self, kind: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM jobs WHERE kind=? ORDER BY created_ms DESC LIMIT 1", (kind,)).fetchone()
+        return dict(r) if r else None
+
+    # ------------------------------------------------------------------ ingest
+    #: 02 §2.8.8「写入报错先判磁盘满」:装配方(``app.py``)把 ``maintenance.guard_write`` 挂上来。
+    #: 缺省是空壳上下文 ⇒ 未装配 maintenance 时行为与从前逐字相同。
+    write_guard: Callable[[str], Any] = staticmethod(lambda what: nullcontext())
+
+    def ingest(self, msg: Message, *, now_ms: Optional[int] = None) -> IngestResult:
+        with self.write_guard("store.ingest"), self._tx() as c:
             return self._ingest_one(c, msg, now_ms or self._clock())
 
     def ingest_batch(self, msgs: list[Message], cursor_update: Optional[CursorUpdate] = None,
@@ -361,7 +465,7 @@ class Store:
         """一个事务:sessions → messages → cursors;空批只推游标,不早退(R6-41)。"""
         now = now_ms or self._clock()
         out: list[tuple[bool, bool, Message]] = []
-        with self._tx() as c:
+        with self.write_guard("store.ingest_batch"), self._tx() as c:
             for m in msgs:
                 r = self._ingest_one(c, m, now)
                 m.id = r.id

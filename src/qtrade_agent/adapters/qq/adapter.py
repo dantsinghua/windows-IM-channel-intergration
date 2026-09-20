@@ -33,7 +33,7 @@ from .onebot import OneBotClient, OneBotClosed, OneBotError, OneBotTransport, We
 
 log = logging.getLogger("qtrade.adapters.qq.adapter")
 
-CAPABILITIES = frozenset({"get_state", "list_sessions", "read_messages", "screenshot", "send_text"})
+CAPABILITIES = frozenset({"get_state", "list_sessions", "read_messages", "send_text"})
 """= ``capabilities/*.json`` 目录里 ``channels['qq'] == 'supported'`` 的全部 op(R6-57 ⑧:Account 静态集 = 目录 × supported)。
 对账由 ``tests/test_qq_adapter.py::test_capabilities_match_catalog`` 守。"""
 

@@ -1,43 +1,88 @@
 """Agent 进程装配(02 §2.1 启动顺序 / §2.6 崩溃恢复与启动恢复)。
 
-启动:打开 agent.db → 迁移 → 崩溃恢复(queued/running 指令改 failed、SENDING 幂等行改 ABANDONED)→ 装配 events/alerts/health/pool/runtime/vault/winagent/adapters/bus/accounts →
-注册 scheduler 任务(企点全量轮、群缺口、outbox 保留、WinAgent 探活 H02、dockerd H03、H13 校时)→ 启动恢复(02 §2.6:按 desired_state 串行 start)→ api 开始监听。
-真机后端(``DockerCliBackend``/``AdbCliBackend``/``WinAgentVault``/urllib)只在没注入假实现时才用;开发容器里一律注入 ``runtime.FakeContainers``/``FakeAdb``/``FakeVault``/``FakeWinAgent``。
-``mail``、``workflow``、HMAC 公网入站、webhook 投递器、GATE 安全闸本期仍未接。
+启动:打开 agent.db → 迁移 → 崩溃恢复(queued/running 指令改 failed、SENDING 幂等行改 ABANDONED)→ 装配
+events/alerts/health/pool/runtime/vault/winagent/adapters(企点 + QQ + 微信)/bus/accounts/mail/webhook/maintenance/
+pool 校准/workflow/HMAC → 注册 scheduler 任务 → 启动恢复(02 §2.6:按 desired_state 串行 start)→ api 开始监听。
+真机后端(``DockerCliBackend``/``AdbCliBackend``/``WinAgentVault``/``WebsocketsTransport``/``UrllibHttp``/
+``ImapLibBackend`` 等)只在没注入假实现时才用;开发容器里一律注入 ``runtime.FakeContainers``/``FakeAdb``/
+``FakeVault``/``FakeWinAgent``/``FakeOneBot``/``FakeWeChatWinAgent``/``FakeHttp``/``FakeImap`` 等,缺省不连任何真服务
+(``[mail] enabled=false``、``webhooks`` 表空、``adapters`` 只在账号 start 时才建连)。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from typing import Awaitable, Callable, Optional
+from datetime import datetime
+from typing import Any, Awaitable, Callable, Optional
 
 from .accounts import AccountService, LoginFn
 from .adapters.base import Account
 from .adapters.qidian.adapter import QidianAdapter, SendFn
 from .adapters.qidian.maindb import AdbMainDb, LocalSqliteMainDb, MainDb
 from .adapters.qidian.poll import QidianPoller
+from .adapters.qq import H08_INTERVAL_S, OneBotTransport, QQAdapter, QQHealth
+from .adapters.wechat import WeChatWinAgent, WechatAdapter, WechatLoginFlow, WechatPoller
 from .alerts import Alerts
 from .bus.bus import Bus
 from .config import H13_INTERVAL_S, AgentConfig
-from .events import Events
+from .events import TZ_SHANGHAI, Events
 from .gate import Gate
 from .health import Health
 from .healthloop import H05_STEADY_INTERVAL_S, HealthLoop
+from .hmac_inbound import HmacVerifier
+from .ids import ulid as new_trace_id
+from .maintenance import DiskProbe, MaintenanceService
+from .mail.backends import ImapLibBackend, PopLibBackend, SmtpLibBackend
+from .mail.service import MailService
 from .pool import Pool
+from .pool_calibrate import PoolCalibrator
 from .pressure import MemoryWatermark
 from .runtime import AdbBackend, AdbCliBackend, ContainerBackend, DockerCliBackend, Runtime
 from .runtime.runtime import Fs
 from .scheduler import Scheduler
 from .store import Store
 from .timesync import Aligner, TimeSync
-from .vault_client import Vault, WinAgentVault
+from .vault_client import Vault, WinAgentVault, vault_name
+from .webhook import HttpClient, UrllibHttp, WebhookDispatcher
+from .wechat_slot import WechatSlot
 from .winagent_client import Transport, WinAgentClient
+from .workflow import WorkflowEngine
 
 log = logging.getLogger("qtrade.app")
 
 H02_INTERVAL_S = 30         # 04 H02:每 30 s ping(离线后按 [winagent] probe_interval_s 重探)
 H03_INTERVAL_S = 30         # 04 H03:dockerd 每 30 s
+WEBHOOK_TICK_S = 0.5        # 02 §2.2.7 字面:投递器每 500 ms 一轮
+DISK_TICK_S = 15            # §2.8.8 磁盘水位与 health 同 15 s 一轮
+CALIB_TICK_S = 300          # 04 §2.5.3:漂移检查 + 零账号自动重测
+MAIL_SEND_TICK_S = 5        # 06 §2.4:出站队列消费单线程
+MAIL_CONFIRM_TICK_S = 60    # 02 §2.2.11 同 60 s 节拍
+DAILY_TICK_S = 60           # daily_at 包装的检查节拍(每分钟看一次到点没有)
+
+
+def daily_at(hhmm: str, fn: Callable[[], Awaitable[Any]], *, store, key: str, clock) -> Callable[[], Awaitable[None]]:
+    """把「每日 HH:MM 一次」包成 scheduler 认识的「固定间隔」任务(scheduler 只有间隔、没有日历触发)。
+
+    每 ``DAILY_TICK_S`` 一轮:到点(本地 Asia/Shanghai,00 §6)且**今天还没跑过**才跑;跑过的日期落
+    ``settings[key]``,重启后不会重复跑。🔴 首轮遇到「今天已过点但库里没记录」只补记日期**不补跑**——
+    否则装完 Agent 的那一刻就会立刻跑一次清理/备份,不是 §2.8.4「03:00 定时」的意思。
+    """
+    async def tick() -> None:
+        now = datetime.fromtimestamp(clock() / 1000, tz=TZ_SHANGHAI)
+        today = now.strftime("%Y-%m-%d")
+        if now.strftime("%H:%M") < hhmm:
+            return
+        last = store.settings_get(key)
+        if last == today:
+            return
+        store.settings_set(key, today, actor="system:scheduler")
+        if last is None:
+            log.info("daily_at(%s) 首轮只登记日期、不补跑(key=%s)", hhmm, key)
+            return
+        await fn()
+    return tick
 
 
 async def _sender_not_wired(acct: Account, native_id: str, text: str) -> bool:
@@ -52,7 +97,11 @@ class AgentApp:
                  wsl_gateway: Optional[str] = None, containers: Optional[ContainerBackend] = None, adb: Optional[AdbBackend] = None,
                  vault: Optional[Vault] = None, winagent_transport: Optional[Transport] = None, winagent_base_url: Optional[str] = None,
                  winagent_token: Optional[str] = None, fs: Optional[Fs] = None, login_fn: Optional[LoginFn] = None,
-                 aligner: Optional[Aligner] = None, wsl_total_mb: Optional[int] = None, boot_poll_s: Optional[float] = None):
+                 aligner: Optional[Aligner] = None, wsl_total_mb: Optional[int] = None, boot_poll_s: Optional[float] = None,
+                 qq_transport_factory: Optional[Callable[[Account], OneBotTransport]] = None,
+                 http: Optional[HttpClient] = None, disk: Optional[DiskProbe] = None, data_dir: Optional[str] = None,
+                 imap_factory: Optional[Callable[[Any], Any]] = None, pop3_factory: Optional[Callable[[Any], Any]] = None,
+                 smtp_factory: Optional[Callable[[Any], Any]] = None):
         self.cfg = cfg
         self.clock = clock
         self.wsl_gateway = wsl_gateway
@@ -74,6 +123,14 @@ class AgentApp:
         self._aligner = aligner
         self._wsl_total_mb = wsl_total_mb
         self._boot_poll_s = boot_poll_s
+        self._qq_transport_factory = qq_transport_factory
+        self._http = http
+        self._disk = disk
+        self._data_dir = data_dir
+        self._imap_factory = imap_factory
+        self._pop3_factory = pop3_factory
+        self._smtp_factory = smtp_factory
+        self._wechat_next_due: dict[str, int] = {}
         self.adapters: dict = {}
         self.bus: Bus
         self.poller: QidianPoller
@@ -86,6 +143,17 @@ class AgentApp:
         self.gate: Gate
         self.pressure: MemoryWatermark
         self.healthloop: HealthLoop
+        self.qqhealth: QQHealth
+        self.wechat_client: WeChatWinAgent
+        self.wechat_poller: WechatPoller
+        self.wechat_slot: WechatSlot
+        self.wechat_login: WechatLoginFlow
+        self.webhooks: WebhookDispatcher
+        self.maintenance: MaintenanceService
+        self.calibrator: PoolCalibrator
+        self.workflows: WorkflowEngine
+        self.hmac: HmacVerifier
+        self.mail: MailService
         self._started = False
 
     # ------------------------------------------------------------------ 装配
@@ -104,7 +172,16 @@ class AgentApp:
                                alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs, **rt_kw)
         self.poller = QidianPoller(store=self.store, events=self.events, alerts=self.alerts, cfg=self.cfg, h13_firing=self.health.h13_firing,
                                    clock=self.clock, maindb_factory=self._maindb_for_uid)
-        self.adapters = {"qidian": QidianAdapter(self.poller, sender=self._sender, store=self.store)}
+        # ---- 三通道适配器(建连都在账号 start 时才发生,open() 只建对象)
+        qq_kw = {} if self._qq_transport_factory is None else {"transport_factory": self._qq_transport_factory}
+        self.wechat_client = WeChatWinAgent(self.winagent)
+        self.wechat_poller = WechatPoller(store=self.store, events=self.events, client=self.wechat_client, cfg=self.cfg,
+                                          wechat_cfg=self.cfg.wechat_adapter, clock=self.clock)
+        self.adapters = {
+            "qidian": QidianAdapter(self.poller, sender=self._sender, store=self.store),
+            "qq": QQAdapter(store=self.store, events=self.events, cfg=self.cfg, qq_cfg=self.cfg.qq, clock=self.clock, **qq_kw),
+            "wechat": WechatAdapter(self.wechat_poller, client=self.wechat_client, store=self.store),
+        }
         self.gate = Gate(self.store)
         self.bus = Bus(store=self.store, events=self.events, adapters=self.adapters, cfg=self.cfg, clock=self.clock, gate=self.gate)
         from .api.app import load_capabilities
@@ -113,11 +190,41 @@ class AgentApp:
                                        adapters=self.adapters, health=self.health, clock=self.clock, login_fn=self._login_fn,
                                        caps_by_op={c["op"]: c for c in caps})
         self.accounts._alerts = self.alerts
+        self.accounts._bus = self.bus
         self.pressure = MemoryWatermark(store=self.store, accounts=self.accounts, alerts=self.alerts, cfg=self.cfg, clock=self.clock)
         self.accounts.pressure = self.pressure
+        # ---- 微信槽位 + 登录流(要 accounts.transition,故排在 accounts 之后)
+        self.wechat_slot = WechatSlot(store=self.store, events=self.events, cfg=self.cfg, clock=self.clock, client=self.wechat_client,
+                                      wechat_cfg=self.cfg.wechat_adapter, purge=self.runtime._purge_ephemeral,
+                                      transition=self.accounts.transition)
+        self.wechat_login = WechatLoginFlow(store=self.store, client=self.wechat_client, slot=self.wechat_slot, cfg=self.cfg,
+                                            transition=self.accounts.transition, clock=self.clock)
+        self.accounts._wechat_slot = self.wechat_slot
+        self.accounts._wechat_login = self.wechat_login
         self.healthloop = HealthLoop(store=self.store, runtime=self.runtime, accounts=self.accounts, alerts=self.alerts, health=self.health,
                                      cfg=self.cfg, clock=self.clock)
+        self.healthloop.wechat_adapter = self.adapters["wechat"]           # 05 §2.5.4 微信两条健康项(KEY_FAIL / SCREEN_LOCKED)
+        self.healthloop.wechat_poller = self.wechat_poller
+        self.healthloop.wechat_client = self.wechat_client
+        self.qqhealth = QQHealth(adapter=self.adapters["qq"], store=self.store, alerts=self.alerts, cfg=self.cfg, clock=self.clock,
+                                 busy=self.accounts.busy, on_login_required=self._qq_login_required)
         self.timesync = TimeSync(self.winagent, health=self.health, alerts=self.alerts, clock=self.clock, aligner=self._aligner, on_resume=self.on_host_resume)
+        # ---- 横切:webhook / 保留期与磁盘 / 资源池自校准 / 工作流 / HMAC 公网入站
+        self.http = self._http if self._http is not None else UrllibHttp(honor_env_proxy=self.cfg.net.honor_env_proxy)
+        self.webhooks = WebhookDispatcher(self.store, http=self.http, secret_provider=self._vault_secret, cfg=self.cfg.webhook,
+                                          alerts=self.alerts, clock=self.clock)
+        self.events.on_emit = self._fanout_webhooks                        # §2.2.7:emit 落 ws 行后同步扇出 webhook 副本
+        self.maintenance = MaintenanceService(self.store, cfg=self.cfg.retention, backup=self.cfg.backup, data_dir=self.data_dir,
+                                              disk=self._disk, alerts=self.alerts, clock=self.clock,
+                                              media_orphan_grace_h=self.cfg.media.orphan_grace_h)
+        self.store.write_guard = self.maintenance.guard_write              # §2.8.8:写入报错先判磁盘满
+        self.calibrator = PoolCalibrator(self.store, cfg=self.cfg.calib, pool=self.pool, events=self.events, clock=self.clock)
+        self.workflows = WorkflowEngine(self.store, bus=self.bus, events=self.events, http=self.http, clock=self.clock,
+                                        webhook_timeout_ms=self.cfg.webhook.webhook_timeout_ms)
+        self.hmac = HmacVerifier(self.store, secret_provider=self._vault_secret, cfg=self.cfg.hmac, clock=self.clock)
+        self.mail = MailService(self.store, self.cfg.mail, clock=self.clock, alerts=self.alerts, secret_of=self._mail_secret,
+                                imap_factory=self._imap_factory or self._real_imap, pop3_factory=self._pop3_factory or self._real_pop3,
+                                smtp_factory=self._smtp_factory or self._real_smtp, disk_state=lambda: self.maintenance.level)
         self.scheduler.register("qidian_poll_all", self.cfg.qidian.poll_interval_s, self.qidian_poll_all)
         self.scheduler.register("qidian_gaps_all", self.cfg.qidian.gap_check_interval_s, self.qidian_gaps_all)
         self.scheduler.register("outbox_ws_retention", 3600, self.outbox_retention)
@@ -128,7 +235,76 @@ class AgentApp:
         self.scheduler.register("health_adb", self.cfg.health.adb_check_s, self.healthloop.check_adb)                          # H06
         self.scheduler.register("health_boot", H05_STEADY_INTERVAL_S, self.healthloop.check_boot)                              # H05 稳态
         self.scheduler.register("login_remind", 60, self.accounts.login_remind)                                                # 05 §2.5.4
+        self.scheduler.register("health_napcat", H08_INTERVAL_S, self.qqhealth.check)                                          # 04 H08,每 15 s
+        self.scheduler.register("health_wechat", self.cfg.wechat_adapter.poll_interval_s, self.healthloop.check_wechat)        # 05 §2.5.4 两条
+        self.scheduler.register("wechat_slot_reaper", self.cfg.wechat.slot_reaper_interval_s, self.wechat_slot.reap)           # 02 §2.2.5 ②
+        self.scheduler.register("wechat_poll_all", 1, self.wechat_poll_all)                                                    # 节拍由 poller 自报
+        self.scheduler.register("webhook_dispatch", WEBHOOK_TICK_S, self.webhooks.tick)                                        # 02 §2.2.7
+        self.scheduler.register("disk_watermark", DISK_TICK_S, self.disk_tick)                                                 # §2.8.8
+        self.scheduler.register("pool_calibrate_drift", CALIB_TICK_S, self.calib_tick)                                         # 04 §2.5.3
+        self.scheduler.register("retention_cleanup", DAILY_TICK_S,
+                                daily_at(self.cfg.retention.cleanup_at, self.cleanup_job, store=self.store,
+                                         key="scheduler.last_retention_cleanup_date", clock=self.clock))                       # §2.8.4 03:00
+        self.scheduler.register("db_backup", DAILY_TICK_S,
+                                daily_at(self.cfg.backup.backup_at, self.backup_job, store=self.store,
+                                         key="scheduler.last_db_backup_date", clock=self.clock))                               # §3.3 03:30
+        self.scheduler.register("mail_inbound", self.cfg.mail.inbound.poll_interval_s, self.mail_inbound_tick)                 # 06 §2.1
+        self.scheduler.register("mail_outbound", MAIL_SEND_TICK_S, self.mail_outbound_tick)                                    # 06 §2.4
+        self.scheduler.register("mail_confirm_reaper", MAIL_CONFIRM_TICK_S, self.mail_confirm_tick)                            # 06 §2.3.6
         return self
+
+    # ------------------------------------------------------------------ 装配期小工具
+    @property
+    def data_dir(self) -> str:
+        """02 §4 固定目录根(``media/``、``cores/``、``mail/archive/``、``accounts/<id>/raw/`` 都在它下面)。
+        缺省取 ``agent.db`` 所在目录 —— 开发容器里那就是 tmp,不会去碰 ``/var/lib/qtrade``。"""
+        if self._data_dir:
+            return self._data_dir
+        if self.store.path == ":memory:":
+            return os.getcwd()
+        return os.path.dirname(os.path.abspath(self.store.path))
+
+    async def _vault_secret(self, row: dict) -> Optional[str]:
+        """webhook / HMAC 共用:登记行的 ``secret_ref`` → Vault 明文(基线 §11.1)。"""
+        ref = row.get("secret_ref")
+        if not ref:
+            return None
+        return await self.vault.read(vault_name(str(ref)), trace_id=new_trace_id())
+
+    def _mail_secret(self, ref: str) -> str:
+        """06 §2.0:邮件后端要的是同步取密;Vault 客户端是 async ⇒ 这里只在事件循环外的后端工厂里用。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:                       # 事件循环里不能同步等:把取密交给调用方在建连前完成
+            raise RuntimeError("mail 后端的取密须在事件循环外完成(建连发生在 to_thread 里)")
+        return asyncio.run(self.vault.read(vault_name(ref), trace_id=new_trace_id())) or ""
+
+    def _real_imap(self, r):
+        return ImapLibBackend(host=r.inbound.host, port=r.inbound.port, ssl=r.inbound.ssl, user=r.inbound.user,
+                              password=self._mail_secret(r.inbound.secret_ref), send_id=r.inbound.send_imap_id)
+
+    def _real_pop3(self, r):
+        return PopLibBackend(host=r.inbound.fallback.host or r.inbound.host, port=r.inbound.fallback.port,
+                             ssl=r.inbound.fallback.ssl, user=r.inbound.user, password=self._mail_secret(r.inbound.secret_ref))
+
+    def _real_smtp(self, r):
+        return SmtpLibBackend(host=r.outbound.host, port=r.outbound.port, ssl=r.outbound.ssl, user=r.outbound.user,
+                              password=self._mail_secret(r.outbound.secret_ref), timeout_s=r.outbound.timeout_s)
+
+    def _fanout_webhooks(self, **kw) -> None:
+        """``Events.on_emit`` 钩子:每条事件给订阅方各写一行 ``target='webhook:<id>'`` 的 pending outbox。
+
+        E-3 例外(§2.2.12):``NET_PUBLIC_ENDPOINT_CHANGED`` 必须推给**全部** ``enabled=1`` 登记方、不受订阅过滤。"""
+        payload = kw.get("payload") or {}
+        ignore = kw.get("event") == "net" and payload.get("code") == "NET_PUBLIC_ENDPOINT_CHANGED"
+        self.webhooks.fanout(ignore_filters=ignore, **kw)
+
+    async def _qq_login_required(self, account_id: str, state_code: str) -> None:
+        """04 H08:``online=false`` 持续 2 min ⇒ 置 ``login_required`` + 推 ``account_state`` 事件,**不自动重登**(D-2)。"""
+        self.accounts.transition(account_id, "login_required", state_code=state_code,
+                                 state_reason="napcat 报离线超过 2 分钟(H08)")
 
     def _maindb_for_uid(self, self_uid: str) -> MainDb:
         acct = self._current_qidian_account
@@ -168,6 +344,80 @@ class AgentApp:
                 await self.adapters["qidian"].check_group_gaps(acct)
             finally:
                 self._current_qidian_account = None
+
+    async def wechat_poll_all(self) -> None:
+        """05 §2.4.4 ⑦:**每账号周期是动态的** —— 平时 ``[adapters.wechat] poll_interval_s``(5 s),
+        发送确认期 ``confirm_poll_interval_ms``(1 s)。scheduler 只有固定间隔,故这里每秒一轮、自己判到点。"""
+        ad = self.adapters.get("wechat")
+        if ad is None:
+            return
+        now = self.clock()
+        for row in self.store.list_accounts(channel="wechat", state="running"):
+            if now < self._wechat_next_due.get(row["id"], 0):
+                continue
+            acct = self._wechat_account(row)
+            try:
+                await ad.poll(acct)
+            finally:
+                self._wechat_next_due[row["id"]] = self.clock() + int(self.wechat_poller.interval_s(row["id"]) * 1000)
+
+    @staticmethod
+    def _wechat_account(row: dict) -> Account:
+        return Account(id=row["id"], channel="wechat", state=row["state"], self_uid=row.get("self_uid"),
+                       self_nick=row.get("self_nick"), state_code=row.get("state_code"))
+
+    async def disk_tick(self) -> None:
+        """§2.8.8 三级水位:每 15 s 量一次 ``data_dir`` 余量,翻档时发 ``H12_DISK_LOW`` 并切运行期开关。"""
+        await asyncio.to_thread(self.maintenance.check_watermark)
+
+    async def calib_tick(self) -> None:
+        """04 §2.5.3:漂移检查(>30% 持续 1h ⇒ ``POOL_CALIBRATION_DRIFT``)+ 零账号持续 ≥5 min 自动重测。"""
+        running = sum(1 for r in self.store.list_accounts(state="running") if r["host"] == "wsl")
+        self.calibrator.note_running_count(running)
+        self.calibrator.maybe_auto_calibrate()
+        self.calibrator.check_drift()
+
+    async def run_cleanup_job(self, job_id: str) -> None:
+        """#109 ``POST /system/cleanup/run`` 的作业体:跑一轮全量**本地**清理并把结果落 ``jobs.result_json``,终态推 ``job`` 事件。"""
+        self.store.job_start(job_id)
+        try:
+            rep = await asyncio.to_thread(self.maintenance.cleanup_once)
+            result = {"freed_mb": rep.freed_mb, "deleted": rep.deleted, "files_removed": rep.files_removed,
+                      "retention_days": rep.retention_days, "errors": rep.errors}
+            self.store.job_finish(job_id, ok=True, result=result)
+            self.events.emit("job", payload={"job_id": job_id, "kind": "system_cleanup", "state": "succeeded", "result": result})
+        except Exception as e:
+            log.exception("全量清理作业失败 job=%s: %s", job_id, e)
+            self.store.job_finish(job_id, ok=False, error={"code": "INTERNAL", "message": str(e)})
+            self.events.emit("job", payload={"job_id": job_id, "kind": "system_cleanup", "state": "failed",
+                                             "error": {"code": "INTERNAL", "message": str(e)}})
+
+    async def cleanup_job(self) -> None:
+        rep = await asyncio.to_thread(self.maintenance.cleanup_once)
+        log.info("保留期清理完成:释放 %.1f MB,删除 %s", rep.freed_mb, rep.deleted)
+        await asyncio.to_thread(self.maintenance.incremental_vacuum)
+
+    async def backup_job(self) -> None:
+        path = await asyncio.to_thread(self.maintenance.backup_once)
+        n = await asyncio.to_thread(self.maintenance.prune_backups)
+        log.info("在线备份完成:%s(清理旧备份 %d 份)", path, n)
+
+    async def mail_inbound_tick(self) -> None:
+        """06 §2.1 取信一轮 + §2.2 派发进总线(``[mail] enabled=false`` 时 ``fetchers`` 为空,整轮是 no-op)。"""
+        if not self.cfg.mail.enabled:
+            return
+        await asyncio.to_thread(self.mail.fetch_once)
+        await self.mail.dispatch(self.bus)
+
+    async def mail_outbound_tick(self) -> None:
+        if not self.cfg.mail.enabled:
+            return
+        await asyncio.to_thread(self.mail.send_once)
+
+    async def mail_confirm_tick(self) -> None:
+        if not self.cfg.mail.enabled:
+            return
+        await asyncio.to_thread(self.mail.reap_confirms)
 
     async def outbox_retention(self) -> None:
         cutoff = self.clock() - self.cfg.events.ws_retention_hours * 3600 * 1000
@@ -226,11 +476,38 @@ class AgentApp:
                 asyncio.create_task(self.accounts.recover(), name="recover")
 
     async def stop(self) -> None:
+        """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""
         if self._started:
             await self.scheduler.stop()
-            await self.bus.close()
             self._started = False
+        await self._stop_quietly(self.webhooks.stop(), "webhook 投递器")
+        for run_id, t in list(getattr(self.workflows, "tasks", {}).items()):
+            t.cancel()
+            await self._await_quietly(t, f"workflow run {run_id}")
+        ad = self.adapters.get("qq")
+        if ad is not None:
+            await self._stop_quietly(ad.close(), "QQ OneBot 连接")
+        wa = self.adapters.get("wechat")
+        if wa is not None:
+            for row in self.store.list_accounts(channel="wechat"):
+                await self._stop_quietly(wa.stop(self._wechat_account(row), graceful=True), f"微信读循环 {row['id']}")
+        if getattr(self, "bus", None) is not None:
+            await self.bus.close()
         self.store.close()
+
+    @staticmethod
+    async def _stop_quietly(coro, what: str) -> None:
+        try:
+            await coro
+        except Exception as e:                    # 收尾的任一步失败都不许挡住后面的收尾
+            log.warning("停止 %s 时出错: %s", what, e)
+
+    @staticmethod
+    async def _await_quietly(task, what: str) -> None:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception) as e:
+            log.debug("收尾 %s: %r", what, e)
 
     def create_api(self):
         from .api.app import create_api

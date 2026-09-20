@@ -23,6 +23,10 @@ class Clock:
     def advance(self, ms: int) -> None:
         self.now_ms += ms
 
+    def set_ms(self, ms: int) -> None:
+        """拨到一个绝对时刻(daily_at 这类按本地日历判定的测试用)。"""
+        self.now_ms = ms
+
     @property
     def now_s(self) -> int:
         return self.now_ms // 1000

@@ -91,7 +91,10 @@ class Pool:
             if win["slot_holder"] != "":
                 return False, "slot_held", [{"kind": "wechat_switch", "holder": win["slot_holder"]}]
             if win["slot_pending"] != "":
-                return False, "slot_pending", [{"kind": "wait_or_cancel", "pending": win["slot_pending"]}]
+                # R6-54 钉死 alternatives[].kind ∈ {add_other_channel, stop_one, wechat_switch};
+                # 原实现给的 `wait_or_cancel` 在枚举外(见 `.omc/handoffs/wechat-channel.md` 既有缺陷 2),
+                # 保守收进 `wechat_switch`(#17/#18 正是「等/取消 pending 或接管」的入口),不新增枚举值。
+                return False, "slot_pending", [{"kind": "wechat_switch", "holder": "", "pending": win["slot_pending"]}]
             if int(win["total_mb"]) - int(win["reserved_mb"]) < int(win["quota"]["wechat"]):
                 return False, "windows_budget", []
             return True, "", []

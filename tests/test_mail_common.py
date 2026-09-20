@@ -98,7 +98,7 @@ class MailEnv:
         return [dict(r) for r in self.ms.con.execute("SELECT * FROM mail_outbox ORDER BY id").fetchall()]
 
     def alert_codes(self) -> list[str]:
-        return [e["payload_json"] for e in self.ms._store.list_events(event="alert")]
+        return [e["payload_json"] for e in self.ms._store.list_events(event="mail")]   # 02 §3.7 事件族
 
 
 def make_env(store, clock, *, cfg: Optional[MailConfig] = None, tmp_path=None,

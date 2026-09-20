@@ -3,7 +3,7 @@
   "kind": "read",
   "danger": false,
   "confirmable": false,
-  "channels": {"qidian": "supported", "qq": "supported", "wechat": "supported"},
+  "channels": {"qidian": "supported", "qq": "not_applicable", "wechat": "supported"},
   "args_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": false, "properties": {}},
   "result_schema": {"type": "object", "properties": {"png_b64": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}}},
   "since": "0.1.0"

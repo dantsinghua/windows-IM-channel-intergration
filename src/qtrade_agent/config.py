@@ -8,6 +8,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .hmac_inbound import HmacConfig
+from .mail.config import MailConfig
+from .maintenance import BackupConfig, RetentionConfig
+from .pool_calibrate import CalibrationConfig
+from .webhook import WebhookConfig
+
 
 @dataclass(frozen=True)
 class BusConfig:
@@ -30,6 +36,39 @@ class QidianAdapterConfig:
     gap_check_interval_s: int = 60              # R6-39:check_group_gaps 周期
     gap_window_days: int = 3
     gap_min_missing: int = 5
+
+
+@dataclass(frozen=True)
+class QQAdapterConfig:
+    """02 §7.1 ``[adapters.qq]``(镜像对账表 docs/07 第 54 行)。
+
+    ``heartbeat_timeout_s`` 是**传输层**自判重连触发点,与 04 ``[health] napcat_heartbeat_timeout_s=30``
+    (H08 **告警阈值**)不同源 —— 两值不同是规格原样,见 `.omc/handoffs/integrator-rulings.md` R6-58 (a)。
+    """
+    heartbeat_timeout_s: int = 40
+    reconnect_delay_s: int = 3
+    history_backfill_on_reconnect: int = 50
+
+
+@dataclass(frozen=True)
+class WechatAdapterConfig:
+    """02 §7.1 ``[adapters.wechat]``(07 §[adapters.wechat] 镜像;C6:``switch_drain_timeout_s`` 归 agent.toml)。"""
+    poll_interval_s: int = 5
+    confirm_poll_interval_ms: int = 1000
+    switch_drain_timeout_s: int = 60
+
+
+@dataclass(frozen=True)
+class MediaConfig:
+    """02 §7.1 ``[media]``:本期只登记被消费的两键(``dir`` / ``orphan_grace_h``)。"""
+    dir: str = "/var/lib/qtrade/media"
+    orphan_grace_h: int = 24
+
+
+@dataclass(frozen=True)
+class NetConfig:
+    """02 §7.1 ``[net]``:本期只登记被消费的 ``honor_env_proxy``(Agent 自身 HTTP 客户端是否读环境代理)。"""
+    honor_env_proxy: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,6 +200,16 @@ class AgentConfig:
     winagent: WinAgentConfig = field(default_factory=WinAgentConfig)
     wechat: WechatConfig = field(default_factory=WechatConfig)
     accounts: AccountsConfig = field(default_factory=AccountsConfig)
+    qq: QQAdapterConfig = field(default_factory=QQAdapterConfig)                 # [adapters.qq]
+    wechat_adapter: WechatAdapterConfig = field(default_factory=WechatAdapterConfig)   # [adapters.wechat]
+    media: MediaConfig = field(default_factory=MediaConfig)                      # [media]
+    net: NetConfig = field(default_factory=NetConfig)                            # [net]
+    retention: RetentionConfig = field(default_factory=RetentionConfig)          # [retention](owner=maintenance)
+    backup: BackupConfig = field(default_factory=BackupConfig)                   # [db] backup_*
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)                # [events] webhook_*
+    hmac: HmacConfig = field(default_factory=HmacConfig)                         # [api] hmac_clock_skew_s / nonce_ttl_s
+    calib: CalibrationConfig = field(default_factory=CalibrationConfig)          # [pool] calibration_*
+    mail: MailConfig = field(default_factory=MailConfig)                         # [mail].*(owner=06 §7)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -169,7 +218,7 @@ class AgentConfig:
             section = section or {}
             names = klass.__dataclass_fields__.keys()
             vals = {k: section[k] for k in names if k in section}
-            for tup_key in ("unauth_health_sources", "container_restart_backoff_s"):
+            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms"):
                 if tup_key in vals and isinstance(vals[tup_key], list):
                     vals[tup_key] = tuple(vals[tup_key])
             return klass(**vals)
@@ -187,6 +236,16 @@ class AgentConfig:
             winagent=pick(d.get("winagent"), WinAgentConfig),
             wechat=pick(d.get("wechat"), WechatConfig),
             accounts=pick(d.get("accounts"), AccountsConfig),
+            qq=pick(adapters.get("qq"), QQAdapterConfig),
+            wechat_adapter=pick(adapters.get("wechat"), WechatAdapterConfig),
+            media=pick(d.get("media"), MediaConfig),
+            net=pick(d.get("net"), NetConfig),
+            retention=pick(d.get("retention"), RetentionConfig),
+            backup=pick(d.get("db"), BackupConfig),
+            webhook=pick(d.get("events"), WebhookConfig),
+            hmac=pick(d.get("api"), HmacConfig),
+            calib=pick(d.get("pool"), CalibrationConfig),
+            mail=MailConfig.from_toml_dict({**(d.get("mail") or {}), "retention": d.get("retention")}),
         )
 
     def quota_mb(self, channel: str) -> int:

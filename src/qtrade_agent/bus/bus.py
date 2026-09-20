@@ -226,6 +226,16 @@ class Bus:
         started = self.clock()
         self.store.command_started(cmd.trace_id, started)
         if cmd.op.startswith("send_"):
+            # 写路径前置闸(`.omc/handoffs/wechat-channel.md` ⑥(c) / 既有缺陷 3):**先问适配器能不能写,再落 SENDING 行**。
+            # 原顺序「先落 SENDING → 再问适配器」会在微信 KEY_FAIL / SCREEN_LOCKED 下留一条注定 FAILED 的出向行。
+            guard = getattr(adapter, "write_guard", None)
+            if guard is not None:
+                blocked = guard(acct)
+                if blocked is not None:
+                    blocked.trace_id = cmd.trace_id
+                    blocked.cost_ms = self.clock() - started
+                    self._finalize(job, blocked)
+                    return
             await self._rate_limit(acct.id)
             session = cmd.args["session"]
             native = session.split(":", 1)[1] if session.startswith(acct.id + ":") else session
@@ -240,8 +250,13 @@ class Bus:
             if not res.ok:
                 if job.msg_id:
                     self.store.mark_out_state(job.msg_id, "FAILED")
-                self._finalize(job, CommandResult(ok=False, code="SEND_FAILED", trace_id=cmd.trace_id, source=res.source,
-                                                  error=CommandError("发送动作失败", retryable=True), cost_ms=self.clock() - started))
+                # 适配器给出的明确不可重试码(NOT_READY / GATE_BLOCKED / LOGIN_REQUIRED)不得抹成 SEND_FAILED:
+                # 抹掉后上层按「可重试」处理,而规格要的是明确告诉人「现在不能发」(05 §2.4.7 / §2.5.4)。
+                code = res.code if res.code in ("NOT_READY", "GATE_BLOCKED", "LOGIN_REQUIRED") else "SEND_FAILED"
+                retryable, needs_human = RESULT_CODES.get(code, (True, False))
+                self._finalize(job, CommandResult(ok=False, code=code, trace_id=cmd.trace_id, source=res.source,
+                                                  error=(res.error or CommandError("发送动作失败", retryable=retryable, needs_human=needs_human)),
+                                                  cost_ms=self.clock() - started))
                 return
             self._last_send_ms[acct.id] = self.clock()
             # 队列外等确认:不 await,让消费者立刻取下一条
@@ -263,7 +278,8 @@ class Bus:
     async def _confirm(self, job: _Job, native_id: str, started: int, source: str) -> None:
         cmd, acct = job.cmd, job.acct
         timeout = self.cfg.confirm_timeout_ms(acct.channel)
-        interval = (self.cfg.qidian.confirm_poll_interval_ms if acct.channel == "qidian" else 1000) / 1000
+        interval = {"qidian": self.cfg.qidian.confirm_poll_interval_ms,
+                    "wechat": self.cfg.wechat_adapter.confirm_poll_interval_ms}.get(acct.channel, 1000) / 1000
         deadline = started + timeout
         while True:
             st = self.store.message_state(job.msg_id) if job.msg_id else None
@@ -274,8 +290,10 @@ class Bus:
                 return
             if self.clock() >= deadline:
                 break
-            if acct.channel == "qidian":
-                self._queue(acct.id).put_nowait((acct, [native_id]))    # 窗内每 confirm_poll_interval_ms 投一轮只查目标会话表的 poll
+            if acct.channel in ("qidian", "wechat"):
+                # 窗内每 confirm_poll_interval_ms 投一轮「只查目标会话」的加速 poll
+                # (企点 06 §2.9.5;微信 05 §2.4.4 ⑦「发送确认期把 5 s 加密到 1 s」)
+                self._queue(acct.id).put_nowait((acct, [native_id]))
             await asyncio.sleep(interval)
         if acct.channel == "wechat":
             if job.msg_id:

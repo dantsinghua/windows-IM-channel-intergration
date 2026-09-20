@@ -102,6 +102,34 @@ class MailService:
     async def dispatch(self, bus: Any) -> list[Any]:
         return await self.ingest.dispatch(bus) if self.ingest else []
 
+    def reparse(self, inbox_id: int) -> Optional[str]:
+        """``POST /mail/inbox/{id}/reparse``(02 #60 / 06 §3.2):模板改对之后,对老邮件**重跑解析**。
+
+        原文从库里已存的 ``body_text`` 重建(取信时就落了;``OUT_OF_SCOPE``/``OVERSIZE`` 不存正文,所以那两态本来
+        也不在 #60 的可重跑集合里)。重跑只走 ``_classify`` 那一段——三道闸 / 去重四层 / 高危 202 / 回执,
+        **不重新落新行**(同一 ``mail_inbox.id`` 原地改 ``status``/``reason``)。
+        """
+        from .fetcher import RawMail
+        from .parser import ParsedMail
+
+        if self.ingest is None:
+            return None
+        row = self.ms.inbox_get(inbox_id)
+        if row is None:
+            return None
+        parsed = ParsedMail(rfc_message_id=row.get("rfc_message_id"), from_addr=row.get("from_addr") or "",
+                            to_addrs=row.get("to_addrs") or "", subject=row.get("subject") or "",
+                            date_ms=row.get("date_ms"), body_text=row.get("body_text") or "")
+        mail = RawMail(mailbox=row.get("mailbox") or "", protocol=row.get("protocol") or "imap",
+                       folder=row.get("folder") or "INBOX", size_bytes=int(row.get("size_bytes") or 0), raw=b"",
+                       uid=row.get("uid"), uidvalidity=row.get("uidvalidity"), uidl=row.get("uidl"))
+        base = {"mailbox": mail.mailbox, "protocol": mail.protocol, "folder": mail.folder, "uid": mail.uid,
+                "uidvalidity": mail.uidvalidity, "uidl": mail.uidl, "rfc_message_id": parsed.message_id_or_hash(),
+                "from_addr": parsed.from_addr, "to_addrs": parsed.to_addrs[:512], "subject": parsed.subject[:512],
+                "date_ms": parsed.date_ms, "received_ms": row.get("received_ms") or self.clock(),
+                "size_bytes": mail.size_bytes, "body_sha256": parsed.body_sha256}
+        return self.ingest._classify(inbox_id, mail, parsed, base).status
+
     def send_once(self, *, limit: int = 50) -> Any:
         return self.sender.run_once(limit=limit) if self.sender else None
 

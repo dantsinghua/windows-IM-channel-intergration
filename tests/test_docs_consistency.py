@@ -64,6 +64,73 @@ def test_config_defaults_match_doc_02(key, value):
     assert int(m.group(1)) == value
 
 
+@pytest.mark.parametrize("key, value", [
+    # [adapters.qq](02 §7.1;07 第 54 行镜像)
+    ("history_backfill_on_reconnect", AgentConfig().qq.history_backfill_on_reconnect),
+    # [adapters.wechat]
+    ("switch_drain_timeout_s", AgentConfig().wechat_adapter.switch_drain_timeout_s),
+    # [api] 公网入站 HMAC(§3.5)
+    ("hmac_clock_skew_s", AgentConfig().hmac.hmac_clock_skew_s),
+    ("nonce_ttl_s", AgentConfig().hmac.nonce_ttl_s),
+    ("rate_default_per_min", AgentConfig().api.rate_default_per_min),
+    # [events] webhook(§2.2.7)
+    ("webhook_timeout_ms", AgentConfig().webhook.webhook_timeout_ms),
+    ("webhook_max_attempts", AgentConfig().webhook.webhook_max_attempts),
+    # [retention](§2.8.4 / E-18)
+    ("files_days", AgentConfig().retention.files_days),
+    ("messages_days", AgentConfig().retention.messages_days),
+    ("media_days", AgentConfig().retention.media_days),
+    ("raw_days", AgentConfig().retention.raw_days),
+    ("mail_archive_days", AgentConfig().retention.mail_archive_days),
+    ("commands_days", AgentConfig().retention.commands_days),
+    ("audit_days", AgentConfig().retention.audit_days),
+    ("events_ws_hours", AgentConfig().retention.events_ws_hours),
+    ("idempotency_days", AgentConfig().retention.idempotency_days),
+    ("mail_inbox_rows_days", AgentConfig().retention.mail_inbox_rows_days),
+    ("export_jobs_days", AgentConfig().retention.export_jobs_days),
+    ("cleanup_batch", AgentConfig().retention.cleanup_batch),
+    # [media] / [db]
+    ("orphan_grace_h", AgentConfig().media.orphan_grace_h),
+])
+def test_new_section_defaults_match_doc_02(key, value):
+    """第五批接线新并入 config.py 的段(02 §7.1 是这些键的真值/镜像位置)。"""
+    m = re.search(r"`%s` \| `(\d+)`" % re.escape(key), _doc(DOC02))
+    assert m, f"02 §7.1 找不到 {key}"
+    assert int(m.group(1)) == value
+
+
+def test_adapters_qq_and_wechat_pairs_match_doc_02():
+    """并列写在同一行的键:`[adapters.qq] heartbeat_timeout_s/reconnect_delay_s` 与 `[adapters.wechat]` 两个周期键。"""
+    t = _doc(DOC02)
+    c = AgentConfig()
+    m = re.search(r"`heartbeat_timeout_s` / `reconnect_delay_s` \| `(\d+)` / `(\d+)`", t)
+    assert m and (int(m.group(1)), int(m.group(2))) == (c.qq.heartbeat_timeout_s, c.qq.reconnect_delay_s)
+    m = re.search(r"\| `poll_interval_s` \| `(\d+)` \| 常态读库周期", t)
+    assert m and int(m.group(1)) == c.wechat_adapter.poll_interval_s
+    m = re.search(r"\| `confirm_poll_interval_ms` \| `(\d+)` \| 发送后临时加速", t)
+    assert m and int(m.group(1)) == c.wechat_adapter.confirm_poll_interval_ms
+
+
+def test_calibration_and_backup_and_watermark_match_doc_02():
+    """`[pool] calibration_*`、`[db] backup_*`、`[retention]` 三级水位与两个时刻串。"""
+    t = _doc(DOC02)
+    c = AgentConfig()
+    m = re.search(r"`calibration_window_min` / `calibration_drift_warn_pct` / `quota_auto_lower` \| `(\d+)` / `(\d+)` / `(\w+)`", t)
+    assert m and (int(m.group(1)), int(m.group(2)), m.group(3) == "true") == (
+        c.calib.calibration_window_min, c.calib.calibration_drift_warn_pct, c.calib.quota_auto_lower)
+    m = re.search(r'`backup_dir` / `backup_keep` \| `"([^"]+)"` / `(\d+)`', t)
+    assert m and (m.group(1), int(m.group(2))) == (c.backup.backup_dir, c.backup.backup_keep)
+    for key, val in (("backup_at", c.backup.backup_at), ("cleanup_at", c.retention.cleanup_at)):
+        m = re.search(r'`%s` \| `"([^"]+)"`' % key, t)
+        assert m and m.group(1) == val, key
+    m = re.search(r"`disk_warn_mb` / `disk_high_mb` / `disk_critical_mb` \| `(\d+)` / `(\d+)` / `(\d+)`", t)
+    assert m and tuple(map(int, m.groups())) == (c.retention.disk_warn_mb, c.retention.disk_high_mb, c.retention.disk_critical_mb)
+    m = re.search(r"`webhook_backoff_ms` \| `\[([\d,]+)\]`", t)
+    assert m and tuple(int(x) for x in m.group(1).split(",")) == c.webhook.webhook_backoff_ms
+    m = re.search(r"`honor_env_proxy` \| `(\w+)`", t)
+    assert m and (m.group(1) == "true") == c.net.honor_env_proxy
+
+
 def test_pool_quota_and_runtime_strings_match_doc_02():
     t = _doc(DOC02)
     m = re.search(r"`quota_qidian_mb` / `quota_qq_mb` / `quota_wechat_mb` \| `(\d+)` / `(\d+)` / `(\d+)`", t)

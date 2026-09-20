@@ -16,7 +16,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .alerts import AUTO_RESTART_EXHAUSTED, CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED, H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT
+from .adapters.base import Account
+from .alerts import (ACCOUNT_OFFLINE, AUTO_RESTART_EXHAUSTED, CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED,
+                     H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT)
 from .events import iso8601
 from .config import AgentConfig
 
@@ -47,7 +49,11 @@ class HealthLoop:
         self._clock = clock
         self.restart: dict[str, RestartState] = {}
         self.h06_fail_streak: dict[str, int] = runtime.h06_fail_streak      # 04 owner 的内存态计数,与 runtime 共享同一 dict
-        self.last: dict[str, dict[str, Any]] = {"H04": {}, "H05": {}, "H06": {}}
+        self.last: dict[str, dict[str, Any]] = {"H04": {}, "H05": {}, "H06": {}, "WECHAT": {}}
+        self.wechat_adapter = None                                          # adapters.wechat.WechatAdapter(装配后注入)
+        self.wechat_poller = None                                           # adapters.wechat.WechatPoller(同上)
+        self.wechat_client = None                                           # adapters.wechat.WeChatWinAgent(同上)
+        self.key_retry: dict[str, list[int]] = {}                           # 05 §2.5.4:每账号每小时 key_retry_per_hour 次
 
     # ------------------------------------------------------------------ 公共
     def _watched(self, states=WATCH_STATES) -> list[dict[str, Any]]:
@@ -136,6 +142,57 @@ class HealthLoop:
                 self._alerts.resolve(H05_BOOT_INCOMPLETE, subject=subject, account_id=aid)
             else:
                 self._alerts.firing(H05_BOOT_INCOMPLETE, subject=subject, account_id=aid, evidence={"boot_completed": v, "phase": "steady"})
+
+    # ------------------------------------------------------------------ 微信两条(05 §2.5.4 第 4/5 行)
+    KEY_RETRY_PER_HOUR = 3          # 05 §2.5.4:chatlog 挂但微信在线 ⇒ 自动重试取钥,每小时上限
+
+    async def check_wechat(self) -> None:
+        """05 §2.5.4:
+        - **chatlog 挂、微信在线**:``wechat/read`` 连续 3 次异常 ⇒ ``degraded(KEY_FAIL)``,自动重试试钥
+          (``key_retry_per_hour=3``);超限停在 ``degraded`` 并 ``alert(error)``,**不是掉线、不进登录阶段**。
+        - **锁屏**:周期读 #28 的 ``screen_locked`` ⇒ ``degraded(SCREEN_LOCKED)``;解锁自动回 ``running``
+          (**不需要扫码,这不是登录**)。
+        两条的状态判定都取自 ``WechatAdapter.probe_state()``(它已按 05 §2.4.7/§2.5.4 给出三元组)。
+        """
+        ad = self.wechat_adapter
+        if ad is None:
+            return
+        now = self._clock()
+        for row in self._store.list_accounts(channel="wechat"):
+            aid = row["id"]
+            if row["state"] not in ("running", "degraded") or self._accounts.busy(aid):
+                continue
+            acct = Account(id=aid, channel="wechat", state=row["state"], self_uid=row.get("self_uid"),
+                           self_nick=row.get("self_nick"), state_code=row.get("state_code"))
+            try:
+                state, code, reason = await ad.probe_state(acct)
+            except Exception as e:                       # 会话代理抖动:本轮不判,下轮再看
+                log.info("微信健康探测未取到 account=%s: %s", aid, e)
+                continue
+            self.last["WECHAT"][aid] = {"state": state, "state_code": code, "checked_ms": now}
+            if state != row["state"] or (code or "") != (row.get("state_code") or ""):
+                self._accounts.transition(aid, state, state_code=code, state_reason=reason)
+            if code == "KEY_FAIL":
+                await self._wechat_key_retry(aid, now)
+
+    async def _wechat_key_retry(self, account_id: str, now: int) -> None:
+        """``degraded(KEY_FAIL)`` 下自动重试取钥,每小时 ``KEY_RETRY_PER_HOUR`` 次;超限只 alert(error)不再试。"""
+        hist = [t for t in self.key_retry.get(account_id, []) if now - t < 3600_000]
+        subject = f"account:{account_id}"
+        if len(hist) >= self.KEY_RETRY_PER_HOUR:
+            self.key_retry[account_id] = hist
+            self._alerts.firing(ACCOUNT_OFFLINE, subject=subject, severity="error", account_id=account_id,
+                                evidence={"code": "KEY_FAIL", "key_retry_1h": len(hist), "exhausted": True},
+                                hint_actions=["retry_key"])
+            return
+        hist.append(now)
+        self.key_retry[account_id] = hist
+        if self.wechat_client is None:
+            return
+        try:
+            await self.wechat_client.key_retry()
+        except Exception as e:
+            log.warning("微信试钥(#35)失败 account=%s: %s", account_id, e)
 
     # ------------------------------------------------------------------ H06
     async def check_adb(self) -> None:

@@ -52,29 +52,98 @@ def read_token(path: str) -> Optional[str]:
         return None
 
 
-def resolve_base_url(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.conf") -> Optional[str]:
-    """02 §2.5「地址」:``url`` → ``host.json`` 的 ``agent_base_url``/``host_ip`` → resolv.conf nameserver。"""
-    if cfg.url:
-        return cfg.url.rstrip("/")
+def default_gateway(*, route_file: str = "/proc/net/route") -> Optional[str]:
+    """04 §2.6.3「主机 IP 的发现」的结论口径:**eth0 默认网关**(`ip -4 route show default` 的 `via`)。
+
+    这里读 ``/proc/net/route``(`ip` 命令的同一份内核数据,不 fork 子进程、容器里也一定在):
+    取 ``Destination==00000000`` 的那一行,``Gateway`` 列是**小端 hex 的 IPv4**。
+    路由表里有多条默认路由时按 ``Metric`` 最小的那条(与 `ip route show default` 的选路一致)。
+
+    可注入:调用方传 ``route_file``(测试用临时文件),或直接给 ``resolve_base_url(gateway=…)`` 传一个函数。
+    """
+    best: Optional[tuple[int, str]] = None
     try:
-        with open(cfg.host_ip_hint_file, encoding="utf-8") as f:
-            hint = json.load(f)
-        if isinstance(hint, dict):
-            if hint.get("winagent_base_url"):
-                return str(hint["winagent_base_url"]).rstrip("/")
-            if hint.get("host_ip"):
-                return f"http://{hint['host_ip']}:{WA_PORT}"
-    except (OSError, ValueError):
-        pass
+        with open(route_file, encoding="utf-8") as f:
+            next(f, None)                                   # 表头
+            for line in f:
+                cols = line.split()
+                if len(cols) < 8 or cols[1] != "00000000" or cols[2] == "00000000":
+                    continue
+                try:
+                    raw = int(cols[2], 16)
+                    metric = int(cols[6])
+                except ValueError:
+                    continue
+                ip = ".".join(str((raw >> (8 * i)) & 0xFF) for i in range(4))   # 小端 hex → 点分十进制
+                if best is None or metric < best[0]:
+                    best = (metric, ip)
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def _resolv_nameserver(resolv_conf: str) -> Optional[str]:
     try:
         with open(resolv_conf, encoding="utf-8") as f:
             for line in f:
                 m = re.match(r"\s*nameserver\s+(\S+)", line)
                 if m:
-                    return f"http://{m.group(1)}:{WA_PORT}"
+                    return m.group(1)
     except OSError:
-        pass
+        return None
     return None
+
+
+def _host_hint(path: str) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            hint = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(hint, dict):
+        return None
+    if hint.get("winagent_base_url"):
+        return str(hint["winagent_base_url"]).rstrip("/")
+    if hint.get("host_ip"):
+        return f"http://{hint['host_ip']}:{WA_PORT}"
+    return None
+
+
+def base_url_candidates(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.conf",
+                        gateway: Optional[Callable[[], Optional[str]]] = None) -> list[tuple[str, str]]:
+    """按优先级给出 ``[(来源, base_url), …]``(去重、保序)。来源 ∈ ``url|host_json|gateway|resolv_conf``。
+
+    🔴 顺序依据 **04 §2.6.3**(网络册是这条结论的 owner)与 **02 §7.1 `[winagent] url` 注**(「空=自动:先
+    `host_ip_hint_file`,再默认网关」),即 ``url → host.json → 默认网关 → resolv.conf``。
+    04 §2.6.3 逐条论证了 ``resolv.conf`` 的 ``nameserver`` **不可靠**(①公司 VPN 改写 Windows DNS;
+    ②§2.6.5 的 DNS 对策会主动 `generateResolvConf=false` 并写公司 DNS),故它**降为最后兜底**。
+    (02 §2.5 的表格把两者并列写成「resolv.conf nameserver 或 ip route」且未排序,见 rulings R6-58 (bp)。)
+    """
+    out: list[tuple[str, str]] = []
+
+    def add(source: str, url: Optional[str]) -> None:
+        if url and url not in {u for _s, u in out}:
+            out.append((source, url))
+
+    if cfg.url:
+        return [("url", cfg.url.rstrip("/"))]                # 显式配置就是唯一答案,不再自动发现
+    add("host_json", _host_hint(cfg.host_ip_hint_file))
+    gw = (gateway or default_gateway)()
+    add("gateway", f"http://{gw}:{WA_PORT}" if gw else None)
+    ns = _resolv_nameserver(resolv_conf)
+    add("resolv_conf", f"http://{ns}:{WA_PORT}" if ns else None)
+    return out
+
+
+def resolve_base_url(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.conf",
+                     gateway: Optional[Callable[[], Optional[str]]] = None) -> Optional[str]:
+    """回退链首选项:``url`` → ``host.json`` → **默认网关** → ``resolv.conf`` nameserver(04 §2.6.3)。
+
+    「`host.json` 与默认网关不一致时以**能 ping 通 `/wa/v1/ping` 的那个**为准并记 `warn`」这一步是异步的,
+    在 :meth:`WinAgentClient.discover` 里做(本函数只给同步的首选项,保持纯函数可测)。
+    """
+    c = base_url_candidates(cfg, resolv_conf=resolv_conf, gateway=gateway)
+    return c[0][1] if c else None
 
 
 async def urllib_transport(method: str, url: str, headers: dict[str, str], body: Optional[bytes], timeout_s: float) -> tuple[int, dict[str, str], bytes]:
@@ -111,7 +180,12 @@ class WinAgentClient:
         return self._token
 
     async def request(self, method: str, path: str, *, json: Optional[dict[str, Any]] = None, timeout_s: Optional[float] = None,
-                      retry: bool = False, auth: bool = True, headers: Optional[dict[str, str]] = None) -> tuple[int, Optional[dict[str, Any]]]:
+                      retry: bool = False, auth: bool = True, headers: Optional[dict[str, str]] = None,
+                      raw: bool = False) -> Any:
+        """``raw=False``(缺省)回 ``(status, parsed_json | None)``;``raw=True`` 回 ``(status, headers, body_bytes)``。
+
+        ``raw=True`` 供二进制端点(#40 ``wechat/media``、#42 ``wechat/screenshot``)用 —— 它们的响应体不是 JSON,
+        解析会丢字节。其余语义(地址/令牌/超时/重试/版本头)两种模式完全一致。"""
         base = self.base_url
         if not base:
             raise WinAgentUnavailable("no_address")
@@ -130,7 +204,7 @@ class WinAgentClient:
         last: Optional[Exception] = None
         for _ in range(attempts):
             try:
-                status, rh, raw = await asyncio.wait_for(self._transport(method, base + path, hdrs, body, t), timeout=t + 0.5)
+                status, rh, body_bytes = await asyncio.wait_for(self._transport(method, base + path, hdrs, body, t), timeout=t + 0.5)
             except (asyncio.TimeoutError, OSError, urllib.error.URLError) as e:
                 last = e
                 continue
@@ -138,10 +212,12 @@ class WinAgentClient:
             if ver:
                 self.last_version = ver
             self.last_error = None
-            parsed: Optional[dict[str, Any]] = None
             if raw:
+                return status, rh, body_bytes            # 二进制端点:原样回字节,不做 JSON 解析
+            parsed: Optional[dict[str, Any]] = None
+            if body_bytes:
                 try:
-                    parsed = _loads(raw.decode("utf-8"))
+                    parsed = _loads(body_bytes.decode("utf-8"))
                 except ValueError:
                     parsed = None
             return status, parsed

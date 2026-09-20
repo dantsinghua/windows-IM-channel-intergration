@@ -81,6 +81,7 @@ class WechatLoginFlow:
             if self._clock() > deadline:
                 # 会话代理不可达 / 人一直没扫:超 qr_max_wait_s 转 stopped、释放 pending(05 §2.4.2.1「断连期间的规则」)
                 return await self._fail_stopped(aid, ls, f"扫码等待超过 {self.cfg.accounts.qr_max_wait_s}s")
+            self._renew_pending(bound_to or aid)       # T-11:登录流在世期间续期 pending TTL,免得 reaper 在 600 s 处误杀
             try:
                 st = await self._client.login_status()
             except (WeChatNotReady, WeChatCallFailed) as e:
@@ -108,6 +109,16 @@ class WechatLoginFlow:
                 code = self._code_for(phase, st)
                 last_code = self._set_state(aid, "login_required", code, ls, last_code, prompt=self._prompt(code, st))
             await self._sleep(self._status_interval_s)
+
+    def _renew_pending(self, target: str) -> None:
+        """T-11(`.omc/handoffs/wechat-channel.md`,总控裁决草案 R6-58 (l) 取「登录流在世期间续期」):
+        每轮把 ``slot_pending_expires_ms`` 推到 ``now + [wechat] slot_pending_ttl_s``。
+        规格两值冲突(TTL 600 < ``qr_max_wait_s`` 1800)时,续期让 reaper 只回收**真没人管**的 pending。"""
+        try:
+            self._store.wechat_slot_renew_pending(target, self._clock() + self.cfg.wechat.slot_pending_ttl_s * 1000,
+                                                  now_ms=self._clock())
+        except Exception as e:                        # 续期失败不打断登录流(reaper 兜底)
+            log.warning("续期微信槽位 pending TTL 失败 account=%s: %s", target, e)
 
     # ------------------------------------------------------------------ 相位 → state_code / prompt
     @staticmethod
@@ -211,19 +222,8 @@ class WechatLoginFlow:
         ⚠️ 语句顺序不可调,被两条库约束夹住:① ``ux_accounts_wxid`` 是「未软删且未合并」的部分唯一索引 ⇒
         **必须先给临时行落 `deleted_ms`** 才能把同一个 `wxid` 落到老行/重建行上;② ``merged_into REFERENCES accounts(id)``
         ⇒ **老行必须已经存在** 才能写 `merged_into`。故顺序 = 软删临时行 → 重建老行(如缺)→ 写墓碑指针 → 回填老行 → 槽位改指。
-        handoff:建议收进 ``store.wechat_merge_account(temp_id, old_id, wxid, create_template)``,本处是等价实现。"""
-        with self._store._tx() as c:
-            c.execute("UPDATE accounts SET deleted_ms=?, state='stopped', updated_ms=? WHERE id=?", (now, now, temp_id))
-            if create_template is not None:
-                c.execute("INSERT INTO accounts(id, channel, seq, label, host, state, login_mode, remember, quota_mb, wxid, self_uid, "
-                          "identity_json, settings_json, created_ms, updated_ms) "
-                          "VALUES (?,'wechat',?,?,'windows','created','qrcode',0,?,?,?,'{}','{}',?,?)",
-                          (old_id, int(old_id[2:]), create_template["label"], create_template["quota_mb"], wxid, wxid, now, now))
-                c.execute("INSERT OR IGNORE INTO account_runtime(account_id, kind, desired_state, updated_ms) VALUES (?,?,'stopped',?)",
-                          (old_id, self._store.RUNTIME_KIND["wechat"], now))
-            c.execute("UPDATE accounts SET merged_into=?, updated_ms=? WHERE id=?", (old_id, now, temp_id))
-            c.execute("UPDATE accounts SET wxid=COALESCE(wxid, ?), self_uid=COALESCE(self_uid, ?), updated_ms=? WHERE id=?", (wxid, wxid, now, old_id))
-            c.execute("UPDATE resource_pools SET slot_pending=?, updated_ms=? WHERE pool='windows' AND slot_pending=?", (old_id, now, temp_id))
+        该事务已收进 ``store.wechat_merge_account``(语句顺序同上),本处只转调并补审计。"""
+        self._store.wechat_merge_account(temp_id, old_id, wxid, create_template=create_template, now_ms=now)
         self._store.insert_audit(kind="system", transport="system", actor="system:wechat_login", action="account.wechat_merge",
                                  account_id=old_id, result_code="OK", detail={"merged_from": temp_id, "wxid": wxid}, now_ms=now)
         return old_id

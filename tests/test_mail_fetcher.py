@@ -19,7 +19,7 @@ def env_pop3(store, clock, **kw):
 def fire_count(env, code: str) -> int:
     import json
     n = 0
-    for e in env.events._store.list_events(event="alert"):
+    for e in env.events._store.list_events(event="mail"):      # 02 §3.7:MAIL_* 的事件族是 mail,不是 alert
         p = json.loads(e["payload_json"])
         if p["code"] == code and p["state"] == "firing":
             n += 1

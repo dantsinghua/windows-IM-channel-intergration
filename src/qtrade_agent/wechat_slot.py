@@ -110,16 +110,10 @@ class WechatSlot:
     def promote(self, target: str, *, now_ms: Optional[int] = None) -> bool:
         """**成功**才把 `pending` 转 `holder`:``slot_holder=slot_pending`` 且三列一起清(02 §2.2.5)。
 
-        ⚠️ 列的写入顺序不可调:``resource_pools`` 的第二条 CHECK 是「没有 pending 就不该有过期时刻/残留尝试 id」,
-        故必须先清 ``expires``/``login_session_id``、最后清 ``slot_pending``。
-        (handoff 已建议给 ``store`` 补一个与规格同形的单条 ``wechat_slot_promote()`` UPDATE 取代本处。)"""
-        now = now_ms or self._clock()
-        s = self.view()
-        if not s.pending or s.pending != target or s.holder:
-            return False
-        self._store.pool_set("windows", now_ms=now, slot_holder=target, slot_pending_expires_ms=None,
-                             slot_pending_login_session_id="", slot_pending="")
-        return True
+        已收进 ``store.wechat_slot_promote``(与规格同形的**单条** UPDATE + rowcount 判定),本处只转调:
+        单条语句天然绕开 ``resource_pools`` 第二条 CHECK(「没有 pending 就不该有过期时刻/残留尝试 id」)
+        对多条 UPDATE 的写入顺序要求。"""
+        return bool(self._store.wechat_slot_promote(target, now_ms=now_ms or self._clock()))
 
     def release_holder(self, holder: str, *, now_ms: Optional[int] = None) -> int:
         """`holder` 的释放**只走**正常 ``stopping → stopped``(#6/#10);本方法是那条路径的落点,不受 TTL 约束。"""

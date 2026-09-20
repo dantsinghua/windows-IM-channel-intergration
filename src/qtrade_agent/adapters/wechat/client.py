@@ -66,19 +66,12 @@ class WeChatWinAgent:
         return parsed or {}
 
     async def _raw(self, method: str, path: str, *, timeout_s: Optional[float] = None) -> bytes:
-        """二进制端点(#40 media / #42 screenshot)。``WinAgentClient.request`` 只回解析后的 JSON,
-        故这里复用它的 base_url/令牌后直接走同一个传输层(handoff:建议给 ``request`` 加 ``raw=True``,由总控统一改)。"""
-        base = self._wa.base_url
-        if not base:
-            raise WeChatNotReady("no_address")
-        tok = self._wa.token()
-        if not tok:
-            raise WeChatNotReady("no_token")
-        t = timeout_s or self._timeout_s
+        """二进制端点(#40 media / #42 screenshot):走 ``WinAgentClient.request(..., raw=True)``(总控已补),
+        回 ``(status, headers, bytes)``,不经 JSON 解析。"""
         try:
-            status, _rh, raw = await self._wa._transport(method, base + path, {"Authorization": f"Bearer {tok}"}, None, t)
-        except OSError as e:
-            raise WeChatNotReady("winagent_unreachable", repr(e)) from e
+            status, _rh, raw = await self._wa.request(method, path, timeout_s=timeout_s or self._timeout_s, raw=True)
+        except WinAgentUnavailable as e:
+            raise WeChatNotReady("winagent_unreachable", e.detail) from e
         if status == 503:
             raise WeChatNotReady("user_agent_offline")
         if status >= 400:

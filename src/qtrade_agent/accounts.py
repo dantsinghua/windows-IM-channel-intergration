@@ -61,6 +61,9 @@ class AccountService:
         self._login_fn: LoginFn = login_fn or _login_not_wired
         self._caps_by_op = caps_by_op or {}
         self.pressure = pressure                                # pressure.MemoryWatermark(装配后注入);None = 不判水位
+        self._wechat_slot = None                                # wechat_slot.WechatSlot(装配后注入);None = 微信分支退回「本期未接」
+        self._wechat_login = None                               # adapters.wechat.WechatLoginFlow(装配后注入)
+        self._bus = None                                        # bus.Bus(装配后注入):#17 切换排空 holder 队列用
         self.tasks: dict[str, asyncio.Task] = {}
         self._state_cache: dict[str, tuple[int, str]] = {}
         self.recovering: Optional[tuple[int, int]] = None      # (done, total) 供 P-DASH「正在恢复 2/3」
@@ -125,7 +128,10 @@ class AccountService:
         return t is not None and not t.done()
 
     # ------------------------------------------------------------------ #2 新增
-    async def create(self, body: dict[str, Any], *, actor: str) -> dict[str, Any]:
+    async def create(self, body: dict[str, Any], *, actor: str, pool_check: bool = True) -> dict[str, Any]:
+        """``pool_check=False`` 只给 #18 ``switch_new`` 用:切换的语义就是「槽位被占着也要新建一个号去顶」,
+        ``can_add('wechat')`` 在 holder/pending 非空时必然拒绝,先建行再走 switch 才是 05 §2.4.5 的顺序。
+        内存水位 critical 的阻断(E-19)**不跳过**。"""
         channel = body.get("channel")
         if channel not in ("qidian", "qq", "wechat"):
             raise ApiError(400, "INVALID_ARGS", "channel 须为 qidian|qq|wechat", reason="bad_channel", extra={"details": [{"pointer": "/channel"}]})
@@ -144,9 +150,10 @@ class AccountService:
         # 内存水位 critical(E-19):新增一律 409 mem_pressure + LRU 建议停用名单
         self._raise_if_mem_pressure()
         # 资源预检(05 §2.1.1 ①):不足 409 + alternatives;微信槽位被占 409 + hint_actions
-        ok, reason, alts = self._pool.can_add(channel)
-        if not ok:
-            self._raise_exhausted(channel, reason, alts)
+        if pool_check:
+            ok, reason, alts = self._pool.can_add(channel)
+            if not ok:
+                self._raise_exhausted(channel, reason, alts)
         remember = bool(login.get("remember", False))       # R4-6:默认不存
         secret = login.get("secret")
         capture_text = body.get("capture_text")
@@ -229,8 +236,7 @@ class AccountService:
         row = self._store.get_account_full(id)
         try:
             if row["channel"] == "wechat":
-                self.transition(id, "starting")
-                self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="微信登录由 WinAgent 会话代理承接,本期未接")
+                await self._wechat_start(id)
                 return
             await self._runtime.start(row)                                       # ④ docker run/start(全局串行)
             row = self.transition(id, "starting")
@@ -241,12 +247,109 @@ class AccountService:
                 await self._runtime.ensure_root(row)                             # ⑤b 提权;失败只 warn,不阻断
                 await self._login_phase(id, row)
             else:
-                self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="QQ 扫码登录执行层未接入")
+                await self._qq_start(id, row)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.exception("start 序列失败 account=%s: %s", id, e)
             self.transition(id, "error", state_code="CONTAINER_EXIT", state_reason=f"启动失败:{e}")
+
+    # ------------------------------------------------------------------ 05 §2.3 QQ 首登序列 ⑤/⑦
+    async def _qq_start(self, id: str, row: dict[str, Any]) -> None:
+        """05 §2.3.1 ⑤:建 OneBot 连接(不阻塞到登录)→ ``qq_quick_login_wait_s`` 内轮询 ``get_state``。
+
+        ⑤a ``qq_data`` 免扫命中 ⇒ ``get_login_info`` 有 ``user_id``,回填 ``self_uid``/``self_nick`` 并转 ``running``;
+        ⑤b 窗内没登上 ⇒ ``login_required(WAIT_QRCODE)`` 等人(**不自动重登**,D-2;二维码转发的接口路径 05 §10 待定 3,未接)。"""
+        ad = self._adapters.get("qq")
+        if ad is None:
+            self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="QQ 适配器未装配")
+            return
+        acct = Account(id=id, channel="qq", state=row["state"], self_uid=row.get("self_uid"), self_nick=row.get("self_nick"),
+                       state_code=row.get("state_code"))
+        await ad.start(acct)                                                     # ⑤ 建连,不阻塞到登录
+        deadline = self._clock() + self.cfg.accounts.qq_quick_login_wait_s * 1000
+        while self._clock() < deadline:
+            if await ad.get_state(acct) == "running":                            # ⑤a 免扫命中
+                info = await self._qq_login_info(ad, id)
+                if info:
+                    # ⑦ 身份列:`self_nick` 不在 transition/patch_account 的白名单里(它不是人能改的设置项),直接写同一张表
+                    self._store.con.execute("UPDATE accounts SET self_nick=?, updated_ms=? WHERE id=?",
+                                            (str(info.get("nickname") or ""), self._clock(), id))
+                self.transition(id, "running", state_code=None,
+                                **({"self_uid": str(info["user_id"])} if info else {}))
+                return
+            await asyncio.sleep(1)
+        self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="免扫码登录未命中,请在 NapCat WebUI 扫码",
+                        prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
+
+    @staticmethod
+    async def _qq_login_info(ad: Any, account_id: str) -> Optional[dict[str, Any]]:
+        """⑦ 判定:``get_login_info`` 有 ``user_id`` ⇒ 写 ``self_uid``/``self_nick``;取不到就只转状态、不写身份列。"""
+        sess = ad.session_of(account_id)
+        if sess is None:
+            return None
+        try:
+            info = await sess.client.call_action("get_login_info")
+        except Exception as e:                                                   # 连接抖动:状态已判 running,身份下轮再补
+            log.info("QQ get_login_info 未取到 account=%s: %s", account_id, e)
+            return None
+        return info if isinstance(info, dict) and info.get("user_id") else None
+
+    # ------------------------------------------------------------------ 05 §2.4 微信登录流
+    async def _wechat_start(self, id: str) -> None:
+        """05 §2.4.2:行级 claim 槽位(02 §2.2.5)→ ``WechatLoginFlow`` 驱动相位与状态。
+
+        ``WechatLoginFlow.run`` 自己做 ``provisioning → starting``(``_enter_starting`` 幂等),故此处不再 transition。"""
+        if self._wechat_slot is None or self._wechat_login is None:
+            self.transition(id, "starting")
+            self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="微信登录流未装配")
+            return
+        ls = new_login_session_id()
+        if not self._wechat_slot.claim(id, ls):
+            self.transition(id, "stopped", state_reason="微信槽位被占用", desired_state="stopped")
+            return
+        await self._wechat_login.run(id, ls)
+
+    async def _drain_account(self, account_id: str, timeout_s: float) -> bool:
+        """#17 切换第 ① 步:等该账号的总线队列跑完(上限 ``[adapters.wechat] switch_drain_timeout_s``)。
+
+        返回 True = 排空;False = 超时(队列里未跑完的由总线自己按 TIMEOUT 收尾)。总线未装配 ⇒ 视作已排空。"""
+        if self._bus is None:
+            return True
+        q = self._bus._queues.get(account_id)
+        if q is None:
+            return True
+        try:
+            await asyncio.wait_for(q.join(), timeout=timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    # ------------------------------------------------------------------ #17 / #18 微信切换
+    async def switch(self, id: str, body: dict[str, Any], *, actor: str) -> dict[str, Any]:
+        """#17 ``POST /accounts/{id}/switch``:出参字面键集顶层平铺(R6-55)``{holder_before, target, login_session_id}``。"""
+        if self._wechat_slot is None:
+            raise ApiError(503, "NOT_READY", "微信槽位模块未装配", reason="wechat_not_wired", retryable=True)
+        return await self._wechat_slot.switch(
+            id, confirm=bool(body.get("confirm", False)), actor=actor,
+            stop_account=self._switch_stop_account,
+            begin_login=self._switch_begin_login,
+            drain=self._drain_account)
+
+    async def switch_new(self, body: dict[str, Any], *, actor: str) -> dict[str, Any]:
+        """#18 ``POST /accounts/switch``(``body.target='new'``):先建 ``wxNN`` 行(``created``/``wxid=NULL``)再走同一条 switch。"""
+        row = await self.create({"channel": "wechat", "label": body.get("label") or "新微信",
+                                 "login": {"mode": "qrcode", "remember": False}}, actor=actor, pool_check=False)
+        return await self.switch(row["id"], body, actor=actor)
+
+    async def _switch_stop_account(self, holder: str) -> None:
+        await self.stop(holder, graceful=True, actor="system:wechat_switch")
+        await self.wait_idle(holder)
+
+    async def _switch_begin_login(self, target: str, ls: str) -> None:
+        if self._wechat_login is None:
+            raise RuntimeError("微信登录流未装配")
+        self._spawn(target, self._wechat_login.run(target, ls))
 
     async def _login_phase(self, id: str, row: dict[str, Any]) -> None:
         """05 §2.1.1 ⑨~⑪:序列不跳段(00 §8.1),先 login_required 再 logging_in;保存了凭据(人预先授权的启动,05 §2.0)才自动取用。"""
@@ -408,11 +511,22 @@ class AccountService:
             cur = win["slot_pending_login_session_id"] if win and win["slot_pending"] == id else ""
             if not cur or (login_session_id is not None and login_session_id != cur):
                 return {"cancelled": False, "stale": True, "current_login_session_id": cur}
-            self._store.wechat_slot_release_pending(id, now_ms=now)               # 三列一起清
-            await self._runtime._purge_ephemeral(row) if row["host"] == "wsl" else None
+            t = self.tasks.get(id)
+            if t is not None and not t.done():                                    # 取消在跑的登录流,免得它继续续期 pending
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if self._wechat_slot is not None:
+                # 三列 + **无条件**回收中间产物 + 审计,全在 WechatSlot.release_pending 里(02 §2.2.5 ①)。
+                # 既有实现的 `if row["host"] == "wsl"` 对微信恒假(微信账号 host='windows')⇒ 中间产物永不回收,是实现缺陷。
+                await self._wechat_slot.release_pending(id, reason="user_cancel", actor=actor)
+            else:
+                self._store.wechat_slot_release_pending(id, now_ms=now)
+                self._store.insert_audit(kind="system", transport="system", actor=actor, action="slot_pending_cancelled", account_id=id,
+                                         result_code="OK", detail={"login_session_id": cur}, now_ms=now)
             self.transition(id, "stopped", login_session_id=cur, desired_state="stopped")
-            self._store.insert_audit(kind="system", transport="system", actor=actor, action="slot_pending_cancelled", account_id=id, result_code="OK",
-                                     detail={"login_session_id": cur}, now_ms=now)
             return {"cancelled": True, "stale": False}
         cur = self._current_ls.get(id, "") if row["state"] in LOGIN_PHASE else ""
         if not cur:
@@ -626,7 +740,7 @@ class AccountService:
             if row["channel"] != "wechat":
                 await self._runtime._purge_ephemeral(row)                            # ……同步清可再生临时数据(05 §2.5.7)……
             else:
-                self._store.wechat_slot_release_holder(id, now_ms=self._clock())    # 微信释放槽位
+                self._release_holder(id)                                             # 微信释放槽位(收口到 WechatSlot)
             self._pool.release(id)                                                  # ……再释放额度
         except asyncio.CancelledError:
             raise
@@ -660,8 +774,14 @@ class AccountService:
             await self.wait_idle(id)
         self.transition(id, "stopped", deleted_ms=self._clock(), desired_state="stopped")
         if row["channel"] == "wechat":
-            self._store.wechat_slot_release_holder(id, now_ms=self._clock())
+            self._release_holder(id)
         return {"deleted": True, "data_kept": True, "id": id}
+
+    def _release_holder(self, id: str) -> int:
+        """微信 holder 释放的唯一落点:装配后走 ``WechatSlot.release_holder``(槽位语义收在一个模块),否则退回 store。"""
+        if self._wechat_slot is not None:
+            return int(self._wechat_slot.release_holder(id, now_ms=self._clock()))
+        return int(self._store.wechat_slot_release_holder(id, now_ms=self._clock()))
 
     # ------------------------------------------------------------------ #4 PATCH
     PATCH_KEYS = ("label", "quota_mb", "capture_text", "retention_days", "media_policy", "login")
