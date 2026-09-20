@@ -332,8 +332,36 @@ LITERALS = [
     # mail_cleanup_log.candidates / 06 伪代码局部变量 candidates 三类正当用法排除掉。
     ("实测采样出参旧键 candidates(应为 rows)",
      "0[1-7]-*.md",
-     r"(?=.*(?:实测采样|sample))candidates(?:\[\]|:\s*\[)",
+     # 🔴 终审第二轮 N2:原写法 `(?=.*…)` 的先行断言是从 `candidates` **出现的位置**往后看,
+     #    要求 `candidates` 之后还有「实测采样|sample」—— 旧句能红纯属它后半句恰好带一个 `samples`。
+     #    最可能的回潮形态(改用 DDL 新列名、句尾不再出现 sample 字样)在盲区里,副本实测 exit=0。
+     #    改为**锚到行首**:整行任意位置含「实测采样|sample」即可,同型变体能红且现行文档不误报。
+     r"^(?=.*(?:实测采样|sample)).*candidates(?:\[\]|:\s*\[)",
      "R6-58 (de):sample 出参逐字 `{sampled_at, duration_s, rows, skipped}`,行的字段名用 02 §3.2 DDL 的列;`candidates`/`run_id`/`resolved_by` 均作废。"),
+
+    # ---- 终审第二轮 N4:DEAD_KEYNAMES 的 bind_* 在**行内含「→」**的说明行里被 _KEYNAME_RECORD_MARKS
+    #      整行吞掉(副本实测 exit=0),而真实回潮几乎必然发生在那种说明行里。
+    #      🔴 **不动共享的 NEGATION / _KEYNAME_RECORD_MARKS 逻辑**(R6-37:没把握前别动共享逻辑),
+    #      改为在本族各补一条 —— 绕开行级否定吞噬,代价是正则必须窄到只命中
+    #      「**作为现行键被赋值**」这一种形态(`键 = ` 的 TOML 赋值),并显式排除记录/作废语境。
+    #      现行文档的三处残留都在排除面内:02 §7.2 与 07 §2 带 `~~` 删除线、04 §7 注释写「已作废」。
+    ("winagent.toml [api] 作废键 bind_loopback 被当现行键赋值",
+     "0[1-7]-*.md",
+     r"^(?!.*(?:~~|作废|已改名|取代|旧名|不得再)).*\bbind_loopback\s*=",
+     "R6-58 (av):服务监听地址的键唯一落点 = 04 §7 `[net] listen_loopback`;02 §7.2 `[api]` 那一套已作废,写它等于静默失效。"),
+
+    ("winagent.toml [api] 作废键 bind_wsl_adapter 被当现行键赋值",
+     "0[1-7]-*.md",
+     r"^(?!.*(?:~~|作废|已改名|取代|旧名|不得再)).*\bbind_wsl_adapter\s*=",
+     "R6-58 (av):同上 —— 应为 04 §7 `[net] listen_wsl_adapter`。"),
+
+    # ---- R6-60 (b):机型档案库字段名统一 profile_key(02 §3.1 DDL 为准),05 三处旧名 template_key 作废。
+    #      同样放 LITERAL2:05 §8b R4 那一行是验收断言行,极易带否定词而被 FORBIDDEN 整行吞掉。
+    #      正则窄到「裸词 template_key」,再排除记录/作废语境(本轮改后的两处都写着「作废 / no such column」)。
+    ("device_profiles 旧字段名 template_key(应为 profile_key)",
+     "0[1-7]-*.md",
+     r"^(?!.*(?:~~|作废|已改名|取代|旧名|no such column)).*\btemplate_key\b",
+     "R6-60 (b):库列名以 02 §3.1 DDL 的 `profile_key` 为准(实现 `schema_agent.sql` 与 `device_profiles.json` 亦然);照 `template_key` 写的断言 `no such column`。"),
 ]
 
 
@@ -1020,13 +1048,24 @@ def check_result_codes_to_01():
         red.append("00 §8.3 取不到结果码")
         print("  ❌ 00 §8.3 一个码都没取到(表格形态变了?)——规则失效,必须修")
         return red
-    t01 = io.open(src01, encoding="utf-8").read()
+    t01_full = io.open(src01, encoding="utf-8").read()
+    # 🔴 终审第二轮 W2 加固:原先只查「码是否出现在 01 **全文**」—— 变更记录 / §9 提及同一个码
+    #    就能让「§2.10 表行被删」静默放过(CONFIRM_EXPIRED 已同时出现在 01:6 / 01:635,实测 exit=0)。
+    #    改为**只切 01 §2.10 那一段**再查;切不出来即判红(规则失效必须被发现,不能静默变空)。
+    m = re.search(r"^#{2,4}\s*2\.10\b", t01_full, re.M)
+    if not m:
+        red.append("01 §2.10 切不出来")
+        print("  ❌ 01 §2.10 段落切不出来(标题变了?)——规则失效,必须修")
+        return red
+    nxt = re.search(r"^#{1,3}\s", t01_full[m.end():], re.M)
+    t01 = t01_full[m.start(): m.end() + nxt.start()] if nxt else t01_full[m.start():]
     missing = sorted(c for c in codes if c not in t01)
     if missing:
         red.append(f"01 缺 {len(missing)} 个结果码")
         print(f"\n  ❌ 01 缺 {len(missing)}/{len(codes)} 个 —— {', '.join(missing)}")
         print("     理由:01 §2.10 明令「不能靠解析中文」;码表缺一个,控制台拿到它就渲染不出引导"
               "(与 WINAGENT_USER_OFFLINE 那次事故同型)。")
+        print("     ⚠️ 本检查只看 01 §2.10 **那一段**(R6-60):别处(变更记录/§9)提到该码不算收录。")
     else:
         print(f"  ✅ 01 收录完整({len(codes)}/{len(codes)}) —— {', '.join(sorted(codes))}")
     return red
