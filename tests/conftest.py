@@ -100,3 +100,39 @@ class FakeMainDb:
 @pytest.fixture
 def maindb(tmp_path) -> FakeMainDb:
     return FakeMainDb(str(tmp_path / "3007373675.db"))
+
+
+# ---------------------------------------------------------------------- 第三批:全假后端的 AgentApp(容器里绝不碰真 docker/adb/WinAgent)
+@dataclass
+class Rig:
+    agent: object
+    store: object
+    clock: Clock
+    containers: object
+    adb: object
+    vault: object
+    winagent: object
+    fs: object
+
+
+def make_rig(tmp_path, *, cfg=None, clock: Clock | None = None, wsl_total_mb: int = 11264, login_fn=None, aligner=None, db_name: str = "agent.db"):
+    from qtrade_agent.app import AgentApp
+    from qtrade_agent.config import AgentConfig
+    from qtrade_agent.runtime import FakeAdb, FakeContainers
+    from qtrade_agent.runtime.runtime import FakeFs
+    from qtrade_agent.vault_client import FakeVault
+    from qtrade_agent.winagent_client import FakeWinAgent
+
+    clock = clock or Clock(auto_step_ms=50)
+    containers, adb, vault, wa, fs = FakeContainers(), FakeAdb(), FakeVault(), FakeWinAgent(), FakeFs()
+    agent = AgentApp(cfg or AgentConfig(), db_path=str(tmp_path / db_name), clock=clock, containers=containers, adb=adb, vault=vault,
+                     winagent_transport=wa, winagent_base_url="http://winagent.fake:17610", winagent_token=wa.token, fs=fs, login_fn=login_fn,
+                     aligner=aligner, wsl_total_mb=wsl_total_mb, boot_poll_s=0).open()
+    return Rig(agent=agent, store=agent.store, clock=clock, containers=containers, adb=adb, vault=vault, winagent=wa, fs=fs)
+
+
+@pytest.fixture
+def rig3(tmp_path) -> Rig:
+    r = make_rig(tmp_path)
+    yield r
+    r.store.close()

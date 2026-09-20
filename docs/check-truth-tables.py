@@ -282,6 +282,19 @@ def check_merge_window_literal():
 # ---------------------------------------------------------------- PAIRED
 # (标题, 声明方文件, 声明方正则, 消费方文件, 消费方正则, 说明)
 PAIRED = [
+    # ---- R6-54(第三批代码口径)----
+    # #2/#9 的 409 信封引用 error.alternatives,而形态此前三册从未定义 ⇒ 02 §2.2.5 必须给 kind 枚举。
+    # 反向验证:改前备份(git HEAD 的 02)上 §2.2.5 无 `alternatives[].kind` ⇒ 红(2026-09-20 实测)。
+    ("error.alternatives:02 §3.4.1 #2/#9 引用 → 02 §2.2.5 必须定 alternatives[].kind 形态",
+     "02-*.md", r"error\.alternatives",
+     "02-*.md", r"alternatives\[\]\.kind ∈ \{add_other_channel, stop_one, wechat_switch\}",
+     "R6-54:控制台按 kind 渲染「改开 QQ / 停用一个」;没有形态 = 前后端各猜一套字段名。"),
+    # 02 §7.1 新登记的 [runtime] accounts_dir 必须镜像到 07 配置总表(07 是全表镜像,漏一键即分叉)。
+    # 反向验证:改前备份的 07 无 accounts_dir ⇒ 红。
+    ("accounts_dir:02 §7.1 [runtime] 登记 → 07 配置总表必须镜像",
+     "02-*.md", r"`accounts_dir` \| `\"/var/lib/qtrade/accounts\"`",
+     "07-*.md", r"`accounts_dir=\"/var/lib/qtrade/accounts\"`",
+     "R6-54:07 是配置项全表镜像;02 登记 07 不镜像 = 两表键集不一致。"),
     # ---- R6-47~R6-50(第八轮 cursor 评审 8.4/10)----
     # R6-47:norm() 三册到处引用、无一处可抄函数体(第八轮唯一 P0)。凡引用 norm(text) 的册,06 §2.9.2 必须有那一行 def。
     # 反向验证:改前备份上 06 无 `def norm(` ⇒ 两条都红(2026-09-19 实测)。

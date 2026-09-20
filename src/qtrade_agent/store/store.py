@@ -100,6 +100,7 @@ class Store:
                 pass    # :memory: 下 WAL 不适用
         self._con = con
         self._migrate()
+        self._seed()
         return self
 
     def close(self) -> None:
@@ -145,10 +146,12 @@ class Store:
 
     # ------------------------------------------------------------------ 账号(最小;完整生命周期在 api/runtime)
     def ensure_account(self, id: str, channel: str, *, label: Optional[str] = None, state: str = "created",
-                       login_mode: str = "password", quota_mb: int = 2560, self_uid: Optional[str] = None) -> None:
+                       login_mode: str = "password", quota_mb: Optional[int] = None, self_uid: Optional[str] = None) -> None:
         seq = int(id[2:])
         host = "windows" if channel == "wechat" else "wsl"
         now = self._clock()
+        if quota_mb is None:
+            quota_mb = {"qidian": 2560, "qq": 614, "wechat": 1536}[channel]     # 02 §7.1 [pool] quota_* 初始值
         with self._tx() as c:
             c.execute(
                 "INSERT INTO accounts(id, channel, seq, label, host, state, login_mode, quota_mb, self_uid, created_ms, updated_ms) "
@@ -163,9 +166,187 @@ class Store:
 
     def set_account_state(self, id: str, state: str, *, state_code: Optional[str] = None,
                           self_uid: Optional[str] = None, state_reason: str = "") -> None:
+        self.transition(id, state, state_code=state_code, state_reason=state_reason, self_uid=self_uid)
+
+    # ------------------------------------------------------------------ 账号生命周期(02 §3.4.1 / §2.6;00 §8.1)
+    RUNTIME_KIND = {"qidian": "redroid", "qq": "napcat", "wechat": "wechat_pc"}
+    ID_PREFIX = {"qidian": "qd", "qq": "qq", "wechat": "wx"}
+    STATES = ("created", "provisioning", "starting", "login_required", "logging_in", "running", "degraded", "stopping", "stopped", "error", "disabled")
+
+    def _seed(self) -> None:
+        """settings.seq.* 三行(02 §3.1 注:account_id 永不复用的真值);幂等。"""
+        now = self._clock()
         with self._tx() as c:
+            for ch in ("qidian", "qq", "wechat"):
+                c.execute("INSERT OR IGNORE INTO settings(key, value_json, updated_ms, updated_by) VALUES (?, '0', ?, 'system:store')", (f"seq.{ch}", now))
+
+    def settings_get(self, key: str) -> Any:
+        r = self.con.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def settings_set(self, key: str, value: Any, *, actor: str = "system", now_ms: Optional[int] = None) -> None:
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("INSERT INTO settings(key, value_json, updated_ms, updated_by) VALUES (?,?,?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                      (key, json.dumps(value, ensure_ascii=False), now, actor))
+
+    def _next_seq(self, c: sqlite3.Connection, channel: str, now: int) -> int:
+        """settings.seq.<channel> 单调递增(含已删除的不复用;05 §2.1.1 ②);在调用方的 BEGIN IMMEDIATE 里。"""
+        r = c.execute("SELECT value_json FROM settings WHERE key=?", (f"seq.{channel}",)).fetchone()
+        cur = int(json.loads(r[0])) if r else 0
+        nxt = cur + 1
+        if nxt > 98:                                    # 99 保留给安装自检(C-07),seq ∈ 1..98
+            raise ValueError(f"{channel} 序号已用尽(seq>98)")
+        c.execute("INSERT INTO settings(key, value_json, updated_ms, updated_by) VALUES (?,?,?,'system:store') "
+                  "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                  (f"seq.{channel}", json.dumps(nxt), now))
+        return nxt
+
+    def create_account(self, *, channel: str, label: str, login_mode: str, quota_mb: int, remember: bool = False,
+                       capture_text: Optional[bool] = None, identity: Optional[dict[str, Any]] = None, settings: Optional[dict[str, Any]] = None,
+                       ports: Optional[dict[str, Any]] = None, container_name: Optional[str] = None, data_dir: Optional[str] = None,
+                       mem_limit_mb: Optional[int] = None, now_ms: Optional[int] = None) -> dict[str, Any]:
+        """#2:一个事务里分配 id(settings.seq.<channel> +1,永不复用)、落 accounts(state=created)与 account_runtime(desired_state=stopped,端口冗余)。"""
+        now = now_ms or self._clock()
+        host = "windows" if channel == "wechat" else "wsl"
+        ports = ports or {}
+        with self._tx() as c:
+            seq = self._next_seq(c, channel, now)
+            id = f"{self.ID_PREFIX[channel]}{seq:02d}"
+            c.execute(
+                "INSERT INTO accounts(id, channel, seq, label, host, state, login_mode, remember, quota_mb, capture_text, identity_json, settings_json, created_ms, updated_ms) "
+                "VALUES (?,?,?,?,?,'created',?,?,?,?,?,?,?,?)",
+                (id, channel, seq, label, host, login_mode, 1 if remember else 0, quota_mb, None if capture_text is None else int(capture_text),
+                 json.dumps(identity or {}, ensure_ascii=False), json.dumps(settings or {}, ensure_ascii=False), now, now))
+            c.execute(
+                "INSERT INTO account_runtime(account_id, kind, desired_state, container_name, data_dir, adb_port, stream_port, frida_port, adb_serial, "
+                "ws_port, http_port, webui_port, mem_limit_mb, updated_ms) VALUES (?,?,'stopped',?,?,?,?,?,?,?,?,?,?,?)",
+                (id, self.RUNTIME_KIND[channel], container_name, data_dir, ports.get("adb"), ports.get("stream"), ports.get("frida"), ports.get("adb_serial"),
+                 ports.get("ws"), ports.get("http"), ports.get("webui"), mem_limit_mb, now))
+        return self.get_account_full(id)
+
+    def transition(self, id: str, state: str, *, state_code: Optional[str] = None, state_reason: str = "", self_uid: Optional[str] = None,
+                   enabled: Optional[bool] = None, desired_state: Optional[str] = None, deleted_ms: Optional[int] = None,
+                   now_ms: Optional[int] = None) -> tuple[Optional[str], dict[str, Any]]:
+        """账号状态迁移的唯一写点:改 accounts.state 与 account_runtime.error_since_ms 两个动作(02 §2.6 规范 SQL)在同一个 BEGIN IMMEDIATE 里。
+        返回 (before_state, after_row)。"""
+        if state not in self.STATES:
+            raise ValueError(f"unknown state {state!r}")
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            r = c.execute("SELECT state, channel FROM accounts WHERE id=?", (id,)).fetchone()
+            if r is None:
+                raise KeyError(id)
+            before = r["state"]
             c.execute("UPDATE accounts SET state=?, state_code=?, state_reason=?, self_uid=COALESCE(?, self_uid), updated_ms=? WHERE id=?",
-                      (state, state_code, state_reason, self_uid, self._clock(), id))
+                      (state, state_code, state_reason, self_uid, now, id))
+            if enabled is not None:
+                c.execute("UPDATE accounts SET enabled=? WHERE id=?", (1 if enabled else 0, id))
+            if deleted_ms is not None:
+                c.execute("UPDATE accounts SET deleted_ms=? WHERE id=?", (deleted_ms, id))
+            if state == "running":
+                c.execute("UPDATE accounts SET last_running_ms=?, last_seen_ms=? WHERE id=?", (now, now, id))
+            c.execute("INSERT OR IGNORE INTO account_runtime(account_id, kind, updated_ms) VALUES (?,?,?)", (id, self.RUNTIME_KIND[r["channel"]], now))
+            if state == "error":
+                # ① 进 error(迁入 error 时写当前 epoch ms);已在 error 的重复迁入不覆盖原时刻
+                c.execute("UPDATE account_runtime SET error_since_ms = ?, updated_ms = ? WHERE account_id = ? AND error_since_ms IS NULL", (now, now, id))
+            else:
+                # ② 离 error(迁出到任一非 error 态时清 NULL)
+                c.execute("UPDATE account_runtime SET error_since_ms = NULL, updated_ms = ? WHERE account_id = ? AND error_since_ms IS NOT NULL", (now, id))
+            if desired_state is not None:
+                c.execute("UPDATE account_runtime SET desired_state=?, updated_ms=? WHERE account_id=?", (desired_state, now, id))
+            if state == "stopped":
+                c.execute("UPDATE account_runtime SET last_stopped_ms=? WHERE account_id=?", (now, id))
+            elif state == "starting":
+                c.execute("UPDATE account_runtime SET last_started_ms=? WHERE account_id=?", (now, id))
+        return before, self.get_account_full(id)
+
+    ACCOUNT_PATCHABLE = ("label", "quota_mb", "capture_text", "retention_days", "media_policy_json", "remember", "credential_ref", "auto_recover", "settings_json")
+
+    def patch_account(self, id: str, *, now_ms: Optional[int] = None, **cols: Any) -> dict[str, Any]:
+        bad = [k for k in cols if k not in self.ACCOUNT_PATCHABLE]
+        if bad:
+            raise ValueError(f"not patchable: {bad}")
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            for k, v in cols.items():
+                if isinstance(v, bool):
+                    v = int(v)
+                c.execute(f"UPDATE accounts SET {k}=?, updated_ms=? WHERE id=?", (v, now, id))
+        return self.get_account_full(id)
+
+    def set_desired_state(self, id: str, desired: str, *, now_ms: Optional[int] = None) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE account_runtime SET desired_state=?, updated_ms=? WHERE account_id=?", (desired, now_ms or self._clock(), id))
+
+    def get_runtime(self, id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM account_runtime WHERE account_id=?", (id,)).fetchone()
+        return dict(r) if r else None
+
+    def list_recover_candidates(self) -> list[dict[str, Any]]:
+        """02 §2.6:enabled=1 AND auto_recover=1 AND deleted_ms IS NULL AND account_runtime.desired_state='running',按 seq 升序。"""
+        rows = self.con.execute("SELECT a.* FROM accounts a JOIN account_runtime r ON r.account_id=a.id "
+                                "WHERE a.enabled=1 AND a.auto_recover=1 AND a.deleted_ms IS NULL AND r.desired_state='running' ORDER BY a.channel, a.seq").fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ 资源池(02 §2.2.5;00 §7.6)
+    POOL_USED_SQL = "SELECT COALESCE(SUM(quota_mb), 0) FROM accounts WHERE host='wsl' AND enabled=1 AND state NOT IN ('stopped','disabled','error')"
+
+    def ensure_pools(self, *, quota: dict[str, int], wsl_total_mb: int, wsl_reserved_mb: int, windows_total_mb: int, windows_reserved_mb: int,
+                     now_ms: Optional[int] = None) -> None:
+        """resource_pools 两行初始值(agent.toml [pool] 只是首次建表默认,C-43);已存在则不动。"""
+        now = now_ms or self._clock()
+        q = json.dumps({"qidian": int(quota["qidian"]), "qq": int(quota["qq"]), "wechat": int(quota["wechat"])})
+        with self._tx() as c:
+            c.execute("INSERT OR IGNORE INTO resource_pools(pool, total_mb, reserved_mb, quota_json, updated_ms) VALUES ('wsl', ?, ?, ?, ?)",
+                      (wsl_total_mb, wsl_reserved_mb, q, now))
+            c.execute("INSERT OR IGNORE INTO resource_pools(pool, total_mb, reserved_mb, quota_json, updated_ms) VALUES ('windows', ?, ?, ?, ?)",
+                      (windows_total_mb, windows_reserved_mb, q, now))
+
+    def pool_get(self, pool: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM resource_pools WHERE pool=?", (pool,)).fetchone()
+        return dict(r) | {"quota": json.loads(r["quota_json"])} if r else None
+
+    def pool_set(self, pool: str, *, now_ms: Optional[int] = None, **cols: Any) -> None:
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            for k, v in cols.items():
+                if isinstance(v, bool):
+                    v = int(v)
+                c.execute(f"UPDATE resource_pools SET {k}=?, updated_ms=? WHERE pool=?", (v, now, pool))
+
+    def pool_used_mb(self) -> int:
+        return int(self.con.execute(self.POOL_USED_SQL).fetchone()[0])
+
+    def pool_claim_wsl(self, quota_mb: int, *, now_ms: Optional[int] = None) -> bool:
+        """行级 claim(R-08 §2.3.1 ③):条件 UPDATE + rowcount 判定,防两个并发新增同时通过预检;不用内存锁。"""
+        with self._tx() as c:
+            cur = c.execute(f"UPDATE resource_pools SET updated_ms=? WHERE pool='wsl' AND total_mb - reserved_mb - ({self.POOL_USED_SQL}) >= ?",
+                            (now_ms or self._clock(), quota_mb))
+            return cur.rowcount == 1
+
+    def wechat_slot_claim(self, target: str, login_session_id: str, expires_ms: int, *, now_ms: Optional[int] = None) -> bool:
+        """02 §2.2.5:置 pending 的规范 UPDATE(三列同一条语句),rowcount==1 判抢到。"""
+        with self._tx() as c:
+            cur = c.execute("UPDATE resource_pools SET slot_pending=?, slot_pending_expires_ms=?, slot_pending_login_session_id=?, updated_ms=? "
+                            "WHERE pool='windows' AND slot_holder='' AND slot_pending=''", (target, expires_ms, login_session_id, now_ms or self._clock()))
+            return cur.rowcount == 1
+
+    def wechat_slot_release_pending(self, target: Optional[str] = None, *, now_ms: Optional[int] = None) -> int:
+        with self._tx() as c:
+            if target is None:
+                cur = c.execute("UPDATE resource_pools SET slot_pending='', slot_pending_expires_ms=NULL, slot_pending_login_session_id='', updated_ms=? "
+                                "WHERE pool='windows' AND slot_pending<>''", (now_ms or self._clock(),))
+            else:
+                cur = c.execute("UPDATE resource_pools SET slot_pending='', slot_pending_expires_ms=NULL, slot_pending_login_session_id='', updated_ms=? "
+                                "WHERE slot_pending=?", (now_ms or self._clock(), target))
+            return cur.rowcount
+
+    def wechat_slot_release_holder(self, holder: str, *, now_ms: Optional[int] = None) -> int:
+        with self._tx() as c:
+            return c.execute("UPDATE resource_pools SET slot_holder='', updated_ms=? WHERE pool='windows' AND slot_holder=?",
+                             (now_ms or self._clock(), holder)).rowcount
 
     # ------------------------------------------------------------------ ingest
     def ingest(self, msg: Message, *, now_ms: Optional[int] = None) -> IngestResult:
@@ -498,8 +679,9 @@ class Store:
     # ------------------------------------------------------------------ api 用的查询(账号 / 会话 / 消息 / 指令 / 调用方)
     def list_accounts(self, *, channel: Optional[str] = None, state: Optional[str] = None, enabled: Optional[bool] = None,
                       include_deleted: bool = False) -> list[dict[str, Any]]:
-        sql = "SELECT a.*, r.app_version AS runtime_app_version, r.kind AS runtime_kind, r.container_name, r.adb_port, r.stream_port, " \
-              "r.ws_port, r.http_port, r.wechat_version, r.wxkey_dll, r.error_since_ms AS runtime_error_since_ms " \
+        sql = "SELECT a.*, r.app_version AS runtime_app_version, r.kind AS runtime_kind, r.container_name, r.adb_port, r.stream_port, r.frida_port, " \
+              "r.adb_serial, r.ws_port, r.http_port, r.webui_port, r.wechat_version, r.wxkey_dll, r.error_since_ms AS runtime_error_since_ms, " \
+              "r.desired_state, r.data_dir, r.mem_limit_mb, r.container_id, r.last_started_ms, r.last_stopped_ms, r.last_boot_completed_ms " \
               "FROM accounts a LEFT JOIN account_runtime r ON r.account_id = a.id WHERE 1=1"
         params: list[Any] = []
         if not include_deleted:

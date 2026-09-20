@@ -37,6 +37,18 @@ def test_schema_file_matches_doc_sql_block():
     ("ws_queue_max", AgentConfig().events.ws_queue_max),
     ("ws_retention_hours", AgentConfig().events.ws_retention_hours),
     ("port", AgentConfig().api.port),
+    ("boot_timeout_s", AgentConfig().runtime.boot_timeout_s),
+    ("qidian_mem_limit_mb", AgentConfig().runtime.qidian_mem_limit_mb),
+    ("qq_mem_limit_mb", AgentConfig().runtime.qq_mem_limit_mb),
+    ("webui_temp_minutes", AgentConfig().runtime.webui_temp_minutes),
+    ("auto_restart_max_per_hour", AgentConfig().runtime.auto_restart_max_per_hour),
+    ("wsl_reserved_mb", AgentConfig().pool.wsl_reserved_mb),
+    ("windows_reserved_mb", AgentConfig().pool.windows_reserved_mb),
+    ("probe_interval_s", AgentConfig().winagent.probe_interval_s),
+    ("timeout_ms", AgentConfig().winagent.timeout_ms),
+    ("slot_pending_ttl_s", AgentConfig().wechat.slot_pending_ttl_s),
+    ("slot_reaper_interval_s", AgentConfig().wechat.slot_reaper_interval_s),
+    ("slot_error_takeover_s", AgentConfig().wechat.slot_error_takeover_s),
 ])
 def test_config_defaults_match_doc_02(key, value):
     t = _doc(DOC02)
@@ -50,6 +62,49 @@ def test_config_defaults_match_doc_02(key, value):
         m = re.search(r"`%s` \| `(\d+)`" % key, t)
     assert m, f"02 §7.1 找不到 {key}"
     assert int(m.group(1)) == value
+
+
+def test_pool_quota_and_runtime_strings_match_doc_02():
+    t = _doc(DOC02)
+    m = re.search(r"`quota_qidian_mb` / `quota_qq_mb` / `quota_wechat_mb` \| `(\d+)` / `(\d+)` / `(\d+)`", t)
+    c = AgentConfig()
+    assert tuple(map(int, m.groups())) == (c.pool.quota_qidian_mb, c.pool.quota_qq_mb, c.pool.quota_wechat_mb)
+    for key, val in (("redroid_image", c.runtime.redroid_image), ("napcat_image", c.runtime.napcat_image), ("token_file", c.winagent.token_file),
+                     ("apk_cache_dir", c.runtime.apk_cache_dir), ("docker_socket", c.runtime.docker_socket), ("accounts_dir", c.runtime.accounts_dir),
+                     ("host_ip_hint_file", c.winagent.host_ip_hint_file)):
+        m = re.search(r'`%s` \| `"([^"]*)"`' % key, t)
+        assert m and m.group(1) == val, key
+    m = re.search(r"`qidian_resolution` / `qidian_dpi` \| `\"([^\"]+)\"` / `(\d+)`", t)
+    assert m.group(1) == c.runtime.qidian_resolution and int(m.group(2)) == c.runtime.qidian_dpi
+
+
+def test_port_plan_matches_doc_00_port_table():
+    """00 §3 端口表:段基址 + NN;02 §2.2.4 唯一算法。"""
+    from qtrade_agent.runtime import port_plan
+    d02 = _doc(DOC02)
+    m = re.search(r"qidian: adb=(\d+)\+seq\s+stream=(\d+)\+seq\s+frida=(\d+)\+seq", d02)
+    assert m and port_plan("qidian", 7) == {"adb": int(m.group(1)) + 7, "stream": int(m.group(2)) + 7, "frida": int(m.group(3)) + 7, "adb_serial": f"127.0.0.1:{int(m.group(1)) + 7}"}
+    m = re.search(r"qq:\s+ws=(\d+)\+seq\s+http=(\d+)\+seq\s+webui=(\d+)\+seq", d02)
+    assert m and port_plan("qq", 7) == {"ws": int(m.group(1)) + 7, "http": int(m.group(2)) + 7, "webui": int(m.group(3)) + 7}
+
+
+def test_pool_used_sql_matches_doc_02_pseudocode():
+    """02 §2.2.5:used = Σ quota_mb of accounts where host='wsl' and enabled and state ∉ {stopped, disabled, error}。"""
+    from qtrade_agent.store import Store
+    d02 = _doc(DOC02)
+    assert "used = Σ quota_mb of accounts where host='wsl' and enabled and state ∉ {stopped, disabled, error}" in d02
+    assert "host='wsl' AND enabled=1 AND state NOT IN ('stopped','disabled','error')" in Store.POOL_USED_SQL
+
+
+def test_error_since_sql_matches_doc_02():
+    """02 §2.6「两个动作」的规范 SQL 逐字出现在 store.transition 里(参数占位换成 ?)。"""
+    d02 = _doc(DOC02)
+    src = _doc(os.path.join(ROOT, "src", "qtrade_agent", "store", "store.py"))
+    for stmt in ("UPDATE account_runtime SET error_since_ms = :now_ms, updated_ms = :now_ms\n WHERE account_id = :id AND error_since_ms IS NULL",
+                 "UPDATE account_runtime SET error_since_ms = NULL, updated_ms = :now_ms\n WHERE account_id = :id AND error_since_ms IS NOT NULL"):
+        assert stmt in d02
+        code = re.sub(r":now_ms|:id", "?", stmt).replace("\n ", " ")
+        assert code in src, code
 
 
 def test_gap_keys_match_doc_02():

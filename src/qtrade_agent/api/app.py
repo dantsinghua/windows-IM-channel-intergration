@@ -146,7 +146,8 @@ def create_api(agent) -> FastAPI:
         _principal(request, "read")
         sv = agent.store.con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         return {"ok": True, "agent": {"version": AGENT_VERSION}, "api_version": cfg.api.api_version, "capabilities_version": caps_version,
-                "schema_version": sv, "winagent": None, "kernel": None, "wsl": None, "docker": None, "images": {}}
+                "schema_version": sv, "winagent": {"version": agent.health.winagent_version, "online": agent.health.winagent_online},
+                "kernel": None, "wsl": None, "docker": None, "images": {}}
 
     @app.get(f"{API_PREFIX}/system/health")
     async def system_health(request: Request):
@@ -164,9 +165,12 @@ def create_api(agent) -> FastAPI:
                 disk_free_mb = None
             return {"ok": True, "agent": {"version": AGENT_VERSION, "api_version": cfg.api.api_version, "uptime_s": agent.health.uptime_s(),
                                           "db_mb": db_mb, "wal_mb": wal_mb},
-                    "dockerd": agent.health.dockerd_ok, "winagent": {"online": agent.health.winagent_online, "version": None, "user_agent": agent.health.user_agent_online},
+                    "dockerd": agent.health.dockerd_ok,
+                    "winagent": {"online": agent.health.winagent_online, "version": agent.health.winagent_version, "user_agent": agent.health.user_agent_online},
                     "accounts": {"running": running, "n": total}, "disk_free_mb": disk_free_mb,
-                    "checks": {"H13": "firing" if agent.health.h13_firing() else "ok"},       # {Hxx: ok|firing|unknown},其余健康项待 health 探测接入
+                    "checks": {"H13": "firing" if agent.health.h13_firing() else ("ok" if agent.timesync.last_probe_ms else "unknown"),
+                               "H02": "unknown" if agent.health.winagent_online is None else ("ok" if agent.health.winagent_online else "firing"),
+                               "H03": "unknown" if agent.health.dockerd_ok is None else ("ok" if agent.health.dockerd_ok else "firing")},
                     "alerts": [{"code": a.code, "subject": a.subject, "severity": a.severity, "count": a.count} for a in agent.alerts.active.values()],
                     "scheduler": agent.scheduler.snapshot()}
         if is_unauth_health_source(host, cfg.api.unauth_health_sources, agent.wsl_gateway):
@@ -201,6 +205,112 @@ def create_api(agent) -> FastAPI:
             raise ApiError(404, "TARGET_NOT_FOUND", f"账号不存在:{account_id}")
         request.state.account_id = account_id
         return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    # ------------------------------------------------------------------ 账号生命周期(02 §3.4.1 #2/#4/#5/#6/#7/#9/#10/#11/#19)
+    IDEM_PREFIX = "idem.accounts."
+
+    @app.post(f"{API_PREFIX}/accounts", status_code=201)
+    async def create_account(request: Request, response: Response):
+        p = _principal(request, "write")
+        body = await request.json()
+        key = body.get("idempotency_key")
+        if not key or not isinstance(key, str) or len(key) > 128:
+            raise ApiError(400, "INVALID_ARGS", "POST /accounts 必带 idempotency_key(≤128 字符)", reason="idempotency_key_required",
+                           extra={"details": [{"pointer": "/idempotency_key"}]})
+        prior = agent.store.settings_get(IDEM_PREFIX + key)
+        if prior:
+            row = agent.store.get_account_full(prior)
+            return JSONResponse(status_code=409, content=_error_body("IDEMPOTENT_REPLAY", f"同 idempotency_key 已创建账号 {prior}", reason="replay",
+                                                                     extra={"account_id": prior}) | {"data": account_view(row, _acct_caps(row)) if row else None})
+        row = await agent.accounts.create(body, actor=p.actor)
+        agent.store.settings_set(IDEM_PREFIX + key, row["id"], actor=p.actor)
+        request.state.account_id = row["id"]
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.patch(f"{API_PREFIX}/accounts/{{account_id}}")
+    async def patch_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        row = await agent.accounts.patch(account_id, await request.json(), actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/enable")
+    async def enable_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        row = await agent.accounts.enable(account_id, actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/disable")
+    async def disable_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        body = await _json_or_empty(request)
+        row = await agent.accounts.disable(account_id, graceful=bool(body.get("graceful", True)), actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/start")
+    async def start_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        res = await agent.accounts.start(account_id, actor=p.actor)
+        return JSONResponse(status_code=200 if res.get("already") else 202, content={"ok": True, **res})
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/stop")
+    async def stop_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        body = await _json_or_empty(request)
+        res = await agent.accounts.stop(account_id, graceful=bool(body.get("graceful", True)), actor=p.actor)
+        return JSONResponse(status_code=200 if res.get("already") else 202, content={"ok": True, **res})
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/restart")
+    async def restart_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        res = await agent.accounts.restart(account_id, actor=p.actor)
+        return JSONResponse(status_code=202, content={"ok": True, **res})
+
+    @app.delete(f"{API_PREFIX}/accounts/{{account_id}}")
+    async def delete_account(request: Request, account_id: str, confirm: Optional[str] = None):
+        p = _principal(request, "admin")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        res = await agent.accounts.delete(account_id, confirm=confirm, actor=p.actor)
+        return {"ok": True, **res}
+
+    @app.get(f"{API_PREFIX}/accounts/{{account_id}}/state")
+    async def account_state(request: Request, account_id: str):
+        p = _principal(request, "read")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        return {"ok": True, **(await agent.accounts.state_of(account_id))}
+
+    @app.get(f"{API_PREFIX}/resources")
+    async def resources(request: Request):
+        _principal(request, "read")
+        snap = agent.pool.snapshot()
+        rows = agent.store.list_accounts()
+        by_ch: dict[str, int] = {}
+        for r in rows:
+            by_ch[r["channel"]] = by_ch.get(r["channel"], 0) + 1
+        return {"ok": True, **snap, "accounts": [], "accounts_by_channel": by_ch}
+
+    async def _json_or_empty(request: Request) -> dict[str, Any]:
+        raw = await request.body()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ApiError(400, "INVALID_ARGS", "请求体须为 JSON", reason="bad_json")
+        return data if isinstance(data, dict) else {}
 
     # ------------------------------------------------------------------ commands / send
     async def _submit(request: Request, p: Principal, account_id: str, body: dict[str, Any], *, force_confirm: bool = False):

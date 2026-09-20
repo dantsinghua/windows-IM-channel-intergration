@@ -72,6 +72,61 @@ class DbConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    """02 §7.1 [runtime]:docker 编排参数(02 §2.2.4)。"""
+    docker_socket: str = "unix:///var/run/docker.sock"
+    redroid_image: str = "redroid/redroid:11.0.0-latest"
+    napcat_image: str = "mlikiowa/napcat-docker:latest"
+    qidian_mem_limit_mb: int = 3584             # A.5 建议 3.5G
+    qq_mem_limit_mb: int = 1024
+    qidian_resolution: str = "720x1280"
+    qidian_dpi: int = 320
+    gpu_mode: str = "guest"
+    boot_timeout_s: int = 180                   # 等 boot_completed(C-43 唯一定义处;04 [health] 引用)
+    start_serial: bool = True                   # 启动串行开关(不建议关)
+    apk_url: str = ""                           # 企点内部下载地址(全系统唯一定义处)
+    apk_sha256: str = ""
+    apk_cache_dir: str = "/var/lib/qtrade/apk"
+    auto_restart_max_per_hour: int = 5
+    webui_temp_minutes: int = 10                # QQ WebUI 临时开启时长(C-35)
+    accounts_dir: str = "/var/lib/qtrade/accounts"     # 卷目录根:<accounts_dir>/<id>/data(02 §2.2.4 字面路径)
+
+
+@dataclass(frozen=True)
+class PoolConfig:
+    """02 §7.1 [pool]:quota_* 仅建表初始值,真值在 resource_pools.quota_json(C-43)。"""
+    wsl_reserved_mb: int = 2048
+    windows_reserved_mb: int = 4096
+    quota_qidian_mb: int = 2560
+    quota_qq_mb: int = 614
+    quota_wechat_mb: int = 1536
+    autocalibrate_on_first_login: bool = True
+
+
+@dataclass(frozen=True)
+class WinAgentConfig:
+    """02 §7.1 [winagent] + §2.5 调用契约。"""
+    url: str = ""                               # 空=自动:先 host_ip_hint_file,再默认网关
+    token_file: str = "/etc/qtrade/winagent.token"
+    timeout_ms: int = 3000                      # 通用;各动作按 §2.5 覆盖(ping/health 2 s、time/vault 3 s)
+    probe_interval_s: int = 60                  # 离线重探
+    host_ip_hint_file: str = "/run/qtrade/host.json"   # 04 [net] host_ip_hint_file(WinAgent 经会话代理写)
+
+
+@dataclass(frozen=True)
+class WechatConfig:
+    """02 §7.1 [wechat](agent.toml 段;与 winagent.toml [wechat] 同名不同键)。"""
+    slot_pending_ttl_s: int = 600
+    slot_reaper_interval_s: int = 60
+    slot_error_takeover_s: int = 300
+
+
+H13_INTERVAL_S = 60                             # 04 §2.9 字面:Agent 每 60 s GET /wa/v1/time(不是配置项)
+H13_DRIFT_THRESHOLD_MS = 2000                   # 04 §2.9 字面:|Δ| > 2 s 判漂移
+H05_BOOT_POLL_S = 2                             # 04 H05 字面:起动期每 2 s 查 sys.boot_completed
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     bus: BusConfig = field(default_factory=BusConfig)
     qidian: QidianAdapterConfig = field(default_factory=QidianAdapterConfig)
@@ -80,6 +135,10 @@ class AgentConfig:
     api: ApiConfig = field(default_factory=ApiConfig)
     events: EventsConfig = field(default_factory=EventsConfig)
     db: DbConfig = field(default_factory=DbConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    pool: PoolConfig = field(default_factory=PoolConfig)
+    winagent: WinAgentConfig = field(default_factory=WinAgentConfig)
+    wechat: WechatConfig = field(default_factory=WechatConfig)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -100,7 +159,15 @@ class AgentConfig:
             api=pick(d.get("api"), ApiConfig),
             events=pick(d.get("events"), EventsConfig),
             db=pick(d.get("db"), DbConfig),
+            runtime=pick(d.get("runtime"), RuntimeConfig),
+            pool=pick(d.get("pool"), PoolConfig),
+            winagent=pick(d.get("winagent"), WinAgentConfig),
+            wechat=pick(d.get("wechat"), WechatConfig),
         )
+
+    def quota_mb(self, channel: str) -> int:
+        """建表初始配额(真值在 resource_pools.quota_json,C-43;这里只供首次建行)。"""
+        return {"qidian": self.pool.quota_qidian_mb, "qq": self.pool.quota_qq_mb, "wechat": self.pool.quota_wechat_mb}[channel]
 
     def confirm_timeout_ms(self, channel: str) -> int:
         return {
