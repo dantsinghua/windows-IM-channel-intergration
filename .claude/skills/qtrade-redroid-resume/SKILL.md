@@ -24,7 +24,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 ## 0. 项目一句话
 
-给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**目前是详细设计阶段(R6-38~R6-42 已收第七轮 cursor 评审 7.8/10,五轮只读终审末轮 ACCEPT;此前:六轮回改 + 第七轮 cursor 复评已闭环:R6-36「读取正线改主库」的邻表半改由 §15g R6-37 收口、独立只读终审两轮判 ACCEPT/可开工基线、评审提的边缘风险已补),尚未进入编码;企点收发已真机验证。**
+给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**2026-09-19 第八轮 cursor 评审(8.4/10)由 R6-47~R6-50 收口后已开工:仓库 `src/qtrade_agent/` 有 Agent 侧 M2 骨架(store / 企点读库 / 总线,49 条单测全绿,见 §5「代码现状」);真机接入(redroid / RPA 执行层)仍只在安琳原机;企点收发已真机验证。此前:R6-38~R6-46 收第七轮评审与企点专项,R6-1~R6-37 六轮回改与终审。**
 
 - 🔴 **设计文档唯一的源(2026-09-19 夜安琳定;改这里、读这里)**:`/mnt/c/Users/anlin/Desktop/work/docs/`(= `C:\Users\anlin\Desktop\work\docs\`)。它所在的 `Desktop\work\` 是 git 仓库,远端 = **`git@github.com:dantsinghua/windows-IM-channel-intergration.git`(私有,分支 `main`)**;**每轮改完:跑对账脚本 → `git add -A && git commit` → `git push`**。提交身份只在该仓库本地配置(`dantsinghua` + GitHub noreply 邮箱),没动全局 git 配置。
 - ⛔ **已停止维护、不要再改也不要再同步**:WSL 的 `~/work/qtrade-redroid-installer/docs/design/`(内容停在 R6-46、与 GitHub 首个提交 `a2e93ee` 逐文件一致,放了一份「⛔已迁移」说明;文件未删,只作历史留底)。原桌面知识库 `Desktop\QTrade详细设计-20260918\` **已被安琳挪进 `Desktop\work\docs\`、原路径不存在了**——本文件下面凡写「桌面知识库 / 桌面副本 / cp 回桌面」的旧句,一律理解为 `Desktop\work\docs\`。
@@ -46,6 +46,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 | 6 | `06-邮件摆渡与消息存取.md` (v0.4.6) | 邮件收发/模板/去重、消息本地存取、**企点旁路读库 §2.9.5(主库;🔴 R6-38~R6-42 重写:`poll_maindb` 伪代码=表发现+bootstrap+历史闸+水位自检+掉线续读、`check_group_gaps` 群缺口、发送确认阻塞语义)**、30天保留 |
 | 附 | `07-配置项总表.md` (v0.2) | 约130键跨册对账基准(owner/默认/消费方) |
 | 附 | `check-truth-tables.py` | **真值表对账器,改完必跑**(FORBIDDEN/PAIRED/ENUM/STATUS/KEYNAME/COPYABLE/MIRROR/**⑨DYNAMIC=值集合从owner册现读**/**⑩VALUE=企点确认窗≥15000 且 02↔07 同值**/版本;**73 条规则**(R6-37 `qdidx:`/`c4ext1`;R6-38~R6-41 新增索引库列名、L2 二选一、`.backup`、6 字节密钥、`poll` 无参签名、`ingest` 两元组、新码/新键登记等;**每条新规则都在改前备份上反向验证过能红**);`python3 check-truth-tables.py`,退出0=全绿 |
+| 代码 | `src/qtrade_agent/` + `tests/` | Agent 侧首批代码(2026-09-19 开工):`text.py`(`norm`/`clean_text` 逐字 = 06 §2.9.2/§2.9.5)、`store/`(`schema_agent.sql` 逐字抽自 02 §3.1;`ingest` 三元组、同事务顺序、出向合并定序、QQ id 复用、`qidian_bootstrap_rebase` 含审计)、`adapters/qidian/`(`xor.py` 17 字节密钥、`msgdata.py` msgtype 路由 + `-1035` protobuf Elem、`maindb.py` 本地/adb 两后端、`poll.py` = 06 §2.9.5 两段伪代码逐分支)、`bus/`(R6-48 校验、出向先落库、幂等三态、队列外等确认)、`events.py`/`alerts.py`、`capabilities/*.json`;`python3 -m pytest -q` |
 
 ⚠️ **没有「同步副本」了**:唯一的源是 `Desktop\work\docs\`(见 §0),改完跑对账脚本、提交、推送。该目录在 Windows 盘上(`/mnt/c`),**不是 git 之外还有一份备份**——每轮改前仍先 `cp` 一份到 scratchpad 供只读终审 diff,但真正的还原点现在是 git 历史(`git diff` / `git checkout -- <file>`)。
 
@@ -70,6 +71,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 | **企点读消息(历史/全文兜底)** | 索引库 `{uin}-IndexQQMsg.db`:`db_reader.py`(Base64、单表 `IndexContent_content`、单 `docid` 水位) | **滞后 13~36 s、只索文本**,不做实时正线(R6-36);只作历史回填/全文检索 |
 | **微信取钥** | `/mnt/c/Users/anlin/Desktop/盈米/蜂鸟项目/南银理财/weChatlog/` (chatlog + wx_key DLL) | 三段固定序:起hook→点图片(img_key)→退出重登(data_key),两钥同轮才落盘;详见 [[wechat-pc-install-facts-2026-09-18]] |
 | **改设计文档** | 改 `/mnt/c/Users/anlin/Desktop/work/docs/` → 跑 `check-truth-tables.py`(在该目录里跑)→ `git commit` → `git push` | 新裁决追加到基线 §11 末尾、引用写"§11.N [锚名]";别插中间(会导致编号漂移) |
+| **改代码 / 跑单测** | 仓库根 `python3 -m pytest -q`(需 `pytest`、`pytest-asyncio`;`pythonpath=src` 在 pyproject.toml);`tests/test_docs_consistency.py` 把代码与文档对账(配置默认值 = 02 §7.1、schema 文件 = 02 §3.1 sql 块、`norm` 函数体 = 06 §2.9.2) | 代码以文档为准;改表先改 02 再重新抽 `schema_agent.sql`(抽取方式写在文件头);真机执行层(点发送键等)以 `sender` 回调注入,`tests/test_bus.py::FakeSender` 是假的 |
 
 ## 4. 🔴 禁区(违反会出大事)
 
@@ -88,7 +90,14 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 - **R6-48 开放项 (r) 拍板 = A(总控定,安琳可改)**:`send_text.text` 须 `clean_text(text)==text`,违例 `400 INVALID_ARGS`/`error.reason='text_has_control_chars'`/`pointer='/text'`,校验点 02 §3.10 `bus` 参数校验段、三通道同一条、不写 `SENDING` 行不占幂等键。不选 B 的理由:`U+0014` 是客户端内部转义、不可输入;B 会让库里「我方发出的内容」与实际发出的不一致。**真机待验一格**:企点会不会把 Unicode emoji 改写成 `U+0014` 落库(06 §8b M2「含表情/控制字符的发送」④,超时且读回含 `[表情]` 即记实测结论另裁,不预设)。
 - **R6-49(P1)** 01 §2.7.7 `P-MSG` 渲染事件专属三字段:`late` 琥珀「迟到 {lag_s} s」`qt-msg-row-{id}-late`、`origin="external"`「外部来源」`qt-msg-row-{id}-origin-external`;只进本次会话 store,`GET /messages` 不带、重拉后消失 = 预期;§8b M2-1/M2-2。
 - **R6-50(P1)** 02 §3.1 `audit_log` 登记 `action='qidian.rebootstrap'`(`kind/transport='system'`、`actor='system:qidian_adapter'`、`detail_json{old_uin,new_uin,deleted_cursors}`),05 ⑪a 同名引用;01 §2.10 写明 `QIDIAN_TABLE_DECODE_STUCK`/`QIDIAN_MSG_GAP` **只进铃与角标**、不上 `qt-acct-detail-read-degraded` 横幅。
-- 脚本新增 PAIRED ×10(norm 定义 ×2、`text_has_control_chars` ×2、三字段 testid ×2、`qidian.rebootstrap` ×2、两码 01 承接 ×2)+ ⑪ NORM;**每条都在改前备份与「抹掉登记行」副本上反向验证能红**(harness 留在 session scratchpad,不入库)。评审「开工门」:M1、内核 D、WinAgent、Electron 路由与 testid、微信向导、邮件取信、企点 poll 骨架可开;`norm()`/`send_*` 确认匹配已补 ⇒ **无阻塞项,进入编码**(见本节末「代码现状」)。
+- 脚本新增 PAIRED ×10(norm 定义 ×2、`text_has_control_chars` ×2、三字段 testid ×2、`qidian.rebootstrap` ×2、两码 01 承接 ×2)+ ⑪ NORM;**每条都在改前备份与「抹掉登记行」副本上反向验证能红**(harness 留在 session scratchpad,不入库)。评审「开工门」:M1、内核 D、WinAgent、Electron 路由与 testid、微信向导、邮件取信、企点 poll 骨架可开;`norm()`/`send_*` 确认匹配已补 ⇒ **无阻塞项,进入编码**(见下「代码现状」)。
+
+**🔴 代码现状(2026-09-19 夜,首批;GitHub 分支 `claude/lucid-dijkstra-uu5max`,尚未合入 `main`)**:
+- 范围 = 02 §8 里 **M2** 行中能在无 redroid 环境下编码与单测的部分:`store` + `agent.db` 基线 DDL(逐字抽自 02 §3.1,SQLite 3.45 实跑;`schema_version` 记 sha256)、`bus` 单账号队列(出向先落库经 `store.ingest`、幂等三态、R6-48 入口校验、登录门、队列外等确认 + 加速轮投递)、`adapters.qidian` 读库正线(`poll_maindb`/`check_group_gaps` 按 06 §2.9.5 伪代码逐分支,含历史闸/水位自检/换号审计/H13 守卫/加速轮不动计数)、`events`(outbox + 事件专属 `lag_s`/`late`/`origin`)、`alerts`(去重键 `(code,subject)`)。**没做**:`api`(FastAPI 端点)、`runtime`(docker/redroid)、`pool`、`workflow`、`mail`、`vault_client`、`scheduler`、`health`、UI 执行层(搜索/打开会话/ADBKeyboard/点发送)——后者以 `QidianAdapter(sender=…)` 回调注入,真机接入时把 `qidian_cold_start.sh` 的动作包成同签名回调。
+- 单测 49 条全绿(`tests/`):`norm`/`clean_text` 全部边界(纯表情不为空、串尾孤零、后继 `\t`)、XOR 17 字节自反、路由表五行、`-1035` 顺序、`ingest` 重扫 `(False,False)`、撤回 `changed`、出向合并定序/窗口/空文本守卫、QQ `#n`、空批推游标、单事务回滚、首登历史闸、新会话不丢第一条、重扫不重放、被踢重登 `late`/`external`、加速轮不动计数、首登 12 轮宽限、H13 换号只审计一次、个别表 STUCK 独立码、整库解不出一条告警、群缺口、bus 端到端「send_text → 假 RPA 落库 → poll 合并 → DELIVERED」、控制字符 400 且不进 commands、UNCONFIRMED 留 SENDING、登录门、send 让出队列。
+- **代码 ↔ 文档对账**(`tests/test_docs_consistency.py`):配置默认值 = 02 §7.1、`schema_agent.sql` = 02 §3.1 sql 块、`norm` 函数体逐行 = 06 §2.9.2、能力目录会话参数只叫 `session`。改文档后跑单测也会红。
+- **接手下一步(按优先级)**:①真机接 `sender` 回调 + `AdbMainDb`(需 `ensure_root`,06 §2.9.5)跑一次 06 §8b M2「含表情/控制字符的发送」五例——(r) 拍板 A 的那格「企点会不会把 Unicode emoji 转成 `U+0014`」只能真机验;②`scheduler`(全量轮每 `poll_interval_s`、`check_group_gaps` 每 60 s)+ `api` 骨架(#28 commands/#send、`GET /messages`、WS events 重放);③把 `main` 合入(或 PR)由安琳定。
+- ⚠️ 已知取舍:`Store` 是同步 sqlite3 核心 + `AsyncStore` 分片锁包装(文档要求 aiosqlite;容器无网络装包,且 aiosqlite 本质也是线程 + sqlite3);bus 的 GATE 安全闸(§6 双闸门)本期为空放行,留 TODO;`Bus.submit` 对 `SENDING` 幂等行的等待用进程内 future,跨进程重启走 `ABANDONED → confirm_probe`。
 
 **第七轮 cursor 评审(7.8/10,5 条 P0)已收口:基线 §15g R6-38 → R6-42,五轮只读独立终审 REVISE×4 → ACCEPT**(会改行为的问题数 8 → 13 → 7 → 2 → 0;末轮 0 阻塞、置信度高)。桌面副本已同步、脚本全绿(规则数以脚本实跑为准:FORBIDDEN 38 / PAIRED 17 / COPYABLE 3 / MIRROR 6 / DYNAMIC 3 + KEYNAME/ENUM/⑩值检查)。
 - **R6-38(评审 5 条 P0,均核实属实)**:06 §2.9.1 `type/ts/self` 改主库 `msgtype/time/issend`(唯一出处 §2.9.5);`[bus] confirm_timeout_qidian_ms` 8000→**15000** + 新键 `[adapters.qidian] confirm_poll_interval_ms=1000`(真机实测我方回复落库可见 9.3~11.4 s,8 s 必然 `UNCONFIRMED`);§2.12 企点确认 = **ingest 合并**(`confirmed_by=ingest_merge`、`ext=qd:{uniseq}`;`history` 仅控件树降级路线;回执「确认方式」取的是 `CommandResult.source`=`qidian_db`,别和 `confirmed_by` 混);表发现算法;L2 **只认方案 D**(manifest 恒 `"D"` + CI 硬门)。总控另查出:方案 A 残留多 3 处、`.backup` 与实测读取器相反(主库 64 MB,正线 = `mode=ro` 只读直查增量)。

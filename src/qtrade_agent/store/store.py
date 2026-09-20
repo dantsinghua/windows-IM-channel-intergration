@@ -1,0 +1,503 @@
+"""store 模块(02 §2.2.8)—— 唯一读写 ``agent.db`` 的地方;其它模块经本模块的方法,不互相读对方的表。
+
+硬约束(逐字来自 02 §2.2.8 / §2.8.1 / 06 §2.9.2 / §2.12):
+- ``ingest(msg) -> (inserted, changed, id)``;``changed`` = 撤回标记翻转 / 并进我方出向行 二者之一;
+  撞上去重键、内容无变化的已存在行 ``(False, False)`` ⇒ 调用方不发事件(重扫不重放)。
+- ``ingest_batch(msgs, cursor_update)`` 在**一个** ``BEGIN IMMEDIATE … COMMIT`` 里先 upsert ``sessions``、再写 ``messages``、再推 ``cursors``;
+  ``msgs`` 为空而 ``cursor_update`` 非空时只推游标、不得早退。
+- 出向(``dir='out'``)与入向共用本入口;``bus`` 不得绕过 store 直插 ``messages``。
+- 入向轮询撞到自己发的:同账号 ``dir='out' AND state IN ('SENDING','UNCONFIRMED')`` 且(``fingerprint`` 相同 或 同 ``session_id`` + ``norm(text)`` 相等 + 两侧非空 + ``|ts 差| ≤ out_merge_window_s``)→ 合并进那一行;
+  多候选取 ``|读到的行 ts − 出向行 ts|`` 最小、并列取更早写入;一条读到的行只合并一次。
+- QQ ``message_id`` 复用:同键且 ``|ts 差| > 1h`` 判新消息,``ext_msg_id`` 追加 ``#n``。
+- 并发:单写连接;事务整体互斥(``_tx_lock``);应用层按账号分片排队在 ``AsyncStore``。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Optional
+
+from ..ids import message_id
+from ..models import Message
+from ..text import norm
+
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_agent.sql")
+
+PRAGMAS = (
+    "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000",
+    "PRAGMA foreign_keys=ON", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-65536", "PRAGMA wal_autocheckpoint=2000",
+)
+
+QQ_ID_REUSE_MS = 3600 * 1000
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    inserted: bool
+    changed: bool
+    id: str
+
+
+@dataclass(frozen=True)
+class CursorUpdate:
+    owner: str
+    kind: str
+    value_int: Optional[int]
+    value: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Cursor:
+    owner: str
+    kind: str
+    value: Optional[str]
+    value_int: Optional[int]
+    updated_ms: int
+
+    def value_json(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.value) if self.value else {}
+        except ValueError:
+            return {}
+
+
+def compute_fingerprint(account_id: str, session_id: str, sender: Optional[str], text: Optional[str],
+                        media_sha256s: list[str], ts_ms: int) -> str:
+    """06 §2.9.2:``sha256(account_id | session_id | sender_id_or_name | norm(text) | media_sha256s | ts 取整到秒)``。"""
+    raw = "|".join([account_id, session_id, sender or "", norm(text), ",".join(sorted(media_sha256s)), str(ts_ms // 1000)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class Store:
+    def __init__(self, path: str = ":memory:", *, clock: Callable[[], int] = _now_ms,
+                 out_merge_window_s: int = 60, capture_text: bool = True):
+        self.path = path
+        self._clock = clock
+        self.out_merge_window_ms = out_merge_window_s * 1000
+        self.capture_text = capture_text
+        self._con: Optional[sqlite3.Connection] = None
+        self._tx_lock = threading.RLock()
+
+    # ------------------------------------------------------------------ 打开 / 迁移
+    def open(self) -> "Store":
+        con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        for p in PRAGMAS:
+            try:
+                con.execute(p)
+            except sqlite3.OperationalError:
+                pass    # :memory: 下 WAL 不适用
+        self._con = con
+        self._migrate()
+        return self
+
+    def close(self) -> None:
+        if self._con is not None:
+            try:
+                self._con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            self._con.close()
+            self._con = None
+
+    @property
+    def con(self) -> sqlite3.Connection:
+        assert self._con is not None, "store not opened"
+        return self._con
+
+    def _migrate(self) -> None:
+        """基线 DDL 一次性建齐(项目未发行,无历史迁移;02 §2.1 步 4:迁移失败拒绝启动)。"""
+        has = self.con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+        if has:
+            return
+        with open(SCHEMA_PATH, encoding="utf-8") as f:
+            ddl = f.read()
+        with self._tx_lock:
+            # executescript 会先隐式 COMMIT 再逐条执行,不能包在 _tx() 里;DDL 失败即抛(拒绝启动)
+            self.con.executescript("BEGIN;\n" + ddl + "\nCOMMIT;")
+            checksum = hashlib.sha256(ddl.encode("utf-8")).hexdigest()   # 脚本 sha256,防被改过的脚本重跑(02 §3.1)
+            self.con.execute("INSERT INTO schema_version(version, name, applied_ms, checksum) VALUES (?, ?, ?, ?)",
+                             (1, "0001_baseline_docs02_v0.4.6", self._clock(), checksum))
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        with self._tx_lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.con
+            except BaseException:
+                if self.con.in_transaction:
+                    self.con.execute("ROLLBACK")
+                raise
+            else:
+                self.con.execute("COMMIT")
+
+    # ------------------------------------------------------------------ 账号(最小;完整生命周期在 api/runtime)
+    def ensure_account(self, id: str, channel: str, *, label: Optional[str] = None, state: str = "created",
+                       login_mode: str = "password", quota_mb: int = 2560, self_uid: Optional[str] = None) -> None:
+        seq = int(id[2:])
+        host = "windows" if channel == "wechat" else "wsl"
+        now = self._clock()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO accounts(id, channel, seq, label, host, state, login_mode, quota_mb, self_uid, created_ms, updated_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, self_uid=COALESCE(excluded.self_uid, accounts.self_uid), updated_ms=excluded.updated_ms",
+                (id, channel, seq, label or id, host, state, login_mode, quota_mb, self_uid, now, now))
+
+    def get_account(self, id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM accounts WHERE id=? AND deleted_ms IS NULL", (id,)).fetchone()
+        return dict(r) if r else None
+
+    def set_account_state(self, id: str, state: str, *, state_code: Optional[str] = None,
+                          self_uid: Optional[str] = None, state_reason: str = "") -> None:
+        with self._tx() as c:
+            c.execute("UPDATE accounts SET state=?, state_code=?, state_reason=?, self_uid=COALESCE(?, self_uid), updated_ms=? WHERE id=?",
+                      (state, state_code, state_reason, self_uid, self._clock(), id))
+
+    # ------------------------------------------------------------------ ingest
+    def ingest(self, msg: Message, *, now_ms: Optional[int] = None) -> IngestResult:
+        with self._tx() as c:
+            return self._ingest_one(c, msg, now_ms or self._clock())
+
+    def ingest_batch(self, msgs: list[Message], cursor_update: Optional[CursorUpdate] = None,
+                     *, now_ms: Optional[int] = None) -> list[tuple[bool, bool, Message]]:
+        """一个事务:sessions → messages → cursors;空批只推游标,不早退(R6-41)。"""
+        now = now_ms or self._clock()
+        out: list[tuple[bool, bool, Message]] = []
+        with self._tx() as c:
+            for m in msgs:
+                r = self._ingest_one(c, m, now)
+                m.id = r.id
+                out.append((r.inserted, r.changed, m))
+            if cursor_update is not None:
+                self._cursor_set(c, cursor_update.owner, cursor_update.kind, cursor_update.value_int, cursor_update.value, now)
+        return out
+
+    # -- 内部:同一事务内的各步
+    def _upsert_session(self, c: sqlite3.Connection, msg: Message, now: int) -> None:
+        s = msg.session
+        name = s.name or s.native_id
+        c.execute(
+            "INSERT INTO sessions(id, account_id, channel, native_id, name, kind, last_msg_ms, msg_count, first_seen_ms, created_ms, updated_ms) "
+            "VALUES (?,?,?,?,?,?,?,0,?,?,?) "
+            "ON CONFLICT(account_id, native_id) DO UPDATE SET "
+            "  name = CASE WHEN excluded.name <> excluded.native_id THEN excluded.name ELSE sessions.name END, "
+            "  last_msg_ms = MAX(COALESCE(sessions.last_msg_ms, 0), excluded.last_msg_ms), updated_ms = excluded.updated_ms",
+            (s.id, msg.account_id, msg.channel, s.native_id, name, s.kind, msg.ts_ms, msg.ts_ms, now, now))
+
+    def _row_values(self, msg: Message, now: int) -> dict[str, Any]:
+        text = msg.text
+        media_shas = [m["sha256"] for m in msg.media if m.get("sha256")]
+        fp = compute_fingerprint(msg.account_id, msg.session_id, msg.sender_id or msg.sender_name, text, media_shas, msg.ts_ms)
+        msg.fingerprint = fp
+        msg.received_ms = now
+        stored_text = text if self.capture_text else None
+        return {
+            "id": msg.id or message_id(now), "ext_msg_id": msg.ext_msg_id, "dedup_kind": msg.dedup_kind, "fingerprint": fp,
+            "account_id": msg.account_id, "channel": msg.channel, "session_id": msg.session_id,
+            "dir": msg.dir, "type": msg.type, "state": msg.state if msg.dir == "out" else "DELIVERED",
+            "text": stored_text, "text_len": len(text) if text is not None else None,
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None,
+            "media_json": json.dumps(msg.media, ensure_ascii=False), "sender_id": msg.sender_id, "sender_name": msg.sender_name,
+            "is_self": 1 if msg.self else 0, "ts_ms": msg.ts_ms, "received_ms": now, "source": msg.source,
+            "revoked": 1 if msg.revoked else 0, "revoked_ms": msg.revoked_ms, "revoked_by": msg.revoked_by,
+            "trace_id": msg.trace_id, "idempotency_key": msg.idempotency_key, "raw_ref": msg.raw_ref,
+        }
+
+    def _insert_message(self, c: sqlite3.Connection, msg: Message, now: int, *, ext_override: Optional[str] = None) -> str:
+        v = self._row_values(msg, now)
+        if ext_override is not None:
+            v["ext_msg_id"] = ext_override
+        cols = ",".join(v.keys())
+        qs = ",".join("?" for _ in v)
+        c.execute(f"INSERT INTO messages({cols}) VALUES ({qs})", tuple(v.values()))
+        c.execute("UPDATE sessions SET msg_count = msg_count + 1 WHERE id = ?", (msg.session_id,))
+        msg.id = v["id"]
+        return v["id"]
+
+    def _find_merge_candidate(self, c: sqlite3.Connection, msg: Message) -> Optional[sqlite3.Row]:
+        """06 §2.12「入向轮询撞到自己发的」:只对 self=True 的出向读回行;返回定序后的那一行或 None。"""
+        rows = c.execute(
+            "SELECT id, rowid AS rid, session_id, ts_ms, text, fingerprint FROM messages "
+            "WHERE account_id=? AND dir='out' AND state IN ('SENDING','UNCONFIRMED') AND ext_msg_id IS NULL",
+            (msg.account_id,)).fetchall()
+        media_shas = [m["sha256"] for m in msg.media if m.get("sha256")]
+        my_fp = compute_fingerprint(msg.account_id, msg.session_id, msg.sender_id or msg.sender_name, msg.text, media_shas, msg.ts_ms)
+        my_norm = norm(msg.text)
+        cands = []
+        for r in rows:
+            if r["fingerprint"] == my_fp:
+                cands.append(r)
+                continue
+            if r["session_id"] != msg.session_id:
+                continue
+            # 空文本守卫(R6-44):两侧任一为空时不走这一支,只认 fingerprint
+            if not my_norm or not norm(r["text"]):
+                continue
+            if norm(r["text"]) == my_norm and abs(msg.ts_ms - r["ts_ms"]) <= self.out_merge_window_ms:
+                cands.append(r)
+        if not cands:
+            return None
+        cands.sort(key=lambda r: (abs(msg.ts_ms - r["ts_ms"]), r["rid"]))   # |time − ts| 最小,并列取更早写入
+        return cands[0]
+
+    @staticmethod
+    def _confirmed_by_for(source: str) -> str:
+        return {"qidian_db": "ingest_merge", "chatlog": "chatlog", "onebot": "get_msg"}.get(source, "ingest_merge")
+
+    def _ingest_one(self, c: sqlite3.Connection, msg: Message, now: int) -> IngestResult:
+        self._upsert_session(c, msg, now)
+
+        # ① bus 出向先落库(C-21/R6-16):幂等重试命中同 idempotency_key 直接复用这一行
+        if msg.dir == "out" and msg.state == "SENDING" and msg.ext_msg_id is None:
+            if msg.idempotency_key:
+                r = c.execute("SELECT id FROM messages WHERE account_id=? AND idempotency_key=? AND dir='out'",
+                              (msg.account_id, msg.idempotency_key)).fetchone()
+                if r:
+                    msg.id = r["id"]
+                    return IngestResult(False, False, r["id"])
+            return IngestResult(True, False, self._insert_message(c, msg, now))
+
+        assert msg.ext_msg_id is not None, "入向/读回行必须带 ext_msg_id(anchor 路用 fingerprint 作 ext)"
+
+        # ② 去重键:先查再插(99c C-03)
+        existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=?",
+                             (msg.account_id, msg.ext_msg_id)).fetchone()
+        if existing is not None:
+            if msg.channel == "qq" and abs(msg.ts_ms - existing["ts_ms"]) > QQ_ID_REUSE_MS:
+                n = c.execute("SELECT COUNT(*) FROM messages WHERE account_id=? AND ext_msg_id LIKE ?",
+                              (msg.account_id, msg.ext_msg_id + "#%")).fetchone()[0]
+                return IngestResult(True, False, self._insert_message(c, msg, now, ext_override=f"{msg.ext_msg_id}#{n + 2}"))
+            changed = False
+            if msg.revoked and not existing["revoked"]:
+                c.execute("UPDATE messages SET revoked=1, revoked_ms=COALESCE(?, revoked_ms, ?), revoked_by=COALESCE(?, revoked_by) WHERE id=?",
+                          (msg.revoked_ms, now, msg.revoked_by, existing["id"]))
+                changed = True
+            if existing["text"] is None and msg.text is not None and self.capture_text:
+                c.execute("UPDATE messages SET text=?, text_len=? WHERE id=?", (msg.text, len(msg.text), existing["id"]))
+            msg.id = existing["id"]
+            return IngestResult(False, changed, existing["id"])
+
+        # ③ 入向轮询撞到自己发的(06 §2.12):只对我方出向的读回行
+        if msg.self and msg.dir == "out":
+            cand = self._find_merge_candidate(c, msg)
+            if cand is not None:
+                c.execute("UPDATE messages SET ext_msg_id=?, state='DELIVERED', confirmed_by=?, confirmed_ms=? WHERE id=?",
+                          (msg.ext_msg_id, self._confirmed_by_for(msg.source), now, cand["id"]))
+                msg.id = cand["id"]
+                msg.received_ms = now
+                return IngestResult(False, True, cand["id"])
+
+        # ④ 真新行(含「非本系统发出的我方消息」:dir=out、trace_id NULL、state=DELIVERED)
+        return IngestResult(True, False, self._insert_message(c, msg, now))
+
+    # ------------------------------------------------------------------ 出向行状态
+    def message_state(self, id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT id, state, ext_msg_id, confirmed_by, confirmed_ms, trace_id FROM messages WHERE id=?", (id,)).fetchone()
+        return dict(r) if r else None
+
+    def mark_out_state(self, id: str, state: str) -> None:
+        assert state in ("UNCONFIRMED", "FAILED")
+        with self._tx() as c:
+            c.execute("UPDATE messages SET state=? WHERE id=? AND dir='out' AND state='SENDING'", (state, id))
+
+    def find_out_by_text(self, account_id: str, session_id: str, text: str, window_ms: int, ts_ms: int) -> Optional[dict[str, Any]]:
+        """confirm_probe 用:同会话、同 norm(text)、窗内的已确认出向行。"""
+        rows = self.con.execute(
+            "SELECT id, text, ts_ms, ext_msg_id, state FROM messages WHERE account_id=? AND session_id=? AND dir='out' AND ext_msg_id IS NOT NULL AND ABS(ts_ms-?) <= ?",
+            (account_id, session_id, ts_ms, window_ms)).fetchall()
+        n = norm(text)
+        for r in rows:
+            if n and norm(r["text"]) == n:
+                return dict(r)
+        return None
+
+    def get_message(self, id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM messages WHERE id=?", (id,)).fetchone()
+        return dict(r) if r else None
+
+    def list_messages(self, account_id: str, *, session_id: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM messages WHERE account_id=?"
+        params: list[Any] = [account_id]
+        if session_id:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        sql += " ORDER BY ts_ms DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()]
+
+    def count_messages(self, account_id: str) -> int:
+        return self.con.execute("SELECT COUNT(*) FROM messages WHERE account_id=?", (account_id,)).fetchone()[0]
+
+    # ------------------------------------------------------------------ 游标
+    def cursor_get(self, owner: str, kind: str) -> Optional[Cursor]:
+        r = self.con.execute("SELECT owner, kind, value, value_int, updated_ms FROM cursors WHERE owner=? AND kind=?", (owner, kind)).fetchone()
+        return Cursor(*r) if r else None
+
+    def cursors_list(self, owner: str, kind_prefix: str) -> list[Cursor]:
+        rows = self.con.execute("SELECT owner, kind, value, value_int, updated_ms FROM cursors WHERE owner=? AND kind LIKE ? ORDER BY kind",
+                                (owner, kind_prefix + "%")).fetchall()
+        return [Cursor(*r) for r in rows]
+
+    def _cursor_set(self, c: sqlite3.Connection, owner: str, kind: str, value_int: Optional[int], value: Optional[str], now: int) -> None:
+        c.execute("INSERT INTO cursors(owner, kind, value, value_int, updated_ms) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(owner, kind) DO UPDATE SET value=excluded.value, value_int=excluded.value_int, updated_ms=excluded.updated_ms",
+                  (owner, kind, value, value_int, now))
+
+    def cursor_set(self, owner: str, kind: str, value_int: Optional[int], value: Optional[str] = None) -> None:
+        with self._tx() as c:
+            self._cursor_set(c, owner, kind, value_int, value, self._clock())
+
+    def qidian_bootstrap_rebase(self, account_id: str, new_uin: str, *, old_uin: Optional[str], now_ms: int) -> int:
+        """06 §2.9.5 ③:删旧水位 + 写新基准 **同一事务**;换号(old_uin 非空)时先记审计 ``qidian.rebootstrap``(R6-50)。返回删掉的水位行数。"""
+        with self._tx() as c:
+            deleted = 0
+            if old_uin is not None:
+                deleted = c.execute("SELECT COUNT(*) FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (account_id,)).fetchone()[0]
+                self._insert_audit(c, kind="system", transport="system", actor="system:qidian_adapter", action="qidian.rebootstrap",
+                                   account_id=account_id, trace_id=None, result_code="OK",
+                                   detail={"old_uin": old_uin, "new_uin": new_uin, "deleted_cursors": deleted}, now=now_ms)
+                c.execute("DELETE FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (account_id,))
+            self._cursor_set(c, account_id, "qidian_bootstrap", now_ms, new_uin, now_ms)
+            return deleted
+
+    # ------------------------------------------------------------------ 审计 / outbox
+    def _insert_audit(self, c: sqlite3.Connection, *, kind: str, transport: str, actor: str, action: str, account_id: Optional[str],
+                      trace_id: Optional[str], result_code: Optional[str], detail: dict[str, Any], now: int) -> int:
+        cur = c.execute(
+            "INSERT INTO audit_log(ts_ms, kind, transport, actor, action, account_id, trace_id, result_code, detail_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            (now, kind, transport, actor, action, account_id, trace_id, result_code, json.dumps(detail, ensure_ascii=False)))
+        return int(cur.lastrowid)
+
+    def insert_audit(self, *, kind: str, transport: str, actor: str, action: str, account_id: Optional[str] = None,
+                     trace_id: Optional[str] = None, result_code: Optional[str] = None, detail: Optional[dict[str, Any]] = None,
+                     now_ms: Optional[int] = None) -> int:
+        with self._tx() as c:
+            return self._insert_audit(c, kind=kind, transport=transport, actor=actor, action=action, account_id=account_id,
+                                      trace_id=trace_id, result_code=result_code, detail=detail or {}, now=now_ms or self._clock())
+
+    def list_audit(self, action: Optional[str] = None) -> list[dict[str, Any]]:
+        if action:
+            rows = self.con.execute("SELECT * FROM audit_log WHERE action=? ORDER BY id", (action,)).fetchall()
+        else:
+            rows = self.con.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_outbox_event(self, *, event_id: str, target: str, event: str, trace_id: Optional[str], account_id: Optional[str],
+                            channel: Optional[str], payload_json: str, now_ms: Optional[int] = None) -> int:
+        with self._tx() as c:
+            cur = c.execute(
+                "INSERT INTO events_outbox(event_id, target, event, ts_ms, trace_id, account_id, channel, payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                (event_id, target, event, now_ms or self._clock(), trace_id, account_id, channel, payload_json))
+            return int(cur.lastrowid)
+
+    def replay_outbox(self, since_seq: int, limit: int = 1000) -> list[dict[str, Any]]:
+        rows = self.con.execute("SELECT seq, event, ts_ms, trace_id, account_id, channel, payload_json FROM events_outbox "
+                                "WHERE target='ws' AND seq > ? ORDER BY seq LIMIT ?", (since_seq, limit)).fetchall()
+        return [dict(r) | {"payload": json.loads(r["payload_json"])} for r in rows]
+
+    def list_events(self, event: Optional[str] = None, account_id: Optional[str] = None) -> list[dict[str, Any]]:
+        sql, params = "SELECT * FROM events_outbox WHERE target='ws'", []
+        if event:
+            sql += " AND event=?"; params.append(event)
+        if account_id:
+            sql += " AND account_id=?"; params.append(account_id)
+        return [dict(r) | {"payload": json.loads(r["payload_json"])} for r in self.con.execute(sql + " ORDER BY seq", params).fetchall()]
+
+    # ------------------------------------------------------------------ commands / idempotency(bus 用)
+    def insert_command(self, *, trace_id: str, account_id: str, op: str, args_json: str, idempotency_key: Optional[str], confirm: bool,
+                       timeout_ms: int, transport: str, actor: str, ip: Optional[str], now_ms: int) -> None:
+        with self._tx() as c:
+            c.execute("INSERT INTO commands(trace_id, account_id, op, args_json, idempotency_key, confirm, timeout_ms, origin_transport, origin_actor, origin_ip, status, submitted_ms) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?)",
+                      (trace_id, account_id, op, args_json, idempotency_key, 1 if confirm else 0, timeout_ms, transport, actor, ip, now_ms))
+
+    def command_started(self, trace_id: str, now_ms: int) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE commands SET status='running', started_ms=? WHERE trace_id=?", (now_ms, trace_id))
+
+    def finish_command(self, *, trace_id: str, ok: bool, code: str, data: dict[str, Any], cost_ms: int, source: Optional[str],
+                       error_message: Optional[str], retryable: Optional[bool], needs_human: Optional[bool],
+                       confirmed_by: Optional[str], confirm_ms: Optional[int], now_ms: int) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE commands SET status=?, finished_ms=? WHERE trace_id=?", ("done" if ok else "failed", now_ms, trace_id))
+            c.execute("INSERT INTO command_results(trace_id, ok, code, data_json, cost_ms, source, error_message, error_retryable, error_needs_human, confirmed_by, confirm_ms, finished_ms) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trace_id) DO NOTHING",
+                      (trace_id, 1 if ok else 0, code, json.dumps(data, ensure_ascii=False), cost_ms, source, error_message,
+                       None if retryable is None else int(retryable), None if needs_human is None else int(needs_human), confirmed_by, confirm_ms, now_ms))
+
+    def get_command_result(self, trace_id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM command_results WHERE trace_id=?", (trace_id,)).fetchone()
+        return dict(r) | {"data": json.loads(r["data_json"])} if r else None
+
+    def idem_get(self, account_id: str, key: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM idempotency WHERE account_id=? AND idem_key=?", (account_id, key)).fetchone()
+        return dict(r) if r else None
+
+    def idem_claim(self, *, account_id: str, key: str, op: str, args_hash: str, trace_id: str, now_ms: int, ttl_days: int) -> bool:
+        """行级 claim:不存在才写 SENDING(§2.3.1 ③);返回 True = 本次抢到。"""
+        with self._tx() as c:
+            cur = c.execute("INSERT INTO idempotency(account_id, idem_key, op, args_hash, status, trace_id, created_ms, updated_ms, expires_ms) "
+                            "VALUES (?,?,?,?,'SENDING',?,?,?,?) ON CONFLICT(account_id, idem_key) DO NOTHING",
+                            (account_id, key, op, args_hash, trace_id, now_ms, now_ms, now_ms + ttl_days * 86400 * 1000))
+            return cur.rowcount == 1
+
+    def idem_finish(self, *, account_id: str, key: str, status: str, result_code: Optional[str], now_ms: int) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE idempotency SET status=?, result_code=?, updated_ms=? WHERE account_id=? AND idem_key=?",
+                      (status, result_code, now_ms, account_id, key))
+
+    def idem_delete(self, account_id: str, key: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM idempotency WHERE account_id=? AND idem_key=?", (account_id, key))
+
+    def abandon_inflight(self, now_ms: int) -> int:
+        """02 §2.6 崩溃恢复:queued/running 指令一律 failed + INTERNAL;对应 SENDING 幂等行改 ABANDONED。"""
+        with self._tx() as c:
+            rows = c.execute("SELECT trace_id, account_id, idempotency_key FROM commands WHERE status IN ('queued','running')").fetchall()
+            for r in rows:
+                c.execute("UPDATE commands SET status='failed', finished_ms=? WHERE trace_id=?", (now_ms, r["trace_id"]))
+                c.execute("INSERT INTO command_results(trace_id, ok, code, data_json, cost_ms, error_message, error_retryable, error_needs_human, finished_ms) "
+                          "VALUES (?,0,'INTERNAL','{}',0,'Agent 重启,指令未完成',1,0,?) ON CONFLICT(trace_id) DO NOTHING", (r["trace_id"], now_ms))
+            c.execute("UPDATE idempotency SET status='ABANDONED', updated_ms=? WHERE status='SENDING'", (now_ms,))
+            return len(rows)
+
+
+class AsyncStore:
+    """02 §2.2.8 并发:写锁按账号分片(``dict[account_id → asyncio.Lock]``),同号串行、异号不阻塞;阻塞 I/O 经 ``to_thread`` 离开事件循环。"""
+
+    def __init__(self, store: Store):
+        self.sync = store
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def lock_for(self, account_id: str) -> asyncio.Lock:
+        lk = self._locks.get(account_id)
+        if lk is None:
+            lk = self._locks[account_id] = asyncio.Lock()
+        return lk
+
+    async def ingest(self, msg: Message, **kw) -> IngestResult:
+        async with self.lock_for(msg.account_id):
+            return await asyncio.to_thread(self.sync.ingest, msg, **kw)
+
+    async def ingest_batch(self, account_id: str, msgs: list[Message], cursor_update: Optional[CursorUpdate] = None, **kw):
+        async with self.lock_for(account_id):
+            return await asyncio.to_thread(self.sync.ingest_batch, msgs, cursor_update, **kw)
+
+    async def run(self, account_id: Optional[str], fn: Callable, *args, **kw):
+        """其它写操作:有账号维度的走该账号的分片锁;无账号维度直接进线程池。"""
+        if account_id is None:
+            return await asyncio.to_thread(fn, *args, **kw)
+        async with self.lock_for(account_id):
+            return await asyncio.to_thread(fn, *args, **kw)

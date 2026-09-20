@@ -1,0 +1,18 @@
+{
+  "op": "read_messages",
+  "kind": "read",
+  "danger": false,
+  "confirmable": false,
+  "channels": {"qidian": "supported", "qq": "supported", "wechat": "supported"},
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "session": {"type": "string", "minLength": 1},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
+    }
+  },
+  "result_schema": {"type": "object", "properties": {"items": {"type": "array"}}},
+  "since": "0.1.0"
+}

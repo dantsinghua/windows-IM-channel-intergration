@@ -1,0 +1,19 @@
+{
+  "op": "send_text",
+  "kind": "write",
+  "danger": false,
+  "confirmable": true,
+  "channels": {"qidian": "supported", "qq": "supported", "wechat": "supported"},
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["session", "text"],
+    "additionalProperties": false,
+    "properties": {
+      "session": {"type": "string", "minLength": 1, "description": "session_id({account_id}:{原生ID})或该通道可唯一定位会话的原生标识(02 §2.2.2:一律叫 session)"},
+      "text": {"type": "string", "minLength": 1, "description": "正文;R6-48:须满足 clean_text(text)==text,否则 400 INVALID_ARGS/text_has_control_chars(bus 内容校验,不在 schema 表达)"}
+    }
+  },
+  "result_schema": {"type": "object", "properties": {"message_id": {"type": "string"}, "ext_msg_id": {"type": ["string", "null"]}, "confirmed_by": {"type": ["string", "null"]}}},
+  "since": "0.1.0"
+}
