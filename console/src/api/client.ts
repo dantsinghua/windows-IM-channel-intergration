@@ -379,6 +379,13 @@ export const systemApi = {
    * `kernel/wsl/docker` 后端当前可能恒 `null` —— 页面按「未知」渲染,不写死。
    */
   version: () => request<SystemVersion>('/system/version'),
+
+  /**
+   * #72。🔴 **两种形态(免鉴权摘要、带令牌全量)都不带 `trace_id`,这是规格口径**
+   * (总控 2026-09-21 确认;02 §3.4 通用段 R6-62 (b) 的例外①)——
+   * 前端**不要**据此报错或告警,也不要把它当成「后端漏注入」。
+   * 需要 trace 时用客户端回落的本地 ULID(`http.ts` 的 `recordTrace`)。
+   */
   health: () => request<SystemHealth>('/system/health'),
   env: () => request<SystemEnv>('/system/env'),
 
@@ -563,14 +570,16 @@ export const settingsApi = {
 
   /**
    * #91 新建 API 客户端。
-   * 🔴 **一次性明文令牌**(N-1):走 `requestEnvelope` 拿完整信封,再用 `pickOnceSecret()` 挑键 ——
+   * 🔴 **一次性明文令牌**(N-1):走 `requestEnvelope` 拿完整信封,再用 `pickOnceSecret()` 挑键。
+   * 成功响应是 **R6-55 顶层平铺**(`{ok, app_id, …行字段, token, trace_id}`,**无 `data`**);
    * `request()` 的「有 `data` 就返回 `data`」会把顶层的 `token`/`app_id` 静默丢掉,
    * 而令牌**只下发这一次**,丢了只能删了重建。`token` 为 `null` 说明后端这一版没下发,
    * 页面必须明说「本次没拿到明文,请吊销后重建」,不许显示一个空框假装成功。
    */
   createApiClient: async (body: Record<string, unknown>) => {
     const env = await requestEnvelope<ApiClientRow>('/settings/api-clients', { method: 'POST', body })
-    // 顶层平铺形状下 `data` 是空的 —— 行就在信封顶层,摘掉信封键与明文键即是
+    // 🔴 最终形状 = 顶层平铺(总控 2026-09-21 裁决):`data` 是空的,行就在信封顶层,
+    // 摘掉信封键与明文键即是。读 `env.data` 的那一路仅作防御,保留。
     const { ok: _ok, code: _c, error: _e, trace_id: _t, next_cursor: _n, token: _tk, secret: _s, data: _d, ...flatRow }
       = env as Record<string, unknown>
     const row = (env.data as ApiClientRow | undefined)

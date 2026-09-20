@@ -315,19 +315,21 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
  * 「既包 `data` 又在顶层放业务键」的混合形状会**静默丢键**(与 E-04 同型,本轮 N-1 的前端次责)。
  * 一律先拿完整信封,再自己挑键。
  *
- * ⚠️ **兼容分支(待后端收口后删)**:R6-55 要求「包 `data`」与「顶层平铺」二选一,
- * 后端另一位 agent 正把 #91/#92 收口成「令牌与行同在 `data` 里」的单一形状;
- * 收口前真后端是 `{ok, data:{行}, app_id, token, trace_id}`(两种形状都占)。
- * 这里两形都认 —— 后端收口后,把「顶层」那一路连同本段注释一起删掉。
+ * 🔴 **最终形状已定(总控 2026-09-21 裁决)= R6-55 的顶层平铺**:
+ * `{ok, app_id, token, trace_id, …行字段}`,**没有 `data` 包裹**
+ * (`ApiClient` 不在 00 §7 的对象清单里 ⇒ 该顶层平铺)。**顶层是主路径。**
+ *
+ * 下面的「`data` 内」那一路**仅作防御,保留** —— 不是待删的过渡代码:
+ * 万一哪天某个端点换成包 `data`,这里不会再静默丢掉一把只下发一次的明文。
  */
 export function pickOnceSecret(env: Envelope<unknown>, key: string): string | null {
+  // 主路径:顶层平铺(#91/#92 的最终形状)
+  const top = env[key]
+  if (typeof top === 'string' && top) return top
+  // 防御路径(保留,不删):万一换成包 `data`,明文也不会丢
   const data = isPlainObject(env.data) ? env.data : null
   const inData = data ? data[key] : undefined
   if (typeof inData === 'string' && inData) return inData
-  // ↓↓ 兼容分支:令牌在顶层(后端收口后删这三行) ↓↓
-  const top = env[key]
-  if (typeof top === 'string' && top) return top
-  // ↑↑ 兼容分支结束 ↑↑
   return null
 }
 
