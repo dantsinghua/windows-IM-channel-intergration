@@ -192,6 +192,7 @@ class QidianPoller:
             cutoff_s = boot.value_int / 1000 - HISTORY_GATE_MARGIN_S
             gated = 0
             n_unknown = 0
+            gated_detail: dict[str, list[int]] = {}       # 表名 → [min_time, max_time, n](WARNING 用,R6-51)
             for t in todo:
                 nid = st.table_map[t]
                 kind = "group" if nid.startswith("g_") else "private"
@@ -210,6 +211,8 @@ class QidianPoller:
                 for r in rows:
                     if r.time < cutoff_s:
                         gated += 1
+                        d = gated_detail.setdefault(t, [r.time, r.time, 0])
+                        d[0], d[1], d[2] = min(d[0], r.time), max(d[1], r.time), d[2] + 1
                         continue                    # 历史行:不产出 Message(水位照常越过)
                     m, unknown = st.factory.to_message(r, table=t, native_id=nid, kind=kind)
                     if unknown:
@@ -229,7 +232,9 @@ class QidianPoller:
             if gated or n_unknown:
                 log.info("qidian poll counters account=%s gated=%d n_unknown=%d", acct.id, gated, n_unknown)
                 if gated and self.clock() - boot.value_int > GATED_WARN_AFTER_MS:
-                    log.warning("qidian 历史闸在 bootstrap 10 分钟后仍挡掉 %d 行 account=%s(核对时钟/基准)", gated, acct.id)
+                    detail = "; ".join(f"{t}: {n} 行, time {a}~{b}" for t, (a, b, n) in gated_detail.items())
+                    log.warning("qidian 历史闸在 bootstrap 10 分钟后仍挡掉 %d 行 account=%s cutoff_s=%d(核对时钟/基准)—— %s",
+                                gated, acct.id, int(cutoff_s), detail)
         except MainDbError as e:
             if full:
                 self._fail(acct, st, e.reason)

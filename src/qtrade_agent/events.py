@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .ids import ulid
@@ -16,10 +17,16 @@ from .models import Message
 log = logging.getLogger("qtrade.events")
 
 EVENT_NAMES = ("message", "account_state", "command_done", "alert", "resource", "mail", "net", "workflow", "job")
+TZ_SHANGHAI = timezone(timedelta(hours=8))     # 00 §6:API/事件/邮件用 ISO 8601 带时区偏移;时区固定 Asia/Shanghai
+
+
+def iso8601(ms: int) -> str:
+    """毫秒 epoch → ``2026-09-18T10:03:00+08:00``(00 §6 时间(API/事件/邮件)规则)。"""
+    return datetime.fromtimestamp(ms / 1000, tz=TZ_SHANGHAI).isoformat(timespec="seconds")
 
 
 def message_payload(msg: Message, *, late_after_s: int, origin: Optional[str] = None) -> dict[str, Any]:
-    """落库结构 + 事件专属三字段。``origin`` 只对出向行给(``"rpa"`` / ``"external"``);入向行不带该键。"""
+    """00 §7.4 Message(API 视图:``ts``/``received_at`` 为 ISO 8601)+ 事件专属三字段。``origin`` 只对出向行给(``"rpa"`` / ``"external"``);入向行不带该键。"""
     received_ms = msg.received_ms if msg.received_ms is not None else msg.ts_ms
     lag_s = max(0, (received_ms - msg.ts_ms) // 1000)
     payload: dict[str, Any] = {
@@ -28,7 +35,7 @@ def message_payload(msg: Message, *, late_after_s: int, origin: Optional[str] = 
         "dir": msg.dir, "type": msg.type, "state": msg.state,
         "text": msg.text, "text_len": len(msg.text) if msg.text is not None else None, "fingerprint": msg.fingerprint,
         "media": msg.media, "sender": {"id": msg.sender_id, "name": msg.sender_name}, "self": msg.self,
-        "ts_ms": msg.ts_ms, "received_ms": received_ms, "source": msg.source, "revoked": msg.revoked, "raw_ref": msg.raw_ref,
+        "ts": iso8601(msg.ts_ms), "received_at": iso8601(received_ms), "source": msg.source, "revoked": msg.revoked, "raw_ref": msg.raw_ref,
         "lag_s": lag_s, "late": lag_s > late_after_s,
     }
     if msg.dir == "out" and origin is not None:

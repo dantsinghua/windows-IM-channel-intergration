@@ -156,7 +156,9 @@ class Store:
                 (id, channel, seq, label or id, host, state, login_mode, quota_mb, self_uid, now, now))
 
     def get_account(self, id: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT * FROM accounts WHERE id=? AND deleted_ms IS NULL", (id,)).fetchone()
+        """accounts 行 + account_runtime.app_version(告警 evidence.app_version 的来源;02 §3.7)。"""
+        r = self.con.execute("SELECT a.*, r.app_version AS runtime_app_version FROM accounts a "
+                             "LEFT JOIN account_runtime r ON r.account_id = a.id WHERE a.id=? AND a.deleted_ms IS NULL", (id,)).fetchone()
         return dict(r) if r else None
 
     def set_account_state(self, id: str, state: str, *, state_code: Optional[str] = None,
@@ -272,13 +274,18 @@ class Store:
         assert msg.ext_msg_id is not None, "入向/读回行必须带 ext_msg_id(anchor 路用 fingerprint 作 ext)"
 
         # ② 去重键:先查再插(99c C-03)
-        existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=?",
-                             (msg.account_id, msg.ext_msg_id)).fetchone()
+        if msg.channel == "qq":
+            # QQ message_id 复用(06 §2.9.2 / R6-51):与同键族(原行 + 已有 #n 行)里 **ts 最大的那一行** 比;|ts 差| > 1h 判新、后缀 = 族行数 + 1
+            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND (ext_msg_id=? OR ext_msg_id LIKE ?) "
+                                 "ORDER BY ts_ms DESC, rowid DESC LIMIT 1", (msg.account_id, msg.ext_msg_id, msg.ext_msg_id + "#%")).fetchone()
+        else:
+            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=?",
+                                 (msg.account_id, msg.ext_msg_id)).fetchone()
         if existing is not None:
             if msg.channel == "qq" and abs(msg.ts_ms - existing["ts_ms"]) > QQ_ID_REUSE_MS:
-                n = c.execute("SELECT COUNT(*) FROM messages WHERE account_id=? AND ext_msg_id LIKE ?",
-                              (msg.account_id, msg.ext_msg_id + "#%")).fetchone()[0]
-                return IngestResult(True, False, self._insert_message(c, msg, now, ext_override=f"{msg.ext_msg_id}#{n + 2}"))
+                n = c.execute("SELECT COUNT(*) FROM messages WHERE account_id=? AND (ext_msg_id=? OR ext_msg_id LIKE ?)",
+                              (msg.account_id, msg.ext_msg_id, msg.ext_msg_id + "#%")).fetchone()[0]
+                return IngestResult(True, False, self._insert_message(c, msg, now, ext_override=f"{msg.ext_msg_id}#{n + 1}"))
             changed = False
             if msg.revoked and not existing["revoked"]:
                 c.execute("UPDATE messages SET revoked=1, revoked_ms=COALESCE(?, revoked_ms, ?), revoked_by=COALESCE(?, revoked_by) WHERE id=?",
@@ -436,6 +443,16 @@ class Store:
                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trace_id) DO NOTHING",
                       (trace_id, 1 if ok else 0, code, json.dumps(data, ensure_ascii=False), cost_ms, source, error_message,
                        None if retryable is None else int(retryable), None if needs_human is None else int(needs_human), confirmed_by, confirm_ms, now_ms))
+
+    def backfill_confirm_from_message(self, trace_id: str) -> Optional[dict[str, Any]]:
+        """B-08:probe 命中后把 command_results.confirmed_by/confirm_ms 从该 trace 的出向行派生回填(只补空、code 不改)。返回那条出向行。"""
+        with self._tx() as c:
+            m = c.execute("SELECT id, ext_msg_id, confirmed_by, confirmed_ms, source FROM messages WHERE trace_id=? AND dir='out'", (trace_id,)).fetchone()
+            if m is None or m["confirmed_by"] is None:
+                return dict(m) if m else None
+            c.execute("UPDATE command_results SET confirmed_by=COALESCE(confirmed_by, ?), confirm_ms=COALESCE(confirm_ms, ?) WHERE trace_id=?",
+                      (m["confirmed_by"], m["confirmed_ms"], trace_id))
+            return dict(m)
 
     def get_command_result(self, trace_id: str) -> Optional[dict[str, Any]]:
         r = self.con.execute("SELECT * FROM command_results WHERE trace_id=?", (trace_id,)).fetchone()

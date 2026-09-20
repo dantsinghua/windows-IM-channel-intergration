@@ -120,9 +120,12 @@ async def test_login_gate_rejects_send_without_queue(rig):
     st.set_account_state("qd01", "login_required", state_code="WAIT_SMS")
     res = await bus.submit(Command("qd01", "send_text", {"session": f"qd01:{PEER}", "text": "x"}, idempotency_key="k12"))
     assert res.code == "LOGIN_REQUIRED" and res.error.needs_human and not res.error.retryable
-    assert st.idem_get("qd01", "k12") is None and st.con.execute("select count(*) from commands").fetchone()[0] == 0
+    assert st.idem_get("qd01", "k12") is None                                             # 不写 idempotency
+    rows = st.con.execute("select status, started_ms from commands").fetchall()
+    assert len(rows) == 1 and rows[0]["status"] == "failed" and rows[0]["started_ms"] is None   # B-30/R6-51:留痕但没进队列
+    assert st.get_command_result(res.trace_id)["code"] == "LOGIN_REQUIRED" and st.count_messages("qd01") == 0
     res2 = await bus.submit(Command("qd01", "get_state", {}))
-    assert res2.code != "LOGIN_REQUIRED"                                                   # 屏幕类放行
+    assert res2.code == "OK" and res2.data["state"] == "login_required"                    # 屏幕类放行(R6-51:get_state 返回 OK)
 
 
 async def test_queue_yields_between_send_and_confirm(rig):

@@ -112,7 +112,7 @@ class Bus:
         if row is None:
             return None
         return Account(id=row["id"], channel=row["channel"], state=row["state"], self_uid=row.get("self_uid"),
-                       self_nick=row.get("self_nick"), state_code=row.get("state_code"))
+                       self_nick=row.get("self_nick"), state_code=row.get("state_code"), app_version=row.get("runtime_app_version"))
 
     async def submit(self, cmd: Command) -> CommandResult:
         """同步语义:等到确认结束(或超时)才返回;等待期间不占账号队列(R6-38)。"""
@@ -128,10 +128,20 @@ class Bus:
         if cmd.op not in adapter.capabilities:
             return _err_result("UNSUPPORTED", tid, CommandError(f"{acct.channel} 不支持 {cmd.op}"))
 
-        # 登录门(D-2):登录阶段只放屏幕类;IM 写类直接 LOGIN_REQUIRED,不排队、不写 idempotency
+        # 登录门(D-2):登录阶段只放屏幕类;IM 写类直接 LOGIN_REQUIRED,不排队、不写 idempotency、不写 SENDING 行;
+        # B-30(R6-51 收口):留痕 —— commands 行 status='failed'、started_ms IS NULL(没进队列)+ command_results
         if acct.state in LOGIN_PHASE_STATES and cmd.op not in ALLOWED_IN_LOGIN_PHASE:
-            return _err_result("LOGIN_REQUIRED", tid, CommandError("账号处于登录阶段,需人工完成登录", reason=acct.state_code or acct.state),
-                               state_before=acct.state, state_after=acct.state)
+            res = _err_result("LOGIN_REQUIRED", tid, CommandError("账号处于登录阶段,需人工完成登录", reason=acct.state_code or acct.state),
+                              state_before=acct.state, state_after=acct.state)
+            now = self.clock()
+            self.store.insert_command(trace_id=tid, account_id=acct.id, op=cmd.op, args_json=json.dumps(redact_args(cmd.args), ensure_ascii=False),
+                                      idempotency_key=cmd.idempotency_key, confirm=cmd.confirm, timeout_ms=cmd.timeout_ms,
+                                      transport=cmd.origin.transport, actor=cmd.origin.actor, ip=cmd.origin.ip, now_ms=now)
+            self.store.finish_command(trace_id=tid, ok=False, code="LOGIN_REQUIRED", data={}, cost_ms=0, source=None,
+                                      error_message=res.error.message, retryable=False, needs_human=True, confirmed_by=None, confirm_ms=None, now_ms=now)
+            self.events.emit("command_done", payload={"trace_id": tid, "code": "LOGIN_REQUIRED", "cost_ms": 0, "ok": False},
+                             account_id=acct.id, channel=acct.channel, trace_id=tid, now_ms=now)
+            return res
 
         # 参数校验(02 §3.10 + R6-48):失败不进 commands、不占幂等键
         err = validate_args(cmd.op, cmd.args)
@@ -161,9 +171,12 @@ class Bus:
                         return CommandResult(ok=res.ok, code="IDEMPOTENT_REPLAY", trace_id=res.trace_id, data=res.data, source=res.source)
                     row = dict(row, status="ABANDONED")
                 if row["status"] == "ABANDONED":
-                    if await adapter.confirm_probe(acct, cmd):        # 上次其实已发
+                    if await adapter.confirm_probe(acct, cmd):        # 上次其实已发(只查本库:出向行是否已被 ingest 合并成 DELIVERED)
                         self.store.idem_finish(account_id=acct.id, key=key, status="DONE", result_code="DELIVERED", now_ms=now)
-                        return CommandResult(ok=True, code="IDEMPOTENT_REPLAY", trace_id=row["trace_id"])
+                        # B-08:command_results.confirmed_by 由 probe 回填——回填到**首次**那条 trace(从 messages.confirmed_by 派生,code 不改写)
+                        m = self.store.backfill_confirm_from_message(row["trace_id"])
+                        data = {"message_id": m["id"], "ext_msg_id": m["ext_msg_id"], "confirmed_by": m["confirmed_by"]} if m else {}
+                        return CommandResult(ok=True, code="IDEMPOTENT_REPLAY", trace_id=row["trace_id"], data=data, source=m.get("source") if m else None)
                     self.store.idem_delete(acct.id, key)
             if not self.store.idem_claim(account_id=acct.id, key=key, op=cmd.op, args_hash=args_hash, trace_id=tid, now_ms=now,
                                          ttl_days=self.cfg.bus.idempotency_ttl_days):

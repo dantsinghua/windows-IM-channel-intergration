@@ -253,6 +253,32 @@ FORBIDDEN = [
      "R6-15:hosts 是逐行行尾标记(04 §2.5.4),不是围栏块。"),
 ]
 
+# R6-51(首批验收发现):「入向撞到自己发的」合并窗在 06 §2.12 表里是配置项 out_merge_window_s,同节下文与 02 §2.8.1 却写死 60s;
+# 配置一改两处分叉。⚠️ 这条**不能**放进 FORBIDDEN:那两句必含「不插第二行」之类否定词,行级 NEGATION 整行跳过 ⇒ 永不红
+# (2026-09-19 首跑实测又抓到一条空规则),故单列成 ⑫ 不走 NEGATION。反向验证:R8 改前备份上 02/06 各 1 处 ⇒ 红。
+MERGE_WINDOW_LITERAL = r"\|ts 差\| ≤ 60s"
+
+
+def check_merge_window_literal():
+    red = []
+    print()
+    print("=" * 78)
+    print("⑫ LITERAL —— 出向合并窗不得写死「|ts 差| ≤ 60s」(唯一出处 02 §7.1 [bus] out_merge_window_s,R6-51)")
+    print("=" * 78)
+    hits = []
+    for f in sorted(glob.glob(os.path.join(HERE, "0[1-7]-*.md"))):
+        for i, ln in enumerate(lines_of(io.open(f, encoding="utf-8").read()), 1):
+            if re.search(MERGE_WINDOW_LITERAL, ln):
+                hits.append((os.path.basename(f)[:2], i, ln.strip()[:110]))
+    if hits:
+        red.append("出向合并窗写死 60s")
+        print(f"  ❌ 字面「|ts 差| ≤ 60s」仍在 —— {len(hits)} 处(改配置后与 out_merge_window_s 分叉)")
+        for vol, i, ln in hits[:6]:
+            print(f"       {vol}:{i}  {ln}")
+    else:
+        print("  ✅ 现行册无字面 60s 合并窗,全部引用 [bus] out_merge_window_s")
+    return red
+
 # ---------------------------------------------------------------- PAIRED
 # (标题, 声明方文件, 声明方正则, 消费方文件, 消费方正则, 说明)
 PAIRED = [
@@ -918,6 +944,7 @@ def main():
     red += check_dynamic_sets()
     red += check_qidian_confirm_window()
     red += check_norm_definition()
+    red += check_merge_window_literal()
     red += check_versions()
     print()
     print("=" * 78)

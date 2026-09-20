@@ -42,7 +42,11 @@ class QidianAdapter:
         return acct.state
 
     async def execute(self, acct: Account, cmd: Command) -> CommandResult:
-        return CommandResult(ok=False, code="UNSUPPORTED", trace_id=cmd.trace_id or "")
+        if cmd.op == "get_state":          # 只读:00 §8.1 状态 + 05 维护的 state_code;登录阶段也放行(02 §2.2.2 登录门)
+            return CommandResult(ok=True, code="OK", trace_id=cmd.trace_id or "", source="ui",
+                                 data={"state": acct.state, "state_code": acct.state_code, "self_uid": acct.self_uid})
+        # read_messages / list_sessions / screenshot 的执行层(控件树/截图/读库查询)本期未接
+        return CommandResult(ok=False, code="UNSUPPORTED", trace_id=cmd.trace_id or "", source="ui")
 
     async def send(self, acct: Account, cmd: Command) -> CommandResult:
         native_id = cmd.args["session"].split(":", 1)[1] if cmd.args["session"].startswith(acct.id + ":") else cmd.args["session"]
