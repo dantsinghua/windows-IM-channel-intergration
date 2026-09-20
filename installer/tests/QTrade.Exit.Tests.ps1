@@ -73,7 +73,7 @@ Describe 'QTrade.Exit —— 状态机键名(基线 §8.2 / docs/03 §2.3)' {
         (Get-QtStateChain)[-1] | Should -Be 'DONE'
     }
 
-    It 'FAILED:<步名>:<原因码> 组装格式' {
+    It 'FAILED:«步名»:«原因码» 组装格式' {
         New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason 'E_INSTALL_KERNEL_NO_BINDER' | Should -Be 'FAILED:KERNEL_VERIFIED:KERNEL_NO_BINDER'
         New-QtFailedState -Step 'IMAGES_LOADED' -Reason 'DISK_FULL' | Should -Be 'FAILED:IMAGES_LOADED:DISK_FULL'
     }

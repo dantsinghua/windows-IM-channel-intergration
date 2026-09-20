@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """安装器 ↔ 规格 的逐字对账。
 
 规格唯一出处 = ``docs/03-安装引导与自动化配置.md``:
@@ -66,7 +66,15 @@ def parse_qt_switches(doc: str) -> set[str]:
     fence = block.index("```")
     end = block.index("```", fence + 3)
     code = block[fence + 3 : end]
-    return set(re.findall(r"(/QT_[A-Z_]+)", code))
+    # 🔴 代码块里有「**禁止**自造某个开关」的说明(R6-58 co 给 `--restore-data` 加的那条:
+    #    「⚠️ 它是成对参数,**不是** /QT_* 开关 …… 不要自造 `/QT_RESTORE_DATA=`」)。
+    #    照字面抓 /QT_* 会把这个**被禁止的名字**当成规格要求的开关,然后反过来逼引擎去声明它 ——
+    #    正好做了规格明令不要做的事。所以每行在「不要自造」处截断。
+    lines = []
+    for line in code.splitlines():
+        cut = line.find("不要自造")
+        lines.append(line if cut < 0 else line[:cut])
+    return set(re.findall(r"(/QT_[A-Z_]+)", "\n".join(lines)))
 
 
 def parse_state_names(doc: str) -> set[str]:
@@ -343,8 +351,20 @@ def test_wslconfig_is_written_only_without_bom() -> None:
     assert "New-Object Text.UTF8Encoding($false)" in native
     for p in _script_files():
         text = read(p)
-        if "UTF8Encoding($true)" in text and "Tests" not in p.name:
+        # sfx-stub/ 是打包期工具:它把补丁写回 **C++ 源码**,那里必须带 BOM
+        # (否则 cl.exe 按 GBK 解析补丁里的中文注释)。它从不碰 .wslconfig ——
+        # 这一点由 test_sfx_stub_never_touches_wslconfig 另行兜住。
+        if "UTF8Encoding($true)" in text and "Tests" not in p.name and "sfx-stub" not in p.parts:
             pytest.fail(f"{p.name} 里出现了带 BOM 的 UTF8Encoding($true)")
+
+
+def test_sfx_stub_never_touches_wslconfig() -> None:
+    """上面放行了 sfx-stub 的 BOM 写法,这里把放行的边界钉死:
+    它只写 C++ 源码,绝不碰 .wslconfig / 内核 / WSL 任何东西。"""
+    for name in ("QTrade.SfxStub.psm1", "fetch-sdk.ps1", "build.ps1"):
+        text = read(INSTALLER_ROOT / "sfx-stub" / name)
+        for forbidden in (".wslconfig", "wsl.exe", "wsl --", "kernel="):
+            assert forbidden not in text, f"sfx-stub/{name} 不该出现 {forbidden}"
 
 
 def test_binder_check_command_has_no_double_quote() -> None:
@@ -796,3 +816,270 @@ def test_cmd_files_are_crlf_ascii_no_bom() -> None:
             if not line.strip() or line.lstrip().lower().startswith("rem"):
                 continue
             assert line.isascii(), f"{p.name}:{i} 可执行行含非 ASCII:{line.strip()}"
+
+
+# ── 自编 SFX 存根(第五批)────────────────────────────────────────────────
+SFX_STUB_DIR = INSTALLER_ROOT / "sfx-stub"
+SFX_PATCH = SFX_STUB_DIR / "qtrade-sfx.patch"
+SFX_STUB_PSM1 = SFX_STUB_DIR / "QTrade.SfxStub.psm1"
+
+# 自编存根 = 官方 7 键 + InstallPath。多一个键都不行:多出来的仍然会被静默忽略。
+QTRADE_SFX_KEYS = OFFICIAL_SFX_KEYS | {"InstallPath"}
+
+
+def _read_bytes_text(path: Path) -> str:
+    """补丁文件里内容行带着源码的 CR(对 diff 来说 CR 是行内容),按原样读。"""
+    return path.read_bytes().decode("utf-8")
+
+
+def _config_keys(name: str) -> set[str]:
+    cfg = read(INSTALLER_ROOT / "build" / name)
+    out = set()
+    for line in cfg.splitlines():
+        s = line.strip()
+        if not s or s.startswith(";"):
+            continue
+        m = re.match(r"^([A-Za-z_]+)\s*=", s)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def test_qtrade_sfx_config_adds_exactly_installpath() -> None:
+    """自编存根只比官方多认一个键。这条把「补丁改了什么」和「配置敢写什么」焊在一起:
+    以后谁想再往配置里加 GUIMode/OverwriteMode 之类,这里就会红。"""
+    keys = _config_keys("sfx-config-qtrade.txt")
+    assert keys, "sfx-config-qtrade.txt 一个键都没解析到"
+    extra = sorted(keys - QTRADE_SFX_KEYS)
+    assert not extra, f"自编存根也不认这些键(它们是 7zsfxmm 的):{extra}"
+    assert "InstallPath" in keys, "自编存根的全部价值就在 InstallPath 上,缺了等于白编"
+
+
+def test_official_config_still_has_no_installpath() -> None:
+    """🔴 两份配置绝不能混用:官方存根遇到 InstallPath 是**静默忽略**,
+    装到现场才暴露(载荷解到 %TEMP%、跑完即删)。"""
+    assert "InstallPath" not in _config_keys("sfx-config.txt")
+
+
+def test_each_stub_points_at_its_own_chain_head() -> None:
+    r"""存根 / 配置 / 链首脚本三者必须配套:
+      * 官方存根不搬运 -> 链首必须是 precheck-disk.cmd(它来搬);
+      * 自编存根已经解到 %ProgramData%\QTrade 并留存 -> 链首是 run-engine.cmd(只拉引擎)。
+    """
+    official = read(INSTALLER_ROOT / "build" / "sfx-config.txt")
+    qtrade = read(INSTALLER_ROOT / "build" / "sfx-config-qtrade.txt")
+    assert 'RunProgram="install\\\\engine\\\\precheck-disk.cmd"' in official
+    assert 'RunProgram="install\\\\engine\\\\run-engine.cmd"' in qtrade
+
+
+def test_run_engine_cmd_does_not_stage_anything() -> None:
+    """自编存根路径下链首**不搬运** —— 搬运是官方存根路径的补偿动作。
+    如果这里也搬,等于把已经解对位置的载荷再挪一遍,纯属自找麻烦。"""
+    code = "\n".join(
+        line for line in read(INSTALLER_ROOT / "engine" / "run-engine.cmd").splitlines()
+        if line.strip() and not line.lstrip().lower().startswith("rem")
+    )
+    assert "robocopy" not in code, "run-engine.cmd 不该搬运"
+    assert "move /Y" not in code, "run-engine.cmd 不该搬运"
+    assert "last-exit-code.txt" in code, "退出码仍要落盘存证"
+    assert "qtrade-setup-engine.exe" in code, "链首总得把引擎拉起来"
+
+
+def test_patch_adds_installpath_key() -> None:
+    """补丁改动 (a):存根必须真的去读 InstallPath 这个配置键。
+    (配置里写了、存根不读 —— 这正是官方存根的坑,别在自己身上重演。)"""
+    patch = _read_bytes_text(SFX_PATCH)
+    added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
+    assert 'GetTextConfigValue(pairs, "InstallPath")' in added, \
+        "补丁没有新增读取 InstallPath 的代码"
+    assert "QTrade_ExpandInstallPath" in added, "InstallPath 要支持 %ProgramData% 这类环境变量展开"
+    assert "ExpandEnvironmentStringsW" in added
+
+
+def test_patch_propagates_child_exit_code() -> None:
+    """🔴 补丁改动 (b):官方存根末尾硬编码 `return 0`,子进程退 26 它照样退 0。
+    §8b 的验收判据几乎全是退出码 —— 不透传等于「全 0 = 全部看起来成功」。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
+    removed = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("-") and not l.startswith("---"))
+    assert "GetExitCodeProcess" in added, "补丁没有取子进程退出码"
+    assert "return (int)exitCode;" in added, "取了却没拿它当自己的退出码"
+    assert re.search(r"^\s*return 0;\s*$", removed, re.M), "原来那句硬编码 return 0 没被删掉"
+
+
+def test_patch_disk_low_matches_spec_exit_code(doc03: str) -> None:
+    """存根里那个「解压前空间不足」的退出码,必须逐字等于 §3.4 的 E_INSTALL_DISK_LOW。"""
+    codes = parse_exit_codes(doc03)
+    patch = _read_bytes_text(SFX_PATCH)
+    m = re.search(r"kQTradeExitDiskLow\s*=\s*(\d+)", patch)
+    assert m, "补丁里找不到 kQTradeExitDiskLow"
+    assert int(m.group(1)) == codes["E_INSTALL_DISK_LOW"], \
+        f"存根用了 {m.group(1)},规格是 {codes['E_INSTALL_DISK_LOW']}"
+
+
+def test_patch_space_threshold_is_6gib_and_10_percent() -> None:
+    """门槛 = max(6 GiB, 解包总大小 x 1.1)。6 GiB 来自 §2.1 的硬下限,
+    x1.1 是解压期余量。两个数都必须能在代码里看见。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "((UInt64)6) << 30" in patch, "6 GiB 下限不见了"
+    assert "unpackSize + unpackSize / 10" in patch, "x1.1 余量不见了"
+    assert "QTrade_GetRequiredBytes" in patch
+
+
+def test_patch_checks_space_before_creating_target_dir() -> None:
+    """🔴 判空间必须在 CreateComplexDir 之前 —— 空间不足时连目标目录都不该建出来,
+    否则留下一个空壳目录,下次跑 precheck 还以为装过。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    # `CreateComplexDir(dirPath)` 落在 hunk 的三行上下文窗口之外,抓不到;
+    # 用紧挨着它的 `FString dirPath = DestFolder;` 当锚 —— 目录就是从这行往下建的。
+    i_check = patch.index("QTrade_GetFreeSpace(DestFolder")
+    i_dir = patch.index("FString dirPath = DestFolder;")
+    assert i_check < i_dir, "空间判据跑到建目录后面去了"
+    # 且判据那一支是直接 return,不往下走
+    block = patch[i_check:i_dir]
+    assert "NoSpace = true;" in block and "return;" in block
+
+
+def test_patch_touches_only_the_sfxsetup_bundle() -> None:
+    """补丁只改 SFXSetup 这一个目录的三个文件 —— 绝不碰 SDK 的公共代码,
+    否则下次升 SDK 版本就是一场灾难。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    files = sorted(set(re.findall(r"^\+\+\+ b/(.+?)\s*$", patch, re.M)))
+    assert files == [
+        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp",
+        "CPP/7zip/Bundles/SFXSetup/ExtractEngine.h",
+        "CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp",
+    ], f"补丁碰了计划外的文件:{files}"
+
+
+def test_sdk_source_is_pinned_by_sha256() -> None:
+    """第三方源码只按 sha256 取。摘要写死在模块里,fetch 脚本从模块读 —— 只有一处真值。"""
+    psm1 = read(SFX_STUB_PSM1)
+    assert "317DD834D6BBFD95433488B832E823CD3D4D420101436422C03AF88507DD1370" in psm1
+    fetch = read(SFX_STUB_DIR / "fetch-sdk.ps1")
+    assert "Assert-QtSha256" in fetch, "fetch 脚本必须先校验再解压"
+    assert re.search(r"Assert-QtSha256[\s\S]{0,400}?7z", fetch) or \
+           fetch.index("Assert-QtSha256") < fetch.index("$args7z"), "校验必须发生在解压之前"
+
+
+def test_stub_build_never_self_installs_toolchain() -> None:
+    """🔴 禁区:缺工具链就报缺,不代装。"""
+    build = read(SFX_STUB_DIR / "build.ps1")
+    psm1 = read(SFX_STUB_PSM1)
+    code = strip_comments(build) + "\n" + strip_comments(psm1)
+    # 🔴 这里要区分「**打印**一条给人看的安装指引」和「**执行**安装」。
+    #    前者正是我们要的(缺件时告诉人怎么补),后者才是禁区。
+    #    所以只看那些不是在往输出里塞字符串的行。
+    emits = re.compile(r"AppendLine|Write-Host|Write-Output|Write-Warning|throw|-HowTo")
+    for line in code.splitlines():
+        if emits.search(line):
+            continue
+        for forbidden in ("choco install", "winget install", "vs_buildtools.exe", "Start-BitsTransfer"):
+            assert forbidden not in line, f"构建脚本里出现了自行安装动作:{line.strip()}"
+    assert "不会自行安装" in psm1, "缺件说明里要写明不自行安装"
+
+
+def test_build_supports_both_stubs() -> None:
+    """两条出包路径都要在 build.ps1 里保留,且各有各的 G5 白名单。"""
+    b = read(INSTALLER_ROOT / "build" / "build.ps1")
+    assert "$StubKind" in b
+    assert "'qtrade'" in b and "'official'" in b
+    assert "sfx-config-qtrade.txt" in b and "sfx-config.txt" in b
+    assert "run-engine.cmd" in b and "precheck-disk.cmd" in b
+    assert "Test-QtSfxStubBinary" in b, \
+        "缝自编存根前必须验二进制 —— 防「把官方存根改名成 QTradeSD.sfx」"
+
+
+def test_patch_space_check_only_applies_to_installpath_path() -> None:
+    """🔴 「无 InstallPath 时保持官方原行为」是安琳给的硬要求。
+    空间判据如果无条件生效,一个 200 MB 的普通 SFX 包在只剩 5 GB 的机器上
+    会被凭空拦下 —— 那就不是「逐字一致」了。判据必须由调用方按需开启。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "bool checkSpace" in patch, "ExtractArchive 缺 checkSpace 形参"
+    assert "if (CheckSpace && archive)" in patch, "判据没有被 CheckSpace 守住"
+    assert "!installPath.IsEmpty(), isCorrupt, noSpace" in patch, \
+        "调用方没有把「是否走 InstallPath」传进去"
+
+
+def test_patch_leaves_no_fake_zero_exit() -> None:
+    """补丁 (b) 的全部意义是消灭「假 0」。拿不到进程句柄时也不能退 0,
+    否则等于自己在补丁里又留了一条。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "DWORD exitCode = 1;" in patch, \
+        "exitCode 初值必须是非 0 —— 初值 0 会在 hProcess 为空时退 0(假成功)"
+
+
+def test_patch_unpins_install_root_from_the_stub_process() -> None:
+    r"""进程的当前目录会钉住该目录(句柄不含 DELETE 共享权限)。
+    存根若把当前目录留在 %ProgramData%\QTrade,引擎给安装根改名/回滚删除时
+    会拿到 ERROR_SHARING_VIOLATION —— 原版因为目标是临时目录,从不会碰上。"""
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "GetSystemDir(sysDir)" in patch and "SetCurrentDir(sysDir)" in patch, \
+        "子进程起来后没有把存根自身的当前目录挪出安装根"
+
+
+def test_stub_build_gates_source_bom() -> None:
+    """🔴 打过补丁的源码必须带 BOM(补丁里有中文注释 + 7-Zip 用 -WX)。
+    这道门挡的是「改用 GNU patch / git apply」那条路 —— 它们不加 BOM,
+    而且只在非 936 代码页的机器上才炸,是最难查的一类。"""
+    build = read(SFX_STUB_DIR / "build.ps1")
+    assert "0xEF" in build and "0xBB" in build and "0xBF" in build
+    assert "C4819" in build, "要在报错里点名 C4819,不然下一个人看不懂为什么"
+
+
+def test_pester_names_have_no_placeholder_brackets() -> None:
+    r"""🔴 Pester 5 把 It/Describe/Context 名字里的 `<xxx>` 当**数据占位符**,
+    渲染时展开成 `$xxx`。run-pester.ps1 开着 StrictMode,未定义的变量直接抛 ——
+    于是测试本体明明是对的,却以 `RuntimeException: 检索不到变量"$步名"` 失败,
+    而且**只在渲染测试名的详细输出路径上**才炸,用 Verbosity=None 跑还是绿的。
+    这类假红极难查,所以在这里一次性堵死:名字里想写尖括号就用 « »。
+    """
+    pat = re.compile(r"""^\s*(?:It|Describe|Context)\s+(['"])(.*?)\1\s*\{""")
+    placeholder = re.compile(r"<[^<>\s/]+>")
+    bad = []
+    for p in sorted((INSTALLER_ROOT / "tests").glob("*.Tests.ps1")):
+        for i, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            m = pat.match(line)
+            if m and placeholder.search(m.group(2)):
+                bad.append(f"{p.name}:{i}: {m.group(2)}")
+    assert not bad, "这些测试名会被 Pester 当占位符展开:" + "; ".join(bad)
+
+
+def test_restore_data_is_a_paired_arg_not_a_qt_switch(doc03: str) -> None:
+    """🔴 R6-58 (co):`--restore-data <tar>` 是**成对参数**,不是 `/QT_*` 开关。
+    规格在命令行块里专门写了「不要自造 `/QT_RESTORE_DATA=`」—— 那是给实现方的禁令,
+    不是给解析器的输入。这条同时钉住两件事:解析器不把它当开关、引擎也没有自造它。"""
+    assert "/QT_RESTORE_DATA" not in parse_qt_switches(doc03), \
+        "解析器把规格明令禁止的开关名当成了要求"
+    assert "--restore-data" in doc03
+    iss_text = read(ISS)
+    assert "QT_RESTORE_DATA" not in iss_text, ".iss 自造了规格明令禁止的 /QT_RESTORE_DATA"
+    # 但执行体必须在:§2.13 的还原动作
+    upgrade = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.Upgrade.psm1")
+    assert "function Restore-QtAgentData" in upgrade
+
+
+def test_r6_58_cm_selfbuilt_stub_is_primary_and_fallback_warns(doc03: str) -> None:
+    """🔴 R6-58 (cm):外壳的**正路**是自编存根;官方存根只是回退路径,
+    而且「构建脚本必须在用回退路径时显式打出这条警告,不许静默降级」。"""
+    assert "QTradeSD.sfx" in doc03, "规格已把自编存根写成正路"
+    b = read(INSTALLER_ROOT / "build" / "build.ps1")
+    # 缺省 -Stub auto:有自编存根就用自编的
+    assert "$Stub -eq 'auto' -and (Test-Path -LiteralPath $QtStubFile)" in b, \
+        "auto 模式没有优先选自编存根"
+    # 回退时必须打警告,且点名「退出码不可作判据」
+    assert "不透传退出码" in b and "last-exit-code.txt" in b, \
+        "走官方存根回退路径时没有显式警告 —— 规格不许静默降级"
+
+
+def test_r6_58_cn_sfx_extract_no_longer_maps_to_123(doc03: str) -> None:
+    """🔴 R6-58 (cn):「SFX 解压」已从 123(DISK_FULL)的枚举里移出 ——
+    解压前判据「一个字节都没写、直接拒」属于 26,不该显示成「可续跑」。"""
+    block = _slice(doc03, "**退出码**(与 §8.2 状态一一对应", "\n---\n")
+    row = [l for l in block.splitlines() if re.match(r"^\|\s*123\s*\|", l)]
+    assert row, "§3.4 里找不到 123 那一行"
+    head = row[0].split("🔴")[0]
+    assert "SFX 解压" not in head, "123 的枚举里仍然列着 SFX 解压"
+    # 存根侧:解压前空间不足退的是 26
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "kQTradeExitDiskLow = 26" in patch

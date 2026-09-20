@@ -1,0 +1,34 @@
+;!@Install@!UTF-8!
+; ============================================================================
+;  QTrade 自解压外壳配置 —— **自编存根 QTradeSD.sfx 专用**(docs/03 §2.1)
+;
+;  与 sfx-config.txt(官方 7zSD.sfx 用)的区别只有一条:多一个 `InstallPath`。
+;  这个键是第五批重编存根时加进去的(installer/sfx-stub/qtrade-sfx.patch 改动 a),
+;  官方存根**没有**它、而且是静默忽略 —— 所以两份配置绝对不能混用,
+;  build.ps1 的 G5 门会按「实际要缝进去的存根」切换白名单来卡这件事。
+;
+;  自编存根在这份配置下的行为:
+;    1. 解压到 `%ProgramData%\QTrade\` 并**留存**(续跑/升级/修复/卸载都要它);
+;    2. 解压**之前**先判该卷可用空间,门槛 max(6 GiB, 解包总大小 x 1.1),
+;       不足则一个字节都不解、直接退 26(E_INSTALL_DISK_LOW);
+;    3. 跑完 RunProgram 后**透传子进程退出码**(官方存根恒退 0)。
+;
+;  因为存根自己就解压到位了,RunProgram 不再需要搬运,链首简化成
+;  run-engine.cmd:拉引擎 + 把退出码落盘存证。
+;
+;  🔴 白名单(自编存根认识的 8 个键):
+;     Title / BeginPrompt / Progress / Directory / RunProgram /
+;     ExecuteFile / ExecuteParameters / InstallPath
+;     除此之外的键(GUIMode / OverwriteMode / ExtractTitle / GUIFlags …)
+;     仍然是 7zsfxmm 的,自编存根一样不认、一样静默忽略。
+;
+;  值里的 `\\` 会被 7-Zip 的 TextConfig 解析成单个 `\`(源码 Common/TextConfig.cpp
+;  对 \\ \n \t \" 做反转义),所以路径必须写双反斜杠。
+;  `%ProgramData%` 由存根在运行期用 ExpandEnvironmentStringsW 展开。
+; ============================================================================
+
+Title="QTrade 安装程序"
+Progress="yes"
+InstallPath="%ProgramData%\\QTrade"
+RunProgram="install\\engine\\run-engine.cmd"
+;!@InstallEnd@!

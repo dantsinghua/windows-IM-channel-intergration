@@ -182,7 +182,7 @@ Describe '🔴 §2.13 第 4 步:没备份成功绝不 --unregister' {
         (Backup-QtAgentData -WslDir 'X:\wsl').Ok | Should -BeFalse
     }
 
-    It 'tar 成功 → 回 data-backup-<ts>.tar' {
+    It 'tar 成功 → 回 data-backup-«ts».tar' {
         Mock -ModuleName QTrade.Upgrade New-QtDirectory { $Path }
         Mock -ModuleName QTrade.Upgrade Invoke-QtWsl { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
         Mock -ModuleName QTrade.Upgrade Test-QtPath { $true }

@@ -97,7 +97,7 @@ Describe 'manifest 逐文件 sha256(§2.1「两层都过才算 PAYLOAD_STAGED」
         (Expand-QtPayloadPath -File $e -StageRoot 'X:\stage') | Should -Be (Join-Path $env:ProgramData 'QTrade\kernel\bzImage-6.6')
     }
 
-    It 'dest 缺省或是文档里的省略号 → 落回 <stage>\<path>' {
+    It 'dest 缺省或是文档里的省略号 → 落回 «stage»\«path»' {
         $e = [pscustomobject]@{ path = 'wsl/rootfs.tar'; dest = '…\wsl\rootfs.tar' }
         (Expand-QtPayloadPath -File $e -StageRoot 'X:\stage') | Should -Be 'X:\stage\wsl\rootfs.tar'
     }

@@ -60,7 +60,7 @@ Describe 'install_state —— schema 与原子写' {
         $s.history[0].note | Should -Be 'enabled'
     }
 
-    It '可以迁到 FAILED:<步>:<码>' {
+    It '可以迁到 FAILED:«步»:«码»' {
         $s = New-QtInstallState -PackageVersion '1.0.0'
         Set-QtState -State $s -To (New-QtFailedState -Step 'PRECHECK' -Reason 'DISK_LOW') | Out-Null
         $s.state | Should -Be 'FAILED:PRECHECK:DISK_LOW'
@@ -94,7 +94,7 @@ Describe 'parked —— 停车不是状态(§2.3 图末行,C-36)' {
 
 Describe '可重入 —— Get-QtResumeStep(§2.3 可重入总则 / §2.12)' {
 
-    It 'FAILED:<步> → 重做该步' {
+    It 'FAILED:«步» → 重做该步' {
         Get-QtResumeStep -State 'FAILED:IMAGES_LOADED:DISK_FULL' | Should -Be 'IMAGES_LOADED'
         Get-QtResumeStep -State 'FAILED:PRECHECK:DISK_LOW' | Should -Be 'PRECHECK'
     }
@@ -162,7 +162,7 @@ Describe '幂等判据注册表(§2.3「已完成判据」列)' {
 
 Describe 'RunOnce —— 恒指向落盘引擎(§2.12)' {
 
-    It '值写成 "<engine>" /QT_MODE=resume' {
+    It '值写成 "«engine»" /QT_MODE=resume' {
         Mock -ModuleName QTrade.State Set-QtRegistryValue { }
         $s = New-QtInstallState -PackageVersion '1.0.0'
         $v = Set-QtRunOnce -State $s -EnginePath 'C:\ProgramData\QTrade\install\engine\qtrade-setup-engine.exe'

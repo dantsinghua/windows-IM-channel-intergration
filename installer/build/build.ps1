@@ -16,6 +16,9 @@ param(
     [string] $IsccPath = '',
     [string] $SevenZipPath = '',
     [string] $SfxStubPath = '',
+    # auto = 有自编存根就用自编的,没有就回退官方存根(方案 B 搬运路径)
+    [ValidateSet('auto', 'qtrade', 'official')]
+    [string] $Stub = 'auto',
     [switch] $AllowMissing,
     [switch] $CheckOnly,
     [switch] $SelfCheck,
@@ -68,14 +71,57 @@ $SevenZip = Find-QtTool -Explicit $SevenZipPath -Name '7z.exe' -Param '-SevenZip
     "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
     "$env:ProgramData\chocolatey\tools\7z.exe"
 )
-# 🔴 SFX 存根(7zSD.sfx / 7zS2.sfx)不在 7-Zip 主安装包里,要单独取 7-Zip Extra 或 LZMA SDK
-$SfxStub = Find-QtTool -Explicit $SfxStubPath -Name '7zSD.sfx' -Param '-SfxStubPath' `
-    -HowTo '🔴 SFX 存根**不在 7-Zip 主安装包里**:从**官方 LZMA SDK**(lzma<ver>.7z)或 7-Zip Extra 里解出 7zSD.sfx 放进 installer\build\。⚠️ 要官方件,**不要**第三方改版 7zsfxmm(理由见 build/README §8)' -Candidates @(
+# ── SFX 存根:两条路都保留,各有各的配置、各有各的链首脚本、各有各的 G5 白名单 ──
+#
+#   qtrade   自编 QTradeSD.sfx(installer/sfx-stub/build.ps1 出)
+#            认 InstallPath -> 直接解到 %ProgramData%\QTrade 并留存;
+#            解压前判空间(不足退 26);**透传子进程退出码**。
+#            链首 = run-engine.cmd(只拉引擎 + 落盘退出码)。
+#   official 官方 7zSD.sfx(LZMA SDK / 7-Zip Extra)
+#            只解到 %TEMP% 且跑完即删、退出码恒 0(第四批哑 EXE 实测坐实)。
+#            链首 = precheck-disk.cmd(判空间 + 搬运到 %ProgramData%\QTrade + 拉引擎)。
+#
+# 🔴 存根、配置、链首脚本这三样必须**配套**。配错的后果不是报错,是静默跑偏:
+#    官方存根遇到 InstallPath 会直接忽略它,于是载荷解到 %TEMP%、跑完即删。
+#    所以下面把三者绑成一个对象,G5 按它切换白名单。
+$QtStubFile     = Join-Path $BuildDir 'QTradeSD.sfx'
+$OfficialStubs  = @(
     (Join-Path $BuildDir '7zSD.sfx')
     (Join-Path $BuildDir '7zS2.sfx')
     "$env:ProgramFiles\7-Zip\7zSD.sfx"
     "$env:ProgramFiles\7-Zip\7z.sfx"
 )
+
+$StubKind = 'official'
+if ($SfxStubPath) {
+    # 显式指定时,按文件名判类型(QTradeSD.sfx = 自编);G5 之后还会验二进制自证
+    $StubKind = if ((Split-Path -Leaf $SfxStubPath) -ieq 'QTradeSD.sfx') { 'qtrade' } else { 'official' }
+    if ($Stub -ne 'auto') { $StubKind = $Stub }
+    $SfxStub = Find-QtTool -Explicit $SfxStubPath -Name 'QTradeSD.sfx' -Param '-SfxStubPath' `
+        -HowTo '检查 -SfxStubPath 指的路径' -Candidates @()
+}
+elseif ($Stub -eq 'qtrade' -or ($Stub -eq 'auto' -and (Test-Path -LiteralPath $QtStubFile))) {
+    $StubKind = 'qtrade'
+    $SfxStub = Find-QtTool -Explicit '' -Name 'QTradeSD.sfx' -Param '-SfxStubPath' `
+        -HowTo '自编存根:cd installer\sfx-stub; .\fetch-sdk.ps1 -Proxy <代理>; .\build.ps1(需要 MSVC C++ 工具集)' `
+        -Candidates @($QtStubFile)
+}
+else {
+    $SfxStub = Find-QtTool -Explicit '' -Name '7zSD.sfx' -Param '-SfxStubPath' `
+        -HowTo '🔴 SFX 存根**不在 7-Zip 主安装包里**:从**官方 LZMA SDK**(lzma<ver>.7z)或 7-Zip Extra 里解出 7zSD.sfx 放进 installer\build\。⚠️ 要官方件,**不要**第三方改版 7zsfxmm(理由见 build/README §8)' `
+        -Candidates $OfficialStubs
+}
+
+# 存根类型决定的那三样
+if ($StubKind -eq 'qtrade') {
+    $SfxConfigName = 'sfx-config-qtrade.txt'
+    $ChainHeadName = 'run-engine.cmd'
+    $SfxAllowedKeys = @('Title', 'BeginPrompt', 'Progress', 'Directory', 'RunProgram', 'ExecuteFile', 'ExecuteParameters', 'InstallPath')
+} else {
+    $SfxConfigName = 'sfx-config.txt'
+    $ChainHeadName = 'precheck-disk.cmd'
+    $SfxAllowedKeys = @('Title', 'BeginPrompt', 'Progress', 'Directory', 'RunProgram', 'ExecuteFile', 'ExecuteParameters')
+}
 
 # ── 门 1:ps1/psm1 必须 UTF-8 with BOM(W1;验收 M0-10)──────────────────────
 Write-Section 'G1 脚本编码(W1:UTF-8 with BOM)'
@@ -204,32 +250,49 @@ if ($wxHits.Count -gt 0) {
 }
 Write-Ok '零处 /S 卸载调用'
 
-# ── 门 5:SFX 配置键必须是**官方 SfxSetup 认识的那 7 个** ────────────────────
-# 🔴 官方存根对不认识的键**静默忽略** —— 写了 InstallPath 不报错也不生效,
+# ── 门 5:SFX 配置键必须是**当前这个存根认识的那些** ─────────────────────────
+# 🔴 存根对不认识的键**静默忽略** —— 给官方存根写 InstallPath 不报错也不生效,
 #    结果是载荷被解到 %TEMP% 然后跑完即删。这类错只有装到现场才会暴露,所以在这里卡死。
-Write-Section 'G5 SFX 配置键(官方 SfxSetup 只认 7 个键)'
-$SfxOfficialKeys = @('Title', 'BeginPrompt', 'Progress', 'Directory', 'RunProgram', 'ExecuteFile', 'ExecuteParameters')
-$sfxCfg = Join-Path $BuildDir 'sfx-config.txt'
+#    白名单随存根切换:官方 7 个键,自编存根多一个 InstallPath(补丁改动 a)。
+Write-Section ('G5 SFX 配置键(存根 = {0},认 {1} 个键)' -f $StubKind, $SfxAllowedKeys.Count)
+$sfxCfg = Join-Path $BuildDir $SfxConfigName
+if (-not (Test-Path -LiteralPath $sfxCfg)) { throw ('缺配置文件:{0}' -f $sfxCfg) }
 $badKeys = @()
 $seenKeys = @()
+$runProgram = ''
 foreach ($line in [IO.File]::ReadAllLines($sfxCfg)) {
     $s = $line.Trim()
     if ($s -eq '' -or $s.StartsWith(';')) { continue }
-    $m = [regex]::Match($s, '^([A-Za-z_]+)\s*=')
+    $m = [regex]::Match($s, '^([A-Za-z_]+)\s*=\s*"?([^"]*)"?')
     if (-not $m.Success) { continue }
     $k = $m.Groups[1].Value
     $seenKeys += $k
-    if ($SfxOfficialKeys -notcontains $k) { $badKeys += $k }
+    if ($k -eq 'RunProgram') { $runProgram = $m.Groups[2].Value }
+    if ($SfxAllowedKeys -notcontains $k) { $badKeys += $k }
 }
 if ($badKeys.Count -gt 0) {
     foreach ($k in $badKeys) {
-        Write-Bad ('sfx-config.txt 里的 "{0}" 不是官方 SfxSetup 的键(那是 7zsfxmm 的),官方存根会**静默忽略**它' -f $k)
+        Write-Bad ('{0} 里的 "{1}" 不是当前存根({2})认识的键,存根会**静默忽略**它' -f $SfxConfigName, $k, $StubKind)
     }
-    Write-Host ('           官方只认:{0}' -f ($SfxOfficialKeys -join ' / ')) -ForegroundColor DarkGray
-    throw 'SFX 配置里有官方存根不认识的键 —— 它不会报错,只会不生效,然后把载荷解到 %TEMP% 并跑完即删'
+    Write-Host ('           只认:{0}' -f ($SfxAllowedKeys -join ' / ')) -ForegroundColor DarkGray
+    throw 'SFX 配置里有存根不认识的键 —— 它不会报错,只会不生效,然后把载荷解到 %TEMP% 并跑完即删'
 }
-if ($seenKeys -notcontains 'RunProgram') { throw 'sfx-config.txt 缺 RunProgram —— 外壳不知道该拉起谁' }
-Write-Ok ('配置键全部合法({0})' -f ($seenKeys -join ', '))
+if ($seenKeys -notcontains 'RunProgram') { throw ('{0} 缺 RunProgram —— 外壳不知道该拉起谁' -f $SfxConfigName) }
+# 自编存根的价值全在 InstallPath 上,缺了它就退化成官方行为、而链首脚本又不搬运 -> 装不成
+if ($StubKind -eq 'qtrade' -and $seenKeys -notcontains 'InstallPath') {
+    throw ('{0} 缺 InstallPath —— 自编存根会退化成「解到 %TEMP% 跑完即删」,而 run-engine.cmd 不做搬运' -f $SfxConfigName)
+}
+if ($StubKind -eq 'official' -and $seenKeys -contains 'InstallPath') {
+    throw 'sfx-config.txt 里出现了 InstallPath —— 官方存根不认它,会静默忽略'
+}
+# 🔴 配置里的 RunProgram 必须正是我们待会儿塞进载荷的那个链首脚本,
+#    否则出来的包会去拉一个根本不存在的文件。
+$expectedRun = 'install\engine\' + $ChainHeadName
+if ($runProgram.Replace('\\', '\') -ne $expectedRun) {
+    throw ('{0} 的 RunProgram = "{1}",但存根 {2} 配套的链首是 "{3}"' -f `
+            $SfxConfigName, $runProgram, $StubKind, $expectedRun)
+}
+Write-Ok ('配置键全部合法({0});链首 = {1}' -f ($seenKeys -join ', '), $ChainHeadName)
 
 if ($CheckOnly) {
     Write-Section '仅检查模式(-CheckOnly):五道门已跑完,不出包'
@@ -277,7 +340,7 @@ $collect = & (Join-Path $BuildDir 'collect-payload.ps1') -Stage $StageDir -Sourc
 
 # 引擎与 SFX 链首脚本落进载荷(§2.1:引擎本来就在解压目录里)
 New-Item -ItemType Directory -Path (Join-Path $StageDir 'install\engine') -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $EngineDir 'precheck-disk.cmd') -Destination (Join-Path $StageDir 'install\engine') -Force
+Copy-Item -LiteralPath (Join-Path $EngineDir $ChainHeadName) -Destination (Join-Path $StageDir 'install\engine') -Force
 if ($engineExe) {
     Copy-Item -LiteralPath $engineExe -Destination (Join-Path $StageDir 'install\engine') -Force
     # 引擎进了 stage 才能进 manifest,故重跑一次收集(它会把引擎登记进 files[])
@@ -349,12 +412,23 @@ Write-Ok ('归档:{0}({1:N0} 字节)' -f $ArchivePath, (Get-Item -LiteralPath $A
 # ── 步 4:拼 SFX 存根 + 配置 + 归档 = 单文件 EXE ────────────────────────────
 Write-Section '步 4 拼接自解压 EXE'
 if (-not $SfxStub) {
-    Write-Warn2 '缺 SFX 存根(7zSD.sfx),无法拼单 EXE —— 归档已生成,可人工拼接'
+    Write-Warn2 ('缺 SFX 存根({0}),无法拼单 EXE —— 归档已生成,可人工拼接' -f $StubKind)
     Write-Host ''
-    Write-Host ('  copy /b "<7zSD.sfx>" + "{0}" + "{1}" "{2}"' -f (Join-Path $BuildDir 'sfx-config.txt'), $ArchivePath, $FinalExe)
+    Write-Host ('  copy /b "<存根>" + "{0}" + "{1}" "{2}"' -f (Join-Path $BuildDir $SfxConfigName), $ArchivePath, $FinalExe)
     exit 0
 }
-$cfg = Join-Path $BuildDir 'sfx-config.txt'
+# 🔴 自编存根的二进制自证:防的是「把官方存根改名成 QTradeSD.sfx」这种最容易犯的错 ——
+#    那样 G5 会按 8 键白名单放行 InstallPath,而存根其实不认,载荷照样解到 %TEMP% 跑完即删。
+if ($StubKind -eq 'qtrade') {
+    Import-Module (Join-Path $InstallerRoot 'sfx-stub\QTrade.SfxStub.psm1')
+    $stubCheck = Test-QtSfxStubBinary -Path $SfxStub
+    if (-not $stubCheck.Ok) {
+        foreach ($pb in $stubCheck.Problems) { Write-Bad $pb }
+        throw '自编存根自检不通过 —— 它不是一个打过 QTrade 补丁的 x86 静态 CRT 存根'
+    }
+    Write-Ok ('自编存根自检通过(x86 / 静态 CRT / 含 InstallPath,sha256 {0})' -f $stubCheck.Sha256.Substring(0, 16))
+}
+$cfg = Join-Path $BuildDir $SfxConfigName
 $fs = [IO.File]::Create($FinalExe)
 try {
     foreach ($part in @($SfxStub, $cfg, $ArchivePath)) {
@@ -366,6 +440,12 @@ Write-Ok ('单文件安装包:{0}({1:N0} 字节)' -f $FinalExe, (Get-Item -Liter
 
 Write-Section '完成'
 Write-Host ('  版本      : {0}' -f $Version)
+Write-Host ('  存根      : {0}({1})' -f $StubKind, (Split-Path -Leaf $SfxStub))
+if ($StubKind -eq 'official') {
+    Write-Host '              ⚠️ 官方存根**不透传退出码**(恒 0):验收请读 <目标>\logs\last-exit-code.txt' -ForegroundColor Yellow
+} else {
+    Write-Host '              退出码由存根透传,验收可直接读 EXE 退出码' -ForegroundColor DarkGray
+}
 Write-Host ('  产物      : {0}' -f $FinalExe)
 Write-Host ('  轻量包    : {0}' -f $collect.Lightweight)
 if ($collect.Missing.Count -gt 0) {

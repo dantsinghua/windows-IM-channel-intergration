@@ -147,7 +147,7 @@ Describe '诊断包端到端(不碰 WSL:-SkipWslCommands)' {
         } finally { $zip.Dispose() }
     }
 
-    It '策略键取不到值时写「<未设置>」而不是崩' {
+    It '策略键取不到值时写「«未设置»」而不是崩' {
         Mock -ModuleName QTrade.Diag Get-QtOptionalFeatureState { 'Enabled' }
         Mock -ModuleName QTrade.Diag Get-QtRegistryValue { $null }
         Mock -ModuleName QTrade.Diag Get-QtEnvironmentPath { $script:Root }

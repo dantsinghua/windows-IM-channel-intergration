@@ -278,7 +278,7 @@ Describe '卸载:.wslconfig 恢复(§2.14 第 3 步;验收 M1-28)' {
 
 Describe '🔴 rename 备份残留 —— 卸载只列出、不代删(§2.14 第 6 步末)' {
 
-    It '列出 *.qtbak-<ts> 目录' {
+    It '列出 *.qtbak-«ts» 目录' {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-ob-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $tmp 'xwechat_files.qtbak-20260920-181500') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $tmp 'normal') -Force | Out-Null

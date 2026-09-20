@@ -1,0 +1,367 @@
+--- a/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
++++ b/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
+@@ -116,6 +116,54 @@
+ #define NT_CHECK_FAIL_ACTION ShowErrorMessage(L"Unsupported Windows version"); return 1;
+ #endif
+ 
++/* ========================= [QTrade 补丁 a-1 / b] =========================
++   两处改动,见 installer/sfx-stub/README.md:
++     (a) 新增配置键 InstallPath —— 解压到指定目录并**留存**(不建临时目录、
++         自然也不存在「跑完即删」);无此键时行为与官方存根逐字一致。
++         另加解压前的空间判据(实现在 ExtractEngine.cpp)。
++     (b) 透传子进程退出码。
++   ======================================================================= */
++
++// docs/03 §3.4:26 = E_INSTALL_DISK_LOW
++static const int kQTradeExitDiskLow = 26;
++
++/* 「QTrade:目标磁盘可用空间不足,安装未开始。请清理磁盘后重新运行安装程序。」
++   用通用字符名(\uXXXX)而不是直接写中文字面量:这份源码会在未知的编译器
++   代码页下被 cl.exe 读取,直接写中文一旦 /source-charset 不匹配就是乱码,
++   而 \uXXXX 在任何代码页下都编译成同一串 UTF-16。*/
++static const wchar_t * const kQTradeDiskLowMessage =
++    L"QTrade\uFF1A\u76EE\u6807\u78C1\u76D8\u53EF\u7528\u7A7A\u95F4\u4E0D\u8DB3\uFF0C"
++    L"\u5B89\u88C5\u672A\u5F00\u59CB\u3002\u8BF7\u6E05\u7406\u78C1\u76D8\u540E"
++    L"\u91CD\u65B0\u8FD0\u884C\u5B89\u88C5\u7A0B\u5E8F\u3002";
++
++/* 展开 InstallPath 里的环境变量(%ProgramData% 等),并要求展开结果是
++   `<盘符>:\...` 形式的绝对路径。相对路径会落在 SFX 进程的当前目录里 ——
++   那个位置由谁双击、从哪个壳启动决定,不可预期,直接判配置错。*/
++static bool QTrade_ExpandInstallPath(const UString &src, UString &dest)
++{
++  dest.Empty();
++  if (src.IsEmpty())
++    return true;
++  WCHAR buf[MAX_PATH * 2];
++  // 长度只写一处:两处各写一遍 MAX_PATH*2,改一处忘另一处就是栈溢出
++  const DWORD kBufChars = (DWORD)Z7_ARRAY_SIZE(buf);
++  const DWORD len = ExpandEnvironmentStringsW(src.Ptr(), buf, kBufChars);
++  if (len == 0 || len > kBufChars)
++    return false;
++  dest = buf;
++  // 去掉多余的结尾分隔符,但保留 "C:\" 这种盘根形式里的那一个
++  while (dest.Len() > 3 && (dest.Back() == L'\\' || dest.Back() == L'/'))
++    dest.DeleteBack();
++  /* 🔴 UString **没有 operator[]**,不能写 dest[1];用 SDK 自带的判据。
++     IsDrivePath 的语义正是「前三个字符形如 a:\」。*/
++  if (!NName::IsDrivePath(dest.Ptr()))
++  {
++    dest.Empty();
++    return false;
++  }
++  return true;
++}
++
+ static void ShowErrorMessageSpec(const UString &name)
+ {
+   UString message = NError::MyFormatMessage(::GetLastError());
+@@ -174,6 +222,7 @@
+ 
+   UString dirPrefix ("." STRING_PATH_SEPARATOR);
+   UString appLaunched;
++  UString installPath;   // [QTrade] 空 = 保持官方行为(临时目录 + 跑完即删)
+   bool showProgress = true;
+   if (!config.IsEmpty())
+   {
+@@ -199,6 +248,14 @@
+         return 0;
+     }
+     appLaunched = GetTextConfigValue(pairs, "RunProgram");
++
++    // [QTrade] 新增键
++    if (!QTrade_ExpandInstallPath(GetTextConfigValue(pairs, "InstallPath"), installPath))
++    {
++      if (!assumeYes)
++        ShowErrorMessage(L"Config failed: InstallPath");
++      return 1;
++    }
+     
+     #ifdef MY_SHELL_EXECUTE
+     executeFile = GetTextConfigValue(pairs, "ExecuteFile");
+@@ -206,12 +263,22 @@
+     #endif
+   }
+ 
++  /* [QTrade] 有 InstallPath 就直接解压到该目录并留存:不创建临时目录,
++     CTempDir 保持未 Create 的状态,它的析构 Remove() 便无事可做。
++     没有 InstallPath 时,下面这段与官方存根逐字相同。*/
+   CTempDir tempDir;
+-  if (!tempDir.Create(kTempDirPrefix))
++  FString destPath;
++  if (!installPath.IsEmpty())
++    destPath = us2fs(installPath);
++  else
+   {
+-    if (!assumeYes)
+-      ShowErrorMessage(L"Cannot create temp folder archive");
+-    return 1;
++    if (!tempDir.Create(kTempDirPrefix))
++    {
++      if (!assumeYes)
++        ShowErrorMessage(L"Cannot create temp folder archive");
++      return 1;
++    }
++    destPath = tempDir.GetPath();
+   }
+ 
+   CCodecs *codecs = new CCodecs;
+@@ -225,14 +292,22 @@
+     }
+   }
+ 
+-  const FString tempDirPath = tempDir.GetPath();
+-  // tempDirPath = L"M:\\1\\"; // to test low disk space
+   {
+     bool isCorrupt = false;
++    bool noSpace = false;
+     UString errorMessage;
+-    HRESULT result = ExtractArchive(codecs, fullPath, tempDirPath, showProgress,
+-      isCorrupt, errorMessage);
+-    
++    HRESULT result = ExtractArchive(codecs, fullPath, destPath, showProgress,
++      !installPath.IsEmpty(), isCorrupt, noSpace, errorMessage);
++
++    /* [QTrade] 空间不足:归档打开了,但一个字节都没解压、目标目录也没建。
++       这是唯一一条「解压前就退出」的路径,退出码固定 26(docs/03 §3.4)。*/
++    if (noSpace)
++    {
++      if (!assumeYes)
++        ::MessageBoxW(NULL, kQTradeDiskLowMessage, L"QTrade", MB_ICONERROR);
++      return kQTradeExitDiskLow;
++    }
++
+     if (result != S_OK)
+     {
+       if (!assumeYes)
+@@ -255,7 +330,7 @@
+ 
+   #ifndef UNDER_CE
+   CCurrentDirRestorer currentDirRestorer;
+-  if (!SetCurrentDir(tempDirPath))
++  if (!SetCurrentDir(destPath))
+     return 1;
+   #endif
+   
+@@ -315,14 +390,14 @@
+     }
+     
+     {
+-      FString s2 = tempDirPath;
++      FString s2 = destPath;
+       NName::NormalizeDirPathPrefix(s2);
+       appLaunched.Replace(L"%%T" WSTRING_PATH_SEPARATOR, fs2us(s2));
+     }
+     
+     const UString appNameForError = appLaunched; // actually we need to rtemove parameters also
+ 
+-    appLaunched.Replace(L"%%T", fs2us(tempDirPath));
++    appLaunched.Replace(L"%%T", fs2us(destPath));
+ 
+     if (!switches.IsEmpty())
+     {
+@@ -359,10 +434,33 @@
+     ::CloseHandle(processInformation.hThread);
+     hProcess = processInformation.hProcess;
+   }
++  /* [QTrade] 子进程已经起来了,把 SFX **自己**的当前目录挪出安装根。
++     进程的当前目录会钉住该目录(目录句柄不含 DELETE 共享权限),
++     引擎若要给安装根改名、或在回滚时删掉它,会拿到 ERROR_SHARING_VIOLATION。
++     原版的当前目录是 %TEMP%\7zS<随机>,跑完即删,从来不会碰上这件事。
++     子进程继承到的当前目录不动 —— 引擎本来就该知道自己在哪。
++     (DLL 搜索序列里也有当前目录这一环:安装根是可预测且 Users 可写的路径,
++      这一条只能由引擎去收紧安装根 ACL,存根这层管不了,已提交裁决。)*/
++  if (!installPath.IsEmpty())
++  {
++    FString sysDir;
++    if (GetSystemDir(sysDir))
++      SetCurrentDir(sysDir);
++  }
++
++  /* [QTrade 补丁 b] 原版在这里无条件 `return 0` —— 子进程退 26,EXE 照样退 0。
++     docs/03 §8b 的验收判据几乎全是退出码,那等于「全 0 = 全都看起来成功」,
++     整套 M0/M1 验收都会失真。改为透传子进程退出码。
++     取不到退出码、或压根没拿到进程句柄(ShellExecuteEx 在某些 verb 下即使成功
++     也可能不回句柄)都按失败处理给 1 —— 补丁 (b) 的全部意义就是消灭「假 0」,
++     不能自己在这里留一条。上面几条启动失败路径原本就 return 1,保持不动。*/
++  DWORD exitCode = 1;
+   if (hProcess)
+   {
+     WaitForSingleObject(hProcess, INFINITE);
++    if (!::GetExitCodeProcess(hProcess, &exitCode))
++      exitCode = 1;
+     ::CloseHandle(hProcess);
+   }
+-  return 0;
++  return (int)exitCode;
+ }
+--- a/CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp
++++ b/CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp
+@@ -11,6 +11,10 @@
+ #include "../../UI/FileManager/FormatUtils.h"
+ #include "../../UI/FileManager/LangUtils.h"
+ 
++// [QTrade] 解压前空间判据需要读归档里每一项的 kpidSize
++#include "../../../Windows/PropVariant.h"
++#include "../../PropID.h"
++
+ #include "ExtractCallbackSfx.h"
+ #include "ExtractEngine.h"
+ 
+@@ -21,6 +25,75 @@
+ static LPCSTR const kCantFindArchive = "Cannot find archive file";
+ static LPCSTR const kCantOpenArchive = "Cannot open the file as archive";
+ 
++/* ========================= [QTrade 补丁 a-2] =========================
++   docs/03 §2.1 要求「解压前」判目标卷可用空间,不足则不解压。
++   官方存根没有 pre-extract 钩子,但归档被 Open 之后、Extract 之前这一刻
++   就已经能读到每一项的解包大小了 —— 判据放在这里,是「真的一个字节都没写」。
++
++   门槛 = max(6 GiB, 解包总大小 x 1.1)。
++     - 6 GiB 来自 docs/03 §2.1 的硬下限;
++     - x1.1 是解压期的余量(目录项、簇对齐、以及引擎随后要落的少量文件)。
++   取不到可用空间时放行(fail-open):判据是保护,不该变成新的失败源。
++   ==================================================================== */
++
++static const UInt64 kQTradeMinFreeBytes = ((UInt64)6) << 30;  // 6 GiB = 6442450944
++
++static UInt64 QTrade_GetRequiredBytes(UInt64 unpackSize)
++{
++  const UInt64 withMargin = unpackSize + unpackSize / 10;  // x1.1
++  return (withMargin > kQTradeMinFreeBytes) ? withMargin : kQTradeMinFreeBytes;
++}
++
++/* 不用 ConvertPropVariantToUInt64:它对预料之外的 vt 会 `throw 151199`,
++   而 showProgress=false 那条路径上的 Process2() 没有 try/catch 包着。
++   这里的语义是「算不出来就当 0」,不该变成一个能把进程掀掉的异常。*/
++static UInt64 QTrade_PropToUInt64(const NWindows::NCOM::CPropVariant &prop)
++{
++  switch (prop.vt)
++  {
++    case VT_UI8: return (UInt64)prop.uhVal.QuadPart;
++    case VT_UI4: return prop.ulVal;
++    case VT_UI2: return prop.uiVal;
++    case VT_UI1: return prop.bVal;
++    default: return 0;
++  }
++}
++
++static HRESULT QTrade_GetUnpackSize(IInArchive *archive, UInt64 &total)
++{
++  total = 0;
++  UInt32 numItems = 0;
++  RINOK(archive->GetNumberOfItems(&numItems))
++  for (UInt32 i = 0; i < numItems; i++)
++  {
++    {
++      NWindows::NCOM::CPropVariant propDir;
++      RINOK(archive->GetProperty(i, kpidIsDir, &propDir))
++      if (propDir.vt == VT_BOOL && propDir.boolVal != VARIANT_FALSE)
++        continue;
++    }
++    NWindows::NCOM::CPropVariant prop;
++    RINOK(archive->GetProperty(i, kpidSize, &prop))
++    total += QTrade_PropToUInt64(prop);
++  }
++  return S_OK;
++}
++
++/* 目标目录此刻通常还不存在,GetDiskFreeSpaceEx 对不存在的路径会失败,
++   所以先用 GetVolumePathName 求出它所在卷的挂载根(这也正确处理挂载点)。*/
++static bool QTrade_GetFreeSpace(const FString &dirPath, UInt64 &freeBytes)
++{
++  freeBytes = 0;
++  WCHAR volume[MAX_PATH + 2];
++  if (!GetVolumePathNameW(fs2us(dirPath).Ptr(), volume, (DWORD)(MAX_PATH + 1)))
++    return false;
++  ULARGE_INTEGER avail, totalBytes, totalFree;
++  if (!GetDiskFreeSpaceExW(volume, &avail, &totalBytes, &totalFree))
++    return false;
++  freeBytes = (UInt64)avail.QuadPart;
++  return true;
++}
++
+ struct CThreadExtracting
+ {
+   CCodecs *Codecs;
+@@ -34,6 +107,10 @@
+   HRESULT Result;
+   UString ErrorMessage;
+ 
++  // [QTrade] 空间判据:入参 CheckSpace,出参 NoSpace
++  bool CheckSpace;
++  bool NoSpace;
++
+   void Process2()
+   {
+     NFind::CFileInfo fi;
+@@ -59,6 +136,27 @@
+       return;
+     }
+ 
++    /* [QTrade] 判空间。位置很关键:必须在 CreateComplexDir 之前 ——
++       空间不足时,本次判据不会创建目标目录,也不会有任何一个字节被解出来。
++       (无 InstallPath 的官方路径下,临时目录此前已由 CTempDir::Create 建好,
++        但它会在 CTempDir 析构里被整个删掉,同样不留残留。)*/
++    IInArchive * const archive = ArchiveLink.GetArchive();
++    if (CheckSpace && archive)
++    {
++      UInt64 unpackSize = 0;
++      if (QTrade_GetUnpackSize(archive, unpackSize) == S_OK)
++      {
++        const UInt64 required = QTrade_GetRequiredBytes(unpackSize);
++        UInt64 freeBytes = 0;
++        if (QTrade_GetFreeSpace(DestFolder, freeBytes) && freeBytes < required)
++        {
++          NoSpace = true;
++          Result = E_FAIL;
++          return;
++        }
++      }
++    }
++
+     FString dirPath = DestFolder;
+     NName::NormalizeDirPathPrefix(dirPath);
+     
+@@ -94,14 +192,17 @@
+ };
+ 
+ HRESULT ExtractArchive(CCodecs *codecs, const FString &fileName, const FString &destFolder,
+-    bool showProgress, bool &isCorrupt, UString &errorMessage)
++    bool showProgress, bool checkSpace, bool &isCorrupt, bool &noSpace, UString &errorMessage)
+ {
+   isCorrupt = false;
++  noSpace = false;
+   CThreadExtracting t;
+ 
+   t.Codecs = codecs;
+   t.FileName = fileName;
+   t.DestFolder = destFolder;
++  t.CheckSpace = checkSpace;
++  t.NoSpace = false;
+ 
+   t.ExtractCallbackSpec = new CExtractCallbackImp;
+   t.ExtractCallback = t.ExtractCallbackSpec;
+@@ -131,5 +232,6 @@
+   if (errorMessage.IsEmpty())
+     errorMessage = t.ExtractCallbackSpec->_message;
+   isCorrupt = t.ExtractCallbackSpec->_isCorrupt;
++  noSpace = t.NoSpace;
+   return t.Result;
+ }
+--- a/CPP/7zip/Bundles/SFXSetup/ExtractEngine.h
++++ b/CPP/7zip/Bundles/SFXSetup/ExtractEngine.h
+@@ -5,7 +5,13 @@
+ 
+ #include "../../UI/Common/LoadCodecs.h"
+ 
++/* [QTrade]
++   checkSpace:是否做解压前的空间判据。🔴 只在走 InstallPath 时传 true ——
++     没有 InstallPath 的包要与官方存根**逐字同行为**,不能凭空多出一个 6 GiB 门槛
++     把人家一个 200 MB 的普通 SFX 包拦下来。
++   noSpace(出参):空间不足时置 true。此时归档虽已打开,但**一个字节都没有解压**、
++     目标目录也没有创建。调用方据此退 26(docs/03 §3.4)。*/
+ HRESULT ExtractArchive(CCodecs *codecs, const FString &fileName, const FString &destFolder,
+-    bool showProgress, bool &isCorrupt, UString &errorMessage);
++    bool showProgress, bool checkSpace, bool &isCorrupt, bool &noSpace, UString &errorMessage);
+ 
+ #endif
