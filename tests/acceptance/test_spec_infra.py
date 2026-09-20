@@ -898,11 +898,18 @@ def test_RT03_commands_and_audit_days_are_30():
 
 
 def test_RT04_events_outbox_retention_single_key_is_72h():
-    """🔴 总控裁决 R6-58:`events_outbox` 保留期唯一键 = §7.1 `[events] ws_retention_hours = 72`;
-    `[retention] events_ws_hours` 作废(02 §7.1 / 07 已删键),配置对象上不得再有该字段。
-    (撰写者已关闭,本条由总控按裁决改写;原断言 = 旧键默认 24。)"""
-    assert AgentConfig().events.ws_retention_hours == 72
-    assert not hasattr(RetentionConfig(), "events_ws_hours")
+    """§7.1 + §2.2.7 + 07(R6-58 (c)):`events_outbox` 的保留期**只有一把尺子** = `[events] ws_retention_hours = 72`;
+    `[retention] events_ws_hours` **作废** —— 02 §7.1 / docs/07 / `RetentionConfig` 一起删键,
+    且 §7.1 该行明写「老配置里仍写本键不报错,但**不被任何代码消费**」。
+    三个必要侧面缺一不可:唯一键的默认值、作废键不在 `[retention]` 上、老 `agent.toml` 残留它既不炸也不改尺子。
+    (独立验收复核重写:原总控版只断言前两条,漏了「残留不报错且不被消费」—— 那正是删键的兼容性风险点:
+     若加载器对未知键报错,带旧键的 agent.toml 会直接起不来;若它被悄悄接回去消费,「唯一」就失守。)"""
+    assert AgentConfig().events.ws_retention_hours == 72, "唯一键默认 72 h"
+    assert not hasattr(RetentionConfig(), "events_ws_hours"), "[retention] 上不得再有作废键"
+    legacy = AgentConfig.from_toml_dict({"retention": {"events_ws_hours": 24, "audit_days": 30}, "events": {}})
+    assert legacy.events.ws_retention_hours == 72, "老配置里的作废键不得把尺子改回 24 h"
+    assert not hasattr(legacy.retention, "events_ws_hours"), "作废键不得被加载进配置对象"
+    assert legacy.retention.audit_days == 30, "同段里合法的键仍照常加载(残留键不报错、只被忽略)"
 
 
 def test_RT05_mail_inbox_rows_days_is_30():
