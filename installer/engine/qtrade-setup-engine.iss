@@ -214,6 +214,11 @@ var
   LastStepExit: Integer;
   AckKernelImpact: Boolean;
   DistroConflictChoice: String;    // '' | 'unregister' | 'cancel'
+  PageWeChatSelect: TInputOptionWizardPage;
+  WeChatMultiple: Boolean;
+  WeChatInstallPaths: TArrayOfString;
+  WeChatSelectedPath: String;
+  WeChatUninstallConfirmed: Boolean;
   WeChatUserApproved: Boolean;
   WeChatBackupModeSel: String;     // auto | copy | rename | skip
   AcceptSchemaBreaking: Boolean;
@@ -359,6 +364,8 @@ begin
   S := S + ',"restore_data":"' + OptRestoreData + '"';
   S := S + ',"distro_conflict_choice":"' + DistroConflictChoice + '"';
   S := S + ',"wechat_backup_mode":"' + WeChatBackupModeSel + '"';
+  S := S + ',"wechat_selected_path":"' + WeChatSelectedPath + '"';
+  if WeChatUninstallConfirmed then S := S + ',"wechat_uninstall_confirmed":true' else S := S + ',"wechat_uninstall_confirmed":false';
   if IsSilentRun() then S := S + ',"silent":true' else S := S + ',"silent":false';
   if WeChatUserApproved then S := S + ',"wechat_user_approved":true' else S := S + ',"wechat_user_approved":false';
   if AcceptSchemaBreaking then S := S + ',"accept_schema_breaking":true' else S := S + ',"accept_schema_breaking":false';
@@ -490,6 +497,14 @@ begin
     '同时会在 hosts 里追加带标记的行屏蔽微信更新下载域名,卸载时成对删除。不勾选 = 跳过微信通道。',
     False, False);
   PageWeChat.Add('同意由本软件管理微信版本(等价 /QT_WECHAT=check;不勾选 = /QT_WECHAT=skip)');
+
+  // §2.9.3 末 MULTIPLE_INSTALLS:列出各处路径/版本/是否正在运行,用户选**一处**;
+  // 其余**不卸、不改**。只有真检测到 ≥2 处时才显示(ShouldSkipPage 控制)。
+  PageWeChatSelect := CreateInputOptionPage(PageWeChat.ID,
+    '选择要使用的微信', '本机检测到多处微信安装',
+    '请选一处作为 QTrade 使用的微信。**其余各处我们一律不动**(不卸载、不修改)。' + #13#10 +
+    '选中的那一处会按版本矩阵重新判定,必要时引导你换成随包的 4.1.12.26。',
+    True, False);   // Exclusive = True(单选)
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -503,6 +518,8 @@ begin
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Count, I: Integer;
 begin
   Result := True;
   if CurPageID = PageKernelConfirm.ID then
@@ -519,7 +536,36 @@ begin
   end;
   if CurPageID = PageWeChat.ID then
   begin
-    if not PageWeChat.Values[0] then OptWeChat := 'skip';
+    if not PageWeChat.Values[0] then
+    begin
+      OptWeChat := 'skip';
+      WeChatMultiple := False;
+    end
+    else
+    begin
+      WeChatUserApproved := True;
+      // 只读检测(不动微信),为 MULTIPLE_INSTALLS 的选择页备料
+      if RunStep('wechat-detect') then
+      begin
+        Count := JsonInt(LastStepJson, 'count', 0);
+        WeChatMultiple := Count >= 2;
+        if WeChatMultiple then
+        begin
+          SetArrayLength(WeChatInstallPaths, Count);
+          for I := 0 to Count - 1 do
+          begin
+            WeChatInstallPaths[I] := JsonStr(LastStepJson, 'install_' + IntToStr(I) + '_path');
+            PageWeChatSelect.Add(JsonStr(LastStepJson, 'install_' + IntToStr(I) + '_label'));
+          end;
+          PageWeChatSelect.SelectedValueIndex := 0;
+        end;
+      end;
+    end;
+  end;
+  if CurPageID = PageWeChatSelect.ID then
+  begin
+    if PageWeChatSelect.SelectedValueIndex >= 0 then
+      WeChatSelectedPath := WeChatInstallPaths[PageWeChatSelect.SelectedValueIndex];
   end;
 end;
 
@@ -712,7 +758,37 @@ begin
       OptWeChat := 'skip';
   end;
   if not RunStep(ST_CLIENTS_CHECKED) then
-    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  begin
+    // §2.9.3 方案②:方案①失败 / 3.x 升 4.x / 用户要清掉一处 ⇒ 交互式卸载再装。
+    // 🔴 卸载器**不加任何参数**(`/S` = 卸载并清空聊天记录与登录态);
+    //    超时也不由我们替用户决定,按 §2.9.3 给【我已卸载,继续】/【跳过微信通道】。
+    if (JsonStr(LastStepJson, 'reason') = 'WAIT_WECHAT_UNINSTALL') and (not IsSilentRun()) then
+    begin
+      if JsonBool(LastStepJson, 'timed_out') then
+        Answer := MsgBox('等待微信卸载超时。' + #13#10#13#10 +
+          '【是】= 我已经卸载完了,继续装随包的 4.1.12.26;' + #13#10 +
+          '【否】= 跳过微信通道(安装继续,微信模块保持关闭)。', mbConfirmation, MB_YESNO)
+      else
+        Answer := MsgBox(JsonStr(LastStepJson, 'message') + #13#10#13#10 +
+          '接下来会**以交互方式**打开微信自己的卸载程序(不带任何静默参数)。' + #13#10 +
+          '🔴 请务必确认卸载器里的「保留本地数据」勾选框是**勾上的** —— 取消勾选会删掉聊天记录、备份与设置。' + #13#10#13#10 +
+          '【是】= 现在卸载并重装;【否】= 跳过微信通道。', mbConfirmation, MB_YESNO);
+      if Answer = IDYES then
+      begin
+        WeChatUninstallConfirmed := True;
+        if not RunStep(ST_CLIENTS_CHECKED) then
+          FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+      end
+      else
+      begin
+        OptWeChat := 'skip';
+        if not RunStep(ST_CLIENTS_CHECKED) then
+          FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+      end;
+    end
+    else
+      FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  end;
 
   // 11) SELFTEST_OK(§2.11)
   WizardForm.StatusLabel.Caption := '正在自检(启动一个临时安卓实例)…';
@@ -731,7 +807,13 @@ function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
   // 静默模式下不显示任何自定义页(确认改由 /QT_ACCEPT_SHUTDOWN=1 给出,B-7)
-  if IsSilentRun() then Result := True;
+  if IsSilentRun() then
+  begin
+    Result := True;
+    Exit;
+  end;
+  // 只在真检测到 ≥2 处微信安装时才显示选择页(§2.9.3 末)
+  if PageID = PageWeChatSelect.ID then Result := not WeChatMultiple;
 end;
 
 procedure DeinitializeSetup();

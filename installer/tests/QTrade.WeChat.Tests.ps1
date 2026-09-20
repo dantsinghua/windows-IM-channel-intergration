@@ -333,3 +333,115 @@ Describe 'CLIENTS_CHECKED 决策表 Get-QtWeChatPlan(§2.9.2 × /QT_WECHAT × �
         (Get-QtWeChatPlan -Mode $mode -Match 'UNSUPPORTED_OLDER' -UserApproved $false).Action | Should -Be 'BLOCK'
     }
 }
+
+
+Describe '§2.9.3 两方案的选择 Resolve-QtWeChatReinstallMode' {
+
+    It '默认走方案①(覆盖安装,不卸载)' {
+        (Resolve-QtWeChatReinstallMode -CurrentVersion '4.1.13.12').Mode | Should -Be 'overwrite'
+    }
+    It '🔴 方案①失败 → 转方案②' {
+        $r = Resolve-QtWeChatReinstallMode -CurrentVersion '4.1.13.12' -OverwriteFailed $true
+        $r.Mode | Should -Be 'interactive_uninstall'
+        $r.Reason | Should -Be 'overwrite_failed'
+    }
+    It '🔴 3.x 升 4.x → 方案②(两套安装布局,覆盖装不过去)' {
+        (Resolve-QtWeChatReinstallMode -CurrentVersion '3.9.12.51').Reason | Should -Be 'major_3_to_4'
+    }
+    It 'MULTIPLE_INSTALLS 用户要清掉一处 → 方案②' {
+        (Resolve-QtWeChatReinstallMode -CurrentVersion '4.1.12.26' -UserAskedRemoveOne $true).Reason | Should -Be 'user_asked_remove_one'
+    }
+    It '🔴 静默模式 → none(P-19:重装恒需交互)' {
+        (Resolve-QtWeChatReinstallMode -CurrentVersion '3.9.12.51' -InteractiveAllowed $false).Mode | Should -Be 'none'
+    }
+}
+
+Describe '§2.9.3 第 4 步换版本编排 Invoke-QtWeChatReinstall' {
+
+    It '方案①成功 → 不碰卸载器' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { [pscustomobject]@{ Ok = $true; Reason = ''; FinalVersion = '4.1.12.26' } }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { throw '不该被调用' }
+        $r = Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12'
+        $r.Ok | Should -BeTrue
+        $r.Mode | Should -Be 'overwrite'
+        $r.FinalVersion | Should -Be '4.1.12.26'
+    }
+
+    It '🔴 方案①失败但**用户没确认卸载** → 不卸载,回 WECHAT_REINSTALL_FAILED' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { [pscustomobject]@{ Ok = $false; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = '' } }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { throw '没有用户确认就不许碰卸载器(红线 8)' }
+        $r = Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12' -UninstallString 'C:\wx\Uninstall.exe'
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'WECHAT_REINSTALL_FAILED'
+    }
+
+    It '方案①失败 + 用户确认 → 卸载后再装' {
+        $script:SetupCalls = 0
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup {
+            $script:SetupCalls++
+            if ($script:SetupCalls -eq 1) { return [pscustomobject]@{ Ok = $false; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = '' } }
+            return [pscustomobject]@{ Ok = $true; Reason = ''; FinalVersion = '4.1.12.26' }
+        }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { [pscustomobject]@{ Ok = $true; Reason = '' } }
+        $r = Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12' `
+            -UninstallString 'C:\wx\Uninstall.exe' -UserConfirmedUninstall $true
+        $r.Ok | Should -BeTrue
+        $r.Mode | Should -Be 'interactive_uninstall'
+        $script:SetupCalls | Should -Be 2
+    }
+
+    It '🔴 3.x 一上来就要卸载确认,没确认就不动(红线 8)' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { throw '3.x 不该走覆盖安装' }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { throw '没确认不许动' }
+        (Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '3.9.12.51').Reason |
+            Should -Be 'need_uninstall_confirm'
+    }
+
+    It '🔴 卸载轮询超时 → UninstallTimedOut=true(交给向导问【我已卸载,继续】/【跳过】,不自己决定)' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { [pscustomobject]@{ Ok = $false; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = '' } }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { [pscustomobject]@{ Ok = $false; Reason = 'UNINSTALL_TIMEOUT' } }
+        $r = Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12' `
+            -UninstallString 'C:\wx\Uninstall.exe' -UserConfirmedUninstall $true
+        $r.Ok | Should -BeFalse
+        $r.UninstallTimedOut | Should -BeTrue
+    }
+
+    It '没有 UninstallString(卸载键读不到)→ 明确回 no_uninstall_string' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { [pscustomobject]@{ Ok = $false; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = '' } }
+        (Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12' -UserConfirmedUninstall $true).Reason |
+            Should -Be 'no_uninstall_string'
+    }
+
+    It '🔴 静默模式下整条重装路不可用(P-19),且**绝不穿透到方案②**' {
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatSetup { throw '静默模式不该重装' }
+        Mock -ModuleName QTrade.WeChat Start-QtWeChatInteractiveUninstall { throw '无人值守的机器上绝不许开卸载器' }
+        $r = Invoke-QtWeChatReinstall -SetupExe 'X:\s.exe' -InstallPath 'C:\wx' -CurrentVersion '4.1.13.12' `
+            -UninstallString 'C:\wx\Uninstall.exe' -UserConfirmedUninstall $true -AllowInteractiveUninstall $false
+        $r.Ok | Should -BeFalse
+        $r.Mode | Should -Be 'none'
+        $r.Reason | Should -Be 'silent_not_supported'
+    }
+}
+
+Describe '§2.9.3 末 MULTIPLE_INSTALLS 的列表(路径 / 版本 / 是否正在运行)' {
+
+    It '逐处补上版本与运行状态' {
+        Mock -ModuleName QTrade.WeChat Get-QtWeChatVersion {
+            [pscustomobject]@{ Version = '4.1.12.26'; ExeVersion = '4.1.12.26'; VersionSubdir = ''; WhatsNew = ''; Ambiguous = $false }
+        }
+        Mock -ModuleName QTrade.WeChat Get-QtProcessByName { @([pscustomobject]@{ Path = 'D:\Tencent\Weixin\Weixin.exe' }) }
+        $d = Get-QtWeChatInstallDetails -Installs @(
+            [pscustomobject]@{ path = 'C:\Program Files\Tencent\Weixin'; uninstall_string = 'C:\u.exe'; source = 'uninstall_4x' }
+            [pscustomobject]@{ path = 'D:\Tencent\Weixin'; uninstall_string = ''; source = 'running' }
+        )
+        $d.Count | Should -Be 2
+        $d[0].version | Should -Be '4.1.12.26'
+        $d[0].running | Should -BeFalse
+        $d[1].running | Should -BeTrue
+        $d[0].uninstall_string | Should -Be 'C:\u.exe'
+    }
+
+    It '空列表不抛' {
+        (Get-QtWeChatInstallDetails -Installs @()).Count | Should -Be 0
+    }
+}

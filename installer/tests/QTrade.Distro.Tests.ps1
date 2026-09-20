@@ -238,3 +238,71 @@ Describe '幂等判据' {
         Test-QtImagesLoaded -Context ([pscustomobject]@{ DistroName = 'qtrade'; ExpectedImages = @('redroid/redroid:11.0.0-latest') }) | Should -BeFalse
     }
 }
+
+
+Describe '§2.13 第 6 步:新镜像 tar 变了 → docker load' {
+
+    BeforeAll {
+        $script:Mf = [pscustomobject]@{ rootfs_contents = [pscustomobject]@{
+                redroid_image = [pscustomobject]@{ ref = 'redroid/redroid:11.0.0-latest'; tar = '/var/lib/qtrade/images/redroid-11.tar' }
+                napcat_image  = [pscustomobject]@{ ref = 'mlikiowa/napcat-docker:v1'; tar = '/var/lib/qtrade/images/napcat.tar' }
+            } }
+    }
+
+    It '两个镜像都 load 成功且 ref 出现在 docker images → Ok' {
+        Mock -ModuleName QTrade.Distro Invoke-QtWsl { [pscustomobject]@{ ExitCode = 0; StdOut = 'Loaded image'; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
+        Mock -ModuleName QTrade.Distro Get-QtDockerImages { , @('redroid/redroid:11.0.0-latest', 'mlikiowa/napcat-docker:v1') }
+        $r = Invoke-QtDockerLoadImages -Manifest $script:Mf
+        $r.Ok | Should -BeTrue
+        $r.Loaded.Count | Should -Be 2
+    }
+
+    It '🔴 `docker load` 退出 0 但 ref 没进来 → 判失败(退出 0 不等于你要的 tag 进来了)' {
+        Mock -ModuleName QTrade.Distro Invoke-QtWsl { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
+        Mock -ModuleName QTrade.Distro Get-QtDockerImages { , @() }
+        $r = Invoke-QtDockerLoadImages -Manifest $script:Mf
+        $r.Ok | Should -BeFalse
+        $r.Failed.Count | Should -Be 2
+        $r.Failed[0].reason | Should -Match 'docker images 里没有该 ref'
+    }
+
+    It 'load 命令本身失败 → 带回 stderr' {
+        Mock -ModuleName QTrade.Distro Invoke-QtWsl { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'no space left'; TimedOut = $false; DurationMs = 1 } }
+        Mock -ModuleName QTrade.Distro Get-QtDockerImages { , @() }
+        (Invoke-QtDockerLoadImages -Manifest $script:Mf).Failed[0].reason | Should -Match 'no space left'
+    }
+
+    It '🔴 **绝不**删旧镜像(账号容器按 account_runtime 记的 tag 起,逐账号升级归 Agent)' {
+        $script:Cmds = @()
+        Mock -ModuleName QTrade.Distro Invoke-QtWsl {
+            $script:Cmds += ($WslArgs -join ' ')
+            [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 }
+        }
+        Mock -ModuleName QTrade.Distro Get-QtDockerImages { , @('redroid/redroid:11.0.0-latest', 'mlikiowa/napcat-docker:v1') }
+        Invoke-QtDockerLoadImages -Manifest $script:Mf | Out-Null
+        ($script:Cmds -join ' | ') | Should -Not -Match 'rmi'
+        ($script:Cmds -join ' | ') | Should -Not -Match 'prune'
+        ($script:Cmds -join ' | ') | Should -Match 'docker load -i'
+    }
+
+    It '轻量包(没有 rootfs_contents)→ Ok,什么都不做' {
+        Mock -ModuleName QTrade.Distro Invoke-QtWsl { throw '不该被调用' }
+        (Invoke-QtDockerLoadImages -Manifest ([pscustomobject]@{})).Ok | Should -BeTrue
+    }
+
+    It '载荷侧带了同名 tar 时优先用它(TarOverrideDir)' {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-img-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        try {
+            [IO.File]::WriteAllText((Join-Path $tmp 'redroid-11.tar'), 'x')
+            $script:Used = @()
+            Mock -ModuleName QTrade.Distro Invoke-QtWsl {
+                $script:Used += ($WslArgs -join ' ')
+                [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 }
+            }
+            Mock -ModuleName QTrade.Distro Get-QtDockerImages { , @('redroid/redroid:11.0.0-latest', 'mlikiowa/napcat-docker:v1') }
+            Invoke-QtDockerLoadImages -Manifest $script:Mf -TarOverrideDir $tmp | Out-Null
+            ($script:Used -join ' | ') | Should -Match '/mnt/[a-z]/.*redroid-11\.tar'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}

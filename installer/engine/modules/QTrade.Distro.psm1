@@ -214,6 +214,66 @@ function Invoke-QtRootfsContentsVerify {
     return [pscustomobject]@{ Ok = ($mismatched.Count -eq 0); Mismatched = $mismatched }
 }
 
+function Invoke-QtDockerLoadImages {
+    <#
+    .SYNOPSIS
+        §2.13 第 6 步:**新镜像 tar 变了 → `docker load`**。
+
+        🔴 **旧镜像保留** —— 账号容器按 `account_runtime` 记的镜像 tag 起,
+        逐账号升级由 **Agent** 做、**不在安装器里**(§2.13 第 6 步原文)。
+        所以本函数**绝不** `docker rmi` / `image prune`:把旧 tag 删了,正在跑的账号下次起不来。
+    .PARAMETER TarOverrideDir
+        载荷侧若另带了镜像 tar(`wsl\images\*.tar`),优先用它;否则用 manifest
+        `rootfs_contents.*.tar` 里记的**发行版内**路径。
+    .OUTPUTS
+        {Ok, Loaded[{item, ref, tar}], Failed[{item, ref, tar, reason}]}
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Manifest,
+        [string] $DistroName = 'qtrade',
+        [AllowEmptyString()][string] $TarOverrideDir = '',
+        [int] $TimeoutSec = 1800
+    )
+    $loaded = @()
+    $failed = @()
+    if (-not (Test-QtHasProperty -Object $Manifest -Name 'rootfs_contents')) {
+        return [pscustomobject]@{ Ok = $true; Loaded = $loaded; Failed = $failed }
+    }
+    $contents = $Manifest.rootfs_contents
+    foreach ($key in $script:QtImageKeys) {
+        if (-not (Test-QtHasProperty -Object $contents -Name $key)) { continue }
+        $node = $contents.$key
+        if (-not (Test-QtHasProperty -Object $node -Name 'tar')) { continue }
+        $ref = ''
+        if (Test-QtHasProperty -Object $node -Name 'ref') { $ref = [string]$node.ref }
+        $tar = [string]$node.tar
+
+        # 载荷侧覆盖件(若有)先推进发行版再 load
+        if ($TarOverrideDir) {
+            $leaf = Split-Path -Leaf $tar
+            $override = Join-QtPath -Path $TarOverrideDir -ChildPath $leaf
+            if (Test-QtPath -Path $override) { $tar = ConvertTo-QtWslPath -WindowsPath $override }
+        }
+
+        $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'docker', 'load', '-i', $tar) -TimeoutSec $TimeoutSec
+        if ($r.TimedOut -or $r.ExitCode -ne 0) {
+            $failed += [pscustomobject]@{ item = $key; ref = $ref; tar = $tar; reason = (($r.StdErr + ' ' + $r.StdOut).Trim()) }
+            continue
+        }
+        # load 完确认 ref 真的在了 —— `docker load` 退出 0 不等于你要的那个 tag 进来了
+        if ($ref) {
+            $present = Get-QtDockerImages -DistroName $DistroName
+            if ($present -notcontains $ref) {
+                $failed += [pscustomobject]@{ item = $key; ref = $ref; tar = $tar; reason = 'load 成功但 docker images 里没有该 ref' }
+                continue
+            }
+        }
+        $loaded += [pscustomobject]@{ item = $key; ref = $ref; tar = $tar }
+    }
+    return [pscustomobject]@{ Ok = ($failed.Count -eq 0); Loaded = $loaded; Failed = $failed }
+}
+
 function Get-QtAgentHealth {
     <#
     .SYNOPSIS
@@ -337,6 +397,7 @@ Register-QtStepCheck -Step 'IMAGES_LOADED' -Check { param($ctx) Test-QtImagesLoa
 
 Export-ModuleMember -Function Get-QtDistroName, Get-QtAgentBaseUrl, Resolve-QtDistroConflict,
 Read-QtImportedMarker, Export-QtDistroBackup, Write-QtInstallEnv, Get-QtDockerImages,
-Test-QtImageRefsPresent, Get-QtExpectedImageRefs, Invoke-QtRootfsContentsVerify, Get-QtAgentHealth,
+Test-QtImageRefsPresent, Get-QtExpectedImageRefs, Invoke-QtRootfsContentsVerify,
+Invoke-QtDockerLoadImages, Get-QtAgentHealth,
 Test-QtAgentActive, Get-QtDockerBridgeSubnet, Test-QtDockerPoolApplied, Get-QtContainerLogsTail,
 Test-QtImagesLoaded, Test-QtDistroImported

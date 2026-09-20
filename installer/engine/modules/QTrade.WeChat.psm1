@@ -465,6 +465,142 @@ function Start-QtWeChatSetup {
     return [pscustomobject]@{ Ok = $false; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = '' }
 }
 
+function Get-QtWeChatInstallDetails {
+    <#
+    .SYNOPSIS
+        §2.9.3 末 `MULTIPLE_INSTALLS`:「列出各处**路径 / 版本 / 是否正在运行**,用户选**一处**」。
+        本函数把 Get-QtWeChatInstalls 的裸路径补成能直接上向导的一行。
+        🔴 只读:其余各处**不卸、不改**。
+    .OUTPUTS
+        [{path, version, ambiguous, running, uninstall_string, source}]
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()] $Installs = $null,
+        [AllowEmptyString()][string] $DataRoot = ''
+    )
+    if ($null -eq $Installs) { $Installs = Get-QtWeChatInstalls }
+    $runningDirs = @()
+    foreach ($proc in (Get-QtProcessByName -Name @('Weixin', 'WeChat'))) {
+        try { $runningDirs += (Split-Path -Parent $proc.Path).TrimEnd('\').ToLowerInvariant() } catch { }
+    }
+    $out = @()
+    foreach ($i in @($Installs)) {
+        $p = [string]$i.path
+        $v = Get-QtWeChatVersion -InstallPath $p -DataRoot $DataRoot
+        $out += [pscustomobject]@{
+            path             = $p
+            version          = $v.Version
+            ambiguous        = $v.Ambiguous
+            running          = ($runningDirs -contains $p.TrimEnd('\').ToLowerInvariant())
+            uninstall_string = [string]$i.uninstall_string
+            source           = [string]$i.source
+        }
+    }
+    return , $out
+}
+
+function Resolve-QtWeChatReinstallMode {
+    <#
+    .SYNOPSIS
+        §2.9.3 的两方案二选一。**纯函数**。
+
+        - **① `overwrite`(首选)**:不卸载,直接覆盖安装。用于「已装 4.x(含更高版本降到 4.1.12.26)」与首装。
+        - **② `interactive_uninstall`**:交互式卸载(🔴 **不加 `/S`**)再走 ① 的安装段。用于
+          「方案①失败(安装器拒绝降级 / 装完三来源版本 ≠ 4.1.12.26)」「3.x 升 4.x」「MULTIPLE_INSTALLS 用户要求清掉一处」。
+    .PARAMETER CurrentVersion
+        当前检测到的版本;3.x 走 ②(3.x 与 4.x 是两套安装布局,覆盖装不过去)。
+    .PARAMETER OverwriteFailed
+        方案①已经试过并失败。
+    .PARAMETER UserAskedRemoveOne
+        MULTIPLE_INSTALLS 里用户明确要求清掉选中的那一处。
+    .OUTPUTS
+        {Mode ∈ overwrite|interactive_uninstall|none, Reason}
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string] $CurrentVersion = '',
+        [bool] $OverwriteFailed = $false,
+        [bool] $UserAskedRemoveOne = $false,
+        [bool] $InteractiveAllowed = $true
+    )
+    if (-not $InteractiveAllowed) {
+        # 🔴 P-19:静默模式下重装整个不可用(方案①的安装器静默参数实测通过前,重装恒需交互)
+        return [pscustomobject]@{ Mode = 'none'; Reason = 'silent_not_supported' }
+    }
+    if ($OverwriteFailed) { return [pscustomobject]@{ Mode = 'interactive_uninstall'; Reason = 'overwrite_failed' } }
+    if ($UserAskedRemoveOne) { return [pscustomobject]@{ Mode = 'interactive_uninstall'; Reason = 'user_asked_remove_one' } }
+    if ($CurrentVersion -and (ConvertTo-QtVersionSegments -Version $CurrentVersion)[0] -eq 3) {
+        return [pscustomobject]@{ Mode = 'interactive_uninstall'; Reason = 'major_3_to_4' }
+    }
+    return [pscustomobject]@{ Mode = 'overwrite'; Reason = '' }
+}
+
+function Invoke-QtWeChatReinstall {
+    <#
+    .SYNOPSIS
+        §2.9.3 第 4 步「换版本」的编排:先走方案①;失败且允许交互卸载时,走方案②(卸载 → 再装)。
+
+        🔴 方案②**永远不带 `/S`** —— `Start-QtWeChatInteractiveUninstall` 里有 `Assert-QtNoSilentUninstall` 守门。
+        🔴 卸载轮询超时(默认 10 分钟)**不算硬失败**:§2.9.3 要求给【我已卸载,继续】/【跳过微信通道】,
+           所以这里回 `UninstallTimedOut=$true` 让调用方去问用户,而不是自己决定。
+    .OUTPUTS
+        {Ok, Mode, Reason, FinalVersion, UninstallTimedOut}
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $SetupExe,
+        [Parameter(Mandatory)][string] $InstallPath,
+        [AllowEmptyString()][string] $DataRoot = '',
+        [AllowEmptyString()][string] $UninstallString = '',
+        [AllowEmptyString()][string] $CurrentVersion = '',
+        [bool] $AllowInteractiveUninstall = $true,
+        [bool] $UserConfirmedUninstall = $false,
+        [bool] $SilentSetup = $false,
+        [int] $TimeoutSec = 600
+    )
+    $expected = Get-QtBundledWeChatVersion
+    $plan = Resolve-QtWeChatReinstallMode -CurrentVersion $CurrentVersion -InteractiveAllowed $AllowInteractiveUninstall
+
+    # 🔴 静默模式:整条重装路不可用(P-19)。必须在这里**直接返回** ——
+    #    否则 Mode='none' 会一路穿透到下面的方案②,在无人值守的机器上去开卸载器。
+    if ($plan.Mode -eq 'none') {
+        return [pscustomobject]@{ Ok = $false; Mode = 'none'; Reason = $plan.Reason; FinalVersion = ''; UninstallTimedOut = $false }
+    }
+    # 3.x 这类一上来就该走 ② 的:没有用户确认就先不动(红线 8)
+    if ($plan.Mode -eq 'interactive_uninstall' -and -not $UserConfirmedUninstall) {
+        return [pscustomobject]@{ Ok = $false; Mode = 'interactive_uninstall'; Reason = 'need_uninstall_confirm'; FinalVersion = ''; UninstallTimedOut = $false }
+    }
+
+    if ($plan.Mode -eq 'overwrite') {
+        $r = Start-QtWeChatSetup -SetupExe $SetupExe -InstallPath $InstallPath -DataRoot $DataRoot `
+            -ExpectedVersion $expected -SilentSetup $SilentSetup -TimeoutSec $TimeoutSec
+        if ($r.Ok) {
+            return [pscustomobject]@{ Ok = $true; Mode = 'overwrite'; Reason = ''; FinalVersion = $r.FinalVersion; UninstallTimedOut = $false }
+        }
+        # 方案①失败 → 按 §2.9.3「何时用」转方案②;仍要用户确认过才动
+        $plan = Resolve-QtWeChatReinstallMode -CurrentVersion $CurrentVersion -OverwriteFailed $true -InteractiveAllowed $AllowInteractiveUninstall
+        if ($plan.Mode -ne 'interactive_uninstall' -or -not $UserConfirmedUninstall) {
+            return [pscustomobject]@{ Ok = $false; Mode = 'overwrite'; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = ''; UninstallTimedOut = $false }
+        }
+    }
+
+    # ── 方案②:交互式卸载(不加 /S)→ 再走 ① 的安装段 ──────────────────
+    if (-not $UninstallString) {
+        return [pscustomobject]@{ Ok = $false; Mode = 'interactive_uninstall'; Reason = 'no_uninstall_string'; FinalVersion = ''; UninstallTimedOut = $false }
+    }
+    $un = Start-QtWeChatInteractiveUninstall -UninstallString $UninstallString -TimeoutSec $TimeoutSec
+    if (-not $un.Ok) {
+        return [pscustomobject]@{ Ok = $false; Mode = 'interactive_uninstall'; Reason = $un.Reason; FinalVersion = ''; UninstallTimedOut = ($un.Reason -eq 'UNINSTALL_TIMEOUT') }
+    }
+    $r2 = Start-QtWeChatSetup -SetupExe $SetupExe -InstallPath $InstallPath -DataRoot $DataRoot `
+        -ExpectedVersion $expected -SilentSetup $SilentSetup -TimeoutSec $TimeoutSec
+    if (-not $r2.Ok) {
+        return [pscustomobject]@{ Ok = $false; Mode = 'interactive_uninstall'; Reason = 'WECHAT_REINSTALL_FAILED'; FinalVersion = ''; UninstallTimedOut = $false }
+    }
+    return [pscustomobject]@{ Ok = $true; Mode = 'interactive_uninstall'; Reason = ''; FinalVersion = $r2.FinalVersion; UninstallTimedOut = $false }
+}
+
 function Invoke-QtWeChatUpdateBlock {
     <#
     .SYNOPSIS
@@ -538,4 +674,5 @@ Compare-QtVersion, Get-QtWeChatInstalls, Get-QtWeChatDataRoot, Expand-QtWeChatPa
 Get-QtWeChatVersion, Get-QtWeChatMatch, Get-QtWeChatPlan, Select-QtWeChatBackupMode, Get-QtWeChatBackupEstimate,
 Invoke-QtWeChatBackupCopy, Invoke-QtWeChatBackupRename, Restore-QtWeChatBackupRename,
 Assert-QtNoSilentUninstall, Start-QtWeChatInteractiveUninstall, Start-QtWeChatSetup,
+Get-QtWeChatInstallDetails, Resolve-QtWeChatReinstallMode, Invoke-QtWeChatReinstall,
 Invoke-QtWeChatUpdateBlock, Resolve-QtWeChatMode, Test-QtClientsChecked

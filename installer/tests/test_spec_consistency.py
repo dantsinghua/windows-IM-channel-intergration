@@ -656,3 +656,62 @@ def test_packaging_intermediate_not_shipped() -> None:
     既不在 manifest 里、装机现场也没人用 —— 不许进包。"""
     b = read(INSTALLER_ROOT / "build" / "build.ps1")
     assert "-x!install\\.packed-entries.txt" in b
+
+
+# ── 第三批:补齐的三项 ────────────────────────────────────────────────────
+def test_upgrade_wires_image_load_step() -> None:
+    """§2.13 第 6 步:新镜像 tar 变了 → `docker load`。
+    `Get-QtUpgradePlan` 判了 `Images` 还不够,upgrade 分支必须真的去 load。"""
+    rs = read(RUN_STEP)
+    body = _slice(rs, "'upgrade' {", "'repair' {")
+    assert "Invoke-QtDockerLoadImages" in body, "upgrade 分支没接上镜像加载"
+    assert "$plan.Images" in body
+
+
+def test_old_images_are_never_removed() -> None:
+    """🔴 §2.13 第 6 步:**旧镜像保留** —— 账号容器按 `account_runtime` 记的镜像 tag 起,
+    逐账号升级由 Agent 做、不在安装器里。把旧 tag 删了,正在跑的账号下次起不来。"""
+    hits = []
+    for p in _script_files("runtime"):
+        code = strip_comments(read(p))
+        for pat in (r"\bdocker\s+rmi\b", r"\bimage\s+prune\b", r"\bdocker\s+image\s+rm\b"):
+            if re.search(pat, code):
+                hits.append((p.name, pat))
+    assert not hits, f"出现了删镜像的调用:{hits}"
+
+
+def test_dispatcher_has_readonly_wechat_detect() -> None:
+    """MULTIPLE_INSTALLS 的选择页要在**向导阶段**就知道有哪几处 —— 靠一个**只读**的检测动作。
+    它绝不能改任何东西(不写 state、不动微信)。"""
+    branches = _dispatcher_branches()
+    assert "wechat-detect" in branches
+    rs = read(RUN_STEP)
+    body = _slice(rs, "'wechat-detect' {", "\n        }")
+    assert "Set-QtState" not in body, "只读动作不该迁状态"
+    assert "Start-QtWeChatSetup" not in body and "Start-QtWeChatInteractiveUninstall" not in body, \
+        "只读动作不该碰微信安装器/卸载器"
+    # 回值用扁平键,免得 Pascal 侧要写 JSON 数组解析
+    assert "install_{0}_label" in body and "install_{0}_path" in body
+
+
+def test_iss_has_multiple_installs_selection_page(iss: str) -> None:
+    """§2.9.3 末:MULTIPLE_INSTALLS 时列出各处路径/版本/是否正在运行,用户选**一处**;
+    其余**不卸、不改**。只有真检测到 ≥2 处时才显示。"""
+    assert "PageWeChatSelect" in iss
+    assert "RunStep('wechat-detect')" in iss
+    assert "WeChatSelectedPath" in iss
+    assert "其余各处我们一律不动" in iss
+    # 只在 ≥2 处时显示
+    assert "WeChatMultiple := Count >= 2" in iss
+    assert "Result := not WeChatMultiple" in iss
+
+
+def test_iss_handles_interactive_uninstall_branch(iss: str) -> None:
+    """§2.9.3 方案②:向导要引导用户确认「保留本地数据」勾选框,
+    并在轮询超时时给【我已卸载,继续】/【跳过微信通道】——不替用户决定。"""
+    assert "WAIT_WECHAT_UNINSTALL" in iss
+    assert "保留本地数据" in iss
+    assert "我已经卸载完了" in iss
+    assert "WeChatUninstallConfirmed := True" in iss
+    # 🔴 卸载器不带任何静默参数的提醒必须在文案里
+    assert "不带任何静默参数" in iss

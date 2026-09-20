@@ -614,18 +614,36 @@ try {
 
             $installs = Get-QtWeChatInstalls
             $dataRoot = Get-QtWeChatDataRoot
+            $details = Get-QtWeChatInstallDetails -Installs $installs -DataRoot $dataRoot.DataRoot
             $version = ''
             $ambiguous = $false
             $installPath = ''
-            if ($installs.Count -ge 1) {
-                $installPath = [string]$installs[0].path
-                $v = Get-QtWeChatVersion -InstallPath $installPath -DataRoot $dataRoot.DataRoot
-                $version = $v.Version
-                $ambiguous = $v.Ambiguous
+            $uninstallString = ''
+            $selectedMs = 0
+
+            # §2.9.3 末:MULTIPLE_INSTALLS 时用户选**一处**作为 QTrade 使用的微信;其余**不卸、不改**。
+            # 向导把选中的路径经 `wechat_selected_path` 传回来;没选就用第一处(单安装时就是它)。
+            $selected = [string](Get-QtOpt -Name 'wechat_selected_path' -Default '')
+            $pick = $null
+            if ($selected) {
+                $hit = @($details | Where-Object { ([string]$_.path).TrimEnd('\') -eq $selected.TrimEnd('\') })
+                if ($hit.Count -gt 0) { $pick = $hit[0]; $selectedMs = (Get-QtEpochMs) }
             }
-            $match = Get-QtWeChatMatch -InstallCount $installs.Count -Version $version
+            if ($null -eq $pick -and $details.Count -ge 1) { $pick = $details[0] }
+            if ($null -ne $pick) {
+                $installPath = [string]$pick.path
+                $version = [string]$pick.version
+                $ambiguous = [bool]$pick.ambiguous
+                $uninstallString = [string]$pick.uninstall_string
+            }
+
+            # 🔴 选过之后按 §2.9.2 **对选中的那一处再判**(而不是继续拿「装了几处」当结论)
+            $effectiveCount = $installs.Count
+            if ($selected -and $null -ne $pick) { $effectiveCount = 1 }
+            $match = Get-QtWeChatMatch -InstallCount $effectiveCount -Version $version
             $plan = Get-QtWeChatPlan -Mode $mode -Match $match.Match -UserApproved $approved -BackupMode $backupMode
             $error = ''
+            $reinstallMode = 'overwrite'
 
             if ($plan.NeedReinstall) {
                 # §2.9.3 第 3 步:备份(copy / rename / skip)
@@ -644,10 +662,25 @@ try {
                     }
                 }
                 if (-not $error) {
-                    $setup = Start-QtWeChatSetup -SetupExe (Join-Path $paths.Pkg 'wechat\weixin_4.1.12.26.exe') `
+                    # §2.9.3 第 4 步:方案①(覆盖安装)→ 失败且用户确认过则转方案②(交互式卸载再装)。
+                    # 🔴 方案② 永远不带 /S(Assert-QtNoSilentUninstall 守门)。
+                    $setup = Invoke-QtWeChatReinstall `
+                        -SetupExe (Join-Path $paths.Pkg 'wechat\weixin_4.1.12.26.exe') `
                         -InstallPath $installPath -DataRoot $dataRoot.DataRoot `
+                        -UninstallString $uninstallString -CurrentVersion $version `
+                        -AllowInteractiveUninstall (-not $silent) `
+                        -UserConfirmedUninstall ([bool](Get-QtOpt -Name 'wechat_uninstall_confirmed' -Default $false)) `
                         -SilentSetup ([bool](Get-QtOpt -Name 'wechat_silent_setup' -Default $false))
+                    $reinstallMode = $setup.Mode
                     if (-not $setup.Ok) {
+                        if ($setup.Reason -eq 'need_uninstall_confirm' -or $setup.UninstallTimedOut) {
+                            # §2.9.3:卸载超时要给【我已卸载,继续】/【跳过微信通道】——由向导问,不由这里替用户决定
+                            Set-QtParked -State $state -Step 'CLIENTS_CHECKED' -Reason 'WAIT_WECHAT_UNINSTALL' | Out-Null
+                            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WAIT_WECHAT_UNINSTALL' -ExitName 'E_INSTALL_WAIT_USER' `
+                                -Message '需要你在微信卸载程序里完成卸载(记得保持「保留本地数据」是勾上的),完成后回到这里继续' `
+                                -Data ([ordered]@{ uninstall_string = $uninstallString; timed_out = $setup.UninstallTimedOut })
+                        }
                         $error = 'WECHAT_REINSTALL_FAILED'
                         $plan = Get-QtWeChatPlan -Mode 'skip' -Match $match.Match
                     } else {
@@ -685,8 +718,10 @@ try {
                     version         = $version
                     path            = $installPath
                     dll             = $match.Dll
-                    reinstall_mode  = 'overwrite'
+                    reinstall_mode  = $reinstallMode
                     backup_mode     = $backupMode
+                    selected_ms     = $selectedMs
+                    install_count   = $installs.Count
                     hosts_block     = $hostsBlock
                     ambiguous       = $ambiguous
                     error           = $error
@@ -700,6 +735,26 @@ try {
             else { ('微信已换到 {0}' -f $version) }
             Write-QtStepResult -Ok $true -State 'CLIENTS_CHECKED' -Message $msg `
                 -Data ([ordered]@{ match = $match.Match; action = $plan.Action; hosts_block = $hostsBlock; apk_probe = $apkProbe; error = $error })
+        }
+
+
+        # ── 微信检测(**只读**,供向导在 MULTIPLE_INSTALLS 时弹选择页;§2.9.3 末)──
+        # 回值用**扁平键** install_0_path / install_0_label …,让 Inno 的 Pascal 侧不用写 JSON 数组解析。
+        'wechat-detect' {
+            $dataRoot = Get-QtWeChatDataRoot
+            $details = Get-QtWeChatInstallDetails -DataRoot $dataRoot.DataRoot
+            $data = [ordered]@{ count = $details.Count; data_root = $dataRoot.DataRoot }
+            for ($i = 0; $i -lt $details.Count; $i++) {
+                $d = $details[$i]
+                $ver = $(if ($d.version) { $d.version } else { '版本未知' })
+                $run = $(if ($d.running) { '正在运行' } else { '未运行' })
+                $data[('install_{0}_path' -f $i)] = [string]$d.path
+                $data[('install_{0}_label' -f $i)] = ('{0}  ({1},{2})' -f $d.path, $ver, $run)
+                $data[('install_{0}_version' -f $i)] = [string]$d.version
+            }
+            $m = Get-QtWeChatMatch -InstallCount $details.Count -Version $(if ($details.Count -ge 1) { [string]$details[0].version } else { '' })
+            $data['match'] = $m.Match
+            Write-QtStepResult -Ok $true -State ([string]$state.state) -Message ('检测到 {0} 处微信安装' -f $details.Count) -Data $data
         }
 
         # ── SELFTEST_OK(§2.11 + §2.10)──────────────────────────────────────
@@ -841,6 +896,19 @@ try {
             } elseif ($plan.AgentCode) {
                 Update-QtAgentCode -AgentTarPath (Join-Path $paths.Wsl 'agent\agent.tar') -DistroName ([string]$state.distro.name) | Out-Null
             }
+
+            # §2.13 第 6 步:新镜像 tar 变了 → docker load(🔴 **旧镜像保留**,逐账号升级归 Agent)
+            $imagesLoaded = @()
+            if ($plan.Images) {
+                $mf = Read-QtManifest -Path $paths.Manifest
+                $li = Invoke-QtDockerLoadImages -Manifest $mf -DistroName ([string]$state.distro.name) `
+                    -TarOverrideDir (Join-Path $paths.Wsl 'images')
+                $imagesLoaded = @($li.Loaded | ForEach-Object { $_.ref })
+                if (-not $li.Ok) {
+                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'IMAGE_LOAD_FAILED' -ExitName 'E_INSTALL_IMAGE_LOAD_FAILED' `
+                        -Message '升级期加载新镜像失败' -Data ([ordered]@{ failed = $li.Failed; backup_tar = $backupTar })
+                }
+            }
             $started = Start-QtTriad -ConsoleExePath (Join-Path $paths.Console (Get-QtConsoleNames).exe)
 
             $state.package_version = $selfVersion
@@ -852,6 +920,7 @@ try {
                     backup_tar    = $backupTar
                     console_killed = $stopped.ConsoleKilled
                     user_agent    = $started.UserAgent
+                    images_loaded = $imagesLoaded
                 })
         }
 
