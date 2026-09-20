@@ -41,12 +41,15 @@ if ($Clean) {
     Remove-Item -Recurse -Force "$root\build\build", "$root\dist" -ErrorAction SilentlyContinue
 }
 
-Write-Host "[2/5] 建虚拟环境并装依赖(含 windows extra)" -ForegroundColor Cyan
+Write-Host "[2/5] 建虚拟环境并装依赖(含 windows + dev extra)" -ForegroundColor Cyan
 $venv = "$root\.venv-build"
 if (-not (Test-Path $venv)) { Invoke-Expression "$Python -m venv `"$venv`"" }
 $py = "$venv\Scripts\python.exe"
 & $py -m pip install --upgrade pip wheel | Out-Null
-& $py -m pip install -e ".[windows]" pyinstaller | Out-Null
+# 🔴 必须连 `dev` 一起装:第 3 步要跑 `pytest -q`,而 pytest / pytest-asyncio / httpx 都只在
+#    `[dev]` extra 里(pyproject `[project.optional-dependencies]`)。只装 `[windows]` 的话,
+#    干净机器上第 3 步必炸 `No module named pytest`(2026-09-21 首次在真 Windows 上跑本脚本时踩到)。
+& $py -m pip install -e ".[windows,dev]" pyinstaller | Out-Null
 # 会话代理侧的 UI 自动化栈(不进 pyproject 的硬依赖:Linux 上装不了)
 & $py -m pip install pywinauto pillow | Out-Null
 Write-Host "    ⚠️ pyweixin 不在公共源上:按 03 的随包清单从本地 wheel 安装后再打包(缺它则微信发送不可用)" -ForegroundColor Yellow

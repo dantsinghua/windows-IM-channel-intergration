@@ -226,25 +226,85 @@ def test_installer_token_can_be_revoked():
 
 
 def test_expand_falls_back_under_root_when_env_var_unexpandable(tmp_path):
-    """``%ProgramData%`` 在非 Windows 上展不开 ⇒ 必须落到 ``--root`` 下,**不能当相对路径在 cwd 里造目录**。
+    """``expand()`` 单函数的落点契约 —— **本用例按平台分叉是正当的**(2026-09-21 真机实测后分叉)。
 
-    (``--dev`` 冒烟时实测:原实现在仓库里拉出了一坨 ``%ProgramData%\\QTrade\\winagent\\vault`` 目录。)
+    ``expand`` 是**生产**路径解析工具:02 §7.2 的 ``[vault] dir`` 默认值就写作
+    ``%ProgramData%\\QTrade\\winagent\\vault``,指的正是真机上那个真实目录。所以两边结论本就不同:
+
+    * **Windows**:``%ProgramData%`` 展得开 ⇒ 返回 ``C:\\ProgramData\\QTrade\\winagent\\vault``。
+      这是**期望**的生产语义,**不该**被塞进 ``--root``。
+    * **非 Windows**:变量根本不存在,``expandvars`` 原样返回带 ``%`` 的串;若直接拿去用会被当成
+      **相对路径**在 cwd 里造出名字带 ``%`` 的目录(``--dev`` 冒烟时实测在仓库里拉了一坨),
+      故兜到 ``--root`` 下。
+
+    🔴 **这个分叉不可外推**:它只说明 ``expand`` 这一个函数两平台结论不同,**不**等于
+    「``--dev`` 自包含」也能按平台分叉 —— 自包含是另一条契约,见下一个用例(那条**不分叉**)。
     """
     import os as _os
     from qtrade_winagent.main_svc import expand
     root = str(tmp_path)
     out = expand(r"%ProgramData%\QTrade\winagent\vault", root)
-    assert "%" not in out and out.startswith(root) and out.endswith(_os.path.join("winagent", "vault"))
-    assert expand(r"%LOCALAPPDATA%", root).startswith(root)
-    assert expand("/var/lib/qtrade", root) == "/var/lib/qtrade"          # 已是绝对路径就别动
+
+    # 两个平台共同的不变量
+    assert "%" not in out                                                 # 不许留未展开的变量
+    assert _os.path.isabs(out)                                            # 不许是相对路径
+    assert out.endswith(_os.path.join("winagent", "vault"))
+    assert expand("/var/lib/qtrade", root) == "/var/lib/qtrade"           # 已是绝对路径就别动
+
+    if _os.name == "nt":
+        assert out == _os.path.join(_os.environ["ProgramData"], "QTrade", "winagent", "vault")
+        assert expand(r"%LOCALAPPDATA%", root) == _os.environ["LOCALAPPDATA"]
+    else:
+        assert out.startswith(root)
+        assert expand(r"%LOCALAPPDATA%", root).startswith(root)
+
+    assert not _os.path.exists("%ProgramData%")                           # cwd 里不许留垃圾
 
 
 def test_dev_assembly_keeps_everything_under_root(tmp_path):
+    """``--dev`` / 假后端装配**必须完全自包含在 ``--root`` 下** —— 🔴 **两平台同一条契约,不分叉**。
+
+    依据(不是用例自己发明的口径):
+
+    * ``winagent/README.md`` §3 对这条命令的原话是「**只起 HTTP + 假后端,不动任何真系统状态**」,
+      给的示例正是 ``--dev --root /tmp/wa-dev`` —— 既然要显式给 ``--root``,落点就该全在它下面。
+    * ``main_svc.expand()`` 自己的 docstring 也写着「``--dev`` 因此是自包含的」。
+
+    ⚠️ **本用例在 Windows 上会红,红的是实现、不是用例**:``expand`` 在 Windows 上把 ``%ProgramData%``
+    展开成真实目录,于是 vault / 内核落盘 / ``.wslconfig`` 备份三个**写入**落点一起逃出 ``--root``,
+    落进真机**生产**目录 ``C:\\ProgramData\\QTrade\\``。
+    实测后果(2026-09-21 首次在真 Windows 上跑 winagent 测试):跑一次 ``pytest`` 就在
+    ``C:\\ProgramData\\QTrade\\winagent\\vault\\`` 里造出了 ``blobs\\`` 和一把 32 字节 ``entropy.bin`` ——
+    那是 ``FakeCrypto`` 的产物,而 ``FakeCrypto.tighten_acl`` 是空操作所以 ACL 没收紧(实测 ``-rwxrwxrwx``),
+    它却占在**生产熵文件**的位置上:日后真装机时 ``startup_selfcheck()`` 见文件在就不报
+    ``VAULT_ENTROPY_MISSING``,真凭据会绑到这把假熵上(README §4.1 V1/V3 的后果)。
+    ``--dev`` 的自包含从来没真正实现过,只是「Linux 上恰好展不开」带来的假象。
+
+    ⚠️ 本用例**只做路径断言、绝不落盘**(刻意不调 ``ensure_entropy()``),
+    好让它在 Windows 上红得干净、不会再往 ``C:\\ProgramData`` 写第二次。
+
+    「落点」= WinAgent 会**写**的地方:``winagent.db`` / vault 目录 / 内核落盘目录 / ``.wslconfig`` 备份目录。
+    ``monitor`` 的 ``disks`` 是**只读**的受检目标(还含硬编码的 ``D:\\``),按定义不在此列。
+    """
     from qtrade_winagent.config import WinAgentConfig
     from qtrade_winagent.main_svc import build_real_deps
     root = str(tmp_path / "root")
     d = build_real_deps(WinAgentConfig(), root=root, install_user_sid="S-1-5-21-x-1001", fake=True)
-    d.vault.ensure_entropy()
-    assert d.vault.entropy_path.startswith(root)
-    assert not os.path.exists("%ProgramData%")                            # cwd 里不许留垃圾
-    d.db.close()
+    try:
+        abs_root = os.path.abspath(root)
+        # 私有属性:InstallerOps 没有公开这两个目录,而它们恰是最容易逃逸的两个写入落点
+        written = {
+            "winagent.db": d.db.path,
+            "vault(entropy.bin/blobs)": d.vault.entropy_path,
+            "installer.kernel_dir": d.installer._kernel_dir,
+            "installer.wsl_backup_dir": d.installer._wsl_backup_dir,
+        }
+        for label, p in written.items():
+            abs_p = os.path.abspath(p)
+            assert "%" not in p, f"{label} 残留未展开的变量:{p}"
+            assert abs_p == abs_root or abs_p.startswith(abs_root + os.sep), (
+                f"--dev 的写入落点 {label} 逃出了 --root:{p}(root={root})"
+            )
+        assert not os.path.exists("%ProgramData%")                        # cwd 里不许留垃圾
+    finally:
+        d.db.close()
