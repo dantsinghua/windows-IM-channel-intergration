@@ -71,6 +71,11 @@ def _error_body(code: str, message: str, *, reason: str = "", retryable: bool = 
     return body
 
 
+#: `settings` 里存「用户填的对外域名」的唯一键(02 #102 逐字 `settings api.public_domain`;07 §2:不在 agent.toml 里)。
+#: #88/#89 的 `api` 组与 #102 的 `configured_domain` **必须用同一把键**,否则写得进读不回。
+API_PUBLIC_DOMAIN_KEY = "api.public_domain"
+
+
 def _parse_time(v: Optional[str]) -> Optional[int]:
     if v is None or v == "":
         return None
@@ -81,8 +86,40 @@ def _parse_time(v: Optional[str]) -> Optional[int]:
     return int(datetime.fromisoformat(v).timestamp() * 1000)
 
 
+def _page_window(cursor: Optional[str], since: Optional[str] = None, until: Optional[str] = None
+                 ) -> tuple[Optional[tuple[int, str]], Optional[int], Optional[int]]:
+    """C-42 统一分页/时间参数的入参解析(02 §3.4 通用段;游标格式 G-16)。
+
+    `cursor` 解不开 → ``400 INVALID_ARGS(bad_cursor)``(客户端只能透传、不能自己构造,格式变了就从头拉);
+    `since`/`until` 非法 → ``400 INVALID_ARGS(bad_time)``。
+    🔴 `limit` 由各端点的 ``Query(…, ge=1, le=…)`` 把关 —— **不认识就静默忽略**是最危险的那种(页面会以为自己限过量)。
+    """
+    before: Optional[tuple[int, str]] = None
+    if cursor:
+        try:
+            before = decode_cursor(cursor)
+        except Exception:
+            raise ApiError(400, "INVALID_ARGS", "cursor 非法", reason="bad_cursor", extra={"details": [{"pointer": "/cursor"}]})
+    try:
+        return before, _parse_time(since), _parse_time(until)
+    except ValueError:
+        raise ApiError(400, "INVALID_ARGS", "since/until 须为 ISO 8601 或毫秒", reason="bad_time",
+                       extra={"details": [{"pointer": "/since"}]})
+
+
+def _next_cursor(rows: list[dict[str, Any]], limit: int, *, ts_key: str, id_key: str = "id") -> Optional[str]:
+    """C-42 的 ``next_cursor``:**仅在本页满 `limit` 时非空**(#48 逐字),取值 = 本页末行的 ``(排序列, 主键)``。
+
+    🔴 用的是**权限过滤之前**的那一页:过滤后行数变少不代表没有下一页,拿过滤后的行判满页会把后面的页整段吞掉。
+    """
+    if not rows or len(rows) < limit:
+        return None
+    last = rows[-1]
+    return encode_cursor(int(last.get(ts_key) or 0), str(last[id_key]))
+
+
 async def _ws_reject(ws: WebSocket, code: int, reason: str) -> None:
-    """§3.4.7:握手被拒时也要让客户端**看得到关闭码**(4401/4403…)。
+    """§3.4.7:握手被拒时也要让客户端**看得到关闭码**(本册只定义 **4401 / 4400**,**没有 4403**;R6-62 (a))。
 
     🔴 在 ``accept()`` **之前** ``close()``,Starlette/uvicorn 会退化成「拒绝握手」(HTTP 403),
     浏览器与 ws 客户端只看得到 **1006**(异常关闭)—— 控制台 `ws.ts` 的 `onAuthFailed` 因此永远不触发,
@@ -105,6 +142,9 @@ def create_api(agent) -> FastAPI:
     caps, caps_version = load_capabilities()
     caps_by_op = {c["op"]: c for c in caps}
     app.state.capabilities_version = caps_version
+    # #52 的 `expires_at` 来源:`jobs.expires_ms` 由 `Store.job_create` 按本值填(R4-13「jobs 随产物」;
+    # 键 = `[retention] export_jobs_days`,docs/07 已登记,缺省 7)。此前该列全程没有写点 ⇒ `expires_at` 恒 null。
+    agent.store.job_retention_days = int(getattr(cfg.retention, "export_jobs_days", 7))
 
     # ------------------------------------------------------------------ 横切:版本头 / 错误信封 / 审计
     @app.middleware("http")
@@ -161,7 +201,9 @@ def create_api(agent) -> FastAPI:
                                                  "ip": request.client.host if request.client else None}, now_ms=agent.clock())
             except Exception as e:     # 审计失败不影响响应
                 log.warning("audit_log 写入失败: %s", e)
-        # `#72 /system/health` 的键集被 02 逐字定死(免鉴权来源恰五个布尔键),**不往里塞 trace_id**
+        # `#72 /system/health`:02 §3.4 例外①(R6-62 (b) + Ⅵ W1)逐字 =「**这个路径**(免鉴权摘要与带令牌全量
+        # **两种形态都不注入** `trace_id`)」—— 排除**按 path 整端点**做,与带不带令牌无关(两种形态的键集
+        # 都由 02 #72 行逐字定死)。总控 2026-09-21 复核裁决:维持本实现,不收窄成「只限免鉴权摘要」。
         if request.url.path == f"{API_PREFIX}/system/health":
             return _with_version_headers(response)
         return _with_version_headers(await _inject_trace_id(response, request.state.trace_id))
@@ -367,11 +409,18 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/accounts")
     async def list_accounts(request: Request, channel: Optional[str] = None, state: Optional[str] = None, enabled: Optional[bool] = None,
-                            include_stopped: bool = True, include_deleted: bool = False):
+                            include_stopped: bool = True, include_deleted: bool = False,
+                            since: Optional[str] = None, until: Optional[str] = None,
+                            limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
+        """#1,级别 R。**C-42 统一分页**:``?since&until&limit&cursor`` → ``{ok, data, next_cursor}``
+        (排序 = ``created_ms`` 降序,游标 G-16;`limit` 真生效,不静默忽略)。"""
         p = _principal(request, "read")
-        rows = agent.store.list_accounts(channel=channel, state=state, enabled=enabled, include_deleted=include_deleted)
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = agent.store.list_accounts_page(channel=channel, state=state, enabled=enabled, include_deleted=include_deleted,
+                                              since_ms=since_ms, until_ms=until_ms, limit=limit, before=before)
+        nxt = _next_cursor(rows, limit, ts_key="created_ms")
         rows = [r for r in rows if p.allows_account(r["id"]) and (include_stopped or r["state"] != "stopped")]
-        return {"ok": True, "data": [account_view(r, _acct_caps(r)) for r in rows]}
+        return {"ok": True, "data": [account_view(r, _acct_caps(r)) for r in rows], "next_cursor": nxt}
 
     @app.get(f"{API_PREFIX}/accounts/{{account_id}}")
     async def get_account(request: Request, account_id: str):
@@ -630,10 +679,15 @@ def create_api(agent) -> FastAPI:
     # ------------------------------------------------------------------ sessions / messages
     @app.get(f"{API_PREFIX}/sessions")
     async def list_sessions(request: Request, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
-                            limit: int = Query(100, ge=1, le=500)):
+                            since: Optional[str] = None, until: Optional[str] = None,
+                            limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
+        """#26,级别 R。**C-42 统一分页**:排序 = ``last_msg_ms`` 降序(空值按 0),游标 G-16。"""
         p = _principal(request, "read")
-        rows = agent.store.list_sessions(account_id=account_id, keyword=keyword, kind=kind, limit=limit)
-        return {"ok": True, "data": [session_view(r) for r in rows if p.allows_account(r["account_id"])]}
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = agent.store.list_sessions_page(account_id=account_id, keyword=keyword, kind=kind,
+                                              since_ms=since_ms, until_ms=until_ms, limit=limit, before=before)
+        nxt = _next_cursor(rows, limit, ts_key="last_msg_ms")
+        return {"ok": True, "data": [session_view(r) for r in rows if p.allows_account(r["account_id"])], "next_cursor": nxt}
 
     @app.get(f"{API_PREFIX}/messages")
     async def list_messages(request: Request, account_id: Optional[str] = None, session_id: Optional[str] = None, dir: Optional[str] = None,
@@ -982,7 +1036,7 @@ def create_api(agent) -> FastAPI:
         _principal(request, "read")
         st = agent.store.settings_get("system.public_endpoint") or {}
         return {"ok": True, "public_ip": st.get("public_ip"), "public_ip_v6": st.get("public_ip_v6"),
-                "configured_domain": agent.store.settings_get("api.public_domain"),
+                "configured_domain": agent.store.settings_get(API_PUBLIC_DOMAIN_KEY),
                 "checked_at": iso8601(st["checked_ms"]) if st.get("checked_ms") else None,
                 "changed_at": iso8601(st["changed_ms"]) if st.get("changed_ms") else None,
                 "probe": {"url": st.get("probe_url"), "unreachable_rounds": int(st.get("unreachable_rounds") or 0)}}
@@ -1194,7 +1248,13 @@ def create_api(agent) -> FastAPI:
                     "template_version": cfg.mail.template_version,
                     "scopes": {s: _mail_scope_view(None if s == "default" else s, rows) for s in MAIL_SCOPES}}
         field = SETTINGS_GROUPS[group]
-        return {k: v for k, v in _as_dict(getattr(cfg, str(field))).items() if not any(k.endswith(x) for x in SECRET_KEYS)}
+        out = {k: v for k, v in _as_dict(getattr(cfg, str(field))).items() if not any(k.endswith(x) for x in SECRET_KEYS)}
+        if group == "api":
+            # 🔴 `public_domain` **不在 agent.toml 里**(07 §2 `[api]` 行逐字:运行期可改、随 settings 备份),
+            #    它的唯一存放处 = `settings['api.public_domain']`(02 #102 逐字)。读路径此前只映射 `AgentConfig.api`
+            #    的字段 ⇒ `PUT /settings/api {public_domain}` 写得进、`GET /settings/api` 读不回,P-SET 表单回填不了。
+            out["public_domain"] = agent.store.settings_get(API_PUBLIC_DOMAIN_KEY)
+        return out
 
     def _validate_retention(body: dict[str, Any]) -> dict[str, Any]:
         """#89:数据类 ``*_days > 30`` **按 30 截断并 WARN**(E-18);三级水位顺序非法 → 400。"""
@@ -1574,6 +1634,11 @@ def create_api(agent) -> FastAPI:
         body = await request.json()
         if not isinstance(body, dict):
             raise ApiError(400, "INVALID_ARGS", "请求体须为对象", reason="bad_body")
+        if group == "api" and "public_domain" in body:
+            # 与 `_group_view` 同一把键 ⇒ 写进读得回;空串/None = 清除(P-SET 把域名删掉的动作)。
+            pub = body.pop("public_domain")
+            pub = str(pub).strip() if isinstance(pub, str) else None
+            agent.store.settings_set(API_PUBLIC_DOMAIN_KEY, pub or None, actor=p.actor)
         warnings: list[str] = []
         if group == "resources":
             return {"ok": True, "group": group, **_put_resources(body, p.actor)}
@@ -1585,15 +1650,35 @@ def create_api(agent) -> FastAPI:
         secret_refs = await _stash_secrets(group, body, p.actor)
         agent.store.settings_set(f"config.{group}", body, actor=p.actor)
         written = _write_agent_toml(group, body)
-        return {"ok": True, "group": group, "data": body, "secret_refs": secret_refs,
+        data = dict(body)
+        if group == "api":
+            data["public_domain"] = agent.store.settings_get(API_PUBLIC_DOMAIN_KEY)   # 与 GET 同形,表单回填不用再拉一次
+        return {"ok": True, "group": group, "data": data, "secret_refs": secret_refs,
                 "restart_required": True, "config_written": written, "warnings": warnings}
 
 
     # ------------------------------------------------------------------ 邮件 /mail(06 §3.2;命名以 06 为准,C-29)
+    #: `[mail.inbound.hmac]` 的发件人短名表在 `settings` 里的键前缀(`mail.hmac.<短名>`);#67/#68/GET 三处同源。
+    MAIL_HMAC_PREFIX = "mail.hmac."
+
     def _mail_or_503():
         if getattr(agent, "mail", None) is None:
             raise ApiError(503, "NOT_READY", "邮件服务未装配", reason="mail_not_wired", retryable=True)
         return agent.mail
+
+    def _hmac_route_id(short: str, routes: list[dict[str, Any]]) -> Optional[str]:
+        """短名落在哪条路由的 ``inbound_json.hmac{短名: secret_ref}`` 里(06 §3.1 表);全局短名回 ``None``。
+
+        短名本身**全局唯一、不带 route 维度**(R6-23),这一列只是让 P-SET 知道它挂在哪块卡片上。
+        """
+        for r in routes:
+            try:
+                inbound = json.loads(r.get("inbound_json") or "{}")
+            except ValueError:
+                continue
+            if short in (inbound.get("hmac") or {}):
+                return r.get("id")
+        return None
 
     def _transport_of(p: Principal) -> str:
         """🔴 承重墙(基线 §11.17 ③):``transport`` **只能取自鉴权上下文**,绝不许调用方在 body 里指定。
@@ -1783,11 +1868,13 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/mail/inbox")
     async def mail_inbox(request: Request, status: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None,
-                         q: Optional[str] = None, limit: int = Query(100, ge=1, le=500)):
-        """#58,级别 R。"""
+                         q: Optional[str] = None, limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
+        """#58,级别 R。**C-42 统一分页**:排序 = ``received_ms`` 降序,游标 G-16。"""
         _principal(request, "read")
-        return {"ok": True, "data": _mail_or_503().ms.inbox_list(status=status, since_ms=_parse_time(since),
-                                                                 until_ms=_parse_time(until), q=q, limit=limit)}
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = _mail_or_503().ms.inbox_list_page(status=status, since_ms=since_ms, until_ms=until_ms, q=q,
+                                                 limit=limit, before=before)
+        return {"ok": True, "data": rows, "next_cursor": _next_cursor(rows, limit, ts_key="received_ms")}
 
     @app.get(f"{API_PREFIX}/mail/inbox/{{inbox_id}}")
     async def mail_inbox_get(request: Request, inbox_id: int):
@@ -1813,10 +1900,14 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/mail/outbox")
     async def mail_outbox(request: Request, status: Optional[str] = None, kind: Optional[str] = None,
-                          limit: int = Query(100, ge=1, le=500)):
-        """#61,级别 R。"""
+                          since: Optional[str] = None, until: Optional[str] = None,
+                          limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
+        """#61,级别 R。**C-42 统一分页**:排序 = ``created_ms`` 降序,游标 G-16。"""
         _principal(request, "read")
-        return {"ok": True, "data": _mail_or_503().ms.outbox_list(status=status, kind=kind, limit=limit)}
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = _mail_or_503().ms.outbox_list_page(status=status, kind=kind, since_ms=since_ms, until_ms=until_ms,
+                                                  limit=limit, before=before)
+        return {"ok": True, "data": rows, "next_cursor": _next_cursor(rows, limit, ts_key="created_ms")}
 
     @app.post(f"{API_PREFIX}/mail/outbox/{{outbox_id}}/resend")
     async def mail_resend(request: Request, outbox_id: int):
@@ -1857,6 +1948,37 @@ def create_api(agent) -> FastAPI:
         _principal(request, "read")
         return {"ok": True, "data": _mail_or_503().ms.cleanup_log_list(limit=limit)}
 
+    @app.get(f"{API_PREFIX}/mail/hmac-keys")
+    async def mail_hmac_keys_list(request: Request, limit: int = Query(100, ge=1, le=500)):
+        """**HMAC 发件人短名表(只读)**,级别 A。
+
+        🔴 **本端点是短名表的唯一来源**:02 #88 的 `mail` 组逐字写着「`senders[].shortname` **不随本组下发**
+        (它属 `[mail.inbound.hmac]`,从 `GET /mail/hmac-keys` 侧取)——两处都下发会让前端拿到两份可能不一致的短名表」
+        (R6-58 (ac))。而 02 §3.4 端点表此前只有 #67 `POST` / #68 `DELETE`,**这个 `GET` 没有编号** ⇒ 实现里
+        它就成了 `405`,P-SET 的短名表因此恒空。本端点按 (ac) 那句 + 06 §2.3.4/§3.2 的字段补上,**待文档方补登编号**。
+
+        🔴 **绝不回密钥值**:只回 `secret_ref`(`vault://mail/hmac/cmd/<短名>`),明文只在 #67 那一次下发。
+        """
+        _principal(request, "admin")
+        try:
+            routes = _mail_or_503().ms.routes_list()
+        except ApiError:
+            routes = []                       # 邮件服务没装配也要能列短名表(短名存在 `settings`,不依赖 mail 服务)
+        rows = agent.store.settings_list_prefix(MAIL_HMAC_PREFIX)[:limit]
+        out = []
+        for r in rows:
+            short = r["key"][len(MAIL_HMAC_PREFIX):]
+            val = r["value"] if isinstance(r["value"], dict) else {}
+            out.append({
+                "short_name": short,
+                "sender": val.get("sender"),
+                "route_id": _hmac_route_id(short, routes),
+                "enabled": True,                      # 吊销(#68)= 删条目 ⇒ 列出来的就是启用中的
+                "secret_ref": val.get("secret_ref"),
+                "created_at": iso8601(int(val["created_ms"])) if val.get("created_ms") else iso8601(r["updated_ms"]),
+            })
+        return {"ok": True, "data": out}
+
     @app.post(f"{API_PREFIX}/mail/hmac-keys")
     async def mail_hmac_key_put(request: Request):
         """#67,级别 A:``{sender, short_name}`` → 写 Vault ``vault://mail/hmac/cmd/<短名>``(R6-10;确认钥无此端点)。"""
@@ -1869,22 +1991,25 @@ def create_api(agent) -> FastAPI:
         if not body.get("sender"):
             raise ApiError(400, "INVALID_ARGS", "sender 必填", reason="bad_sender", extra={"details": [{"pointer": "/sender"}]})
         ref = f"mail/hmac/cmd/{short}"
-        if agent.store.settings_get(f"mail.hmac.{short}"):
+        if agent.store.settings_get(f"{MAIL_HMAC_PREFIX}{short}"):
             raise ApiError(400, "INVALID_ARGS", f"短名 {short} 已被占用", reason="short_name_taken",
                            extra={"details": [{"pointer": "/short_name"}]})
         secret = ulid() + ulid()
+        now = agent.clock()
         await agent.vault.put(ref, secret, scope="mail")
-        agent.store.settings_set(f"mail.hmac.{short}", {"sender": str(body["sender"]), "secret_ref": f"vault://{ref}"}, actor=p.actor)
+        agent.store.settings_set(f"{MAIL_HMAC_PREFIX}{short}",
+                                 {"sender": str(body["sender"]), "secret_ref": f"vault://{ref}", "created_ms": now},
+                                 actor=p.actor, now_ms=now)
         return {"ok": True, "short_name": short, "secret_ref": f"vault://{ref}", "secret": secret}   # secret 一次性下发,不再回读
 
     @app.delete(f"{API_PREFIX}/mail/hmac-keys/{{short_name}}")
     async def mail_hmac_key_delete(request: Request, short_name: str):
         """#68,级别 A:按**短名**定位吊销(不按 sender);不存在 → 404。"""
         p = _principal(request, "admin")
-        if not agent.store.settings_get(f"mail.hmac.{short_name}"):
+        if not agent.store.settings_get(f"{MAIL_HMAC_PREFIX}{short_name}"):
             raise ApiError(404, "TARGET_NOT_FOUND", f"短名不存在:{short_name}")
         await agent.vault.delete(f"mail/hmac/cmd/{short_name}")
-        agent.store.settings_set(f"mail.hmac.{short_name}", None, actor=p.actor)
+        agent.store.settings_set(f"{MAIL_HMAC_PREFIX}{short_name}", None, actor=p.actor)
         return {"ok": True, "revoked": True, "short_name": short_name}
 
     @app.get(f"{API_PREFIX}/mail/pending-confirms")

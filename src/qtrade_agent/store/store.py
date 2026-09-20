@@ -125,6 +125,10 @@ class Store:
         self.capture_text = capture_text
         self._con: Optional[sqlite3.Connection] = None
         self._tx_lock = threading.RLock()
+        #: `jobs.expires_ms` 的保留期(天)。缺省 = `[retention] export_jobs_days` 的已登记缺省值 7
+        #: (docs/07 [retention];R4-13「jobs 随产物 7 天」),装配方按配置覆盖(见 `api/app.py` 的 `create_api`)。
+        #: 🔴 此前 `expires_ms` **全程没有写点** ⇒ #52 `GET /exports/{job_id}` 的 `expires_at` 恒 null。
+        self.job_retention_days = 7
 
     # ------------------------------------------------------------------ 打开 / 迁移
     def open(self) -> "Store":
@@ -275,6 +279,24 @@ class Store:
     def settings_get(self, key: str) -> Any:
         r = self.con.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
         return json.loads(r[0]) if r else None
+
+    def settings_list_prefix(self, prefix: str) -> list[dict[str, Any]]:
+        """按键前缀列 ``settings`` 行(``{key, value, updated_ms, updated_by}``);按 ``key`` 升序。
+
+        给「一组同前缀的键就是一张表」的那几处用(现用于 ``mail.hmac.<短名>`` = HMAC 发件人短名表)。
+        """
+        rows = self.con.execute("SELECT key, value_json, updated_ms, updated_by FROM settings WHERE key LIKE ? ORDER BY key",
+                                (prefix.replace("%", "") + "%",)).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                value = json.loads(r["value_json"])
+            except (ValueError, TypeError):
+                value = None
+            if value is None:                       # 吊销写的是 null(行留着),不算一条
+                continue
+            out.append({"key": r["key"], "value": value, "updated_ms": r["updated_ms"], "updated_by": r["updated_by"]})
+        return out
 
     def settings_set(self, key: str, value: Any, *, actor: str = "system", now_ms: Optional[int] = None) -> None:
         now = now_ms or self._clock()
@@ -505,10 +527,11 @@ class Store:
                    account_id: Optional[str] = None, now_ms: Optional[int] = None) -> str:
         now = now_ms or self._clock()
         job_id = ulid(now)
+        expires = now + int(self.job_retention_days) * 86_400_000       # #52 `expires_at` 的来源(R4-13:jobs 随产物)
         with self._tx() as c:
-            c.execute("INSERT INTO jobs(job_id, kind, account_id, actor, state, params_json, created_ms, updated_ms) "
-                      "VALUES (?,?,?,?,'queued',?,?,?)",
-                      (job_id, kind, account_id, actor, json.dumps(params or {}, ensure_ascii=False), now, now))
+            c.execute("INSERT INTO jobs(job_id, kind, account_id, actor, state, params_json, created_ms, updated_ms, expires_ms) "
+                      "VALUES (?,?,?,?,'queued',?,?,?,?)",
+                      (job_id, kind, account_id, actor, json.dumps(params or {}, ensure_ascii=False), now, now, expires))
         return job_id
 
     def job_start(self, job_id: str, *, now_ms: Optional[int] = None) -> None:
@@ -1097,6 +1120,51 @@ class Store:
         """按 ``sha256(token)`` 取行(#92 宽限期复核用;**不判 enabled/revoked**,判定留给调用方)。"""
         r = self.con.execute("SELECT * FROM api_clients WHERE auth_kind='bearer' AND secret_hash=?", (secret_hash,)).fetchone()
         return dict(r) if r else None
+
+    # ------------------------------------------------------------------ C-42 统一分页(02 §3.4 通用段;游标 G-16)
+    #: 🔴 **只新增、不改既有 `list_accounts` / `list_sessions` 的签名与行为**(那两个的调用方遍布 runtime/scheduler)。
+    #: 排序列必须与游标里的 `ts_ms` 同一列,否则翻页期间插入新行会重复 / 漏行(G-16 的「不用 OFFSET」就是为这个)。
+
+    def list_accounts_page(self, *, channel: Optional[str] = None, state: Optional[str] = None, enabled: Optional[bool] = None,
+                           include_deleted: bool = False, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
+                           limit: int = 100, before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#1 的分页视图:按 ``(created_ms, id)`` 降序,``before`` = 上一页末行。
+
+        账号表行数以「本机能跑几个容器」为上限(两位数),故复用 :meth:`list_accounts` 的过滤后在内存里排序切片 ——
+        过滤条件只有一处、不会与列表端点走样。
+        """
+        rows = self.list_accounts(channel=channel, state=state, enabled=enabled, include_deleted=include_deleted)
+        rows.sort(key=lambda r: (int(r["created_ms"] or 0), str(r["id"])), reverse=True)
+        if since_ms is not None:
+            rows = [r for r in rows if int(r["created_ms"] or 0) >= since_ms]
+        if until_ms is not None:
+            rows = [r for r in rows if int(r["created_ms"] or 0) <= until_ms]
+        if before is not None:
+            bts, bid = int(before[0]), str(before[1])
+            rows = [r for r in rows if (int(r["created_ms"] or 0), str(r["id"])) < (bts, bid)]
+        return rows[:limit]
+
+    def list_sessions_page(self, *, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
+                           since_ms: Optional[int] = None, until_ms: Optional[int] = None,
+                           limit: int = 100, before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#26 的分页视图:按 ``(COALESCE(last_msg_ms,0), id)`` 降序(与 ``ix_sessions_account_last`` 同向),``before`` = 上一页末行。"""
+        sql, params = "SELECT * FROM sessions WHERE 1=1", []
+        if account_id:
+            sql += " AND account_id=?"; params.append(account_id)
+        if kind:
+            sql += " AND kind=?"; params.append(kind)
+        if keyword:
+            sql += " AND (name LIKE ? OR native_id LIKE ?)"; params += [f"%{keyword}%", f"%{keyword}%"]
+        if since_ms is not None:
+            sql += " AND COALESCE(last_msg_ms, 0) >= ?"; params.append(since_ms)
+        if until_ms is not None:
+            sql += " AND COALESCE(last_msg_ms, 0) <= ?"; params.append(until_ms)
+        if before is not None:
+            sql += " AND (COALESCE(last_msg_ms, 0) < ? OR (COALESCE(last_msg_ms, 0) = ? AND id < ?))"
+            params += [int(before[0]), int(before[0]), str(before[1])]
+        sql += " ORDER BY COALESCE(last_msg_ms, 0) DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()]
 
 
 class AsyncStore:

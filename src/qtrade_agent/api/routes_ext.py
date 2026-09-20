@@ -608,7 +608,11 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
                                             api_version_min=int(body.get("api_version_min") or 1),
                                             secret_ref=secret_ref, now_ms=agent.clock())
         _audit(p, "settings.update", detail={"group": "api_clients", "op": "create", "app_id": app_id, "level": level})
-        out = {"ok": True, "data": _client_view(row), "app_id": app_id}
+        # 🔴 形状按 §3.4 R6-55 **单一形状**:#91 的响应列是字面键集(「一次性返回 `token` 或 `secret`」)、
+        #    `ApiClient` 不在 00 §7 的对象清单里 ⇒ **顶层平铺 + `ok`**,不包 `data`。
+        #    此前「行包 `data`、明文令牌放顶层」两种形状各占一半,客户端「有 data 就返回 data」这一跳会把
+        #    **只下发一次**的明文令牌丢掉(独立复测 N-1,P0)。
+        out = {"ok": True, **_client_view(row)}
         out["secret" if auth_kind == "hmac" else "token"] = secret            # 一次性下发,不再回读
         return out
 
@@ -636,9 +640,9 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
                    if (grace_minutes > 0 and old_hash) else None, p.actor)
         _audit(p, "settings.update", detail={"group": "api_clients", "op": "rotate", "app_id": app_id,
                                              "grace_minutes": grace_minutes})
-        out = {"ok": True, "app_id": app_id, "grace_minutes": grace_minutes,
-               "grace_until": _iso(now + grace_minutes * 60_000) if grace_minutes > 0 else None,
-               "data": _client_view(_client_or_404(app_id))}
+        # 形状同 #91(R6-55 单一形状:顶层平铺,不包 `data`)—— 轮换回的也是只此一次的明文凭据。
+        out = {"ok": True, **_client_view(_client_or_404(app_id)), "grace_minutes": grace_minutes,
+               "grace_until": _iso(now + grace_minutes * 60_000) if grace_minutes > 0 else None}
         out["secret" if row["auth_kind"] == "hmac" else "token"] = secret
         return out
 

@@ -492,3 +492,57 @@ class MailStore:
 
     def protocol_state_set(self, owner: str, state: dict[str, Any]) -> None:
         self._store.cursor_set(owner, CURSOR_PROTOCOL_STATE, None, json.dumps(state, ensure_ascii=False))
+
+    # ------------------------------------------------------------------ C-42 统一分页(02 §3.4 通用段;游标 G-16)
+    #: 🔴 只新增,不动既有 `inbox_list` / `outbox_list`(投递器与清理器还在按原签名调)。
+    #: 排序列 = 游标里的 `ts_ms` 同一列(收件按 `received_ms`、出件按 `created_ms`),翻页期间进新邮件也不重不漏。
+
+    def inbox_list_page(self, *, status: Optional[str] = None, since_ms: Optional[int] = None,
+                        until_ms: Optional[int] = None, q: Optional[str] = None, limit: int = 100,
+                        before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#58 的分页视图:``(received_ms, id)`` 降序;``before`` = 上一页末行 ``(ts_ms, id)``。"""
+        sql = ["SELECT * FROM mail_inbox WHERE 1=1"]
+        args: list[Any] = []
+        if status:
+            sql.append("AND status=?")
+            args.append(status)
+        if since_ms is not None:
+            sql.append("AND received_ms >= ?")
+            args.append(since_ms)
+        if until_ms is not None:
+            sql.append("AND received_ms <= ?")
+            args.append(until_ms)
+        if q:
+            sql.append("AND (subject LIKE ? OR from_addr LIKE ?)")
+            args += [f"%{q}%", f"%{q}%"]
+        if before is not None:
+            sql.append("AND (received_ms < ? OR (received_ms = ? AND id < ?))")
+            args += [int(before[0]), int(before[0]), int(before[1])]
+        sql.append("ORDER BY received_ms DESC, id DESC LIMIT ?")
+        args.append(limit)
+        return _rows(self.con.execute(" ".join(sql), tuple(args)))
+
+    def outbox_list_page(self, *, status: Optional[str] = None, kind: Optional[str] = None,
+                         since_ms: Optional[int] = None, until_ms: Optional[int] = None, limit: int = 100,
+                         before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#61 的分页视图:``(created_ms, id)`` 降序;``before`` = 上一页末行 ``(ts_ms, id)``。"""
+        sql = ["SELECT * FROM mail_outbox WHERE 1=1"]
+        args: list[Any] = []
+        if status:
+            sql.append("AND status=?")
+            args.append(status)
+        if kind:
+            sql.append("AND kind=?")
+            args.append(kind)
+        if since_ms is not None:
+            sql.append("AND created_ms >= ?")
+            args.append(since_ms)
+        if until_ms is not None:
+            sql.append("AND created_ms <= ?")
+            args.append(until_ms)
+        if before is not None:
+            sql.append("AND (created_ms < ? OR (created_ms = ? AND id < ?))")
+            args += [int(before[0]), int(before[0]), int(before[1])]
+        sql.append("ORDER BY created_ms DESC, id DESC LIMIT ?")
+        args.append(limit)
+        return _rows(self.con.execute(" ".join(sql), tuple(args)))

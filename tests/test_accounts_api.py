@@ -75,7 +75,9 @@ def test_create_account_allocates_seq_and_runtime_row(api):
         and r4.json()["data"]["runtime"]["ws_port"] == 16101
     ev = st.list_events(event="account_state", account_id="qd01")
     assert len(ev) == 1 and ev[0]["payload"]["state"] == "created" and ev[0]["payload"]["state_before"] is None
-    assert st.list_audit(action="POST /api/v1/accounts") and c.get("/api/v1/accounts", headers=H()).json()["data"][0]["id"] == "qd01"
+    # C-42:`GET /accounts` 改按 `created_ms` 降序(游标 G-16 要求排序列 = 游标里的 ts_ms)⇒ 只断言「列得出来」,不锁位次
+    assert st.list_audit(action="POST /api/v1/accounts") \
+        and "qd01" in {x["id"] for x in c.get("/api/v1/accounts", headers=H()).json()["data"]}
     assert create(c, "无权", key="k9", channel="qidian").status_code == 201 or True
     assert c.post("/api/v1/accounts", json={"channel": "qidian", "label": "r", "idempotency_key": "kr"}, headers=H(TOKEN_READ)).status_code == 403
 

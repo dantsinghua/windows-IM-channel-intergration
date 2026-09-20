@@ -390,7 +390,8 @@ def test_api_clients_crud_and_one_shot_token(rig):
     assert r.status_code == 201
     created = r.json()
     app_id, token = created["app_id"], created["token"]
-    assert created["data"]["level"] == "write" and created["data"]["allow_accounts"] == ["qd01"]
+    # R6-55 单一形状:行字段与一次性明文令牌**同在顶层**(此前行包 `data`、令牌在顶层,客户端取 data 会丢令牌)
+    assert "data" not in created and created["level"] == "write" and created["allow_accounts"] == ["qd01"]
     # 新令牌立刻可用;再列一次**读不回明文**
     assert rig.client.get(f"{P}/accounts", headers=H(token)).status_code == 200
     row = next(x for x in rig.client.get(f"{P}/settings/api-clients", headers=H()).json()["data"] if x["app_id"] == app_id)

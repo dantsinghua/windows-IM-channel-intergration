@@ -105,9 +105,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.init_db:
         # `--config` 只用来取 `[db] path` 等建库参数;`[api]`/`[scheduler]` 这类运行期配置本次一律不生效。
         return init_db(cfg, args.db)
-    _agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
+    agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
     import uvicorn
-    uvicorn.run(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl, workers=1, log_level=args.log_level.lower())
+    server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
+                                           workers=1, log_level=args.log_level.lower()))
+
+    async def _graceful_shutdown() -> None:
+        """#83 `POST /system/shutdown` 的**生产**执行体(02 §2.6 优雅停机)。
+
+        🔴 缺省钩子 = `AgentApp.stop()`,它只收调度器/投递器/总线/库,**不会让进程退出** —— 光有它,
+        控制台点了「停止 Agent」以后 uvicorn 还在服务、`/system/health` 照回 200,与 #83 的语义对不上。
+        这里在生产入口把两步接起来:先 `stop()` 收干净,再让 uvicorn 退出监听循环(测试仍注入假钩子,不退进程)。
+        """
+        try:
+            await agent.stop()
+        finally:
+            server.should_exit = True
+
+    agent.shutdown_hook = _graceful_shutdown
+    server.run()
     return 0
 
 
