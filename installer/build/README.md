@@ -227,6 +227,8 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
 | ✅ **`RunProgram` 会被拉起,相对路径基准 = 临时目录根** | `SELF=…\7zSC3753E36\install\engine\hello.cmd` |
 | ✅ **命令行参数原样透传给 RunProgram** | `ARGS=/QT_MODE=install /PROBE=1` |
 | 🔴 **退出码不透传,恒 0** | `SfxSetup.cpp` 末尾 `WaitForSingleObject(...); return 0;`(**根本不读子进程退出码**);实测 `hello.cmd` 退 26,SFX EXE 退 **0** |
+| **没有嵌 `RT_MANIFEST`** | `FindResource(h, 1, RT_MANIFEST)` 直接查 = 空。于是提权靠 UAC 的「安装程序检测」启发式(未签名 + 版本信息含 `Setup`);非提权上下文里 `CreateProcess` 直接 `ERROR_ELEVATION_REQUIRED` |
+| **动态链接 `MSVCRT.dll`**(不是 `-MT` 静态) | `strings` 只见 `MSVCRT.dll`。⚠️ **这不是部署风险**:`MSVCRT.dll` 是 **Windows 自带**的旧版 CRT(System32,NT4 以来每台机器都有),**不是** VC++ 可再发行运行库。真正要怕的是 `vcruntime*`/`msvcp*`/`api-ms-win-crt*`,官方存根**没有**导入它们。自编存根是 `-MT`,两类都没有 |
 
 ### 8.2 第三方 7zsfxmm(`chrislake/7zsfxmm` 1.7.1.3901,LGPL-3.0,2017)
 
@@ -236,14 +238,30 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
 - **2017 年的件,8 年未更新,无签名**。§2.1 已点名「SFX 存根在某些 EDR 里有历史误报」——第三方改版的误报面只会更大,而目标机是行内/公司电脑,多有 AppLocker/EDR。
 - 退出码是否透传**没测到**(连基本流程都没跑通)。
 
-### 8.3 我们的选择:**官方存根 + `precheck-disk.cmd` 搬运**
+### 8.3 我们的选择:**自编存根 `QTradeSD.sfx`**(官方存根仅应急回退)
 
-理由:
-1. **存根用原厂件**,EDR/AppLocker 面最小 —— 这是 §2.1 反复强调的现场约束。
-2. **解压位置**在 `precheck-disk.cmd` 里解决:同卷 `move` 是元数据改名,**O(1)、不额外占空间**(`%TEMP%` 与 `%ProgramData%` 默认同在系统盘);跨卷才退化成真拷贝,那时门槛抬到 ≈2 倍(12 GB)并提示。
-3. **退出码透传做不到** —— 这条外层解决不了,已提交裁决(见 handoff)。当前兜底:引擎退出码**落盘**到 `%ProgramData%\QTrade\logs\last-exit-code.txt`。
+> 本节在第五/六批被推翻过一次。原先的结论是「官方存根 + `precheck-disk.cmd` 搬运」——
+> 那是在**还没有编译器**的前提下能做到的最好;安琳随后拍板重编存根(R6-58 cm)。
+> 两条路都保留,但**正路是自编存根**。
 
-**🔴 自动化/验收不要把 SFX EXE 的退出码当判据 —— 它恒为 0。** 读 `last-exit-code.txt` 或 `install_state.json` 的 `state`。
+**正路:自编存根**(`installer/sfx-stub/`,基于官方 LZMA SDK 打三处补丁)
+
+1. 解压到 `%ProgramData%\QTrade` 并**留存**(`InstallPath`);
+2. 解压**前**判空间,不足退 **26**,一个字节都不解;
+3. **退出码原样透传** —— §8b 的验收判据几乎全靠它;
+4. 嵌显式清单声明 `requireAdministrator`,提权是**声明的**不是猜的。
+
+**应急回退:官方存根 + `precheck-disk.cmd` 搬运**(`-Stub official`)
+
+只在**自编存根被 EDR/AppLocker 拦、又来不及重签**时用。它的三个代价:
+
+| 代价 | 后果 |
+|---|---|
+| 不认 `InstallPath` | 解压位置要由 `precheck-disk.cmd` 搬运来补(同卷 `move` 是改名,O(1);跨卷退化成真拷贝,门槛抬到 ≈2 倍 12 GB 并提示) |
+| **退出码恒 0** | 🔴 **自动化/验收不能把 SFX EXE 的退出码当判据**。读 `%ProgramData%\QTrade\logs\last-exit-code.txt` 或 `install_state.json` 的 `state` |
+| 没有清单 + 动态链接 `MSVCRT.dll` | 提权只能靠 UAC 启发式(见 §8.1)。⚠️ `MSVCRT.dll` 是 **Windows 自带**的旧版 CRT,**不构成部署风险** —— 不要把它当成「目标机要装 VC++ 运行库」 |
+
+`build.ps1` 走回退路径时会**显式打警告**(R6-58 cm 要求「不许静默降级」)。
 
 ### 8.4 搬运逻辑的两个坑(都踩过,都做成了门)
 
@@ -280,7 +298,7 @@ EOF
 |---|---|---|---|
 | 1 | **SFX 解压前「空间不足」分支**:目标卷可用 < `max(6 GiB, 解包总大小 × 1.1)` 时**一个字节都不解**、目标目录也不建、退 **26** | 判据要求可用空间低于阈值,而开发机 C:/D: 都有 280 GB+;要触发得造一个**声明解包 ≈ 260 GiB** 的哑载荷,不现实 | **小盘 VM**(系统盘留 < 6 GB 可用),跑一次完整包,断言 `%ERRORLEVEL% == 26` 且 `%ProgramData%\QTrade` **不存在** |
 | 2 | 自编存根的 `requireAdministrator` 在**非管理员账户**下弹 UAC、拒绝后退出码合理 | 开发机当前账户在 Administrators 组里,走的是「同意提升」那条路 | 建一个标准用户账户跑一次 |
-| 3 | 官方存根回退路径端到端(搬运 + `last-exit-code.txt`) | 回退路径只在自编存根被 EDR/AppLocker 拦时才走,本机没有那个环境 | 在装了 EDR 的测试机上,或手工 `-Stub official` 出包后跑 |
+| 3 | 官方存根回退路径端到端(搬运 + `last-exit-code.txt` + UAC 启发式真的触发) | 回退路径只在自编存根被 EDR/AppLocker 拦时才走,本机没有那个环境;且它**没有清单**,提权是否触发取决于目标机的 `EnableInstallerDetection` 策略 | 在装了 EDR 的测试机上,或手工 `-Stub official` 出包后跑;顺带确认**干净系统**(未装任何 VC++ 运行库)上也能起来 —— 它只依赖系统自带的 `MSVCRT.dll`,预期能起 |
 | 4 | 代码签名后 UAC 行为(§2.2.3) | 本机没有签名证书 | CI 签完名后,在干净 VM 上确认不再弹「未知发布者」 |
 | 5 | 磁盘峰值(§2.1「解压 + 载荷」两份共存) | 轻量验证包只有 1.7 MB,量级差太远 | 真载荷出包后在小盘 VM 上量峰值 |
 

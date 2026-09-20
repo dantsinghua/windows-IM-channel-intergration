@@ -429,10 +429,24 @@ function Test-QtSfxStubBinary {
     if ($text -notmatch 'InstallPath') {
         $problems.Add('二进制里找不到 InstallPath —— 补丁没编进去,这就是一个官方存根')
     }
-    foreach ($crt in @('msvcr', 'vcruntime', 'api-ms-win-crt')) {
+    <#  CRT 依赖要分清两种,别混成一句话:
+
+          * `vcruntime*` / `msvcp*` / `api-ms-win-crt*` —— **可再发行运行库**,
+            目标机没装就真的起不来。这是我们最怕的。
+          * `MSVCRT.dll` —— **Windows 自带**的旧版 CRT(System32 里,NT4 以来每台机器都有)。
+            它不是 redist,**不构成部署风险**;官方 7zSD.sfx 导的就是它。
+            ⚠️ 我一度把这两者混为一谈、得出「官方存根缺运行库会起不来」的错误结论,
+               已更正 —— 出现它只说明「不是 -MT 静态构建」,不说明有部署风险。
+
+        我们自己的存根是 `-MT`,两类都不该有。
+    #>
+    foreach ($crt in @('vcruntime', 'msvcp', 'api-ms-win-crt')) {
         if ($text -match ([regex]::Escape($crt) + '\w*\.dll')) {
-            $problems.Add("发现动态 CRT 导入($crt*.dll)—— 不是静态 CRT(-MT)构建")
+            $problems.Add("发现可再发行 CRT 依赖($crt*.dll)—— 目标机没装 VC++ 运行库就起不来;应当是 -MT 静态构建")
         }
+    }
+    if ($text -match '(?i)\bMSVCRT\.dll\b') {
+        $problems.Add('导入了 MSVCRT.dll —— 那是 Windows 自带的旧版 CRT(不是部署风险),但说明这不是 -MT 静态构建')
     }
 
     # --- RT_MANIFEST(资源 id 1,类型 24)
