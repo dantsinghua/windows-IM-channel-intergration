@@ -24,7 +24,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 ## 0. 项目一句话
 
-给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**2026-09-19 第八轮 cursor 评审(8.4/10)由 R6-47~R6-50 收口后已开工:仓库 `src/qtrade_agent/` 有 Agent 侧 M2 骨架(store / 企点读库 / 总线,49 条单测全绿,见 §5「代码现状」);真机接入(redroid / RPA 执行层)仍只在安琳原机;企点收发已真机验证。此前:R6-38~R6-46 收第七轮评审与企点专项,R6-1~R6-37 六轮回改与终审。**
+给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**2026-09-19 第八轮 cursor 评审(8.4/10)由 R6-47~R6-50 收口后已开工:仓库 `src/qtrade_agent/` 有 Agent 侧 M2 骨架(store / 企点读库 / 总线 / scheduler / api,277 条测试全绿,见 §5「代码现状」);真机接入(redroid / RPA 执行层)仍只在安琳原机;企点收发已真机验证。此前:R6-38~R6-46 收第七轮评审与企点专项,R6-1~R6-37 六轮回改与终审。**
 
 - 🔴 **设计文档唯一的源(2026-09-19 夜安琳定;改这里、读这里)**:`/mnt/c/Users/anlin/Desktop/work/docs/`(= `C:\Users\anlin\Desktop\work\docs\`)。它所在的 `Desktop\work\` 是 git 仓库,远端 = **`git@github.com:dantsinghua/windows-IM-channel-intergration.git`(私有,分支 `main`)**;**每轮改完:跑对账脚本 → `git add -A && git commit` → `git push`**。提交身份只在该仓库本地配置(`dantsinghua` + GitHub noreply 邮箱),没动全局 git 配置。
 - ⛔ **已停止维护、不要再改也不要再同步**:WSL 的 `~/work/qtrade-redroid-installer/docs/design/`(内容停在 R6-46、与 GitHub 首个提交 `a2e93ee` 逐文件一致,放了一份「⛔已迁移」说明;文件未删,只作历史留底)。原桌面知识库 `Desktop\QTrade详细设计-20260918\` **已被安琳挪进 `Desktop\work\docs\`、原路径不存在了**——本文件下面凡写「桌面知识库 / 桌面副本 / cp 回桌面」的旧句,一律理解为 `Desktop\work\docs\`。
