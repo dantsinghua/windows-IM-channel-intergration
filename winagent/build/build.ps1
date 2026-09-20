@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     打包 WinAgent 的两个可执行体(02 §2.4,C-02):qtrade-winagent-svc.exe / qtrade-winagent-user.exe。
 
@@ -36,6 +36,43 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
     throw "build.ps1 只能在 Windows 上运行(PyInstaller 不跨平台产 exe)"
 }
 
+function Invoke-Native {
+    <#
+    .SYNOPSIS
+        跑一条原生命令(python / pip / PyInstaller),**退出码非零就 throw,并把输出吐出来**。
+
+    .DESCRIPTION
+        🔴 为什么非要包这一层:上面那句 `$ErrorActionPreference = "Stop"` 只管 PowerShell **cmdlet**
+        产生的错误记录,**管不到原生 exe 的非零退出码** —— 原生命令失败既不抛异常也不停脚本,
+        执行流照样往下走(PS 7.3+ 才有 `$PSNativeCommandUseErrorActionPreference` 能改这个默认,
+        而本脚本要能在 Windows 自带的 PowerShell 5.1 上跑,不能指望它)。
+        再叠加当初那几个 `| Out-Null` 把 stdout 一起吞掉,pip 的失败原因就彻底看不见了。
+
+        实测(2026-09-21 首次在真 Windows 上跑本脚本):第 2 步装依赖其实**已经失败**,却一路静默,
+        直到第 3 步才以 `No module named pytest` 的面目出现 —— 报错点离病灶隔了一整步,很难查。
+
+        故本函数的契约:**成功照旧安静**(等价于原来的 `| Out-Null`,不刷屏),
+        **失败必须把完整输出打出来再 throw**,让报错点就落在出问题的那条命令上。
+
+        ⚠️ 里面临时把 `$ErrorActionPreference` 降成 `Continue` 是必须的:`2>&1` 会把原生命令写到
+        stderr 的内容转成 ErrorRecord,而在 `Stop` 之下这会**误判成终止错误** —— pip 光是
+        「WARNING: You are using pip version ...」就够把一次成功的安装炸成失败。
+        成败一律以 `$LASTEXITCODE` 为准,这也是语义上唯一正确的判据。
+    #>
+    param(
+        [Parameter(Mandatory)][string]$What,
+        [Parameter(Mandatory)][scriptblock]$Cmd
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $out = & $Cmd 2>&1 } finally { $ErrorActionPreference = $prevEap }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "---- $What 的完整输出(exit=$LASTEXITCODE)----" -ForegroundColor Yellow
+        $out | ForEach-Object { Write-Host $_ }
+        throw "$What 失败(exit=$LASTEXITCODE)"
+    }
+}
+
 if ($Clean) {
     Write-Host "[1/5] 清理 build/ dist/" -ForegroundColor Cyan
     Remove-Item -Recurse -Force "$root\build\build", "$root\dist" -ErrorAction SilentlyContinue
@@ -43,15 +80,18 @@ if ($Clean) {
 
 Write-Host "[2/5] 建虚拟环境并装依赖(含 windows + dev extra)" -ForegroundColor Cyan
 $venv = "$root\.venv-build"
-if (-not (Test-Path $venv)) { Invoke-Expression "$Python -m venv `"$venv`"" }
+if (-not (Test-Path $venv)) { Invoke-Native "建虚拟环境" { Invoke-Expression "$Python -m venv `"$venv`"" } }
 $py = "$venv\Scripts\python.exe"
-& $py -m pip install --upgrade pip wheel | Out-Null
+if (-not (Test-Path $py)) { throw "虚拟环境里没有 python.exe:$py" }
+Invoke-Native "升级 pip/wheel" { & $py -m pip install --upgrade pip wheel }
 # 🔴 必须连 `dev` 一起装:第 3 步要跑 `pytest -q`,而 pytest / pytest-asyncio / httpx 都只在
 #    `[dev]` extra 里(pyproject `[project.optional-dependencies]`)。只装 `[windows]` 的话,
 #    干净机器上第 3 步必炸 `No module named pytest`(2026-09-21 首次在真 Windows 上跑本脚本时踩到)。
-& $py -m pip install -e ".[windows,dev]" pyinstaller | Out-Null
+Invoke-Native "装 windows+dev 依赖与 pyinstaller" { & $py -m pip install -e ".[windows,dev]" pyinstaller }
 # 会话代理侧的 UI 自动化栈(不进 pyproject 的硬依赖:Linux 上装不了)
-& $py -m pip install pywinauto pillow | Out-Null
+Invoke-Native "装 pywinauto/pillow" { & $py -m pip install pywinauto pillow }
+# 就地自检:第 3 步要用的东西现在就确认装到了**这个** venv 里,别等跑到第 3 步才发现缺件。
+Invoke-Native "自检 pytest/pyinstaller 可导入" { & $py -c "import pytest, PyInstaller" }
 Write-Host "    ⚠️ pyweixin 不在公共源上:按 03 的随包清单从本地 wheel 安装后再打包(缺它则微信发送不可用)" -ForegroundColor Yellow
 
 Write-Host "[3/5] 跑单元测试(全假后端;不碰真系统状态)" -ForegroundColor Cyan
@@ -59,10 +99,16 @@ Write-Host "[3/5] 跑单元测试(全假后端;不碰真系统状态)" -Foregrou
 if ($LASTEXITCODE -ne 0) { throw "测试未通过,停止打包" }
 
 Write-Host "[4/5] PyInstaller 打两个执行体(onedir)" -ForegroundColor Cyan
-& $py -m PyInstaller --noconfirm --clean --distpath "$root\dist" --workpath "$root\build\build" `
-    "$here\qtrade-winagent-svc.spec"
-& $py -m PyInstaller --noconfirm --clean --distpath "$root\dist" --workpath "$root\build\build" `
-    "$here\qtrade-winagent-user.spec"
+# 这两条同样是原生命令:不查 $LASTEXITCODE 的话,PyInstaller 失败会被静默吞掉,
+# 一路滑到下面的 Test-Path 才以「产物缺失」的面目出现 —— 那时真正的报错早已刷过去了。
+Invoke-Native "PyInstaller 打 svc" {
+    & $py -m PyInstaller --noconfirm --clean --distpath "$root\dist" --workpath "$root\build\build" `
+        "$here\qtrade-winagent-svc.spec"
+}
+Invoke-Native "PyInstaller 打 user" {
+    & $py -m PyInstaller --noconfirm --clean --distpath "$root\dist" --workpath "$root\build\build" `
+        "$here\qtrade-winagent-user.spec"
+}
 
 $svcExe  = "$root\dist\qtrade-winagent-svc\qtrade-winagent-svc.exe"
 $userExe = "$root\dist\qtrade-winagent-user\qtrade-winagent-user.exe"

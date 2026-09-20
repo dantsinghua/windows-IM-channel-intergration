@@ -308,3 +308,44 @@ def test_dev_assembly_keeps_everything_under_root(tmp_path):
         assert not os.path.exists("%ProgramData%")                        # cwd 里不许留垃圾
     finally:
         d.db.close()
+
+
+def test_dev_user_agent_keeps_backup_dir_under_root(tmp_path):
+    """**会话代理侧**(``main_user``)也得自包含:``.wslconfig`` 备份目录是它这一侧唯一的写入落点。
+
+    同一个病有两个入口 —— 服务侧(``build_real_deps``)修好了而这边漏掉的话,``--dev`` 起的会话代理
+    照样会往生产的 ``%ProgramData%\\QTrade\\wsl`` 写 ``.wslconfig`` 备份。故两侧同一条口径:
+    ``fake=True`` ⇒ 重基到 ``--root`` 下,不看平台、不看变量展不展得开。
+
+    与上一个用例一样**只做路径断言、不落盘**(``WslCtl.__init__`` 只存路径,真正的
+    ``os.makedirs`` 在备份时才发生)。
+    """
+    from qtrade_winagent.config import WinAgentConfig
+    from qtrade_winagent.main_user import build_user_agent
+    root = str(tmp_path / "root")
+    ua = build_user_agent(WinAgentConfig(), session_id="Console", user_sid="S-1-5-21-x-1001",
+                          root=root, fake=True)
+    abs_root, p = os.path.abspath(root), os.path.abspath(ua.wslctl._backup_dir)
+    assert "%" not in p, f".wslconfig 备份目录残留未展开的变量:{p}"
+    assert p == abs_root or p.startswith(abs_root + os.sep), (
+        f"--dev 会话代理的 .wslconfig 备份目录逃出了 --root:{p}(root={root})"
+    )
+
+
+@pytest.mark.parametrize("entry", ["main_svc", "main_user"])
+def test_dev_refuses_to_start_without_explicit_root(entry):
+    """``--dev`` **必须显式给 ``--root``**,两个入口都得堵。
+
+    光有「落点重基到 ``root``」还不够:``DEFAULT_ROOT`` 在真 Windows 上展开就是**生产位置**
+    ``C:\\ProgramData\\QTrade\\winagent``,而 ``winagent.db`` 是无条件 ``os.path.join(root, ...)``、
+    **不经重基**的。所以只要 ``--dev`` 还能省略 ``--root``,冒烟一跑照样写进生产目录 ——
+    自包含等于白做。README §3 给的写法本来就是 ``--dev --root /tmp/wa-dev``。
+
+    ``argparse`` 的 ``error()`` ⇒ ``SystemExit(2)``,且在**参数校验处**就退,
+    不会真去起服务 / 连管道 / 碰文件系统。
+    """
+    import importlib
+    mod = importlib.import_module(f"qtrade_winagent.{entry}")
+    with pytest.raises(SystemExit) as ei:
+        mod.main(["--dev"])
+    assert ei.value.code == 2, f"{entry}:--dev 缺 --root 时应被 argparse 拒绝(得到 code={ei.value.code})"
