@@ -16,15 +16,18 @@ cd <仓库>\installer\build
 
 出来的就是 `installer\out\QTrade-Setup-1.0.0.exe`(单文件,≈3 GB)。
 
-**这一条命令按顺序做了**:四道门(编码 / 语法 / 防火墙红线 / 微信 `/S` 红线)→ ISCC 编译引擎 →
+**这一条命令按顺序做了**:六道门(脚本编码 / `.cmd` 换行 / 语法 / 防火墙红线 / 微信 `/S` 红线 / SFX 配置键)→ ISCC 编译引擎 →
 收集载荷并生成 `manifest.json`(含两条硬校验)→ 7z 两块归档 → 归档 ↔ manifest 路径复核 → 拼 SFX。
 任何一步不过都会**中止并打印中文原因**,不会出半成品。
 
-出包之后还差**签名**(§2.2.3,本脚本不做,见第 5 节):
+**签名已接进出包流程**(§2.2.3,见第 5 节)。自签名阶段先生成一张证书,再带 `-Sign` 出包:
 
 ```powershell
-signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a ..\out\QTrade-Setup-1.0.0.exe
+..\signing\New-QtSelfSignedCert.ps1 -Organization 'QTrade'     # 打印指纹
+.\build.ps1 -Version 1.0.0 -SourceRoot <载荷产物根> -Sign -CertThumbprint <指纹>
 ```
+
+不带 `-Sign` 时出包行为与以前**逐字节一致**(有 AST 回归守卫钉着)。
 
 ### 三样前置,缺一样就出不成正式 EXE
 
@@ -39,7 +42,7 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a ..\out\
 > 取自 Inno 官方 `issrc` 仓库的 `Files/Languages/`(官方语言,非 Unofficial),`.iss` 用相对路径引用。
 > 换一台没装中文包的机器照样能编。
 
-> 三样都没有也能验管线:`.\build.ps1 -SelfCheck -AllowMissing`(只跑四道门 + 生成 manifest),
+> 三样都没有也能验管线:`.\build.ps1 -SelfCheck -AllowMissing`(只跑六道门 + 生成 manifest),
 > 或 `.\build.ps1 -AllowMissing`(再加 7z 归档;有 `7z.exe` 就行)。
 
 ---
@@ -72,7 +75,7 @@ QTrade-Setup-<ver>.exe(≈3 GB,单文件,签名)
 | **PowerShell** | Windows PowerShell **5.1**(目标机自带) | — | — |
 | **Pester** | **5.x**(单测用;系统自带的 3.4.0 语法不兼容) | `tests/run-pester.ps1 -Bootstrap` 下到 `%LOCALAPPDATA%\QTradeInstallerTests\pester`,**不进机器模块路径** | 单测跑不起来 |
 | **Python** | 3.11+(规格对账用) | `~/.venvs/qtrade` | `test_spec_consistency.py` 跑不起来 |
-| **signtool** | Windows SDK | — | 包没签名;目标机多有 AppLocker/EDR,未签名大概率被拦 |
+| **signtool** | Windows SDK(Signing Tools)| 本机在 `C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe` | 带 `-Sign` 时直接报错中止;不带 `-Sign` 则只是包没签名,而目标机多有 AppLocker/EDR,未签名大概率被拦 |
 
 > `build.ps1` **不会替你装任何工具**:缺件只报缺、给获取方式、列出它找过哪些位置。
 
@@ -83,18 +86,24 @@ QTrade-Setup-<ver>.exe(≈3 GB,单文件,签名)
 ```powershell
 .\build.ps1 -Version 1.0.0 -SourceRoot <根>     # 完整包(要 ISCC + 7z + 7zSD.sfx + 全部载荷)
 .\build.ps1 -Version 1.0.0 -AllowMissing        # 轻量验证包(缺件占位,只验管线)
-.\build.ps1 -SelfCheck -SourceRoot <根>         # 四道门 + 收载荷 + 生成 manifest(不需要任何打包工具)
-.\build.ps1 -CheckOnly                          # 只跑四道门
+.\build.ps1 -SelfCheck -SourceRoot <根>         # 六道门 + 收载荷 + 生成 manifest(不需要任何打包工具;**不签名**)
+.\build.ps1 -CheckOnly                          # 只跑六道门
 .\build.ps1 -Version 1.0.0 -IsccPath 'D:\Inno Setup 6\ISCC.exe' -SevenZipPath 'D:\7-Zip\7z.exe' -SfxStubPath 'D:\7zSD.sfx'
+.\build.ps1 -Version 1.0.0 -SourceRoot <根> -Sign -CertThumbprint <指纹>   # 带代码签名出包(第 5 节)
+.\build.ps1 -Version 1.0.0 -SourceRoot <根> -Sign -CertThumbprint <指纹> -NoTimestamp   # 离线环境,见第 5 节的警告
 ```
 
-四道门(任何模式都先跑):
+六道门(任何模式都先跑;带 `-Sign` 时出包末尾还有 **G6 签名复核**,见第 5.3 节):
 
 1. **G1 脚本编码** —— 全部 `.ps1`/`.psm1` 必须 UTF-8 **with BOM**。
    🔴 Windows PowerShell 5.1 把无 BOM 的 UTF-8 脚本按系统 ANSI(中文机 = GBK)解析,中文注释里的字节会被当成引号 → `ParserError`,而且**报错本身也是乱码**(§2.6.7 W1;验收 M0-10)。
-2. **G2 语法解析** —— `[Parser]::ParseFile` 逐个过。
-3. **G3 防火墙红线** —— 随包脚本里零处 `netsh advfirewall` / `New-NetFirewallRule`(§6;验收 M1-14)。
-4. **G4 微信卸载红线** —— 零处以 `/S` 运行微信 `Uninstall.exe`。🔴 `/S` = **卸载并清空聊天记录与登录态**(§2.9.3 事实 1)。
+   扫描范围:`engine\`、`build\`、**`signing\`**(它要随包发给目标机同事)、`tests\`。
+2. **G1b `.cmd` 换行与编码** —— `engine\` 与 `signing\` 下的 `.cmd` 必须 **CRLF、无 BOM、可执行行纯 ASCII**。
+   🔴 LF-only 会让 `cmd.exe` 的 `for`/`if`/`call`/标签解析错乱,而且**只有真跑起来才暴露**。
+3. **G2 语法解析** —— `[Parser]::ParseFile` 逐个过。
+4. **G3 防火墙红线** —— 随包脚本里零处 `netsh advfirewall` / `New-NetFirewallRule`(§6;验收 M1-14)。
+5. **G4 微信卸载红线** —— 零处以 `/S` 运行微信 `Uninstall.exe`。🔴 `/S` = **卸载并清空聊天记录与登录态**(§2.9.3 事实 1)。
+6. **G5 SFX 配置键** —— 配置里的键必须是**当前这个存根认识的**那些;存根对不认识的键**静默忽略**。
 
 压缩参数按 §2.2.2:
 
@@ -160,17 +169,194 @@ QTrade-Setup-<ver>.exe(≈3 GB,单文件,签名)
 
 ---
 
-## 5. 签名(§2.2.3,本脚本不做)
+## 5. 代码签名(自签名阶段)
 
-外壳 EXE、引擎 EXE、`qtrade-winagent-svc.exe`、Electron 主程序、**以及全部 `.ps1`** 用同一张代码签名证书(**OV 起步**,A-4)签名,SHA-256 + RFC 3161 时间戳:
+> 规格 = docs/03 §2.2.3。**证书类型定案是 OV 起步(A-4)**;下面这套自签名是**内部试用期的过渡形态**,
+> 不是交付形态。换成公司内部 CA 或买来的 OV 证书时,**流程一个字都不改,只把 `-CertThumbprint` 换掉**。
+
+### 5.1 四步走(安琳的操作顺序)
+
+| 步 | 在哪台机器 | 做什么 |
+|---|---|---|
+| ① | 打包机(本机) | 生成自签名证书,拿到**指纹**与公钥 `.cer` |
+| ② | 打包机(本机) | 带 `-Sign -CertThumbprint <指纹>` 出包 |
+| ③ | — | 把 `.cer` + `installer\signing\` 下的导入脚本随包发给目标机同事 |
+| ④ | 目标机(同事) | 双击「导入QTrade签名证书.cmd」(会弹 UAC) |
+
+### 5.2 ① 生成证书
 
 ```powershell
-signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
+cd <仓库>\installer\signing
+.\New-QtSelfSignedCert.ps1 -WhatIf                      # 🔴 先干跑,看它打算做什么
+.\New-QtSelfSignedCert.ps1 -Organization 'QTrade'       # 真生成(默认有效期 3 年)
 ```
 
-- 载荷内的 ps1 一律 `-ExecutionPolicy Bypass -File` 调用,同时**做 Authenticode 签名**,AllSigned 策略的企业机也能跑。
-- 单文件签名覆盖整个 EXE(含归档)——**改载荷必须重签**。
-- SmartScreen:OV 新签名初期必然弹「Windows 已保护你的电脑」,靠下载量累积信誉;目标机多有 AppLocker/EDR,**未签名大概率直接被拦**。
+**会改动这台机器上的什么**
+
+| 改了什么 | 位置 |
+|---|---|
+| 多一张代码签名证书 | `Cert:\CurrentUser\My`(**当前用户**的个人存储,不是全机) |
+| 多一个**公钥** `.cer` | `C:\Users\anlin\qtrade-payload\signing\QTrade-CodeSigning-<指纹>.cer`(产物根,**仓库外**) |
+
+不需要管理员;不碰 `LocalMachine` 任何存储;不动任何已有证书。
+
+**怎么撤销**
+
+```powershell
+Remove-Item "Cert:\CurrentUser\My\<指纹>"                             # 删证书
+Remove-Item "C:\Users\anlin\qtrade-payload\signing\QTrade-CodeSigning-<指纹>.cer"
+```
+
+**幂等**:同主题且**未过期**的证书已存在时直接复用并打印指纹,不会重复生成。
+过期了再跑才会生成新的。
+
+> 🔴 **私钥不可导出**(`-KeyExportPolicy NonExportable`)。整套脚本里**没有任何一处**
+> `Export-PfxCertificate` —— 密钥材料只存在于当前用户的证书存储里,永远不落盘、不进仓库。
+> 代价:**换一台打包机就要重新生成证书**(指纹也会变)。这是刻意的取舍:
+> 能导出的私钥迟早会被谁 `commit` 进仓库。
+
+### 5.3 ② 带签名出包
+
+```powershell
+cd <仓库>\installer\build
+.\build.ps1 -Version 1.0.0 -SourceRoot C:\Users\anlin\qtrade-payload `
+            -Sign -CertThumbprint <上一步打印的指纹>
+```
+
+离线环境(连不上时间戳服务)另加 `-NoTimestamp`,并看清楚它打的警告:
+
+```powershell
+.\build.ps1 ... -Sign -CertThumbprint <指纹> -NoTimestamp
+```
+
+> 🔴 **不带时间戳的签名,在证书过期那天全部失效 —— 包括已经发出去的包**。
+> 带 RFC 3161 时间戳的签名则在证书有效期内永久有效。能联网就别关。
+
+**签名发生在流程的哪几处(顺序是硬约束,不是风格)**
+
+| 步 | 签什么 | 为什么必须在这个位置 |
+|---|---|---|
+| 0b | `winagent/app` 与 `console` 的**我方 exe** | 🔴 **必须先于 manifest 算 sha256**。做法是把源目录复制到 `out\presign\` 下、在**副本**上签、再把 `QT_SRC_WA_APP` / `QT_SRC_CONSOLE` 指到副本 —— `collect-payload.ps1` 是「复制 → 算 sha256 → 写 manifest」一气呵成的,而 `build.ps1` 会**调它两次**,就地签 stage 会被第二次覆盖回未签名版本 |
+| 1a | 引擎的**全部 ps1/psm1** | 签在 `out\engine-signed\` 的副本上,ISCC 从副本编译 ⇒ 引擎里内嵌的就是已签名脚本 |
+| 1b | 引擎 exe | 在它被复制进 stage、被 collect 登记 sha256 **之前** |
+| 5 | 外壳 EXE | **最后**一步。签名覆盖整个 EXE(含里面的 7z 归档)⇒ **此后改载荷必须重签** |
+| G6 | (复核) | 逐个验证应签文件确实带签名、且签名者指纹 = 传入的指纹;并反向检查第三方件**没有**被我方证书重签;还复核 manifest 里引擎的 sha256 = stage 里已签名文件的实际值 |
+
+**🔴 仓库里的源文件一个字节都不会被改**:签名块是追加到文件尾的,签仓库源文件会污染 git、
+让规格对账的逐字比对失效。所有签名动作都发生在 `installer\out\` 下的副本上
+(而 G1/G1b 门的文件枚举本来就排除了 `\out\`)。
+
+**不签什么**
+
+* `.cmd`(`run-engine.cmd` / `precheck-disk.cmd`)—— **Authenticode 不支持批处理**;
+* 第三方件:随包微信安装包、`wsl.msi`、`VC_redist`、chatlog / `wx_key*.dll`、
+  platform-tools(`adb`)、scrcpy、嵌入式 Python、Electron 自带的 `ffmpeg.dll` 等、
+  PyInstaller `_internal\` 下的 CPython 与依赖 DLL。
+  §2.2.3 原文:**adb/scrcpy 由其上游签名不动**。重签会毁掉原厂签名链;
+  而**随包微信的 sha256 是钉死的(R2-6)**,改一个字节就是 `E_INSTALL_PAYLOAD_CORRUPT`。
+  清单在 `installer\signing\QTrade.Signing.psm1` 的 `Get-QtNeverSignRule`。
+
+**不带 `-Sign` 时行为与以前逐字节一致**(`QTrade.Signing.Tests.ps1` 有 AST 回归守卫钉着:
+每一处签名调用都必须在 `if ($Sign)` 里)。
+
+**`-SelfCheck` 不签名** —— 那条路只收载荷、生成 manifest,不出可交付的包。
+
+### 5.4 ③ 分发给目标机
+
+把这四样发给同事(一个文件夹即可):
+
+```
+QTrade-Setup-1.0.0.exe
+QTrade-CodeSigning-<指纹>.cer
+Import-QtCodeSigningCert.ps1
+Remove-QtCodeSigningCert.ps1
+导入QTrade签名证书.cmd
+QTrade.Signing.psm1          ← 上面两个 ps1 要 Import 它
+```
+
+**同时把指纹用另一条渠道告诉对方**(微信/邮件正文里写明),让他核对 —— 这一步不是形式:
+导入 `Root` 等于告诉那台机器「这张证书签什么都可信」,`.cer` 被掉包就是一条后门。
+
+### 5.5 ④ 目标机导入(同事操作)
+
+双击 **「导入QTrade签名证书.cmd」**。它会:
+
+1. 自动请求管理员权限(弹 UAC);
+2. 打印证书的**主题、颁发者、指纹、有效期**,要求核对;
+3. 核对无误后导入两个存储。
+
+或者用管理员 PowerShell:
+
+```powershell
+.\Import-QtCodeSigningCert.ps1 -CerPath .\QTrade-CodeSigning-<指纹>.cer -ExpectedThumbprint <指纹>
+.\Import-QtCodeSigningCert.ps1 -CerPath .\xxx.cer -WhatIf     # 先看它打算做什么
+```
+
+**会改动那台机器上的什么**
+
+| 改了什么 | 位置 | 为什么要 |
+|---|---|---|
+| +1 张证书 | `Cert:\LocalMachine\Root` | 自签名证书自己就是根;不导这里,Authenticode 验出来恒 `UnknownError` |
+| +1 张证书 | `Cert:\LocalMachine\TrustedPublisher` | AllSigned 执行策略与 AppLocker 的发布者规则认它 |
+
+两处都是**全机生效**,所以要管理员。别的什么都不改。**幂等**:已经有了就跳过。
+`-ExpectedThumbprint` 对不上**直接拒绝,一个存储都不碰**。
+
+**怎么撤销**
+
+```powershell
+# 管理员 PowerShell
+.\Remove-QtCodeSigningCert.ps1 -Thumbprint <指纹>
+```
+
+从两个存储里各删掉那一张(幂等,不在就说不在)。已经装好的 QTrade 不受影响,
+只是以后再运行已签名的包会重新显示「未知发布者」。
+
+### 5.6 一条反直觉的事实:打包机上验签会显示「未受信任」
+
+自签名证书在**没导入信任库的机器上**,`Get-AuthenticodeSignature` 回的**不是 `Valid`**,
+而是 `UnknownError` / `NotTrusted`(链终止于一个不受信任的根)。
+
+所以验证逻辑分**三态**(`Test-QtSignatureVerdict`):
+
+| 状态 | 判定 | 含义 |
+|---|---|---|
+| `Valid` | ✅ 通过,受信任 | 证书已导入,或换成 CA 证书之后 |
+| `UnknownError` / `NotTrusted` **且有签名者证书** | ✅ 通过,未受信任 | **自签名阶段的正常态**,不是失败;提示去导入证书 |
+| `NotSigned` / `HashMismatch` / `NotSupportedFileFormat` | ❌ 失败 | 没签上 / 签完又被改过 / 格式不支持 |
+| 指纹 ≠ 传入的指纹 | ❌ 失败 | 签是签了,但签成了另一张证书 |
+
+> 🔴 如果照直写 `Status -eq 'Valid'` 当判据,打包机上**每个文件都会"验证失败"**,
+> 接着就会有人把验证整个关掉 —— 那才是真事故。G6 门按上表判。
+
+### 5.7 SmartScreen 与 AppLocker(§2.2.3)
+
+* 自签名**不解决 SmartScreen**:OV 证书新签名初期都会弹「Windows 已保护你的电脑」,
+  信誉靠下载量累积;**EV 证书即时通过**。
+* 但自签名**解决 AppLocker/EDR 的"未签名"拦截** —— 前提是 IT 把这个发布者加白
+  (把**发布者信息 + 证书指纹**写进部署说明,就是上面 5.4 要发的那份)。
+* 真机上还没验过的:**代码签名后的 UAC 行为**(见本文末「须真机验证清单」第 4 条)。
+
+### 5.8 将来换正式证书
+
+买到 OV 证书(或拿到公司内部 CA 签发的证书)之后:
+
+1. 把证书装进打包机的 `Cert:\CurrentUser\My`(或按 CA 的说明用硬件令牌);
+2. `Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert` 拿指纹;
+3. 出包命令**只换指纹**:`.\build.ps1 ... -Sign -CertThumbprint <新指纹>`。
+
+`New-QtSelfSignedCert.ps1` 与两个导入/清理脚本届时作废(目标机不再需要导入任何东西,
+证书链由公开 CA 或企业 CA 提供)。`Invoke-QtSign.ps1`、G6 门、测试**全部照旧**。
+
+### 5.9 手工补签(排障用)
+
+```powershell
+cd <仓库>\installer\signing
+.\Invoke-QtSign.ps1 -CertThumbprint <指纹> -Path <文件1>,<文件2>
+.\Invoke-QtSign.ps1 -CertThumbprint <指纹> -Path <副本目录> -Scope engine    # 目录内全部 ps1/psm1
+```
+
+🔴 别拿它去签**仓库里的源文件**(理由见 5.3)。要签就签副本。
 
 ---
 
@@ -183,6 +369,11 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
 # 规格逐字对账(退出码表 / /QT_* 开关 / 状态机键名 / 受管键表 / BOM / 红线 / 派发器覆盖)
 ~/.venvs/qtrade/bin/python -m pytest -q installer/tests
 ```
+
+签名那一套单独两个文件,同样被上面两条命令覆盖:
+`tests\QTrade.Signing.Tests.ps1`(Pester,**全 Mock**:不生成证书、不碰证书存储、不真签名)与
+`tests\test_signing_consistency.py`(从 `docs/03` §2.2.3 现场解析应签对象清单,与 `build.ps1` 的
+`$QtSignSpec`、`QTrade.Signing.psm1` 的 `Get-QtSignSpecTarget` / `Get-QtNeverSignRule` 三方对账)。
 
 `test_spec_consistency.py` 从 `docs/03` **现场解析**退出码表与命令行块,再与 `.iss` / `QTrade.Exit.psm1` 逐条比对,
 并检查派发器与 `.iss` 把 §2.3 的每个状态都接上了 —— **改文档不改实现(或反过来)会立刻红**。

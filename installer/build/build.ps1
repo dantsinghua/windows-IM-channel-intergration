@@ -22,7 +22,15 @@ param(
     [switch] $AllowMissing,
     [switch] $CheckOnly,
     [switch] $SelfCheck,
-    [switch] $SkipEngine
+    [switch] $SkipEngine,
+    # ── 代码签名(§2.2.3;操作步骤见 build\README.md 第 5 节)────────────────────
+    # 🔴 **不带 -Sign 时,本脚本的行为与加签名之前逐字节一致** —— 签名相关的每一句都在
+    #    `if ($Sign)` 里,`installer/tests/QTrade.Signing.Tests.ps1` 有回归守卫钉着这条。
+    [switch] $Sign,
+    [string] $CertThumbprint = '',
+    [string] $TimestampUrl = '',
+    [switch] $NoTimestamp,
+    [string] $SignToolPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -35,6 +43,28 @@ if (-not $OutDir) { $OutDir = Join-Path $InstallerRoot 'out' }
 $StageDir = Join-Path $OutDir 'payload'
 $ArchivePath = Join-Path $OutDir 'payload.7z'
 $FinalExe = Join-Path $OutDir ('QTrade-Setup-{0}.exe' -f $Version)
+$SigningDir = Join-Path $InstallerRoot 'signing'
+# 签名只发生在 out\ 下的**副本**上 —— 仓库里的源文件一个字节都不动(见下面「为什么」)
+$SignedEngineDir = Join-Path $OutDir 'engine-signed'
+$PresignDir = Join-Path $OutDir 'presign'
+# ISCC 的编译输入:不签名时 = 仓库 engine\;签名时 = 已签脚本的副本
+$IssSourceDir = $EngineDir
+# 签了哪些文件(G6 门逐个复核)
+$QtSignedArtifacts = @()
+
+# ── §2.2.3 应签对象清单 ────────────────────────────────────────────────────
+# 🔴 与 docs/03 §2.2.3 逐条对账(installer/tests/test_signing_consistency.py)。
+#    改这里 = 改规格口径:要么同步改文档,要么先出裁决(基线 §15g,编号续 R6-N)。
+#    §2.2.3 同时写明 **adb / scrcpy 由其上游签名不动** —— 第三方件一律不重签,
+#    清单在 signing\QTrade.Signing.psm1 的 Get-QtNeverSignRule。
+$QtSignSpec = @(
+    @{ Key = 'shell_exe'; Spec = '外壳 EXE'; Step = '步 5:拼接完成之后**最后**签(签名覆盖整个 EXE 含归档)' }
+    @{ Key = 'engine_exe'; Spec = '引擎 EXE'; Step = '步 1b:ISCC 从**已签脚本副本**编译出来之后签' }
+    @{ Key = 'winagent_svc'; Spec = 'qtrade-winagent-svc.exe'; Step = '步 0b:签预签副本,**先于 manifest 算 sha256**' }
+    @{ Key = 'winagent_user'; Spec = 'qtrade-winagent-user.exe'; Step = '步 0b:签预签副本,**先于 manifest 算 sha256**' }
+    @{ Key = 'electron_main'; Spec = 'Electron 主程序'; Step = '步 0b:签预签副本,**先于 manifest 算 sha256**' }
+    @{ Key = 'ps1_all'; Spec = 'ps1'; Step = '步 1a:引擎副本内全部 .ps1/.psm1(§2.2.3 第 3 条)' }
+)
 
 function Write-Section { param([string] $T) Write-Host ''; Write-Host ('== ' + $T + ' ' + ('=' * [math]::Max(0, 60 - $T.Length))) -ForegroundColor Cyan }
 function Write-Ok { param([string] $T) Write-Host ('  [OK]   ' + $T) -ForegroundColor Green }
@@ -58,6 +88,63 @@ function Find-QtTool {
     Write-Host  '           找过这些位置:' -ForegroundColor DarkGray
     foreach ($c in $Candidates) { if ($c) { Write-Host ('             - ' + $c) -ForegroundColor DarkGray } }
     return ''
+}
+
+# ── 签名辅助(只在 -Sign 时用到)────────────────────────────────────────────
+function Resolve-QtPresignSource {
+    <#
+        与 collect-payload.ps1 的 Resolve-QtSource **同语义**:EnvVar > -SourceRoot > 相对路径。
+        预签副本必须按同一套规则找源,否则签的是 A、collect 收的是 B。
+    #>
+    param([string] $EnvVar, [string[]] $RelPaths)
+    $v = [Environment]::GetEnvironmentVariable($EnvVar)
+    if ($v) { return @($v) }
+    if ($SourceRoot) { return @($RelPaths | ForEach-Object { [IO.Path]::Combine($SourceRoot, ($_ -replace '/', '\')) }) }
+    return @($RelPaths | ForEach-Object { $_ -replace '/', '\' })
+}
+
+function New-QtPresignCopy {
+    <#
+        把一组源目录**合并复制**到 out\presign\<名> 下(合并语义与 collect 的多 Sources 覆盖合并一致),
+        在**副本**上签我方可执行件,再把对应的 QT_SRC_* 环境变量指到副本。
+
+        🔴 为什么非得这么绕(这是本次改动最容易被"简化"掉、一简化就出事的地方):
+           collect-payload.ps1 是「复制 → 算 sha256 → 写 manifest」一气呵成的,而 build.ps1
+           **调了它两次**(第二次是为了把引擎 exe 登记进 files[]),第二次会照 PayloadMap
+           **重新从源复制、覆盖 stage 里的同名文件**。所以「收完载荷再去签 stage 里的 exe」
+           会被第二次 collect 覆盖回未签名版本 —— manifest 记的是未签名哈希,
+           装机时按 manifest 复核…… 其实两边"一致地错",包里的 exe 压根没签名。
+           把源头换成**已签名副本**,collect 跑几次都从副本拷,sha256 天然算在签名之后。
+    #>
+    param(
+        [string] $Name, [string] $EnvVar, [string[]] $RelPaths,
+        [ValidateSet('winagent', 'console')][string] $Scope,
+        [string] $Thumbprint, $Certificate, [string] $SignTool, [string] $Ts, [bool] $NoTs
+    )
+    $srcs = @(Resolve-QtPresignSource -EnvVar $EnvVar -RelPaths $RelPaths)
+    $exists = @($srcs | Where-Object { Test-Path -LiteralPath $_ })
+    if ($exists.Count -eq 0) {
+        Write-Warn2 ('{0}:源目录一个都不在({1}),跳过预签 —— 这一项会在收载荷时报缺件' -f $Name, ($srcs -join ' | '))
+        return @()
+    }
+    $dst = Join-Path $PresignDir $Name
+    if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force }
+    New-Item -ItemType Directory -Path $dst -Force | Out-Null
+    foreach ($src in $exists) {
+        foreach ($c in @(Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue)) {
+            Copy-Item -LiteralPath $c.FullName -Destination $dst -Recurse -Force
+        }
+    }
+    $plan = @(Get-QtSignPlan -Root $dst -Scope $Scope)
+    if ($plan.Count -eq 0) { throw ('{0}:预签副本 {1} 里找不到任何该签的可执行件 —— 源目录形态不对' -f $Name, $dst) }
+    foreach ($f in $plan) {
+        Invoke-QtSignFile -Path $f -Thumbprint $Thumbprint -Certificate $Certificate `
+            -SignToolPath $SignTool -TimestampUrl $Ts -NoTimestamp:$NoTs | Out-Null
+        Write-Ok ('已签 {0}' -f (Split-Path -Leaf $f))
+    }
+    # 🔴 把源指到已签名副本:collect-payload.ps1 的 Resolve-QtSource 里 EnvVar 优先级最高
+    [Environment]::SetEnvironmentVariable($EnvVar, $dst, 'Process')
+    return $plan
 }
 
 $Iscc = Find-QtTool -Explicit $IsccPath -Name 'ISCC.exe' -Param '-IsccPath' `
@@ -136,8 +223,10 @@ function Get-QtScriptFile {
             $_.FullName -notmatch '\\(\.omc|__pycache__|out|node_modules)\\'
         })
 }
+# signing\ 下的脚本**要随包发给目标机同事**(双击导入证书那一套),同样受 W1 约束
 $scriptFiles = @(Get-QtScriptFile -Root $EngineDir) +
 @(Get-QtScriptFile -Root $BuildDir) +
+@(Get-QtScriptFile -Root $SigningDir) +
 @(Get-QtScriptFile -Root (Join-Path $InstallerRoot 'tests'))
 $bomBad = @()
 foreach ($f in $scriptFiles) {
@@ -155,7 +244,8 @@ Write-Ok ('{0} 个脚本全部 UTF-8 with BOM' -f $scriptFiles.Count)
 #    症状是「The system cannot find the batch label specified」「) was unexpected at this time」,
 #    而且只有真跑起来才暴露。BOM 则会让第一行命令解析失败。
 Write-Section 'G1b .cmd 换行与编码(CRLF、无 BOM)'
-$cmdFiles = @(Get-ChildItem -Path $EngineDir -Recurse -File -ErrorAction SilentlyContinue |
+$cmdFiles = @(@(Get-ChildItem -Path $EngineDir -Recurse -File -ErrorAction SilentlyContinue) +
+    @(Get-ChildItem -Path $SigningDir -Recurse -File -ErrorAction SilentlyContinue) |
     Where-Object { $_.Extension -eq '.cmd' -and $_.FullName -notmatch '\\(\.omc|__pycache__)\\' })
 $cmdBad = @()
 foreach ($f in $cmdFiles) {
@@ -312,10 +402,46 @@ if ($CheckOnly) {
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
+# ── 签名准备(只在 -Sign 时)─────────────────────────────────────────────────
+$SignCert = $null
+$SignTool = ''
+$SignTs = ''
+if ($Sign) {
+    Write-Section '签名准备(§2.2.3)'
+    if (-not $CertThumbprint) {
+        throw '-Sign 必须同时给 -CertThumbprint <指纹>。没有证书先跑:installer\signing\New-QtSelfSignedCert.ps1'
+    }
+    Import-Module (Join-Path $SigningDir 'QTrade.Signing.psm1') -Force -DisableNameChecking
+    $SignCert = Get-QtSigningCertByThumbprint -Thumbprint $CertThumbprint
+    $CertThumbprint = [string]$SignCert.Thumbprint     # 统一成存储里的规范写法(大写、无空格)
+    $SignTool = Find-QtSignTool -Explicit $SignToolPath
+    if (-not $SignTool) {
+        throw ('要签 PE 文件但找不到 signtool.exe(装 Windows SDK 的 Signing Tools,' +
+               '本机实测在 "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe"),' +
+               '或用 -SignToolPath 指定完整路径')
+    }
+    $SignTs = $TimestampUrl
+    if (-not $SignTs) { $SignTs = (Get-QtSigningDefault).TimestampUrl }
+    if ($NoTimestamp) { Write-QtNoTimestampWarning }
+
+    Write-Ok ('证书  : {0}' -f $SignCert.Subject)
+    Write-Ok ('指纹  : {0}' -f $CertThumbprint)
+    Write-Ok ('有效期: {0:yyyy-MM-dd} ~ {1:yyyy-MM-dd}' -f $SignCert.NotBefore, $SignCert.NotAfter)
+    Write-Ok ('signtool: {0}' -f $SignTool)
+    if ($NoTimestamp) { Write-Warn2 '时间戳:**关闭**(-NoTimestamp)' } else { Write-Ok ('时间戳: {0}' -f $SignTs) }
+    Write-Host '  应签对象(§2.2.3):' -ForegroundColor DarkGray
+    foreach ($t in $QtSignSpec) { Write-Host ('    - {0,-26} {1}' -f $t.Spec, $t.Step) -ForegroundColor DarkGray }
+    Write-Host '  🔴 第三方件(微信安装包 / wsl.msi / VC_redist / chatlog / adb / scrcpy / 嵌入式 python)一律**不重签**' -ForegroundColor DarkGray
+}
+
 if ($SelfCheck) {
     # -SelfCheck:五道门 + 收载荷 + 生成 manifest。不碰 ISCC / 7z / SFX 存根,
     # 所以在**没装工具链的开发机上也能跑**,用来确认「载荷来源对不对、manifest 长什么样」。
     Write-Section '步 S 自检模式:收集载荷并生成 manifest(不编译、不归档、不拼 EXE)'
+    if ($Sign) {
+        # 自检模式不产出可交付的包,签名没有意义;更要紧的是别让人误以为"自检过了 = 签过了"。
+        Write-Warn2 '-SelfCheck 只收载荷与生成 manifest,**不签名**;要签名请走正式出包路径(不加 -SelfCheck)'
+    }
     $collect = & (Join-Path $BuildDir 'collect-payload.ps1') -Stage $StageDir -SourceRoot $SourceRoot `
         -PackageVersion $Version -AllowMissing:$AllowMissing -Clean
     Write-Section '自检完成'
@@ -328,7 +454,49 @@ if ($SelfCheck) {
     exit 0
 }
 
+# ── 步 0b:预签载荷里的我方可执行件(🔴 必须**先于** collect 算 sha256)────────
+#    做法与理由见 New-QtPresignCopy 的注释:签副本 + 把 QT_SRC_* 指到副本,
+#    这样 collect-payload.ps1 无论被调几次,拷进 stage 的都已经是签过名的文件。
+if ($Sign) {
+    Write-Section '步 0b 预签载荷中的我方可执行件(先于 manifest 哈希)'
+    $QtSignedArtifacts += @(New-QtPresignCopy -Name 'winagent-app' -EnvVar 'QT_SRC_WA_APP' `
+            -RelPaths @('winagent/dist/qtrade-winagent-svc', 'winagent/dist/qtrade-winagent-user') `
+            -Scope 'winagent' -Thumbprint $CertThumbprint -Certificate $SignCert `
+            -SignTool $SignTool -Ts $SignTs -NoTs ([bool]$NoTimestamp))
+    $QtSignedArtifacts += @(New-QtPresignCopy -Name 'console' -EnvVar 'QT_SRC_CONSOLE' `
+            -RelPaths @('console/release/win-unpacked') `
+            -Scope 'console' -Thumbprint $CertThumbprint -Certificate $SignCert `
+            -SignTool $SignTool -Ts $SignTs -NoTs ([bool]$NoTimestamp))
+}
+
 # ── 步 1:编译引擎(Inno Setup 6)──────────────────────────────────────────
+# 步 1a(只在 -Sign 时):把 engine\ 复制到 out\engine-signed\,在**副本**上签全部 ps1/psm1。
+# 🔴 为什么签副本而不是仓库里的源文件:Authenticode 签名块会追加到文件尾 ——
+#    ①污染 git(每次出包都让 18 个模块变成已修改);
+#    ②破 test_spec_consistency.py 的逐字对账(它按内容比对文档与实现);
+#    ③G1 的 BOM 门虽然仍过(签名块在文件尾,BOM 还在),但文件哈希与内容都变了。
+#    副本落在 out\ 下,而 G1/G1b 的文件枚举**本来就排除了 \out\**,不会被门扫到。
+if ($Sign) {
+    Write-Section '步 1a 在引擎副本上签全部 ps1/psm1(不碰仓库源文件)'
+    if (Test-Path -LiteralPath $SignedEngineDir) { Remove-Item -LiteralPath $SignedEngineDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $SignedEngineDir -Force | Out-Null
+    foreach ($c in @(Get-ChildItem -LiteralPath $EngineDir -Force)) {
+        Copy-Item -LiteralPath $c.FullName -Destination $SignedEngineDir -Recurse -Force
+    }
+    $enginePlan = @(Get-QtSignPlan -Root $SignedEngineDir -Scope 'engine')
+    if ($enginePlan.Count -eq 0) { throw ('引擎副本 {0} 里一个 ps1/psm1 都没有 —— 复制出问题了' -f $SignedEngineDir) }
+    foreach ($f in $enginePlan) {
+        Invoke-QtSignFile -Path $f -Thumbprint $CertThumbprint -Certificate $SignCert `
+            -SignToolPath $SignTool -TimestampUrl $SignTs -NoTimestamp:$NoTimestamp | Out-Null
+    }
+    $QtSignedArtifacts += $enginePlan
+    Write-Ok ('{0} 个 ps1/psm1 已签(副本:{1})' -f $enginePlan.Count, $SignedEngineDir)
+    # 🔴 .cmd **不支持 Authenticode**,不签;链首脚本照旧从仓库原件复制进载荷。
+    Write-Host '  .cmd 不支持 Authenticode,不签(链首 run-engine.cmd / precheck-disk.cmd)' -ForegroundColor DarkGray
+    # ISCC 改从副本编译 ⇒ 引擎里内嵌的就是**已签名**的脚本
+    $IssSourceDir = $SignedEngineDir
+}
+
 Write-Section '步 1 编译安装引擎(Inno Setup 6)'
 $engineExe = ''
 if ($SkipEngine) {
@@ -337,11 +505,18 @@ if ($SkipEngine) {
     Write-Warn2 '缺 ISCC.exe,跳过引擎编译 —— 产出的包将没有引擎,只能用于流程验证'
 } else {
     $issOut = Join-Path $OutDir 'engine'
-    & $Iscc ('/O' + $issOut) ('/DEngineVersion=' + $Version) (Join-Path $EngineDir 'qtrade-setup-engine.iss')
+    & $Iscc ('/O' + $issOut) ('/DEngineVersion=' + $Version) (Join-Path $IssSourceDir 'qtrade-setup-engine.iss')
     if ($LASTEXITCODE -ne 0) { throw ('ISCC 编译失败,退出码 {0}' -f $LASTEXITCODE) }
     $engineExe = Join-Path $issOut 'qtrade-setup-engine.exe'
     if (-not (Test-Path -LiteralPath $engineExe)) { throw '引擎编译成功但找不到产物 qtrade-setup-engine.exe' }
     Write-Ok ('引擎:{0}({1:N0} 字节)' -f $engineExe, (Get-Item -LiteralPath $engineExe).Length)
+    # ── 步 1b:签引擎 exe(🔴 必须在它被复制进 stage、被 collect 算 sha256 之前)────
+    if ($Sign) {
+        Invoke-QtSignFile -Path $engineExe -Thumbprint $CertThumbprint -Certificate $SignCert `
+            -SignToolPath $SignTool -TimestampUrl $SignTs -NoTimestamp:$NoTimestamp | Out-Null
+        $QtSignedArtifacts += $engineExe
+        Write-Ok ('引擎 exe 已签({0:N0} 字节,签名后)' -f (Get-Item -LiteralPath $engineExe).Length)
+    }
 }
 
 # ── 步 2:收集载荷 + 生成 manifest ─────────────────────────────────────────
@@ -458,6 +633,98 @@ try {
 } finally { $fs.Close() }
 Write-Ok ('单文件安装包:{0}({1:N0} 字节)' -f $FinalExe, (Get-Item -LiteralPath $FinalExe).Length)
 
+# ── 步 5:签外壳 EXE(🔴 **最后一步**;签名覆盖整个 EXE 含归档,§2.2.2)────────
+if ($Sign) {
+    Write-Section '步 5 签外壳 EXE(最后一步)'
+    Invoke-QtSignFile -Path $FinalExe -Thumbprint $CertThumbprint -Certificate $SignCert `
+        -SignToolPath $SignTool -TimestampUrl $SignTs -NoTimestamp:$NoTimestamp | Out-Null
+    $QtSignedArtifacts += $FinalExe
+    Write-Ok ('外壳已签:{0}({1:N0} 字节,签名后)' -f $FinalExe, (Get-Item -LiteralPath $FinalExe).Length)
+    Write-Warn2 '此后**再改载荷就必须重签**(签名覆盖整个 EXE,含里面的 7z 归档)'
+}
+
+# ── 门 6:签名复核(只在 -Sign 时)──────────────────────────────────────────
+# 🔴 逐个验证「应签文件**确实带签名**、且签名者指纹 = 传入的指纹」,缺一个就 throw。
+#    为什么不能省:signtool 的退出码只说明"命令没报错",证明不了文件里真写进了签名;
+#    而预签副本 + 两次 collect 的链条里,任何一环把文件覆盖回未签名版本都是**静默**的。
+if ($Sign) {
+    Write-Section 'G6 签名复核(应签文件全部带签名 + 指纹逐字相符)'
+
+    $g6 = @()
+    $g6 += [pscustomobject]@{ Path = $FinalExe; What = '外壳 EXE' }
+    $g6 += [pscustomobject]@{ Path = (Join-Path $StageDir 'install\engine\qtrade-setup-engine.exe'); What = '引擎 EXE(stage 内)' }
+    $g6 += [pscustomobject]@{ Path = (Join-Path $StageDir 'winagent\app\qtrade-winagent-svc.exe'); What = 'WinAgent 服务(stage 内)' }
+    $g6 += [pscustomobject]@{ Path = (Join-Path $StageDir 'winagent\app\qtrade-winagent-user.exe'); What = 'WinAgent 会话代理(stage 内)' }
+    foreach ($e in @(Get-ChildItem -LiteralPath (Join-Path $StageDir 'console') -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -ieq '.exe' })) {
+        $g6 += [pscustomobject]@{ Path = $e.FullName; What = 'Electron 主程序(stage 内)' }
+    }
+    foreach ($f in @(Get-QtSignPlan -Root $SignedEngineDir -Scope 'engine')) {
+        $g6 += [pscustomobject]@{ Path = $f; What = 'ps1/psm1(内嵌进引擎 EXE 的那一份)' }
+    }
+
+    $g6Bad = @()
+    $g6Skip = @()
+    $g6Untrusted = 0
+    foreach ($t in $g6) {
+        if (-not (Test-Path -LiteralPath $t.Path)) {
+            # 轻量验证包里本来就缺件;正式包缺一个都不行
+            if ($AllowMissing) { $g6Skip += $t.Path; continue }
+            $g6Bad += ('{0}:文件不在({1})' -f $t.What, $t.Path); continue
+        }
+        $v = Test-QtSignatureVerdict -Signature (Get-QtFileSignature -Path $t.Path) -ExpectedThumbprint $CertThumbprint
+        if (-not $v.Ok) { $g6Bad += ('{0} {1}:{2}' -f $t.What, (Split-Path -Leaf $t.Path), $v.Reason); continue }
+        if (-not $v.Trusted) { $g6Untrusted++ }
+    }
+
+    # 🔴 反向检查:第三方件**不该**被我们的证书签过(重签会毁掉原厂签名链;
+    #    随包微信的 sha256 还是钉死的,改一个字节就是 E_INSTALL_PAYLOAD_CORRUPT)。
+    $thirdParty = @(
+        'pkg\wechat\weixin_4.1.12.26.exe'
+        'pkg\vcredist\VC_redist.x64.exe'
+        'pkg\adb\adb.exe'
+        'pkg\scrcpy\scrcpy.exe'
+        'winagent\python\python.exe'
+    )
+    foreach ($rel in $thirdParty) {
+        $abs = Join-Path $StageDir $rel
+        if (-not (Test-Path -LiteralPath $abs)) { continue }
+        $sig = Get-QtFileSignature -Path $abs
+        $th = ''
+        if ($sig -and $sig.SignerCertificate) { $th = [string]$sig.SignerCertificate.Thumbprint }
+        if ($th -and $th -eq $CertThumbprint) {
+            $g6Bad += ('🔴 第三方件被我方证书重签了:{0} —— §2.2.3 要求 adb/scrcpy 等由其上游签名不动' -f $rel)
+        }
+    }
+
+    # 🔴 「签名先于 manifest 哈希」的**真凭据**:manifest 里登记的引擎 sha256
+    #    必须等于 stage 里那个**已签名**文件的实际 sha256。顺序错了这里当场红。
+    $mfPath = Join-Path $StageDir 'install\manifest.json'
+    $engInStage = Join-Path $StageDir 'install\engine\qtrade-setup-engine.exe'
+    if ((Test-Path -LiteralPath $mfPath) -and (Test-Path -LiteralPath $engInStage)) {
+        $mf = (Get-Content -LiteralPath $mfPath -Raw) | ConvertFrom-Json
+        $row = @($mf.files | Where-Object { $_.path -eq 'install/engine/qtrade-setup-engine.exe' })
+        if ($row.Count -gt 0) {
+            $actual = (Get-FileHash -LiteralPath $engInStage -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ([string]$row[0].sha256 -ne $actual) {
+                $g6Bad += ('manifest 里引擎的 sha256({0})与 stage 里已签名文件的实际值({1})不符 —— 签名发生在算哈希**之后**了,装机时会判 PAYLOAD_CORRUPT' -f
+                    $row[0].sha256, $actual)
+            }
+        }
+    }
+
+    foreach ($sk in $g6Skip) { Write-Warn2 ('轻量包缺件,跳过复核:' + $sk) }
+    if ($g6Bad.Count -gt 0) {
+        foreach ($b in $g6Bad) { Write-Bad $b }
+        throw ('G6 签名复核不通过({0} 项)' -f $g6Bad.Count)
+    }
+    Write-Ok ('{0} 个应签文件全部带签名,签名者指纹 = {1}' -f ($g6.Count - $g6Skip.Count), $CertThumbprint)
+    if ($g6Untrusted -gt 0) {
+        Write-Warn2 ('其中 {0} 个在**本机**显示"发布者未受信任" —— 自签名阶段的正常态,不是失败;' -f $g6Untrusted)
+        Write-Warn2 '   目标机跑 installer\signing\导入QTrade签名证书.cmd 之后即受信任'
+    }
+}
+
 Write-Section '完成'
 Write-Host ('  版本      : {0}' -f $Version)
 Write-Host ('  存根      : {0}({1})' -f $StubKind, (Split-Path -Leaf $SfxStub))
@@ -472,5 +739,17 @@ if ($collect.Missing.Count -gt 0) {
     Write-Host ('  缺件      : {0}' -f ($collect.Missing -join ', ')) -ForegroundColor Yellow
 }
 Write-Host ''
-Write-Host '  ⚠️ 签名未做:§2.2.3 要求外壳 EXE / 引擎 EXE / 全部 ps1 用同一张代码签名证书(OV 起步,A-4)签名。'
-Write-Host '     本脚本不持有证书,签名由 CI 在本步之后做(signtool sign /fd sha256 /tr <时间戳> /td sha256 …)。'
+if ($Sign) {
+    Write-Host ('  ✅ 已签名(§2.2.3):指纹 {0}' -f $CertThumbprint) -ForegroundColor Green
+    if ($NoTimestamp) {
+        Write-Host '     🔴 **没有时间戳**:证书一过期,已发出去的包签名当场失效。联网后请重签。' -ForegroundColor Yellow
+    } else {
+        Write-Host ('     时间戳:{0}(RFC 3161;证书过期后签名仍有效)' -f $SignTs) -ForegroundColor DarkGray
+    }
+    Write-Host '     自签名阶段:目标机需先跑 installer\signing\导入QTrade签名证书.cmd,否则仍显示"未知发布者"。' -ForegroundColor DarkGray
+    Write-Host '     换公司内部 CA / 购买的 OV 证书时:流程不变,只把 -CertThumbprint 换成新证书的指纹。' -ForegroundColor DarkGray
+} else {
+    Write-Host '  ⚠️ 签名未做:§2.2.3 要求外壳 EXE / 引擎 EXE / 全部 ps1 用同一张代码签名证书(OV 起步,A-4)签名。'
+    Write-Host '     加 -Sign -CertThumbprint <指纹> 即可在出包过程中签(见 build\README.md 第 5 节);'
+    Write-Host '     没有证书先跑:installer\signing\New-QtSelfSignedCert.ps1'
+}
