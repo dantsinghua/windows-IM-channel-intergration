@@ -395,6 +395,38 @@ Describe 'Set-QtKernelAcl(§2.6.1 内核文件 ACL)' {
         }
     }
 
+    It '🔴 写完读回仍不合规 → 判失败(Set-Acl 不抛 ≠ 真的生效)' {
+        # Get-QtAcl 的 Mock 恒回「Users 有 Modify」的那份,等于模拟 Set-Acl 被挡下、静默无效
+        $r = Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        $r.Ok | Should -BeFalse
+        $r.Problems.Count | Should -BeGreaterThan 0
+    }
+
+    It '幂等:已经收紧过就不写' {
+        Mock -ModuleName QTrade.Kernel Get-QtAcl {
+            $a = New-Object System.Security.AccessControl.DirectorySecurity
+            $a.SetAccessRuleProtection($true, $false)
+            foreach ($x in @(@('S-1-5-32-544', 'FullControl'), @('S-1-5-18', 'FullControl'), @('S-1-5-32-545', 'Read'))) {
+                $a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    (New-Object Security.Principal.SecurityIdentifier($x[0])),
+                    [Security.AccessControl.FileSystemRights]$x[1],
+                    [Security.AccessControl.AccessControlType]::Allow)))
+            }
+            return $a
+        }
+        $r = Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        $r.Ok | Should -BeTrue
+        $r.Changed | Should -BeFalse
+        Should -Invoke -ModuleName QTrade.Kernel Set-QtAcl -Times 0 -Exactly
+    }
+
+    It '读 ACL 抛异常 → 回失败而不是把异常抛给调用方' {
+        Mock -ModuleName QTrade.Kernel Get-QtAcl { throw '文件被占用' }
+        $r = Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        $r.Ok | Should -BeFalse
+        ($r.Problems -join ' ') | Should -BeLike '*读 ACL 失败*'
+    }
+
     It 'Administrators 与 SYSTEM 都是 FullControl(否则回滚删不掉内核文件)' {
         Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
         foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {

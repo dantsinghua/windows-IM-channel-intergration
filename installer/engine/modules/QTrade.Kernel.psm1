@@ -5,6 +5,9 @@
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Native.psm1') -DisableNameChecking
+# 安全判定与安装根共用同一份实现(禁止位、必须的完全控制、不许有多余身份)——
+# 这种东西存在第二份实现,迟早两边会漂移。
+Import-Module (Join-Path $PSScriptRoot 'QTrade.Acl.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Exit.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.State.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Log.psm1') -DisableNameChecking
@@ -124,21 +127,50 @@ function Set-QtKernelAcl {
     .NOTES
         走 Native 接缝(Get-QtAcl/Set-QtAcl)而不是直接 Get-Acl/Set-Acl ——
         直接调的话 Pester 没法 Mock,单测就只能去碰真机的 ACL。
-        ⚠️ 这里**没有**写完读回复核;安装根那条(Set-QtInstallRootAcl)有。
-           要不要给内核文件也补上,已提交裁决。
+
+        🔴 写完**读回复核**(总控 2026-09-20 裁决 ②,与安装根同一口径):
+           `Set-Acl` 不抛异常 **≠** DACL 真的变成了你要的样子 —— 被组策略或安全软件
+           挡下来时它可能静默无效。而这条 ACL 守的是「内核文件被普通用户替换
+           = 任意内核代码执行」,静默失效是不可接受的。
+           复核不过由调用方按 KERNEL_STAGED 既有的失败路径处置。
+    .OUTPUTS
+        { Ok; Changed; Path; Problems[] }
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $Path)
-    $acl = Get-QtAcl -Path $Path
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
-    $admins = New-Object Security.Principal.SecurityIdentifier ([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-    $users = New-Object Security.Principal.SecurityIdentifier ([Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
-    $system = New-Object Security.Principal.SecurityIdentifier ([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($admins, 'FullControl', 'Allow')))
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, 'FullControl', 'Allow')))
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($users, 'Read', 'Allow')))
-    Set-QtAcl -Path $Path -AclObject $acl
+
+    try {
+        $acl = Get-QtAcl -Path $Path
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Changed = $false; Path = $Path; Problems = @(('读 ACL 失败:{0}' -f $_.Exception.Message)) }
+    }
+
+    # 幂等:已经是收紧后的样子就不写
+    if ((Test-QtKernelFileAcl -Acl $acl).Ok) {
+        return [pscustomobject]@{ Ok = $true; Changed = $false; Path = $Path; Problems = @() }
+    }
+
+    try {
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+        foreach ($item in (Get-QtKernelFileAclSpec)) {
+            # 内核文件是**文件**,ACE 不带继承标志(三参构造器)
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier($item.Sid)),
+                $item.Rights,
+                [Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-QtAcl -Path $Path -AclObject $acl
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Changed = $false; Path = $Path; Problems = @(('写 ACL 失败:{0}' -f $_.Exception.Message)) }
+    }
+
+    try {
+        $after = Test-QtKernelFileAcl -Acl (Get-QtAcl -Path $Path)
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Changed = $true; Path = $Path; Problems = @(('写完读回失败:{0}' -f $_.Exception.Message)) }
+    }
+    return [pscustomobject]@{ Ok = $after.Ok; Changed = $true; Path = $Path; Problems = @($after.Problems) }
 }
 
 function Remove-QtKCheck {

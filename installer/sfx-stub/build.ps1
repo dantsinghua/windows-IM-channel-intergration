@@ -90,9 +90,18 @@ Write-Host '[3/4] 调 vcvars32 + nmake ...' -ForegroundColor Cyan
 $cleanCmd = if ($Clean) { 'nmake -f makefile clean & ' } else { '' }
 # vcvars32 会把 Platform=x86 塞进环境,于是 Build.mak 的 $O 变成 x86\ ——
 # 产物落在 x86\7zS.sfx;没设 Platform 时落在 o\7zS.sfx。两处都找。
+# 🔴 输出落文件再读回,不要 `& cmd.exe ... 2>&1`:
+#    PowerShell 会把原生程序的 stderr 当成错误记录,于是 cl.exe 的**每一条告警/错误**
+#    都变成一个 NativeCommandError,真正的编译输出反而看不见(实测踩过)。
+$logFile = Join-Path $env:TEMP ('qt-sfx-nmake-{0}.log' -f ([guid]::NewGuid().ToString('N')))
 $cmdLine = '"{0}" && cd /d "{1}" && {2}nmake -f makefile' -f $probe.VcVarsPath, $projDir, $cleanCmd
-$output = & cmd.exe /c $cmdLine 2>&1
+& cmd.exe /c "$cmdLine > `"$logFile`" 2>&1"
 $rc = $LASTEXITCODE
+$output = @()
+if (Test-Path -LiteralPath $logFile) {
+    $output = @([IO.File]::ReadAllLines($logFile))
+    Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
+}
 $output | ForEach-Object { Write-Host "  $_" }
 if ($rc -ne 0) {
     throw "nmake 失败,退出码 $rc(上面是完整输出;注意 7-Zip 用 -Wall -WX,任何告警都是错误)"

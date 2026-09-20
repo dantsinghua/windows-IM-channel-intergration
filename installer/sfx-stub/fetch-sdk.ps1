@@ -81,6 +81,12 @@ $args7z += '-r'
 & $SevenZipPath @args7z | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "7z 解压失败,退出码 $LASTEXITCODE" }
 
+# 🔴 归档里的文件带只读属性(7z 会把属性一起还原)。留着它,打补丁写不进去、
+#    nmake 的 clean 也删不掉中间产物。整棵树摘掉只读位。
+Get-ChildItem -LiteralPath $DestDir -Recurse -File -Force |
+    Where-Object { $_.IsReadOnly } |
+    ForEach-Object { $_.IsReadOnly = $false }
+
 $projDir = Join-Path $DestDir $info.ProjectDir
 if (-not (Test-Path -LiteralPath $projDir)) {
     throw "解压后找不到 SFXSetup 工程目录:$projDir(归档结构变了?)"

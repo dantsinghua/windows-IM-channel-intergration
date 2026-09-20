@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 import pytest
@@ -145,8 +146,70 @@ def test_spec_exit_table_parsed(doc03: str) -> None:
     assert spec["E_INSTALL_INTERNAL"] == 200
 
 
-def test_psm1_exit_table_matches_spec(doc03: str) -> None:
+# ── 实现已落地、但 docs/03 §3.4 还没回写的退出码 ────────────────────────
+#
+# 先有鸡还是先有蛋:对账测试从 docs/03 现读退出码表,而实现要先落地。
+# 在这里登记的码会被当成「文档 ∪ 登记表」的一部分参与对账,
+# 同时 test_pending_exit_rows_are_tracked 会把要补的那一行原样打出来并判红 ——
+# 不静默绿,否则文档永远补不上。
+#
+# 🔴 文档补上之后**把对应项删掉**(留着不会红,只会出一条 warning 提醒)。
+#
+# 历史:`E_INSTALL_ACL_HARDEN_FAILED = 31` 曾登记于此,
+#       docs-scribe 已按 R6-58 (cy) 回写 docs/03 §3.4,故已清空。
+PENDING_DOC_EXIT_ROWS: dict[str, int] = {}
+
+
+def test_pending_exit_rows_are_tracked(doc03: str) -> None:
+    """🔴 实现里有、文档里还没有的退出码,必须在这里**显式登记**并报出来 ——
+    不能静默绿(那样文档就永远补不上了),也不能以一句看不懂的 diff 失败。
+
+    文档补上之后这条会提示「把登记项删掉」,然后全绿。
+    """
     spec = parse_exit_codes(doc03)
+    still_missing = {k: v for k, v in PENDING_DOC_EXIT_ROWS.items() if k not in spec}
+    already_there = {k: v for k, v in PENDING_DOC_EXIT_ROWS.items() if k in spec}
+
+    # 文档已经补上的:
+    #   * 码对得上 -> **绿**(总控要求「文档补上后应全绿」),只用 warning 提醒清理登记表。
+    #     留着一条码值相同的登记项是无害的(上面两条对账用的是 文档 ∪ 登记表,并集不变),
+    #     所以不值得为它把整个套件判红、挡住别人。
+    #   * 码对不上 -> **红**。那是真的不一致:文档和实现各说各的,必须当场停下。
+    mismatched = [
+        f"{name}:文档写的是 {spec[name]},实现/登记的是 {code}"
+        for name, code in already_there.items() if spec[name] != code
+    ]
+    assert not mismatched, "文档与实现的退出码对不上:" + "；".join(mismatched)
+
+    if already_there:
+        warnings.warn(
+            "这些退出码 docs/03 已经补上了,可以把 PENDING_DOC_EXIT_ROWS 里对应的项删掉:"
+            + ", ".join(sorted(already_there)),
+            stacklevel=2,
+        )
+
+    # 还没补的,把要补的内容原样报出来
+    if still_missing:
+        lines = []
+        for name, code in still_missing.items():
+            assert code not in spec.values(), (
+                f"{name} 选的码 {code} 已经被文档里的 "
+                f"{[k for k, v in spec.items() if v == code]} 占了,换一个"
+            )
+            lines.append(f"| {code} | `{name}` | PAYLOAD_STAGED / KERNEL_STAGED |")
+        pytest.fail(
+            "docs/03 §3.4 退出码表还缺下面这些行(实现已落地,等 docs-scribe 回写):\n"
+            + "\n".join(lines)
+            + "\n详细文案与触发条件见本文件 PENDING_DOC_EXIT_ROWS 上方的注释,"
+              "以及 .omc/handoffs/installer.md 顶部。"
+        )
+
+
+def test_psm1_exit_table_matches_spec(doc03: str) -> None:
+    # 实现 = 文档 ∪ 待补项。待补项由 test_pending_exit_rows_are_tracked 单独报出来,
+    # 所以这里不会因为「文档还没补」而给出一句看不懂的 diff。
+    spec = dict(parse_exit_codes(doc03))
+    spec.update(PENDING_DOC_EXIT_ROWS)
     impl = parse_psm1_exit_table(read(EXIT_PSM1))
     assert impl == spec, (
         "QTrade.Exit.psm1 的退出码表与 docs/03 §3.4 不一致。\n"
@@ -157,7 +220,8 @@ def test_psm1_exit_table_matches_spec(doc03: str) -> None:
 
 
 def test_iss_exit_consts_match_spec(doc03: str, iss: str) -> None:
-    spec = parse_exit_codes(doc03)
+    spec = dict(parse_exit_codes(doc03))
+    spec.update(PENDING_DOC_EXIT_ROWS)
     consts = parse_iss_consts(iss, "E_INSTALL_")
     consts_int = {k: int(v) for k, v in consts.items()}
     ok = re.search(r"^\s*OK\s*=\s*(\d+);", iss, re.M)
@@ -1140,17 +1204,53 @@ def test_payload_staged_hardens_acl_before_everything_else() -> None:
     assert "'QTrade.Acl'" in step, "run-step.ps1 没有导入 QTrade.Acl 模块"
 
 
-def test_acl_failure_does_not_block_install_but_is_loud() -> None:
-    """§3.4 里没有给 ACL 的退出码,凭空造一个会和规格分叉,所以失败**不阻断**。
-    但不阻断不等于可以安静:必须 ERROR 日志 + 落进 install_state + 带进本步 data,
-    否则「装完了但安装根还是人人可写」不会在任何地方显形。"""
+def test_acl_failure_blocks_the_install() -> None:
+    """🔴 总控 2026-09-20 裁决:ACL 收紧失败 = **阻断**,退出码 31。
+
+    理由:提权运行的引擎、以及随后以 LocalSystem 起的服务,工作目录都在安装根;
+    这个目录能被普通用户写 = 一条现成的本地提权路径(当前目录在默认 DLL 搜索序列里)。
+    **带病装完比装不上更糟** —— 用户会以为自己装好了。
+
+    (上一批我做成了「不阻断但大声」,总控推翻了,这条测试改成守新口径。)
+    """
     step = read(INSTALLER_ROOT / "engine" / "run-step.ps1")
-    branch = _slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest")
-    assert "Write-QtLog -Level 'ERROR'" in branch, "ACL 失败没有 ERROR 日志"
-    assert "Set-QtAclHardened" in branch, "ACL 结果没有落进 install_state"
-    assert "acl_hardened" in step, "本步结果里没有带上 acl_hardened"
-    # 不阻断:这一段里不许出现 ACL 自己的失败出口
-    assert "ExitName 'E_INSTALL_ACL" not in step, "给 ACL 造了规格里没有的退出码"
+    impl = parse_psm1_exit_table(read(EXIT_PSM1))
+    assert impl["E_INSTALL_ACL_HARDEN_FAILED"] == 31
+
+    # 安装根(PAYLOAD_STAGED)与内核文件(KERNEL_STAGED)两处都要阻断
+    for marker, where in (("'PAYLOAD_STAGED' {", "安装根"), ("'KERNEL_STAGED' {", "内核文件")):
+        branch = _slice(step, marker, "Write-QtStepResult -Ok $true")
+        assert "E_INSTALL_ACL_HARDEN_FAILED" in branch, f"{where}的 ACL 失败没有用 31 号码阻断"
+        assert "ACL_HARDEN_FAILED" in branch, f"{where}缺 ACL_HARDEN_FAILED 原因码"
+        assert "Write-QtLog -Level 'ERROR'" in branch, f"{where}的 ACL 失败没有 ERROR 日志"
+
+    # 失败前必须先把结果落进 install_state —— 否则诊断包里看不到为什么装不上。
+    # ⚠️ 比位置前**必须先去注释**:说明文字里也写着 E_INSTALL_ACL_HARDEN_FAILED,
+    #    照原文找 index 会命中注释而不是代码。
+    payload = strip_comments(_slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest"))
+    assert payload.index("Set-QtAclHardened") < payload.index("E_INSTALL_ACL_HARDEN_FAILED"), \
+        "先退出再落状态,诊断包就带不走原因了"
+
+
+def test_kernel_acl_verifies_readback() -> None:
+    """🔴 裁决 ②:内核文件 ACL 同样要「写完读回复核」。
+    `Set-Acl` 不抛异常 ≠ DACL 真的变了(被组策略/安全软件挡下时会静默无效),
+    而这条 ACL 守的是「内核文件被普通用户替换 = 任意内核代码执行」。"""
+    kernel = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.Kernel.psm1")
+    fn = _slice(kernel, "function Set-QtKernelAcl", "function Remove-QtKCheck")
+    assert "Test-QtKernelFileAcl" in fn, "没有读回复核"
+    assert fn.count("Get-QtAcl") >= 2, "只读了一次 —— 写完没有再读回来比"
+    assert "Set-QtAcl -Path" in fn
+
+
+def test_acl_judgement_has_exactly_one_implementation() -> None:
+    """安全判定(禁止位、必须的完全控制、不许有多余身份)只能有**一份**实现。
+    两份迟早漂移,而漂移的那一份多半是没人看的那份。"""
+    acl = read(ACL_PSM1)
+    assert "function Test-QtHardenedAcl" in acl
+    kernel = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.Kernel.psm1")
+    assert "QTrade.Acl.psm1" in kernel, "Kernel 模块没有复用 QTrade.Acl 的判据"
+    assert "QtAclForbiddenForUsers" not in kernel, "禁止位掩码在 Kernel 里被复制了一份"
 
 
 def test_install_state_declares_acl_fields() -> None:
@@ -1182,3 +1282,25 @@ def test_g5_requires_relative_runprogram() -> None:
     assert "'^[A-Za-z]:'" in b, "没有按盘符判绝对路径"
     readme = read(INSTALLER_ROOT / "sfx-stub" / "README.md")
     assert "相对路径" in readme, "README 没写裁决 12"
+
+
+def test_space_rule_verifier_extracts_from_real_source() -> None:
+    """🔴 空间判据的边界验证必须**从真源码里抽**,不能在测试里抄一份 ——
+    抄的那份在 `ExtractEngine.cpp` 改了之后还会继续绿,等于没有验证。"""
+    v = read(SFX_STUB_DIR / "verify-space-rule.ps1")
+    assert "ExtractEngine.cpp" in v, "没有去读真源码"
+    assert "kQTradeMinFreeBytes" in v and "QTrade_GetRequiredBytes" in v
+    assert "IndexOf" in v, "不是按锚点抽取"
+    # 抽出来之后必须真编译真跑,而不是做文本比对
+    assert "cl /nologo" in v and "test.exe" in v
+    assert "/WX" in v, "抽出来的片段也该在 -WX 下编译"
+
+
+def test_stub_build_is_reproducible_from_repo_alone() -> None:
+    """仓库里只存补丁与脚本,源码按 sha256 取 —— 换一台机器也得能一条命令复现。"""
+    readme = read(SFX_STUB_DIR / "README.md")
+    for must in ("fetch-sdk.ps1", "build.ps1", "vcvars32", "静态 CRT"):
+        assert must in readme, f"README 没写清楚怎么复现:{must}"
+    # 已知缺口必须写明,不能装作全验过了
+    assert "已知缺口" in readme, "README 没有写明验证缺口"
+    assert "requireAdministrator" in readme, "没有记录清单/提权那条待裁决"

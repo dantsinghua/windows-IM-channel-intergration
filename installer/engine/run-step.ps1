@@ -127,16 +127,23 @@ try {
                   2. 后面每一步都要往安装根里写状态和载荷,先收紧再写,不给中间窗口;
                   3. 放在跳过判断之前,是为了让**续跑**也走一遍 —— 它幂等(先读回比对,
                      已经对了就一个字节都不写),成本只有一次 Get-Acl。
-                失败不阻断安装:§3.4 里没有给 ACL 的退出码,凭空造一个会和规格分叉。
-                但失败要**大声**:ERROR 日志 + 记进状态 + 带进本步的 data,不许静默。
-                (要不要给它一个退出码 / 是否应阻断,已提交裁决。)#>
+                🔴 **失败即阻断**(总控 2026-09-20 裁决,退出码 31 E_INSTALL_ACL_HARDEN_FAILED):
+                提权运行的引擎、以及随后以 LocalSystem 起的服务,工作目录都在安装根;
+                这个目录能被普通用户写 = 一条现成的本地提权路径(当前目录在默认 DLL 搜索序列里)。
+                带病装完比装不上更糟 —— 用户会以为自己装好了。
+                失败前先把结果落进 install_state(acl_hardened / acl_problems),诊断包才带得走。#>
             $aclRes = Set-QtInstallRootAcl -Path $paths.Root
+            Set-QtAclHardened -State $state -Result $aclRes | Out-Null
             if ($aclRes.Ok) {
                 Write-QtLog -Level 'INFO' -Message ('安装根 ACL {0}:{1}' -f $(if ($aclRes.Changed) { '已收紧' } else { '本就合规' }), $paths.Root)
             } else {
-                Write-QtLog -Level 'ERROR' -Message ('🔴 安装根 ACL 未能收紧({0}):{1} —— 普通用户可能仍可往安装根写入,存在 DLL 植入面' -f $paths.Root, ($aclRes.Problems -join '; '))
+                Write-QtLog -Level 'ERROR' -Message ('🔴 安装根 ACL 收紧失败({0}):{1}' -f $paths.Root, ($aclRes.Problems -join '; '))
+                Set-QtState -State $state -To (New-QtFailedState -Step 'PAYLOAD_STAGED' -Reason 'ACL_HARDEN_FAILED') | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'ACL_HARDEN_FAILED' -ExitName 'E_INSTALL_ACL_HARDEN_FAILED' `
+                    -Message ('安装目录权限收紧失败,安装已中止。请确认以管理员身份运行,且该目录未被组策略或安全软件锁定:{0}' -f $paths.Root) `
+                    -Data ([ordered]@{ acl_hardened = $false; acl_problems = @($aclRes.Problems); path = $paths.Root })
             }
-            Set-QtAclHardened -State $state -Result $aclRes | Out-Null
 
             $ctx = [pscustomobject]@{ ManifestPath = $paths.Manifest; StageRoot = $paths.Root }
             if (Test-QtStepComplete -Step 'PAYLOAD_STAGED' -Context $ctx) {
@@ -247,7 +254,17 @@ try {
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KERNEL_SHA_MISMATCH' -ExitName 'E_INSTALL_KERNEL_SHA_MISMATCH' -Message '内核文件校验失败,请重新获取安装包'
             }
-            Set-QtKernelAcl -Path $kernelPath
+            # 🔴 §2.6.1 内核文件 ACL:写完读回复核,不过就按本步既有的失败路径中止。
+            #    内核文件被普通用户替换 = 任意内核代码执行,静默失效不可接受。
+            $kAcl = Set-QtKernelAcl -Path $kernelPath
+            if (-not $kAcl.Ok) {
+                Write-QtLog -Level 'ERROR' -Message ('🔴 内核文件 ACL 收紧失败({0}):{1}' -f $kernelPath, ($kAcl.Problems -join '; '))
+                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason 'ACL_HARDEN_FAILED') | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'ACL_HARDEN_FAILED' -ExitName 'E_INSTALL_ACL_HARDEN_FAILED' `
+                    -Message ('内核文件权限收紧失败,安装已中止。请确认以管理员身份运行,且该文件未被安全软件锁定:{0}' -f $kernelPath) `
+                    -Data ([ordered]@{ acl_problems = @($kAcl.Problems); path = $kernelPath })
+            }
             Write-QtKernelPointer -Path $paths.KernelPtr -KernelPath $kernelPath -Sha256 ([string]$k.sha256) -Version ([string]$k.version) -Line (Get-QtKernelLine) | Out-Null
             $imp = Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar')
             if (-not $imp.Ok) {

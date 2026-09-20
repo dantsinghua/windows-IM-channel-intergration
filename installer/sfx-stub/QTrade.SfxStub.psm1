@@ -15,9 +15,11 @@ $script:QtSdkFileName = 'lzma2301.7z'
 $script:QtSdkUrl      = 'https://www.7-zip.org/a/lzma2301.7z'
 $script:QtSdkSha256   = '317DD834D6BBFD95433488B832E823CD3D4D420101436422C03AF88507DD1370'
 
-# 重编只需要这两棵子树(CPP 是 C++ 实现,C 是 LZMA 解码核);
-# CS/Java/Asm/DOC/bin 对 SFXSetup 的 nmake 目标没有用,不解出来省时间也少噪音。
-$script:QtSdkSubtrees = @('C', 'CPP')
+# 重编需要这三棵子树:CPP 是 C++ 实现,C 是 LZMA 解码核,
+# Asm 是 CRC 的汇编优化 —— `Crc.mak` 会去引 `Asm/x86/7zCrcOpt.asm`,
+# 少了它 nmake 直接 `U1073: 不知道如何生成…`(实测踩过)。
+# CS/Java/DOC/bin 对 SFXSetup 的 nmake 目标没有用,不解出来省时间也少噪音。
+$script:QtSdkSubtrees = @('C', 'CPP', 'Asm')
 
 # SFXSetup 在 SDK 里的位置,以及 nmake 的产物名(makefile 里 PROG = 7zS.sfx)。
 $script:QtSfxProjectDir = 'CPP\7zip\Bundles\SFXSetup'
@@ -221,6 +223,10 @@ function Invoke-QtUnifiedDiff {
         for ($k = $cur; $k -lt $src.Count; $k++) { $out.Add($src[$k]) }
 
         if (-not $DryRun) {
+            # 🔴 LZMA SDK 归档里的源文件**带只读属性**(7z 会把属性一起还原),
+            #    直接 WriteAllText 会 UnauthorizedAccessException。先摘掉只读位。
+            $fi = New-Object System.IO.FileInfo($target)
+            if ($fi.IsReadOnly) { $fi.IsReadOnly = $false }
             $text = ($out -join "`r`n") + "`r`n"
             [System.IO.File]::WriteAllText($target, $text, $utf8Bom)
         }

@@ -173,10 +173,11 @@ x86 是为了任何 Windows 都能跑这个外壳(§2.4.1 的架构判断由内�
 
 | 文件 | 说明 |
 |---|---|
-| `fetch-sdk.ps1` | 下载 → **先校验 sha256 再解压** → 解出 `C/` `CPP/` → 打补丁 |
+| `fetch-sdk.ps1` | 下载 → **先校验 sha256 再解压** → 解出 `C/` `CPP/` `Asm/` → 打补丁(并摘掉归档带来的只读位) |
 | `qtrade-sfx.patch` | 两处改动的 unified diff(+221 / −15,多数是中文注释) |
 | `build.ps1` | 探工具链 → 验补丁标记与 BOM → `vcvars32` + `nmake` → 验货 → 落 `../build/QTradeSD.sfx` |
 | `QTrade.SfxStub.psm1` | 上面两个脚本的实现(取源/打补丁/探工具链/验货),单测在 `tests/QTrade.SfxStub.Tests.ps1` |
+| `verify-space-rule.ps1` | 把真源码里的空间判定函数**抽出来**编译跑边界断言(见 §7) |
 | `src/` | 第三方源码,**gitignore** |
 | `work/` | 归档与中间产物,**gitignore** |
 
@@ -191,3 +192,68 @@ x86 是为了任何 Windows 都能跑这个外壳(§2.4.1 的架构判断由内�
 
 正确性不是靠自说自话:测试里让它和 GNU `patch` 对同一棵源码树各打一遍,
 **逐字节比对**(仅差那个有意加的 BOM),三个文件全部一致。
+
+
+---
+
+## 7. 实测结论与已知缺口(2026-09-20,MSVC 14.29.30133 / Win SDK 10.0.19041.0)
+
+### 编译
+
+`nmake` **一次通过,零错误零告警**(7-Zip 用 `-Wall -WX`,告警即错误)。
+产物 `QTradeSD.sfx` **205,824 字节**,
+sha256 `A081DE93E9453F87A69CAFE33B2998A4F3535E2151C04CF7E2F0E937BF373A70`,
+三项自检全过:x86 / 静态 CRT / 含 `InstallPath`。
+
+补丁一行没改就编过了 —— 事前那次逐 API 的静态评审(以及据它加的 BOM 那道门)是值的。
+
+### 哑 EXE 实测(载荷只有 `hello.cmd` + `marker.txt`,绝不含我方引擎)
+
+| 被测行为 | 实测值 |
+|---|---|
+| 解压位置 | `CWD=C:\Users\anlin\AppData\Local\Temp\qt-sfx-probe` —— `InstallPath` 生效 |
+| **留存** | 跑完后目录还在,内容 `marker.txt`、`install\engine\hello.cmd` |
+| RunProgram 拉起 | `SELF=…\qt-sfx-probe\install\engine\hello.cmd` |
+| 参数透传 | `ARGS=/QT_MODE=install /PROBE=1` —— 原样到达 |
+| **退出码透传** | 子进程退 **26** → EXE 退 **26**;退 **3010** → EXE 退 **3010** |
+| 无 `InstallPath` 时 | 解到 `%TEMP%\7zS435CC89B`、**跑完即删**(跑前跑后 `7zS*` 目录数都是 0),退出码仍透传 —— 逐字保持官方原行为 |
+
+### 🔴 已知缺口一:端到端触发不了「空间不足」分支
+
+判据是 `free < max(6 GiB, 解包总大小 × 1.1)`。本机 C:/D: 都有 **280 GB+** 可用,
+要让它成立就得造一个**声明解包大小 ≈ 260 GiB** 的哑载荷 —— 不现实。
+
+替代验证(`verify-space-rule.ps1`):把 `ExtractEngine.cpp` 里那段判定**原样抽出来**
+(不是抄一份 —— 抄的那份在源码改了之后还会继续绿),和边界断言一起用**同一个 cl.exe**
+编译成小程序跑。实测全过:
+
+```
+unpacked=0      = 6442450944      (空归档 -> 硬下限 6 GiB)
+unpacked=5GiB   = 6442450944      (5.5 GiB < 6 GiB -> 仍取下限)
+unpacked=6GiB   = 7086696038      (6.6 GiB > 6 GiB -> 取余量值)
+unpacked=10GiB  = 11811160064
+monotonic near 6GiB / no overflow at 10TiB
+```
+
+**真机端到端**这条分支建议放到 M0 验收、在一台小盘 VM 上补。
+
+### 🔴 已知缺口二 / 待裁决:存根没有嵌清单,靠 UAC 启发式才提权
+
+实测:**官方 `7zSD.sfx` 和自编 `QTradeSD.sfx` 都没有嵌 `RT_MANIFEST`**
+(用 `FindResource(…, 1, RT_MANIFEST)` 直接查的,不是猜的)。
+两者都是未签名、版本信息里含 `7z Setup SFX`,于是命中 Windows 的
+**安装程序检测(Installer Detection)启发式** —— 非提权上下文里
+`CreateProcess` 直接以 `ERROR_ELEVATION_REQUIRED` 失败,EXE **根本起不来**。
+
+对本产品来说「要提权」本身是对的(`.iss` 就是 `PrivilegesRequired=admin`),
+但**靠启发式拿到它是脆的**:它依赖文件名/版本信息里的关键词,也依赖
+`EnableInstallerDetection` 策略没被关掉。一旦不触发,静默安装会以一个
+很难懂的错误挂掉。
+
+建议(已提交裁决):给存根嵌一份显式清单
+`<requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>`,
+让提权变成**声明的**而不是**猜出来的**。这是资源级改动,不碰 `SfxSetup.cpp` 的任何逻辑。
+
+> 哑 EXE 实验因此用的是 `QTradeSD.sfx` 的**副本**(`mt.exe` 注入 `asInvoker`),
+> 好让它能在非提权上下文里跑。清单只决定「要不要提权」,
+> 对上表那六项被测行为没有任何影响;**出货的存根逐字节未动**(实验脚本会复核 sha256)。

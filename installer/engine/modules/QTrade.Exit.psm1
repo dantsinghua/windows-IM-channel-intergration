@@ -21,6 +21,11 @@ $script:QtExitTable = [ordered]@{
     'E_INSTALL_OTHER_CUSTOM_KERNEL_DECLINED' = 28
     'E_INSTALL_ALREADY_RUNNING'             = 29
     'E_INSTALL_PAYLOAD_CORRUPT'             = 30
+    # 裁决(总控 2026-09-20):安装根 / 内核文件的 ACL 收紧**失败即阻断** ——
+    # 提权引擎与 LocalSystem 服务的工作目录能被普通用户写 = 本地提权面,不能带病装完。
+    # 选 31:紧邻 20–30 的安全/权限簇(22 NOT_ADMIN / 23 ELEVATED_AS_OTHER_USER / 25 POLICY_BLOCKED),
+    # 且紧接 PAYLOAD_STAGED 自己的 30。
+    'E_INSTALL_ACL_HARDEN_FAILED'           = 31
     'E_INSTALL_FEATURE_ENABLE_FAILED'       = 40
     'E_INSTALL_RESUME_ENGINE_MISSING'       = 41
     'E_INSTALL_WSL_MSI_FAILED'              = 50

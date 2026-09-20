@@ -6,11 +6,17 @@ BeforeAll {
 
 Describe 'QTrade.Exit —— 退出码表' {
 
-    It '表里 45 个条目,码互不重复' {
+    It '码互不重复,且覆盖两端边界' {
+        # 不再钉「条目数」这个魔法数字:它随规格增长而变,写死之后每加一个码就要手工改,
+        # 而且用例名(45)和断言(46)早就对不上了 —— 这种数字不保护任何东西。
+        # 「与 docs/03 §3.4 逐条一致」由 python 对账测试负责(它是逐名逐码比的);
+        # 这里只守模块自己的不变量:码不重复、两端边界在表里。
         $t = Get-QtExitTable
-        $t.Count | Should -Be 46
         $codes = @($t.Values)
+        $codes.Count | Should -BeGreaterThan 40
         ($codes | Select-Object -Unique).Count | Should -Be $codes.Count
+        $t['OK'] | Should -Be 0
+        $t['E_INSTALL_REBOOT_REQUIRED'] | Should -Be 3010
     }
 
     It 'docs/03 §3.4 的关键码逐条对齐' -ForEach @(

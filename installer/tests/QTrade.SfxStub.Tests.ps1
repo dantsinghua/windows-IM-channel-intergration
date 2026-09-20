@@ -41,8 +41,8 @@ Describe 'Get-QtSfxSdkInfo' {
         (Get-QtSfxSdkInfo).Sha256 |
             Should -BeExactly '317DD834D6BBFD95433488B832E823CD3D4D420101436422C03AF88507DD1370'
     }
-    It '只解重编需要的两棵子树' {
-        (Get-QtSfxSdkInfo).Subtrees | Should -Be @('C', 'CPP')
+    It '只解重编需要的三棵子树(Asm 是 CRC 汇编,少了它 nmake 报 U1073)' {
+        (Get-QtSfxSdkInfo).Subtrees | Should -Be @('C', 'CPP', 'Asm')
     }
     It '工程目录指向 SFXSetup' {
         (Get-QtSfxSdkInfo).ProjectDir | Should -BeExactly 'CPP\7zip\Bundles\SFXSetup'

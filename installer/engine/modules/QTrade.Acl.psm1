@@ -67,9 +67,29 @@ function Get-QtInstallRootAclSpec {
     [CmdletBinding()]
     param()
     return @(
-        [pscustomobject]@{ Sid = $script:QtAclSidAdministrators; Rights = [Security.AccessControl.FileSystemRights]::FullControl;     Name = 'Administrators' }
-        [pscustomobject]@{ Sid = $script:QtAclSidSystem;         Rights = [Security.AccessControl.FileSystemRights]::FullControl;     Name = 'SYSTEM' }
-        [pscustomobject]@{ Sid = $script:QtAclSidUsers;          Rights = [Security.AccessControl.FileSystemRights]::ReadAndExecute;  Name = 'Users' }
+        [pscustomobject]@{ Sid = $script:QtAclSidAdministrators; Rights = [Security.AccessControl.FileSystemRights]::FullControl;     Name = 'Administrators'; IsUsers = $false }
+        [pscustomobject]@{ Sid = $script:QtAclSidSystem;         Rights = [Security.AccessControl.FileSystemRights]::FullControl;     Name = 'SYSTEM';         IsUsers = $false }
+        [pscustomobject]@{ Sid = $script:QtAclSidUsers;          Rights = [Security.AccessControl.FileSystemRights]::ReadAndExecute;  Name = 'Users';          IsUsers = $true }
+    )
+}
+
+function Get-QtKernelFileAclSpec {
+    <#
+    .SYNOPSIS
+        内核文件(docs/03 §2.6.1)期望的 ACE 表。
+
+        与安装根的差别只有两处:
+          * Users 只要 `Read`,不需要执行位 —— 它是被 WSL 读取的数据文件,不是可执行体;
+          * 它是**文件**,ACE 不带继承标志(继承标志只对目录有意义)。
+        判据本身(禁止位、必须有 Administrators/SYSTEM 完全控制、不许有多余身份)
+        与安装根共用同一段代码 —— 安全判定不该存在第二份实现。
+    #>
+    [CmdletBinding()]
+    param()
+    return @(
+        [pscustomobject]@{ Sid = $script:QtAclSidAdministrators; Rights = [Security.AccessControl.FileSystemRights]::FullControl; Name = 'Administrators'; IsUsers = $false }
+        [pscustomobject]@{ Sid = $script:QtAclSidSystem;         Rights = [Security.AccessControl.FileSystemRights]::FullControl; Name = 'SYSTEM';         IsUsers = $false }
+        [pscustomobject]@{ Sid = $script:QtAclSidUsers;          Rights = [Security.AccessControl.FileSystemRights]::Read;        Name = 'Users';          IsUsers = $true }
     )
 }
 
@@ -85,10 +105,10 @@ function ConvertTo-QtAclSid {
     }
 }
 
-function Test-QtInstallRootAcl {
+function Test-QtHardenedAcl {
     <#
     .SYNOPSIS
-        比对一份 ACL 是否已经是收紧后的样子。回 { Ok; Problems[] }。
+        比对一份 ACL 是否已经是收紧后的样子(安装根与内核文件共用)。回 { Ok; Problems[] }。
     .NOTES
         判据四条,缺一不可:
           1. 已去继承(AreAccessRulesProtected = true)——否则 %ProgramData% 的默认放行会继承回来;
@@ -98,7 +118,12 @@ function Test-QtInstallRootAcl {
         三条 ACE 都必须带容器+对象继承,否则只收紧了根目录、子目录照旧敞着。
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][AllowNull()][object] $Acl)
+    param(
+        [Parameter(Mandatory)][AllowNull()][object] $Acl,
+        [Parameter(Mandatory)][object[]] $Spec,
+        # 目录要求 ACE 带继承标志;文件没有「继承」这回事,传 $false
+        [bool] $RequireInheritance = $true
+    )
 
     $problems = New-Object System.Collections.Generic.List[string]
     if ($null -eq $Acl) {
@@ -116,7 +141,7 @@ function Test-QtInstallRootAcl {
     }
 
     $wanted = @{}
-    foreach ($spec in Get-QtInstallRootAclSpec) { $wanted[$spec.Sid] = $spec }
+    foreach ($item in $Spec) { $wanted[$item.Sid] = $item }
 
     $seen = @{}
     foreach ($ace in $allow) {
@@ -129,32 +154,48 @@ function Test-QtInstallRootAcl {
         if (-not $seen.ContainsKey($sid)) { $seen[$sid] = 0 }
         $seen[$sid] = $seen[$sid] -bor $rights
 
-        $ci = ($ace.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ContainerInherit) -ne 0
-        $oi = ($ace.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0
-        if (-not ($ci -and $oi)) {
-            $problems.Add(('{0} 的 ACE 没有同时带容器+对象继承 —— 只收紧了根目录,子目录照旧敞着' -f $wanted[$sid].Name))
+        if ($RequireInheritance) {
+            $ci = ($ace.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ContainerInherit) -ne 0
+            $oi = ($ace.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0
+            if (-not ($ci -and $oi)) {
+                $problems.Add(('{0} 的 ACE 没有同时带容器+对象继承 —— 只收紧了根目录,子目录照旧敞着' -f $wanted[$sid].Name))
+            }
         }
     }
 
-    foreach ($spec in Get-QtInstallRootAclSpec) {
-        if (-not $seen.ContainsKey($spec.Sid)) {
-            $problems.Add(('缺 {0} 的 Allow ACE' -f $spec.Name))
+    foreach ($item in $Spec) {
+        if (-not $seen.ContainsKey($item.Sid)) {
+            $problems.Add(('缺 {0} 的 Allow ACE' -f $item.Name))
             continue
         }
-        $got = $seen[$spec.Sid]
-        if ($spec.Sid -eq $script:QtAclSidUsers) {
+        $got = $seen[$item.Sid]
+        if ($item.IsUsers) {
             if (($got -band [int]$script:QtAclForbiddenForUsers) -ne 0) {
-                $problems.Add('Users 仍带写/建/删/改权位 —— 普通用户还能往安装根里放 DLL')
+                $problems.Add('Users 仍带写/建/删/改权位 —— 普通用户还能替换这里的文件')
             }
-            if (($got -band [int][Security.AccessControl.FileSystemRights]::ReadAndExecute) -ne [int][Security.AccessControl.FileSystemRights]::ReadAndExecute) {
-                $problems.Add('Users 连读+执行都不全 —— 控制台/引擎会起不来')
+            if (($got -band [int]$item.Rights) -ne [int]$item.Rights) {
+                $problems.Add(('Users 连 {0} 都不全 —— 该读的读不到' -f $item.Rights))
             }
         } elseif (($got -band [int][Security.AccessControl.FileSystemRights]::FullControl) -ne [int][Security.AccessControl.FileSystemRights]::FullControl) {
-            $problems.Add(('{0} 不是 FullControl —— 卸载/修复会删不掉自己装的东西' -f $spec.Name))
+            $problems.Add(('{0} 不是 FullControl —— 卸载/修复会删不掉自己装的东西' -f $item.Name))
         }
     }
 
     return [pscustomobject]@{ Ok = ($problems.Count -eq 0); Problems = @($problems.ToArray()) }
+}
+
+function Test-QtInstallRootAcl {
+    <#  安装根:目录,ACE 必须带继承标志。 #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][object] $Acl)
+    return Test-QtHardenedAcl -Acl $Acl -Spec (Get-QtInstallRootAclSpec) -RequireInheritance $true
+}
+
+function Test-QtKernelFileAcl {
+    <#  内核文件:是文件,不谈继承。 #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][object] $Acl)
+    return Test-QtHardenedAcl -Acl $Acl -Spec (Get-QtKernelFileAclSpec) -RequireInheritance $false
 }
 
 function Set-QtInstallRootAcl {
@@ -214,4 +255,5 @@ function Set-QtInstallRootAcl {
     return [pscustomobject]@{ Ok = $after.Ok; Changed = $true; Path = $Path; Problems = @($after.Problems) }
 }
 
-Export-ModuleMember -Function Get-QtInstallRootAclSpec, ConvertTo-QtAclSid, Test-QtInstallRootAcl, Set-QtInstallRootAcl
+Export-ModuleMember -Function Get-QtInstallRootAclSpec, Get-QtKernelFileAclSpec, ConvertTo-QtAclSid,
+Test-QtHardenedAcl, Test-QtInstallRootAcl, Test-QtKernelFileAcl, Set-QtInstallRootAcl
