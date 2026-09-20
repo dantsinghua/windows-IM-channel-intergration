@@ -88,10 +88,11 @@ class WinWeChat:
         import win32gui
         hwnd = win32gui.FindWindow(self._cls, None)
         if not hwnd:
-            return {"exists": False, "visible": False, "minimized": False, "pid": None}
+            return {"exists": False, "visible": False, "minimized": False, "pid": None, "class_name": None}
         import win32process
         return {"exists": True, "visible": bool(win32gui.IsWindowVisible(hwnd)),
-                "minimized": bool(win32gui.IsIconic(hwnd)), "pid": win32process.GetWindowThreadProcessId(hwnd)[1]}
+                "minimized": bool(win32gui.IsIconic(hwnd)), "pid": win32process.GetWindowThreadProcessId(hwnd)[1],
+                "class_name": self._cls}      # R6-58 (at):FindWindow 命中即证明该类名对这次探测成立
 
     # ---------------------------------------------------------------- 讲述人仪式
     def ui_tree_visible(self) -> bool:

@@ -5,13 +5,15 @@ import os
 
 import pytest
 
+import re
+
 from qtrade_winagent import __version__
 from qtrade_winagent.audit import ACTOR_SVC_TO_USER, ACTORS, Audit
-from qtrade_winagent.db import Db
+from qtrade_winagent.db import SCHEMA_PATH, Db
 from qtrade_winagent.errors import HTTP_BY_CODE, WaError, user_agent_offline
 from qtrade_winagent.fakes import FakeCrypto
 from qtrade_winagent.ids import login_session_id, trace_id, ulid
-from qtrade_winagent.installer_ops import InstallerOps
+from qtrade_winagent.installer_ops import KERNEL_TO_STATES, InstallerOps
 from qtrade_winagent.logfmt import format_line, get_logger, iso8601, redact, redact_path
 
 
@@ -149,6 +151,30 @@ def test_install_history_actor_enum(tmp_path):
     with pytest.raises(WaError):
         io_.history(to_state="X", actor="不存在的执行者")
     assert io_.history_page()[0]["to_state"] == "DONE"
+    db.close()
+
+
+# ---------------------------------------------------------------- R6-58 (au):install_history.to_state 七个内核迁移名
+def test_kernel_to_states_match_ddl_registration():
+    """``install_history.to_state`` **无 CHECK 是有意的**(schema_winagent.sql 注释逐字登记七个名字)——
+    installer_ops.KERNEL_TO_STATES 必须与该注释逐字一致,实现方不得另起同义名。"""
+    sql = open(SCHEMA_PATH, encoding="utf-8").read()
+    m = re.search(r"实现方不得另起同义名\):(.+?)\(#26/#27/#46 写\)", sql, re.S)
+    assert m is not None, "schema_winagent.sql 里的 R6-58 (au) 登记注释找不到了,DDL 与代码脱节"
+    names = tuple(n.strip() for n in re.sub(r"--", " ", m.group(1)).split("/") if n.strip())
+    assert names == KERNEL_TO_STATES
+    assert KERNEL_TO_STATES == ("KERNEL_APPLYING", "KERNEL_APPLIED", "KERNEL_APPLY_FAILED", "KERNEL_VERIFIED",
+                                "KERNEL_VERIFY_FAILED", "KERNEL_ROLLING_BACK", "KERNEL_ROLLED_BACK")
+
+
+def test_history_rejects_kernel_to_state_synonyms(tmp_path):
+    db, io_ = mk_installer(tmp_path)
+    with pytest.raises(WaError) as e:
+        io_.history(to_state="KERNEL_APLLIED", actor="winagent")        # 打错的同义名
+    assert e.value.reason == "bad_kernel_to_state"
+    io_.history(to_state="KERNEL_APPLYING", actor="winagent")           # 登记过的名字放行
+    assert io_.history_page()[0]["to_state"] == "KERNEL_APPLYING"
+    io_.history(to_state="DONE", actor="installer")                    # 非 KERNEL_ 前缀(00 §8.2 安装状态机键)不受本校验约束
     db.close()
 
 

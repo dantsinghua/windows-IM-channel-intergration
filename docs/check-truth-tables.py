@@ -271,6 +271,20 @@ FORBIDDEN = [
      "0[1-7]-*.md",
      r"onebot_seq:<session>",
      "R6-58 (v):逐字为 `onebot_seq:<native_id>`(与企点 `qidian_rowid:<native_id>` 同惯例);旧写法会造出两种 kind。"),
+
+    # (de):实测采样的出参键 `candidates` 作废(改 `rows`,元素 = probe_targets_observed 的行 + in_config),
+    #      且 sample 不产生 probe_result ⇒ 没有 run_id。⚠️ 刻意盯【旧形状的字面】而不是裸词 `candidates` ——
+    #      `docker_pool_candidates` / `mail_cleanup_log.candidates` / 06 伪代码的局部变量都叫 candidates,
+    #      盯裸词会一次误报 6 处。反向验证:改前备份 04:587 命中 1 处。
+    ("实测采样出参旧形状 candidates:[{channel",
+     "0[1-7]-*.md",
+     r"candidates:\s*\[\s*\{\s*channel",
+     "R6-58 (de):sample 出参逐字 `{sampled_at, duration_s, rows, skipped}`,`rows` 的元素 = 02 §3.2 行 + `in_config`;`candidates` 与 `run_id` 均作废。"),
+
+    # ⚠️ 这里曾加过一条「`PUT /settings/probe {qidian_hosts` 旧入参」的 FORBIDDEN,**首跑在改前备份上不红 ⇒ 是空规则,已删**:
+    #    04 §2.8.4 那一行里带着「**替换**整表不追加」,而「替换」在行级 NEGATION 词表里 ⇒ 整行被跳过,这条永不红。
+    #    (这是 R6-51 ⑫ 同一个坑的第二次出现。)该维度改由 PAIRED「#76b 入参 observed_ids:02 → 01」与
+    #    FORBIDDEN「实测采样出参旧形状」两条覆盖,两条都实测能红。
 ]
 
 # R6-51(首批验收发现):「入向撞到自己发的」合并窗在 06 §2.12 表里是配置项 out_merge_window_s,同节下文与 02 §2.8.1 却写死 60s;
@@ -483,6 +497,21 @@ PAIRED = [
      "02-*.md", r"observed_ids",
      "01-*.md", r"observed_ids",
      "R6-58 (z):端点 owner 是 02;01 仍写 {targets} 则前端一调就 400 use_observed_ids。"),
+
+    # (db):#76b 出参新增的通道分组键;04 §2.8.4 是「实测采样」的行为 owner,它若不提这个键,
+    #       面板就会退回去按通道各发一次入参(那正是 (z)/(db) 刚消掉的旧形态)。
+    #       反向验证:把 04 里的该词抹掉的副本上 ⇒ 红(2026-09-20 实测)。
+    ("#76b 出参 hosts_by_channel:02 定形 → 04 §2.8.4 必须承接",
+     "02-*.md", r"hosts_by_channel",
+     "04-*.md", r"hosts_by_channel",
+     "R6-58 (db):通道维度只出现在出参的 hosts_by_channel;04 不提 = 面板按旧的 *_hosts 入参写回去。"),
+
+    # (cz):落库与出 JSON 两处共用 models.json_safe();02 §2.2.2 声明 → §3.10 的 screenshot 行必须给出 result_schema,
+    #       否则「图片体怎么回流」在目录里是空白,实现方又会把裸 bytes 塞进 data 直接 dumps。
+    ("screenshot 的 result_schema:02 §2.2.2 定序列化出口 → §3.10 必须给形状",
+     "02-*.md", r"models\.json_safe\(\)",
+     "02-*.md", r"`result_schema` = `\{png_b64, width, height\}`",
+     "R6-58 (cz):只写「用 json_safe」而不给 screenshot 的 result_schema,图片怎么回流仍是空白。"),
 ]
 
 # ---------------------------------------------------------------- KEYNAME

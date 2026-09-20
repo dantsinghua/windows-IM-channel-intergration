@@ -106,6 +106,31 @@ class WeChatStore:
             con.execute("UPDATE wechat_profiles SET ritual_done_ms=?, updated_ms=? WHERE wxid=?",
                         (self._clock(), self._clock(), wxid))
 
+    # ---- main_wnd_class(R6-58 (at):02 §3.2 新增列 + 02 §7.2/05 §7 [wechat] main_wnd_class 配置默认)
+    def effective_main_wnd_class(self, wxid: Optional[str], *, default: str) -> str:
+        """取用顺序:``wechat_profiles.main_wnd_class`` 该 wxid 非 NULL 用本列(实测值)优先,
+        否则回落 ``default``(winagent.toml ``[wechat] main_wnd_class``,配置侧默认/兜底)。
+
+        ``wxid`` 为 None(仪式/扫码阶段尚未识别出账号)时直接用 ``default``。
+        """
+        if wxid:
+            row = self._db.one("SELECT main_wnd_class FROM wechat_profiles WHERE wxid=?", (wxid,))
+            if row and row.get("main_wnd_class"):
+                return row["main_wnd_class"]
+        return default
+
+    def record_main_wnd_class(self, wxid: str, class_name: Optional[str]) -> None:
+        """把该 wxid 实测到的微信主窗口类名(经 ``WeChatBackend.main_window()`` 探测)写回本列。
+
+        ``class_name`` 落空(未测到/窗口不存在)时不写 —— 不能用「没测到」覆盖已有实测值,也不能把列打回 NULL;
+        wxid 尚未经 ``bind()`` 建行时同样静默无操作(``UPDATE`` 零行,与 ``mark_ritual_done`` 同一套写法)。
+        """
+        if not class_name:
+            return
+        with self._db.tx() as con:
+            con.execute("UPDATE wechat_profiles SET main_wnd_class=?, updated_ms=? WHERE wxid=?",
+                        (class_name, self._clock(), wxid))
+
     # ---- wechat_install(单行)
     def install(self) -> Optional[dict[str, Any]]:
         return self._db.one("SELECT * FROM wechat_install WHERE key='current'")
@@ -287,7 +312,10 @@ class WeChatSession:
         return {"enabled": True,
                 "wechat": {"installed": loc.get("installed"), "version": loc.get("version"),
                            "running": win.get("exists"), "logged_in": bool(self._wx.current_wxid()),
-                           "wxid": self._wx.current_wxid(), "nickname": s.nickname if s else None, "pid": win.get("pid")},
+                           "wxid": self._wx.current_wxid(), "nickname": s.nickname if s else None, "pid": win.get("pid"),
+                           # R6-58 (at):经 main_window() 探测到的主窗口类名(未识别/窗口不存在为 None);
+                           # 落库走 WeChatStore.record_main_wnd_class(该 wxid, 本值)——服务侧持有 DB,本类只探测
+                           "main_wnd_class": win.get("class_name")},
                 "chatlog": {"running": cl.get("running"), "port": self._cfg.chatlog_port,
                             "key_ok": bool(keys.get("ok")), "dll": cl.get("dll")},
                 "ritual_done": not self._wx.narrator_running() and self._wx.ui_tree_visible(),

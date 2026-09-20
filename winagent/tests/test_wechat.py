@@ -292,6 +292,65 @@ def test_record_login_updates_profile_counters():
     db.close()
 
 
+# ---------------------------------------------------------------- main_wnd_class(R6-58 (at))
+def test_main_wnd_class_falls_back_to_config_when_row_is_null():
+    """②取用顺序:该列(实测值)为 NULL 时回落 ``[wechat] main_wnd_class`` 配置默认;wxid 未知时同样回落。"""
+    db = Db(":memory:").open()
+    st = WeChatStore(db)
+    st.bind(wxid="wxid_a", account_id="wx01")
+    assert st.profiles()[0]["main_wnd_class"] is None
+    assert st.effective_main_wnd_class("wxid_a", default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    assert st.effective_main_wnd_class(None, default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    assert st.effective_main_wnd_class("wxid_never_bound", default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    db.close()
+
+
+def test_main_wnd_class_row_value_overrides_config_once_measured():
+    """②取用顺序:该 wxid 实测值(本列非 NULL)优先于配置默认。"""
+    db = Db(":memory:").open()
+    st = WeChatStore(db)
+    st.bind(wxid="wxid_a", account_id="wx01")
+    st.record_main_wnd_class("wxid_a", "WeChatMainWndForPC")           # 该 wxid 实测到(如 3.x)的类名
+    assert st.effective_main_wnd_class("wxid_a", default="Qt51514QWindowIcon") == "WeChatMainWndForPC"
+    assert st.profiles()[0]["main_wnd_class"] == "WeChatMainWndForPC"
+    db.close()
+
+
+def test_record_main_wnd_class_ignores_empty_value_and_unbound_wxid():
+    db = Db(":memory:").open()
+    st = WeChatStore(db)
+    st.bind(wxid="wxid_a", account_id="wx01")
+    st.record_main_wnd_class("wxid_a", None)                          # 没测到不写,不把列打回 NULL / 不覆盖已有实测值
+    assert st.profiles()[0]["main_wnd_class"] is None
+    st.record_main_wnd_class("wxid_never_bound", "Qt51514QWindowIcon")  # 未 bind 过的 wxid:静默无操作,不凭空建行
+    assert len(st.profiles()) == 1
+    db.close()
+
+
+def test_main_window_class_name_detected_via_existing_backend_protocol_writes_through():
+    """①经现有 ``WeChatBackend.main_window()`` 协议探测(Fake 可编程),把该 wxid 实测到的类名写回 ``wechat_profiles``。"""
+    wx, s, _clk = mk_session()
+    wx.running_pid = 5101
+    wx.window_class = "Qt51514QWindowIcon"                            # 测试可编程的「实测值」
+    win = wx.main_window()
+    assert win["class_name"] == "Qt51514QWindowIcon"
+    st_status = s.status()
+    assert st_status["wechat"]["main_wnd_class"] == "Qt51514QWindowIcon"   # status() 顺带探测出来
+
+    db = Db(":memory:").open()
+    st = WeChatStore(db)
+    st.bind(wxid="wxid_a", account_id="wx01")
+    st.record_main_wnd_class("wxid_a", st_status["wechat"]["main_wnd_class"])
+    assert st.profiles()[0]["main_wnd_class"] == "Qt51514QWindowIcon"
+    db.close()
+
+
+def test_main_window_class_name_is_none_when_window_absent():
+    wx, s, _clk = mk_session()
+    assert wx.main_window()["class_name"] is None
+    assert s.status()["wechat"]["main_wnd_class"] is None
+
+
 def test_version_match_all_branches():
     db = Db(":memory:").open()
     st = WeChatStore(db)

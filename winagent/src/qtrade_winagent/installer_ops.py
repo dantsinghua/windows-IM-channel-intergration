@@ -31,6 +31,10 @@ log = get_logger("installer")
 
 # 02 §3.2 install_history.actor CHECK
 ACTORS = ("installer", "winagent", "console", "user")
+# 02 §3.2 install_history.to_state:R6-58 (au)「无 CHECK 是有意的」—— 取值 = 00 §8.2 安装状态机键
+# **外加**下列内核流程的七个非安装态迁移名(逐字抄自 schema_winagent.sql 的 DDL 注释,登记在此,不得另起同义名)
+KERNEL_TO_STATES = ("KERNEL_APPLYING", "KERNEL_APPLIED", "KERNEL_APPLY_FAILED",
+                    "KERNEL_VERIFIED", "KERNEL_VERIFY_FAILED", "KERNEL_ROLLING_BACK", "KERNEL_ROLLED_BACK")
 KERNEL_FILE = "bzImage"
 # 02 §2.5「超时」:wsl 30s(经会话代理再减 1s,由 PipeHub.call 统一做)
 WSL_TIMEOUT_S = 30.0
@@ -77,6 +81,9 @@ class InstallerOps:
                 note: Optional[str] = None, detail: Optional[dict[str, Any]] = None) -> int:
         if actor not in ACTORS:
             raise WaError(INTERNAL, f"install_history.actor 必须是 {ACTORS} 之一", reason="bad_actor")
+        if to_state.startswith("KERNEL_") and to_state not in KERNEL_TO_STATES:
+            raise WaError(INTERNAL, f"install_history.to_state 的 KERNEL_ 前缀名必须是 {KERNEL_TO_STATES} 之一"
+                          "(R6-58 (au):登记在 02 §3.2 DDL 注释,不得另起同义名)", reason="bad_kernel_to_state")
         with self._db.tx() as con:
             cur = con.execute(
                 "INSERT INTO install_history(at_ms, from_state, to_state, package_version, actor, note, detail_json) "
