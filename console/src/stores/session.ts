@@ -19,14 +19,28 @@ export const useSessionStore = defineStore('session', () => {
   const userAgentOnline = ref(true)
   const apiVersion = ref('')
   const appVersion = ref<{ console: string; electron: string } | null>(null)
+  /**
+   * 版本协商失败(02 §3.8:`X-QT-Api-Min` 不被满足 ⇒ `426 UPGRADE_REQUIRED`)。
+   * 一旦出现,任何请求都发不出去 —— 必须给一句能照着做的话,不能只弹「请求失败」。
+   */
+  const upgradeRequired = ref<{ needMin: string; serverVersion: string | null; message: string } | null>(null)
 
-  /** 门禁覆盖层可见:令牌不 ok 或 Agent 不可达(保留原路由,恢复后原地继续) */
-  const gateVisible = computed(() => authState.value !== 'ok' || !agentReachable.value)
+  /** 门禁覆盖层可见:令牌不 ok / Agent 不可达 / 版本协商不通过(保留原路由,恢复后原地继续) */
+  const gateVisible = computed(
+    () => authState.value !== 'ok' || !agentReachable.value || upgradeRequired.value !== null,
+  )
   const gateTitle = computed(() => {
+    if (upgradeRequired.value) return 'API 版本不匹配,请用安装包整体升级'
     if (authState.value === 'winagent_offline') return 'WinAgent 未运行'
     if (authState.value === 'no_token') return '控制台令牌失效,请在 WinAgent 中重新签发'
     if (!agentReachable.value) return 'Agent 未运行(WSL 发行版 qtrade 可能已停止)'
     return ''
+  })
+  /** 门禁正文第二行:426 时写清「控制台要什么、Agent 是什么」 */
+  const gateDetail = computed(() => {
+    const u = upgradeRequired.value
+    if (!u) return ''
+    return `${u.message}(控制台要求 API ≥ ${u.needMin},当前 Agent ${u.serverVersion ?? '未报告版本'})`
   })
 
   /** A-7:两处门禁共用的固定一句 */
@@ -48,6 +62,7 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   async function retryToken(): Promise<void> {
+    upgradeRequired.value = null
     await window.qt?.auth.refresh()
     await refreshAuth()
     await pingAgent()
@@ -97,6 +112,9 @@ export const useSessionStore = defineStore('session', () => {
       onApiVersion: (v) => {
         apiVersion.value = v
       },
+      onUpgradeRequired: (info) => {
+        upgradeRequired.value = info
+      },
     })
     void refreshAuth()
     void pingAgent()
@@ -112,7 +130,8 @@ export const useSessionStore = defineStore('session', () => {
 
   return {
     authState, agentReachable, agentDownReason, winagentOnline, userAgentOnline, apiVersion, appVersion,
-    gateVisible, gateTitle, GATE_LOGIN_HINT, wechatDisabled, vaultDisabled, wslGroupDisabled,
+    upgradeRequired,
+    gateVisible, gateTitle, gateDetail, GATE_LOGIN_HINT, wechatDisabled, vaultDisabled, wslGroupDisabled,
     refreshAuth, retryToken, pingAgent, startWsl, install, uninstall,
   }
 })

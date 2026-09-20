@@ -19,7 +19,7 @@ import JsonViewer from '@/components/JsonViewer.vue'
 import {
   ARGS_DIGEST_MISMATCH_TEXT, INVALID_ARGS_REASONS, OCR_REVIEW_TEXT, SOURCE_TEXT, capabilityText,
 } from '@/i18n/zh-CN/codes'
-import type { CommandResult } from '@/api/types'
+import { isCommandAccepted, type CommandAccepted, type CommandResult } from '@/api/types'
 
 const router = useRouter()
 const accounts = useAccountsStore()
@@ -36,7 +36,11 @@ const confirm = ref(true)
 const timeoutMs = ref(30000)
 const running = ref(false)
 const result = ref<CommandResult | null>(null)
+/** #28 的 `202` 受理体:同步等待超 `http_sync_max_wait_ms` 或 `async:true`(结果走 command_done) */
+const accepted = ref<CommandAccepted | null>(null)
 const failure = ref<ApiFailure | null>(null)
+/** `409 IDEMPOTENT_REPLAY` 的响应体仍是完整 CommandResult(B-06):显示首次结果并说明来由 */
+const replayNote = ref<string | null>(null)
 const sessionPickOpen = ref(false)
 
 const account = computed(() => (accountId.value ? accounts.byId[accountId.value] ?? null : null))
@@ -95,7 +99,9 @@ async function run(): Promise<void> {
   if (!op.value) return
   running.value = true
   result.value = null
+  accepted.value = null
   failure.value = null
+  replayNote.value = null
   try {
     if (mode.value === 'broadcast') {
       const r = await commandsApi.broadcast({
@@ -111,22 +117,46 @@ async function run(): Promise<void> {
         confirm: channel.value === 'wechat' ? undefined : confirm.value,
         timeout_ms: timeoutMs.value,
       })
-      result.value = r
-      store.lastResult = r
-      store.pushHistory({
-        accountId: accountId.value!, op: op.value, args: { ...args.value },
-        idempotencyKey: idem.value, confirm: confirm.value, timeoutMs: timeoutMs.value,
-        result: r, traceId: r.trace_id,
-      })
+      // 🔴 `ok:false` + 业务结果码(SEND_FAILED / UNCONFIRMED / GATE_BLOCKED…)是**正常业务结果**,
+      // 走的就是这条路径 —— 不是异常。异常只有 HTTP 层错误(见 catch)。
+      if (isCommandAccepted(r)) {
+        accepted.value = r
+        store.pushHistory({
+          accountId: accountId.value!, op: op.value, args: { ...args.value },
+          idempotencyKey: idem.value, confirm: confirm.value, timeoutMs: timeoutMs.value,
+          traceId: r.trace_id,
+        })
+        message.info('指令已受理,仍在执行;结果会由 command_done 事件回填')
+      } else {
+        result.value = r
+        store.lastResult = r
+        store.pushHistory({
+          accountId: accountId.value!, op: op.value, args: { ...args.value },
+          idempotencyKey: idem.value, confirm: confirm.value, timeoutMs: timeoutMs.value,
+          result: r, traceId: r.trace_id,
+        })
+      }
     }
   } catch (e) {
     if (e instanceof ApiFailure) {
-      failure.value = e
-      store.lastError = { code: e.code, message: e.message, reason: e.reason, traceId: e.traceId }
-      store.pushHistory({
-        accountId: accountId.value ?? '', op: op.value, args: { ...args.value },
-        errorCode: e.code, errorMessage: e.message, errorReason: e.reason, traceId: e.traceId,
-      })
+      const env = e.envelope as unknown as CommandResult | null
+      if (e.code === 'IDEMPOTENT_REPLAY' && env && env.code !== undefined) {
+        // 02 #28:409 的响应体是**首次那条**完整 CommandResult,`trace_id` 也是首次的
+        result.value = env
+        store.lastResult = env
+        replayNote.value = '这把幂等键此前已执行过(IDEMPOTENT_REPLAY);下面显示的是首次的结果与 trace。'
+        store.pushHistory({
+          accountId: accountId.value ?? '', op: op.value, args: { ...args.value },
+          idempotencyKey: idem.value, result: env, traceId: env.trace_id,
+        })
+      } else {
+        failure.value = e
+        store.lastError = { code: e.code, message: e.message, reason: e.reason, traceId: e.traceId }
+        store.pushHistory({
+          accountId: accountId.value ?? '', op: op.value, args: { ...args.value },
+          errorCode: e.code, errorMessage: e.message, errorReason: e.reason, traceId: e.traceId,
+        })
+      }
     } else {
       message.error(String(e))
     }
@@ -260,25 +290,8 @@ onMounted(async () => {
     <section class="qt-card box result">
       <div class="qt-section-title">结果</div>
 
-      <template v-if="failure">
-        <ResultCodeTag :data-testid="T.resultCode" :code="failure.code" :reason="failure.reason" />
-        <p class="qt-danger">
-          {{ failure.reason === 'args_digest_mismatch' ? ARGS_DIGEST_MISMATCH_TEXT : invalidArgsText || failure.message }}
-        </p>
-        <span class="qt-mono qt-small qt-muted" :data-testid="T.result('trace')">trace {{ failure.traceShort }}</span>
-        <div class="qt-row">
-          <a-button
-            v-if="failure.detail.retryable && !invalidArgsText"
-            size="small"
-            :data-testid="T.resultRetry"
-            @click="resend"
-          >重试</a-button>
-          <a-button v-if="failure.detail.needs_human" size="small" :data-testid="T.resultGohuman"
-                    @click="router.push(`/screen/${accountId}`)">去画面</a-button>
-        </div>
-      </template>
-
-      <template v-else-if="result">
+      <template v-if="result">
+        <p v-if="replayNote" class="qt-small qt-muted">{{ replayNote }}</p>
         <div class="qt-row">
           <ResultCodeTag :data-testid="T.resultCode" :code="result.code" />
           <span :data-testid="T.result('cost')">{{ result.cost_ms }} ms</span>
@@ -286,6 +299,8 @@ onMounted(async () => {
           <span v-if="result.data?.needs_review" class="ocr" :data-testid="T.resultOcrReview">{{ OCR_REVIEW_TEXT }}</span>
           <span class="qt-mono qt-small qt-muted" :data-testid="T.result('trace')">trace {{ result.trace_id.slice(0, 8) }}</span>
         </div>
+        <!-- 业务失败(ok:false)也要把服务端那句话摆出来,不能只剩一个码 -->
+        <p v-if="result.ok === false && result.error?.message" class="qt-danger">{{ result.error.message }}</p>
         <div :data-testid="T.result('state')" class="qt-small qt-muted">
           state_before {{ result.state_before ?? '—' }} → state_after {{ result.state_after ?? '—' }}
         </div>
@@ -303,7 +318,45 @@ onMounted(async () => {
             :data-testid="T.resultRecheck"
             @click="resend"
           >再查一次</a-button>
+          <a-button
+            v-else-if="result.ok === false && result.error?.retryable"
+            size="small"
+            :data-testid="T.resultRetry"
+            @click="resend"
+          >重试</a-button>
+          <a-button
+            v-if="result.ok === false && result.error?.needs_human"
+            size="small"
+            :data-testid="T.resultGohuman"
+            @click="router.push(`/screen/${accountId}`)"
+          >去画面</a-button>
           <a-button size="small" :data-testid="T.copyCurl" @click="copyCurl">复制 curl</a-button>
+        </div>
+      </template>
+
+      <template v-else-if="accepted">
+        <p class="qt-small">
+          指令已受理(HTTP 202),仍在执行 —— 同步等待超过 <code>http_sync_max_wait_ms</code> 或用了
+          <code>async</code>;结果会由 <code>command_done</code> 事件回填。
+        </p>
+        <span class="qt-mono qt-small qt-muted" :data-testid="T.result('trace')">trace {{ accepted.trace_id.slice(0, 8) }}</span>
+      </template>
+
+      <template v-else-if="failure">
+        <ResultCodeTag :data-testid="T.resultCode" :code="failure.code" :reason="failure.reason" />
+        <p class="qt-danger">
+          {{ failure.reason === 'args_digest_mismatch' ? ARGS_DIGEST_MISMATCH_TEXT : invalidArgsText || failure.message }}
+        </p>
+        <span class="qt-mono qt-small qt-muted" :data-testid="T.result('trace')">trace {{ failure.traceShort }}</span>
+        <div class="qt-row">
+          <a-button
+            v-if="failure.detail.retryable && !invalidArgsText"
+            size="small"
+            :data-testid="T.resultRetry"
+            @click="resend"
+          >重试</a-button>
+          <a-button v-if="failure.detail.needs_human" size="small" :data-testid="T.resultGohuman"
+                    @click="router.push(`/screen/${accountId}`)">去画面</a-button>
         </div>
       </template>
 

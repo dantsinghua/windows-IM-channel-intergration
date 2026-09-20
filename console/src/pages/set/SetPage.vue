@@ -8,7 +8,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { set as T, MAIL_SCOPES, SET_MAIL_FIELDS } from '@/testids'
-import { useSettingsStore, emptyMailScope } from '@/stores/settings'
+import { useSettingsStore, emptyMailScope, scopeToWire } from '@/stores/settings'
 import { useMailStore } from '@/stores/mail'
 import { useEnvStore } from '@/stores/env'
 import { useSessionStore } from '@/stores/session'
@@ -32,6 +32,8 @@ const vaultModal = ref<{ open: boolean; id: string; secret: string }>({ open: fa
 const routePanelOpen = ref(false)
 const mailRouteDraftAccount = ref<string | undefined>()
 const busy = ref(false)
+/** #102 的 `configured_domain` 编辑草稿(写回落点 = `PUT /settings/api {public_domain}`) */
+const pubDomainDraft = ref('')
 
 const retention = computed(() => store.groups.retention ?? {})
 const apiGroup = computed(() => store.groups.api ?? {})
@@ -61,12 +63,19 @@ async function saveGroup(group: string, body: Record<string, unknown>): Promise<
   }
 }
 
+/**
+ * 保存邮箱设置。🔴 按 #88 R6-58 (ac) 的线上形状下发:
+ * `{enabled, require_signature, template_version, scopes:{<s>:{override, route_id, enabled, inbound, outbound}}}`
+ * ——表单的扁平键在 `scopeToWire()` 里转回 `inbound`/`outbound`(`archive` 不属本组,见 store 注释)。
+ */
 async function saveMail(): Promise<void> {
+  const scopes: Record<string, unknown> = {}
+  for (const [k, cfg] of Object.entries(store.mailScopes)) scopes[k] = scopeToWire(cfg)
   await saveGroup('mail', {
     enabled: store.mailEnabled,
     require_signature: store.requireSignature,
-    archive: store.mailArchive,
-    scopes: store.mailScopes,
+    template_version: store.mailTemplateVersion,
+    scopes,
   })
 }
 
@@ -189,8 +198,13 @@ async function calibrate(): Promise<void> {
   message.success('已保存资源池设置')
 }
 
+/**
+ * #102 的落点是 `PUT /settings/api {public_domain}`(`PUT /settings/public-endpoint` 不存在)。
+ * 保存后重取一次公网端点,让 `configured_domain` 立刻反映出来。
+ */
 async function savePubHost(): Promise<void> {
-  await settingsApi.putPublicEndpoint(String(store.publicEndpoint?.configured_host ?? ''))
+  await settingsApi.putPublicDomain(pubDomainDraft.value.trim())
+  await store.loadAll()
   message.success('已保存配置域名')
 }
 
@@ -211,6 +225,7 @@ async function rerunSetup(): Promise<void> {
 
 onMounted(async () => {
   await store.loadAll()
+  pubDomainDraft.value = store.publicEndpoint?.configured_domain ?? ''
   if (!commands.catalog.length) await commands.loadCatalog().catch(() => undefined)
   if (session.winagentOnline) {
     await store.loadVault().catch(() => undefined)
@@ -227,6 +242,17 @@ onMounted(async () => {
     <!-- API 客户端 -->
     <section class="qt-card box">
       <div class="qt-section-title">API 客户端</div>
+      <!-- #90~#93 后端未就绪时:明确说不可用 + 可重试,不给一张空表让人以为「没有客户端」 -->
+      <a-alert
+        v-if="store.apiClientsUnavailable"
+        type="warning"
+        show-icon
+        class="mb"
+        message="API 客户端管理暂不可用"
+        :description="`Agent 侧 /settings/api-clients 尚未就绪:${store.apiClientsUnavailable}`"
+      >
+        <template #action><a-button size="small" @click="store.loadAll()">重试</a-button></template>
+      </a-alert>
       <table class="tbl" :data-testid="T.clientsTable">
         <thead><tr><th>app_id</th><th>名称</th><th>前 6 位</th><th>权限</th><th>ip_allow</th><th>最近使用</th><th>动作</th></tr></thead>
         <tbody>
@@ -292,6 +318,9 @@ onMounted(async () => {
         </a-form-item>
         <a-form-item label="归档">
           <a-switch :data-testid="T.mailArchive" v-model:checked="store.mailArchive" />
+          <span class="qt-small qt-muted">
+            归档保留期在「保留期」组的 <code>mail_archive_days</code>(#88 的 mail 组不含此键)
+          </span>
         </a-form-item>
       </a-form>
 
@@ -328,15 +357,20 @@ onMounted(async () => {
                 :checked="scopeCfg(scope).ssl"
                 @change="(v: any) => scopeCfg(scope).ssl = !!v"
               />
-              <a-input
-                v-else
-                type="password"
-                autocomplete="new-password"
-                placeholder="只写不读:留空即不改"
-                :data-testid="T.mailField(scope, f)"
-                :value="(scopeCfg(scope) as any)[f]"
-                @change="(e: any) => (scopeCfg(scope) as any)[f] = e.target.value"
-              />
+              <span v-else class="qt-row">
+                <a-input
+                  type="password"
+                  autocomplete="new-password"
+                  placeholder="只写不读:留空即不改"
+                  :data-testid="T.mailField(scope, f)"
+                  :value="(scopeCfg(scope) as any)[f]"
+                  @change="(e: any) => (scopeCfg(scope) as any)[f] = e.target.value"
+                />
+                <!-- `*_ref` 是服务端唯一回读的东西(#88:secret 只写不读) -->
+                <span class="qt-small qt-muted">
+                  {{ (f === 'pass' ? scopeCfg(scope).passRef : scopeCfg(scope).smtpPassRef) ? '已配置' : '未配置' }}
+                </span>
+              </span>
             </label>
           </div>
 
@@ -663,21 +697,28 @@ onMounted(async () => {
     <section class="qt-card box">
       <div class="qt-section-title">公网端点</div>
       <div class="qt-row wrap">
+        <!-- 键集按 02 #102(无 matches/history:见 api/types.ts 的说明) -->
         <span :data-testid="T.pubep('ip')">出口 IP <b>{{ store.publicEndpoint?.public_ip ?? '—' }}</b></span>
-        <span :data-testid="T.pubep('dns')">解析 <b>{{ store.publicEndpoint?.matches ? '一致' : '不一致' }}</b></span>
-        <span :data-testid="T.pubep('changed')">最近变更 <b>{{ store.publicEndpoint?.last_changed_at ?? '—' }}</b></span>
+        <span :data-testid="T.pubep('dns')">
+          出口探测
+          <b>{{ (store.publicEndpoint?.probe?.unreachable_rounds ?? 0) > 0
+            ? `连续不可达 ${store.publicEndpoint?.probe?.unreachable_rounds} 轮` : '正常' }}</b>
+        </span>
+        <span :data-testid="T.pubep('changed')">最近变更 <b>{{ store.publicEndpoint?.changed_at ?? '—' }}</b></span>
       </div>
       <div class="qt-row">
         <span :data-testid="T.pubep('host')">配置域名</span>
         <a-input class="w200" :data-testid="T.pubepHostEdit"
-                 :value="store.publicEndpoint?.configured_host ?? ''"
-                 @change="(e: any) => store.publicEndpoint && (store.publicEndpoint.configured_host = e.target.value)" />
+                 :value="pubDomainDraft"
+                 @change="(e: any) => pubDomainDraft = e.target.value" />
         <a-button size="small" :data-testid="T.pubepHostSave" @click="savePubHost">保存</a-button>
       </div>
       <a-collapse>
+        <!-- 历史来自 NET_PUBLIC_ENDPOINT_CHANGED 事件(与 P-ENV 同一数据源) -->
         <a-collapse-panel key="h" header="历史" :data-testid="T.pubepHistory">
-          <div v-for="(h, i) in store.publicEndpoint?.history ?? []" :key="i" class="qt-small"
+          <div v-for="(h, i) in env.endpointHistory" :key="i" class="qt-small"
                :data-testid="T.pubepHistoryRow(i)">{{ h.at }} {{ h.from_ip }} → {{ h.to_ip }}</div>
+          <div v-if="!env.endpointHistory.length" class="qt-small qt-muted">本次会话内未收到出口变更事件。</div>
         </a-collapse-panel>
       </a-collapse>
       <div class="qt-section-title mt">webhook 登记</div>
@@ -798,7 +839,9 @@ onMounted(async () => {
 .fields { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--qt-space-2); }
 .field { display: flex; flex-direction: column; gap: 2px; }
 .sender { margin-bottom: 6px; flex-wrap: wrap; }
-.w160 { width: 160px; } .w200 { width: 200px; }
+.w160 { width: 160px; } .mb { margin-bottom: var(--qt-space-3); }
+.w200 { width: 200px; }
+.mb { margin-bottom: var(--qt-space-3); }
 .ops { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
 .opitem { display: flex; align-items: center; gap: 6px; }
 .danger-tag { color: var(--qt-state-error); border: 1px solid var(--qt-state-error); border-radius: 8px; padding: 0 4px; font-size: var(--qt-font-xs); }

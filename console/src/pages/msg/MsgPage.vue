@@ -60,8 +60,13 @@ async function downloadMedia(sha: string): Promise<void> {
   await window.qt?.files.saveAs(`${sha.slice(0, 12)}.bin`, blob.type || 'application/octet-stream', bytes)
 }
 
-async function startExport(fmt: 'csv' | 'json'): Promise<void> {
-  const r = await messagesApi.export({ filter: store.filter, format: fmt, include_media: includeMedia.value })
+/** #51 入参逐字:`{fmt:'jsonl|csv|eml', with_media:'none|zip', filter}`(不是 format/include_media) */
+async function startExport(fmt: 'csv' | 'jsonl' | 'eml'): Promise<void> {
+  const r = await messagesApi.export({
+    filter: store.filter,
+    fmt,
+    with_media: includeMedia.value ? 'zip' : 'none',
+  })
   exportJob.value = r.job_id
   store.exportJobId = r.job_id
 }
@@ -166,7 +171,7 @@ onUnmounted(() => {
           <template #overlay>
             <a-menu>
               <a-menu-item @click="startExport('csv')">导出 CSV</a-menu-item>
-              <a-menu-item @click="startExport('json')">导出 JSON</a-menu-item>
+              <a-menu-item @click="startExport('jsonl')">导出 JSONL</a-menu-item>
             </a-menu>
           </template>
         </a-dropdown>

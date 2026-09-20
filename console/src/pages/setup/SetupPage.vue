@@ -2,7 +2,9 @@
 /**
  * `P-SETUP` 首次启动向导(01 §2.7.1)。
  * 告知 → 连接 → 自检 → 首登(可跳过)→ 完成。
- * 合规确认**以 Agent 为准**(01-P3):`PUT /settings/compliance {ack_ms, notice_version}`。
+ * 合规确认**以 Agent 为准**(01-P3):文案与「勾过没有」= #86 `GET /system/notice`
+ * (回 `{notice_version, text, ack_ms, acked_version}`),勾选 = #87 `POST /system/notice/ack`。
+ * (原先写的 `PUT /settings/compliance` 在 02 #88 的 group 枚举里不存在,真后端 404。)
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -82,8 +84,21 @@ onMounted(async () => {
     <!-- 步 1 告知 -->
     <section v-if="step === 0" class="qt-card pane">
       <h3>使用前请阅读</h3>
+      <!-- #86 未就绪时要说清「为什么空」并给重试,不能只挂一句「正在读取」转到底 -->
+      <a-alert
+        v-if="store.error"
+        type="error"
+        show-icon
+        class="mb"
+        message="读不到合规告知文案"
+        :description="store.error"
+      >
+        <template #action><a-button size="small" @click="store.loadNotice()">重试</a-button></template>
+      </a-alert>
       <div ref="noticeBox" class="notice" @scroll="onScroll">
-        <div :data-testid="T.noticeText" class="notice-text">{{ store.noticeText || '正在读取告知文案…' }}</div>
+        <div :data-testid="T.noticeText" class="notice-text">
+          {{ store.noticeText || (store.error ? '——' : '正在读取告知文案…') }}
+        </div>
         <!-- 控制台以固定段追加在 Agent 下发文案之后(A-7 + A-5),不依赖法务改稿 -->
         <div :data-testid="T.noticeFixed" class="notice-fixed">
           <p v-for="(p, i) in NOTICE_FIXED_PARAGRAPHS" :key="i">{{ p }}</p>
@@ -188,6 +203,7 @@ onMounted(async () => {
 .setup { max-width: 860px; margin: 0 auto; padding: var(--qt-space-6); display: flex; flex-direction: column; gap: var(--qt-space-4); height: 100%; }
 .steps { flex: 0 0 auto; }
 .pane { padding: var(--qt-space-4); flex: 1 1 auto; overflow: auto; }
+.mb { margin-bottom: var(--qt-space-3); }
 .notice { max-height: 300px; overflow: auto; border: 1px solid var(--qt-border); padding: var(--qt-space-3); margin: var(--qt-space-3) 0; }
 .notice-text { white-space: pre-wrap; }
 .notice-fixed { margin-top: var(--qt-space-3); border-top: 1px dashed var(--qt-border); padding-top: var(--qt-space-2); }

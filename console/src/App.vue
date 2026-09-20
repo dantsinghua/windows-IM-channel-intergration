@@ -67,6 +67,12 @@ const resChipText = computed(() => {
 const onlineByChannel = computed(() =>
   Object.fromEntries(CHANNELS.map((ch) => [ch, accounts.summary[ch].online])) as Record<string, number>)
 
+/** 门禁「重试」与事件流「重新取令牌」是一件事:先让主进程重取,再把 WS 拉起来 */
+async function retryRealtime(): Promise<void> {
+  await session.retryToken()
+  events.retry()
+}
+
 function go(path: string): void {
   void router.push(path)
 }
@@ -211,6 +217,19 @@ onUnmounted(() => {
             <div v-if="events.syncing" class="banner sync" :data-testid="T.syncBanner">
               同步中——正在全量拉取账号、资源与邮件状态
             </div>
+            <!--
+              事件流握手连败 / 4401:停止无限重连后,这里是唯一的出口提示。
+              HTTP 侧可能还好着,所以只挂横幅、不遮整页。
+            -->
+            <div v-if="events.authLost" class="banner crit">
+              实时事件流连不上,需要重新取令牌
+              <span v-if="events.authLost.reason === 'handshake'">
+                (连续 {{ events.authLost.failures }} 次握手就断,最后关闭码 {{ events.authLost.code }};
+                已停止重连,避免无声空转)
+              </span>
+              <span v-else>(服务端回 4401:令牌无效)</span>
+              <a-button size="small" @click="retryRealtime">重新取令牌并重连</a-button>
+            </div>
             <!-- E-18/E-19:crit 水位告警常驻红横幅 -->
             <div
               v-if="events.watermarkAlert"
@@ -231,11 +250,13 @@ onUnmounted(() => {
         <div v-if="session.gateVisible && !isSetupRoute" class="gate" :data-testid="T.gate">
           <div class="gate-box qt-card">
             <h2>{{ session.gateTitle }}</h2>
+            <!-- 426:把「要什么版本、现在是什么版本、该怎么办」一次说清(02 §3.8) -->
+            <p v-if="session.gateDetail" class="qt-warn">{{ session.gateDetail }}</p>
             <p v-if="session.agentDownReason" class="qt-muted">{{ session.agentDownReason }}</p>
             <!-- A-7:两处门禁共用的固定一句 -->
             <p class="qt-warn" :data-testid="T.gateLoginHint">{{ session.GATE_LOGIN_HINT }}</p>
             <div class="qt-row">
-              <a-button type="primary" :data-testid="T.gateRetry" @click="session.retryToken()">重试</a-button>
+              <a-button type="primary" :data-testid="T.gateRetry" @click="retryRealtime">重试</a-button>
               <a-button v-if="!session.agentReachable" @click="session.startWsl()">让 WinAgent 拉起 Agent</a-button>
               <a-button @click="go('/env')">去环境页</a-button>
             </div>

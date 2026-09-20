@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 连通性探测结果表:结论枚举 00 §8.5,建议文案由控制台 i18n 维护、可被 04 的 hint 覆盖 */
-import type { ProbeRow } from '@/api/types'
+import { probeDetailOf, probeStatusOf, type ProbeRow } from '@/api/types'
 import { PROBE_RESULTS, PROBE_TARGETS } from '@/i18n/zh-CN/codes'
 import { env as T } from '@/testids'
 
@@ -14,18 +14,25 @@ const emit = defineEmits<{ (e: 'rerun', target: string): void }>()
       <tr><th>目标</th><th>结论</th><th>建议</th><th /></tr>
     </thead>
     <tbody>
-      <tr v-for="r in rows" :key="r.target" :data-testid="T.probeRow(r.target)">
-        <td>{{ PROBE_TARGETS[r.target] ?? r.target }}<span class="qt-mono qt-small qt-muted"> {{ r.target }}</span></td>
+      <!-- 结论列在后端叫 `status`(旧实现叫 `result`),诊断文字叫 `detail`;target 可能为 null(整侧被跳过) -->
+      <tr v-for="(r, i) in rows" :key="r.target ?? `${r.side}-${i}`" :data-testid="T.probeRow(r.target ?? r.side ?? String(i))">
         <td>
-          <span class="chip" :class="`tone-${PROBE_RESULTS[r.result]?.tone ?? 'na'}`">
-            {{ PROBE_RESULTS[r.result]?.zh ?? r.result }}
+          {{ r.target ? PROBE_TARGETS[r.target] ?? r.target : `整侧(${r.side ?? '未知'})` }}
+          <span class="qt-mono qt-small qt-muted"> {{ r.target ?? '' }}</span>
+        </td>
+        <td>
+          <span class="chip" :class="`tone-${PROBE_RESULTS[probeStatusOf(r)]?.tone ?? 'na'}`">
+            {{ PROBE_RESULTS[probeStatusOf(r)]?.zh ?? probeStatusOf(r) }}
           </span>
         </td>
-        <td class="qt-small">{{ r.hint || PROBE_RESULTS[r.result]?.hint || '—' }}</td>
+        <td class="qt-small">{{ probeDetailOf(r) || PROBE_RESULTS[probeStatusOf(r)]?.hint || '—' }}</td>
         <td>
-          <a-button size="small" :data-testid="T.probeRunTarget(r.target)" @click="emit('rerun', r.target)">
-            重跑
-          </a-button>
+          <a-button
+            v-if="r.target"
+            size="small"
+            :data-testid="T.probeRunTarget(r.target)"
+            @click="emit('rerun', r.target!)"
+          >重跑</a-button>
         </td>
       </tr>
       <tr v-if="!rows.length"><td colspan="4" class="qt-muted">暂无探测结果</td></tr>

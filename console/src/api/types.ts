@@ -71,7 +71,8 @@ export interface Account {
   created_at?: string
   updated_at?: string
   last_seen_at?: string | null
-  settings?: Record<string, unknown>
+  /* 🔴 总控裁决④:**不带 `settings` 子对象** —— 账号级设置只经 #22 `PATCH /accounts/{id}/settings` 写,
+     `auto_recover`/`quota_mb` 等已在本对象顶层;详情页不要指望这里有一份完整设置树。 */
 }
 
 /* ── 等人提示(#15 GET /accounts/{id}/prompt) ── */
@@ -107,9 +108,12 @@ export interface ResourcePool {
       reserved_mb: number
       wechat_mb: number
       wechat_slots: WechatSlots
+      status?: string
+      wechat_enabled?: boolean
     }
   }
-  realtime: { wsl_anon_mb: number; win_available_mb: number }
+  /** 采不到时后端给 `null`,不编造(#77 同规则) */
+  realtime: { wsl_anon_mb: number | null; win_available_mb: number | null }
   quota_mb: Record<Channel, number>
   can_add: Record<Channel, number>
   accounts?: { id: string; anon_mb: number; current_mb: number; cpu_pct: number }[]
@@ -122,21 +126,35 @@ export interface ResourcePool {
 export type WatermarkLevel = 'normal' | 'warn' | 'high' | 'critical'
 
 export interface MetricsSnapshot {
-  hardware: {
-    mem: { total_mb: number; used_mb: number; avail_mb: number; vmmem_mb: number }
-    cpu: { logical_cores: number; load_pct: number }
-    disks: { mount: string; total_mb: number; free_mb: number }[]
+  /**
+   * 整机组(02 #77 与 `ours` 两组并排)。
+   * 🔴 **可选**:后端本期还没下发这一组(S-07,后端侧会补)。页面一律走可选链 + 「—」占位,
+   * 绝不写 `m.hardware.mem.total_mb` —— 那是一个 TypeError,整页白屏。
+   */
+  hardware?: {
+    mem?: { total_mb: number; used_mb: number; avail_mb: number; vmmem_mb: number }
+    cpu?: { logical_cores: number; load_pct: number }
+    disks?: { mount: string; total_mb: number; free_mb: number }[]
   }
   ours: {
-    procs: { agent_mb: number; winagent_mb: number; console_mb: number }
-    accounts: { id: string; anon_mb: number; current_mb: number; cpu_pct: number; quota_mb: number }[]
-    wechat: { chatlog_mb: number; wechat_pc_mb: number }
-    storage: {
-      db_mb: number; media_mb: number; mail_mb: number
-      accounts_mb: number; backup_mb: number; vhdx_mb: number
+    procs: { agent_mb: number | null; winagent_mb: number | null; console_mb: number | null }
+    /** R6-58 (aa):每进程明细(采样缺失时值为 `null`,不编造) */
+    procs_detail?: { name: string; rss_mb: number | null; cpu_pct: number | null }[]
+    accounts: {
+      id: string
+      rss_mb?: number | null
+      anon_mb?: number | null
+      current_mb?: number | null
+      cpu_pct: number | null
+      quota_mb: number
+    }[]
+    wechat?: { chatlog_mb: number | null; wechat_pc_mb: number | null }
+    storage?: {
+      db_mb?: number; media_mb?: number; mail_mb?: number
+      accounts_mb?: number; backup_mb?: number; vhdx_mb?: number
     }
   }
-  budget_vs_actual: { id: string; quota_mb: number; rss_mb: number; drift_pct: number }[]
+  budget_vs_actual: { id: string; quota_mb: number; rss_mb: number | null; drift_pct: number | null }[]
   disk_watermark: {
     level: WatermarkLevel
     free_mb: number
@@ -145,7 +163,8 @@ export interface MetricsSnapshot {
     /** R6-30:扁平两键,不嵌套 */
     last_cleanup_at: string | null
     last_cleanup_freed_mb: number | null
-    vhdx_grown_mb: number
+    /** 后端本期未下发(S-07) */
+    vhdx_grown_mb?: number | null
   }
   mem_watermark: {
     level: WatermarkLevel
@@ -174,6 +193,24 @@ export interface CommandResult {
   state_before?: string
   state_after?: string
   error?: ApiError
+}
+
+/**
+ * #28/#29 的 `202` 受理体(R6-53):同步等待超 `[api] http_sync_max_wait_ms` 或 `async:true`。
+ * 结果随后走 `command_done` 事件与 #31。
+ */
+export interface CommandAccepted {
+  ok: true
+  accepted: true
+  pending?: boolean
+  trace_id: string
+}
+
+/** #28/#29 的两种正常回包 */
+export type CommandOutcome = CommandResult | CommandAccepted
+
+export function isCommandAccepted(o: CommandOutcome): o is CommandAccepted {
+  return (o as CommandAccepted).accepted === true && (o as CommandResult).code === undefined
 }
 
 export interface CapabilityDef {
@@ -223,8 +260,11 @@ export interface Message {
   text_len: number
   fingerprint?: string
   media: MessageMedia[]
-  sender: { id: string; name: string }
+  sender: { id: string; name: string | null }
   self: boolean
+  /** 出向追溯(02 #48) */
+  confirmed_by?: string | null
+  trace_id?: string | null
   ts: string
   received_at: string
   source: string
@@ -246,8 +286,28 @@ export interface SessionRow {
   channel: Channel
   name: string
   kind: 'group' | 'private'
+  /** 🔴 总控裁决②:会话最后消息时间字段名 = `last_msg_at`(ISO 8601 带时区偏移,00 §7) */
+  last_msg_at?: string | null
+  /**
+   * @deprecated 一次性兼容:后端若仍下发 `last_ts` 则映射到 `last_msg_at`。
+   * **后端改完即删本键与 `normalizeSession()` 里的那一行。**
+   */
   last_ts?: string | null
   unread?: number
+  native_id?: string | null
+  msg_count?: number | null
+  member_count?: number | null
+  muted?: boolean
+  capture_text?: boolean | null
+  retention_days?: number | null
+}
+
+/** 裁决②的一次性兼容映射:`last_ts` → `last_msg_at`(后端改完删除) */
+export function normalizeSession(row: SessionRow): SessionRow {
+  if (row.last_msg_at === undefined && row.last_ts !== undefined) {
+    return { ...row, last_msg_at: row.last_ts }
+  }
+  return row
 }
 
 /* ── 异步作业(§11.21 [JOB]) ── */
@@ -261,9 +321,35 @@ export interface Job {
   progress: number
   result?: Record<string, unknown> & { freed_mb?: number; download_url?: string }
   error?: { code: string; message: string }
+  /** 02 #107 定死 `*_at`(ISO 8601 带时区偏移,00 §6「API/事件时间一律 ISO」) */
   created_at?: string
   updated_at?: string
   expires_at?: string
+  /**
+   * @deprecated 一次性兼容:后端当前下发 epoch 毫秒 `*_ms`(S-05,后端侧会改成 `*_at`)。
+   * **后端改完即删这三键与 `normalizeJob()`。**
+   */
+  created_ms?: number
+  updated_ms?: number
+  expires_ms?: number
+  actor?: string | null
+  attempt_count?: number
+  params?: Record<string, unknown>
+  account_id?: string | null
+}
+
+function msToIso(ms: number | undefined): string | undefined {
+  return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toISOString() : undefined
+}
+
+/** S-05 的一次性兼容:`created_ms/updated_ms/expires_ms` → ISO `*_at`(后端改完删除) */
+export function normalizeJob(j: Job): Job {
+  return {
+    ...j,
+    created_at: j.created_at ?? msToIso(j.created_ms),
+    updated_at: j.updated_at ?? msToIso(j.updated_ms),
+    expires_at: j.expires_at ?? msToIso(j.expires_ms),
+  }
 }
 
 /* ── 工作流 ── */
@@ -311,6 +397,14 @@ export interface MailRouteStatus {
   channel: string | null
   account_id: string | null
   scope: string
+  /** #56 逐字:`route:{id,channel,account_id,outbound_template_id,inbound_template_id}` */
+  route?: {
+    id: string
+    channel: string | null
+    account_id: string | null
+    outbound_template_id?: string | null
+    inbound_template_id?: string | null
+  }
   inbound: {
     protocol_configured: 'imap' | 'pop3'
     protocol_active: 'imap' | 'pop3'
@@ -336,6 +430,18 @@ export interface MailRouteStatus {
 export interface MailStatus {
   enabled: boolean
   routes: MailRouteStatus[]
+}
+
+/**
+ * #56 不带 `route_id` 时应回 `{enabled, routes:[…]}`;后端当前把它做成了列表端点
+ * (`{ok:true, data:[…]}`)。两形都接住,免得 P-MAIL 因为多一层数组白屏。
+ */
+export function normalizeMailStatus(raw: unknown): MailStatus {
+  if (Array.isArray(raw)) return { enabled: raw.length > 0, routes: raw as MailRouteStatus[] }
+  const o = (raw ?? {}) as Partial<MailStatus> & { route?: MailRouteStatus }
+  if (Array.isArray(o.routes)) return { enabled: o.enabled !== false, routes: o.routes }
+  if (o.route) return { enabled: o.enabled !== false, routes: [o.route] }
+  return { enabled: o.enabled === true, routes: [] }
 }
 
 export interface MailInboxRow {
@@ -407,14 +513,20 @@ export interface PendingConfirm {
 
 export interface SystemVersion {
   console?: string
-  agent: string
-  winagent: { version: string; online: boolean; user_agent: boolean }
-  kernel: string
-  kernel_state: string
-  wsl: string
-  wsl_state: string
-  docker: string
-  distro: string
+  /**
+   * 🔴 总控裁决①:`agent` 的形状**以后端现实现为准** = `{version}` 对象。
+   * (此前前端按裸字符串渲染,真后端下发对象 ⇒ 版本栏显示 `[object Object]`,S-09。)
+   */
+  agent: { version: string; api_version?: string }
+  winagent: { version: string | null; online: boolean; user_agent?: boolean }
+  /** 未探到时后端给 `null`(不是空串)——页面显示「未知」 */
+  kernel?: string | null
+  kernel_state?: string | null
+  wsl?: string | null
+  wsl_state?: string | null
+  docker?: string | null
+  distro?: string | null
+  images?: Record<string, unknown>
   api_version: string
   capabilities_version: string
   schema_version: number
@@ -422,39 +534,167 @@ export interface SystemVersion {
   migration?: { state: 'idle' | 'pending' | 'running' | 'failed'; from?: number; to?: number; at?: string }
 }
 
+export type HealthCheckState = 'ok' | 'firing' | 'unknown'
+
+/**
+ * #72 `checks`。R6-58 (y):全局 `Hxx` 键集一个字不动,**另带** per-account 子键
+ * `accounts: {"<account_id>": {H04..H08}}`(01 §2.7.3.4 的账号健康行取这里)。
+ */
+export interface SystemHealthChecks {
+  accounts?: Record<string, Record<string, HealthCheckState>>
+  [k: string]: HealthCheckState | Record<string, Record<string, HealthCheckState>> | undefined
+}
+
+/** 取一个全局健康项;未接入时该键缺席(R6-53)⇒ `unknown` */
+export function globalCheck(checks: SystemHealthChecks | undefined, code: string): HealthCheckState {
+  const v = checks?.[code]
+  return typeof v === 'string' ? v : 'unknown'
+}
+
+/** 取某账号的 H04~H08(R6-58 (y)) */
+export function accountCheck(
+  checks: SystemHealthChecks | undefined,
+  accountId: string,
+  code: string,
+): HealthCheckState {
+  return checks?.accounts?.[accountId]?.[code] ?? 'unknown'
+}
+
 export interface SystemHealth {
   ok: boolean
+  /** 免鉴权来源只回布尔级摘要(C-33);带令牌回全量对象 */
   agent: { version: string; api_version: string; uptime_s: number; db_mb: number; wal_mb: number } | boolean
   dockerd: boolean
-  winagent: { online: boolean; version: string; user_agent: boolean } | boolean
+  winagent: { online: boolean; version: string | null; user_agent: boolean } | boolean
+  user_agent?: boolean
   accounts?: Record<string, number>
   disk_free_mb?: number
-  checks?: Record<string, 'ok' | 'firing' | 'unknown'>
+  mem?: { avail_mb: number; level: WatermarkLevel }
+  checks?: SystemHealthChecks
+  /** 各定时任务 `runs/skipped/errors`(#72) */
+  scheduler?: Record<string, { runs?: number; skipped?: number; errors?: number }>
   alerts?: AlertPayload[]
 }
 
-export interface SystemEnv {
-  net_state: string
+/**
+ * #74 `GET /system/env`(P-ENV 环境快照,C-32)。
+ * 🔴 形状按真后端 = 02 #74 的描述:**Windows 侧(`GET /wa/v1/net`)与 WSL 侧分成两半**,
+ * WinAgent 不可达时 `windows` 为 `null` 且 `windows_error` 给原因(四态)——页面显示「未知 + 原因」,
+ * 不是把 net_state 当空串糊过去。
+ */
+export interface SystemEnvWindows {
+  net_state?: string
   proxy?: string | null
   vpn_adapter?: string | null
-  wsl_subnet?: string
-  host_ip?: string
-  mtu?: number
-  clock_drift_s?: number
-  pending_restart?: boolean
-  kernel_state?: string
-  wsl_state?: string
-  wslconfig?: Record<string, unknown>
-  docker_cidr: string
-  /** N-21 / V4:常驻冲突行的数据源 */
-  docker_conflict: { state: 'ok' | 'conflict'; source?: 'install' | 'runtime_vpn'; overlap_prefix?: string; at?: string }
+  wsl_subnet?: string | null
+  host_ip?: string | null
+  /** N-21 / V4:常驻冲突行的数据源(WinAgent 侧算) */
+  docker_conflict?: { state: 'ok' | 'conflict'; source?: 'install' | 'runtime_vpn'; overlap_prefix?: string; at?: string }
+  [k: string]: unknown
 }
 
+export interface SystemEnvWsl {
+  iface?: string
+  mtu?: number | null
+  resolv_conf?: { source?: string; nameservers?: string[] }
+  docker?: { default_address_pools?: { base: string; size: number }[] }
+  ksm?: { run?: number | null }
+  zram?: { disksize_mb?: number | null }
+  kernel_release?: string | null
+  clock?: { drift_ms?: number | null; last_probe_at?: string | null }
+  adb_server?: { running?: boolean | null; reason?: string | null }
+  [k: string]: unknown
+}
+
+export interface SystemEnv {
+  windows: SystemEnvWindows | null
+  /** WinAgent 侧取不到时的原因(`winagent_offline` / `winagent_error` / …) */
+  windows_error?: string | null
+  wsl: SystemEnvWsl | null
+  /** `.wslconfig` 生效对比(会话代理不在线时为 null) */
+  wslconfig?: Record<string, unknown> | null
+  reboot_required?: boolean | null
+  winagent?: { online: boolean; version: string | null; user_agent?: boolean }
+}
+
+/** docker 网段:WSL 侧 `default_address_pools` 的第一段(冲突判定在 Windows 侧) */
+export function dockerCidrOf(env: SystemEnv | null): string | null {
+  return env?.wsl?.docker?.default_address_pools?.[0]?.base ?? null
+}
+
+/**
+ * #75/#76 的探测行。
+ * 🔴 键名以真后端(= 04 的 `probe_results` 列)为准:结论列叫 **`status`**、诊断文字叫 `detail`,
+ * 另带 `side`(哪一侧探的)与 `level_reached`。`result`/`hint` 作一次性兼容保留。
+ */
 export interface ProbeRow {
-  target: string
-  result: string
+  side?: 'wsl' | 'windows' | string
+  target: string | null
+  status?: string
+  /** @deprecated 兼容旧字段名(后端统一成 `status` 后删) */
+  result?: string
+  level_reached?: string | null
+  detail?: string | null
+  /** @deprecated 兼容旧字段名(后端统一成 `detail` 后删) */
   hint?: string | null
-  at?: string
+  at?: string | null
+}
+
+/** 探测结论(00 §8.5):后端列名 `status`,旧实现叫 `result` */
+export function probeStatusOf(row: ProbeRow): string {
+  return row.status ?? row.result ?? 'UNKNOWN'
+}
+
+/** 诊断文字:后端 `detail`,旧实现 `hint` */
+export function probeDetailOf(row: ProbeRow): string | null {
+  return row.detail ?? row.hint ?? null
+}
+
+/**
+ * #79/#79b 一轮自检的出参(02 #79 逐字 `{redroid_boot_ms, napcat_ok, winagent_ok, probes}`)。
+ * 🔴 它是**一个对象**,不是行数组 —— 01 §4 的自检表要行,所以行由 `selftestRows()` 派生。
+ */
+export interface SelftestRun {
+  run_id?: string | null
+  redroid_boot_ms?: number | null
+  napcat_ok?: boolean | null
+  winagent_ok?: boolean | null
+  winagent_version?: string | null
+  probes?: ProbeRow[]
+  started_at?: string | null
+  finished_at?: string | null
+  /** 没有执行体的步骤(`{step, reason}`)—— 不假装 ok,渲染成 warn + 原因 */
+  skipped?: { step: string; reason: string }[]
+}
+
+/**
+ * #76 `?kind=observed` 的行(R6-58 (dc))。
+ * `id` = `probe_targets_observed.id`(#76b 的 `observed_ids` 就是它,**不得用行下标**);
+ * `in_config` = 该行是否已在 `settings['probe.targets']` 里(01 §2.7.9「默认只勾新增项」的判据)。
+ */
+export interface ObservedProbeRow {
+  id: number
+  account_id?: string | null
+  channel?: Channel | null
+  remote_host?: string | null
+  remote_ip: string
+  port: number
+  proto?: string
+  samples?: number
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+  adopted_at?: string | null
+  in_config: boolean
+}
+
+/** #76b `PUT /settings/probe` 出参(R6-58 (db) 逐字四键) */
+export interface AdoptProbeResult {
+  /** 与入参同维度 = 行 id */
+  adopted: number[]
+  adopted_rows?: ObservedProbeRow[]
+  /** 元素逐字 `"host:port"`,**无** `channel_` 前缀 */
+  targets: string[]
+  hosts_by_channel?: { qidian_hosts?: string[]; qq_hosts?: string[]; wechat_hosts?: string[] }
 }
 
 export interface SampleRow {
@@ -474,37 +714,124 @@ export interface SelftestRow {
   message?: string
 }
 
+function boolRow(item: string, label: string, v: boolean | null | undefined, skipped: string | null): SelftestRow {
+  if (v === true) return { item, label, level: 'ok' }
+  if (v === false) return { item, label, level: 'error', message: skipped ?? '检查未通过' }
+  // null/undefined = 没跑(本期没有执行体)⇒ warn + 原因,**不假装 ok**
+  return { item, label, level: 'warn', message: skipped ?? '未执行' }
+}
+
+/** #79/#79b 的一轮对象 → 01 §4 自检表的行;已经是行数组就原样用 */
+export function selftestRows(run: SelftestRun | SelftestRow[] | null | undefined): SelftestRow[] {
+  if (!run) return []
+  if (Array.isArray(run)) return run
+  const why = (step: string): string | null => run.skipped?.find((x) => x.step === step)?.reason ?? null
+  const rows: SelftestRow[] = [
+    run.redroid_boot_ms != null
+      ? { item: 'redroid_boot', label: '临时容器启动', level: 'ok', message: `${run.redroid_boot_ms} ms` }
+      : boolRow('redroid_boot', '临时容器启动', null, why('redroid_boot')),
+    boolRow('napcat', 'NapCat 可用', run.napcat_ok, why('napcat')),
+    boolRow(
+      'winagent',
+      `WinAgent 健康${run.winagent_version ? `(${run.winagent_version})` : ''}`,
+      run.winagent_ok,
+      why('winagent'),
+    ),
+  ]
+  const probes = run.probes ?? []
+  if (probes.length) {
+    const statuses = probes.map(probeStatusOf)
+    const level = statuses.some((x) => ['FAIL', 'DNS_FAIL', 'TCP_FAIL', 'TLS_FAIL', 'BLOCKED'].includes(x))
+      ? 'error'
+      : statuses.some((x) => x !== 'OK')
+        ? 'warn'
+        : 'ok'
+    rows.push({
+      item: 'probes',
+      label: `连通性探测(${probes.length} 项)`,
+      level,
+      message: probes.map((r) => `${r.target ?? r.side ?? '?'}:${probeStatusOf(r)}${probeDetailOf(r) ? `(${probeDetailOf(r)})` : ''}`).join('、'),
+    })
+  }
+  return rows
+}
+
+/**
+ * #102 `GET /system/public-endpoint`(E-3)。
+ * 🔴 键集逐字按 02 #102:`{public_ip, public_ip_v6?, configured_domain?, checked_at, changed_at,
+ * probe:{url, unreachable_rounds}}`。此前前端自造的 `configured_host / dns_resolved_ip /
+ * matches / last_changed_at / history` 在 docs 里**不存在**(S-04)。
+ * `configured_domain` = `settings api.public_domain`,写回走 `PUT /settings/api {public_domain}`。
+ */
 export interface PublicEndpoint {
-  public_ip: string
-  checked_at: string
-  configured_host?: string | null
-  dns_resolved_ip?: string | null
-  matches: boolean
-  last_changed_at?: string | null
-  history: { at: string; from_ip: string; to_ip: string }[]
+  public_ip: string | null
+  public_ip_v6?: string | null
+  configured_domain?: string | null
+  checked_at: string | null
+  changed_at?: string | null
+  probe?: { url: string | null; unreachable_rounds: number }
 }
 
 /* ── 审计 ── */
 
+/**
+ * #95 `GET /audit` 的行。
+ * 🔴 R6-58 (ag) 把列集定死为十列:`id, ts_ms, kind, transport, actor, action, account_id,
+ * trace_id, result_code, detail_json` —— `cost_ms / ip / http_status / method / path / sig_ok`
+ * **在 `detail_json` 里**,不是独立列(S-01;此前前端按 `ts/op/code/...` 取,P-LOG 全列空)。
+ */
 export interface AuditRow {
-  id: string
-  ts: string
+  id: number | string
+  /** epoch 毫秒(库列即毫秒;本端点是 CSV 列序的唯一出处,不做 ISO 转换) */
+  ts_ms: number
   kind: string
-  account_id?: string | null
-  op?: string | null
-  action?: string | null
-  actor?: string | null
   transport?: string | null
-  ip?: string | null
-  code?: string | null
+  actor?: string | null
+  /** 指令行 = op 名;api 行 = `"METHOD /path"` */
+  action?: string | null
+  account_id?: string | null
+  trace_id?: string | null
+  /** 指令行 = 结果码;api 行 = HTTP 状态的字符串形 */
+  result_code?: string | null
+  /** JSON 字符串(后端序列化后原样下发);解析用 `auditDetail()` */
+  detail_json?: string | Record<string, unknown> | null
+  /* 后端同时下发、但真值在 `detail_json` 里的几列(恒 null),留着只为不丢键 */
   cost_ms?: number | null
   http_status?: number | null
-  method?: string | null
-  path?: string | null
-  sig_ok?: boolean | null
-  args_digest?: string | null
-  trace_id?: string | null
-  source?: string | null
+  ip?: string | null
+}
+
+/** `detail_json` 解开后的常见键(端点各异,一律可空) */
+export interface AuditDetail {
+  http_status?: number
+  cost_ms?: number
+  ip?: string
+  method?: string
+  path?: string
+  sig_ok?: boolean
+  op?: string
+  args_digest?: string
+  source?: string
+  reason?: string
+  [k: string]: unknown
+}
+
+/** 解析 `detail_json`(字符串或已解开的对象都吃得下;坏 JSON 回空对象,不抛) */
+export function auditDetail(row: AuditRow): AuditDetail {
+  const d = row.detail_json
+  if (!d) return {}
+  if (typeof d === 'object') return d as AuditDetail
+  try {
+    const parsed = JSON.parse(d) as unknown
+    return typeof parsed === 'object' && parsed !== null ? (parsed as AuditDetail) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** 审计行时间 → 本地可读串(`ts_ms` 是毫秒,不是 ISO) */
+export function auditTsText(row: AuditRow): string {
+  return Number.isFinite(row.ts_ms) ? new Date(row.ts_ms).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
 
 /* ── 事件(00 §7.5) ── */
@@ -553,14 +880,26 @@ export interface AccountStatePayload {
 
 /* ── 设置 ── */
 
+/** #90 `GET /settings/api-clients`(不含 secret;键集按真后端) */
 export interface ApiClientRow {
   app_id: string
   name: string
-  prefix6: string
+  auth_kind?: 'bearer' | 'hmac'
   level: 'read' | 'write' | 'admin'
   ip_allow: string[]
+  allow_ops?: string[]
+  allow_accounts?: string[]
+  rate_per_min?: number
+  api_version_min?: number
+  enabled?: boolean
+  secret_ref?: string | null
+  builtin?: boolean
+  /** 令牌前 6 位(只在创建那一次有;列表不回) */
+  prefix6?: string
   created_at: string
+  updated_at?: string
   last_used_at?: string | null
+  revoked_at?: string | null
 }
 
 export interface VaultEntry {
@@ -591,9 +930,12 @@ export interface MailRouteOverride {
   enabled: boolean
 }
 
+/** #24 `GET /device-profiles/templates`(字段名统一 `profile_key`) */
 export interface DeviceProfileTemplate {
   profile_key: string
   brand: string
   model: string
   release?: string
+  /** 随机挑档案时的权重(02 #24 出参列) */
+  weight?: number
 }

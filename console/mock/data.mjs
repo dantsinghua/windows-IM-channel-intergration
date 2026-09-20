@@ -1,4 +1,9 @@
-/** 开发用假数据(按 00 §7 / 02 §3.4 的出参形态造) */
+/**
+ * 开发用假数据(按 00 §7 / 02 §3.4 的出参形态造)。
+ *
+ * 🔴 口径:**mock 向真后端与规格看齐,不是反过来**。改这里之前先看 02 §3.4 的出参列;
+ * 与真 Agent 的形状差异由 `console/tests/unit/mock-shape.spec.ts` 守着。
+ */
 
 export const now = () => new Date().toISOString()
 
@@ -13,7 +18,6 @@ export function makeAccounts() {
       capabilities: ['read_messages', 'list_sessions', 'get_state', 'screenshot', 'send_text', 'send_image', 'send_file'],
       quota_mb: 2560, self_nick: '张三', self_uid: '415011447',
       created_at: now(), updated_at: now(), last_seen_at: now(),
-      settings: { 'send.min_interval_ms': 1200, 'send.max_per_minute': 20, auto_recover: true, retention_days: 30 },
     },
     {
       id: 'qd02', channel: 'qidian', host: 'wsl', label: '李四-利率', state: 'login_required',
@@ -23,13 +27,13 @@ export function makeAccounts() {
       identity: { brand: 'HUAWEI', model: 'P40' },
       login: { mode: 'password', credential_ref: null, remember: false },
       capabilities: ['get_state', 'screenshot'],
-      quota_mb: 2560, created_at: now(), updated_at: now(), last_seen_at: now(), settings: {},
+      quota_mb: 2560, created_at: now(), updated_at: now(), last_seen_at: now(),
     },
     {
       id: 'qd03', channel: 'qidian', host: 'wsl', label: '备用', state: 'stopped',
       state_code: '', state_reason: '', error_since_ms: null, enabled: true, auto_recover: false, deleted_ms: null,
       runtime: {}, identity: {}, login: { mode: 'password', remember: false }, capabilities: [],
-      quota_mb: 2560, created_at: now(), updated_at: now(), last_seen_at: null, settings: {},
+      quota_mb: 2560, created_at: now(), updated_at: now(), last_seen_at: null,
     },
     {
       id: 'qq01', channel: 'qq', host: 'wsl', label: 'QQ-客服一号', state: 'running',
@@ -37,7 +41,7 @@ export function makeAccounts() {
       runtime: { kind: 'napcat', container: 'qtrade-qq01', ws_port: 16101, http_port: 16201 },
       identity: { qq_uin: '10001' }, login: { mode: 'qrcode', remember: false },
       capabilities: ['read_messages', 'list_sessions', 'get_state', 'send_text', 'send_image'],
-      quota_mb: 614, self_nick: '客服一号', created_at: now(), updated_at: now(), last_seen_at: now(), settings: {},
+      quota_mb: 614, self_nick: '客服一号', created_at: now(), updated_at: now(), last_seen_at: now(),
     },
     {
       id: 'wx01', channel: 'wechat', host: 'windows', label: '张三(微信)', state: 'running',
@@ -46,14 +50,14 @@ export function makeAccounts() {
       identity: {}, login: { mode: 'qrcode', remember: false },
       capabilities: ['read_messages', 'list_sessions', 'get_state', 'screenshot', 'send_text'],
       quota_mb: 1536, self_nick: '张三', wxid: 'wxid_xxx', merged_into: null,
-      created_at: now(), updated_at: now(), last_seen_at: now(), settings: {},
+      created_at: now(), updated_at: now(), last_seen_at: now(),
     },
     {
       id: 'wx02', channel: 'wechat', host: 'windows', label: '李四(微信)', state: 'stopped',
       state_code: '', state_reason: '', error_since_ms: null, enabled: true, auto_recover: false, deleted_ms: null,
       runtime: { wechat_version: '4.1.12.26', wxkey_dll: 'wx_key2.dll' },
       identity: {}, login: { mode: 'qrcode', remember: false }, capabilities: [],
-      quota_mb: 0, wxid: 'wxid_yyy', created_at: now(), updated_at: now(), last_seen_at: null, settings: {},
+      quota_mb: 0, wxid: 'wxid_yyy', created_at: now(), updated_at: now(), last_seen_at: null,
     },
   ]
 }
@@ -92,6 +96,13 @@ export function makeMetrics() {
     },
     ours: {
       procs: { agent_mb: 920, winagent_mb: 310, console_mb: 410 },
+      // R6-58 (aa):每进程明细(采样缺失时值给 null,不编造)
+      procs_detail: [
+        { name: 'qtrade-agent', rss_mb: 920, cpu_pct: 4 },
+        { name: 'qtrade-winagent', rss_mb: 310, cpu_pct: 1 },
+        { name: 'qtrade-console', rss_mb: 410, cpu_pct: 2 },
+        { name: 'dockerd', rss_mb: 180, cpu_pct: null },
+      ],
       accounts: [
         { id: 'qd01', anon_mb: 2150, current_mb: 2400, cpu_pct: 8, quota_mb: 2560 },
         { id: 'qq01', anon_mb: 360, current_mb: 420, cpu_pct: 3, quota_mb: 614 },
@@ -156,10 +167,20 @@ export const CAPABILITIES = [
 ]
 
 export function makeMessages(n = 40) {
+  // 🔴 裁决②:最后消息时间字段名 = `last_msg_at`(ISO),**不是** `last_ts`
   const sessions = [
-    { id: 'wx01:12345@chatroom', name: '某某群', kind: 'group', account_id: 'wx01', channel: 'wechat' },
-    { id: 'qq01:g_123456', name: 'QQ 报价群', kind: 'group', account_id: 'qq01', channel: 'qq' },
-    { id: 'qd01:415011447', name: '张三-固收', kind: 'private', account_id: 'qd01', channel: 'qidian' },
+    {
+      id: 'wx01:12345@chatroom', name: '某某群', kind: 'group', account_id: 'wx01', channel: 'wechat',
+      native_id: '12345@chatroom', last_msg_at: now(), msg_count: 128, unread: 2, muted: false,
+    },
+    {
+      id: 'qq01:g_123456', name: 'QQ 报价群', kind: 'group', account_id: 'qq01', channel: 'qq',
+      native_id: 'g_123456', last_msg_at: now(), msg_count: 64, unread: 0, muted: false,
+    },
+    {
+      id: 'qd01:415011447', name: '张三-固收', kind: 'private', account_id: 'qd01', channel: 'qidian',
+      native_id: '415011447', last_msg_at: now(), msg_count: 27, unread: 0, muted: false,
+    },
   ]
   const out = []
   for (let i = 0; i < n; i++) {
@@ -183,7 +204,8 @@ export function makeMessages(n = 40) {
       source: i % 11 === 0 ? 'screenshot' : s.channel === 'wechat' ? 'chatlog' : s.channel === 'qq' ? 'onebot' : 'qidian_db',
       revoked: i % 17 === 0,
       raw_ref: i % 5 === 0 ? `raw/${i}` : null,
-      needs_review: i % 11 === 0,
+      // 🔴 02 #48 的出参列**不含** `needs_review`(S-13);出向行带 confirmed_by/trace_id
+      ...(i % 3 === 0 ? { confirmed_by: 'ingest_merge', trace_id: `01TRACEMSG${i}` } : {}),
     })
   }
   return { sessions, messages: out }

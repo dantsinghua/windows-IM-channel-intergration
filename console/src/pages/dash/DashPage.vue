@@ -184,8 +184,8 @@ function sysDot(what: string): { ok: boolean; text: string } {
           <span class="qt-small">[{{ metrics?.mem_watermark.level ?? 'normal' }}]</span>
         </div>
         <div>
-          已用 {{ gb(metrics?.hardware.mem.used_mb) }} / {{ gb(metrics?.hardware.mem.total_mb) }} GB ·
-          可用 {{ gb(metrics?.hardware.mem.avail_mb) }} GB
+          已用 {{ gb(metrics?.hardware?.mem?.used_mb) }} / {{ gb(metrics?.hardware?.mem?.total_mb) }} GB ·
+          可用 {{ gb(metrics?.hardware?.mem?.avail_mb) }} GB
         </div>
       </div>
       <div
@@ -199,7 +199,7 @@ function sysDot(what: string): { ok: boolean; text: string } {
           <span class="qt-small">[{{ metrics?.disk_watermark.level ?? 'normal' }}]</span>
         </div>
         <div>
-          <span v-for="d in metrics?.hardware.disks ?? []" :key="d.mount" class="diskpart">
+          <span v-for="d in metrics?.hardware?.disks ?? []" :key="d.mount" class="diskpart">
             {{ d.mount }} 剩 {{ gb(d.free_mb) }} GB
           </span>
           <span v-if="!metrics">—</span>

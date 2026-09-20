@@ -1,7 +1,14 @@
-/** `setup` store:首次向导进度;合规确认**以 Agent 为准**(01-P3) */
+/**
+ * `setup` store:首次向导进度;合规确认**以 Agent 为准**(01-P3)。
+ *
+ * 🔴 端点更正:`/settings/compliance` 在 02 #88 的 `group` 枚举里**不存在**(真后端 404)。
+ * 告知文案与「勾过没有」都走 #86 `GET /system/notice`(它回 `{notice_version, text, ack_ms,
+ * acked_at, acked_version}`),勾选走 #87 `POST /system/notice/ack {notice_version}`。
+ * 判据仍**以 Agent 为准**:`acked_version === notice_version` 才算这一版勾过(05 §6.1)。
+ */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { settingsApi, systemApi } from '@/api/client'
+import { systemApi } from '@/api/client'
 
 /** 控制台自己固定追加的两段(不依赖法务改稿):A-7 + A-5 */
 export const NOTICE_FIXED_PARAGRAPHS = [
@@ -18,6 +25,7 @@ export const useSetupStore = defineStore('setup', () => {
   const acked = ref(false)
   const ackMs = ref<number | null>(null)
   const loading = ref(false)
+  const error = ref<string | null>(null)
 
   async function loadConfig(): Promise<void> {
     const cfg = await window.qt?.config.read()
@@ -26,24 +34,26 @@ export const useSetupStore = defineStore('setup', () => {
 
   async function loadNotice(): Promise<void> {
     loading.value = true
+    error.value = null
     try {
       const n = await systemApi.notice()
       noticeText.value = n.text
       noticeVersion.value = n.notice_version
-      const c = await settingsApi.compliance()
-      ackMs.value = c.ack_ms
+      ackMs.value = typeof n.ack_ms === 'number' ? n.ack_ms : null
       // 告知版本升高后需要重新勾选(05 §6.1)
-      acked.value = !!c.ack_ms && c.notice_version === n.notice_version
+      acked.value = !!n.acked_version && n.acked_version === n.notice_version
+    } catch (e) {
+      // #86 后端未就绪:向导要能显示错误 + 重试,不白屏(文案空 → 页面提示)
+      error.value = e instanceof Error ? e.message : String(e)
     } finally {
       loading.value = false
     }
   }
 
   async function ack(): Promise<void> {
-    const now = Date.now()
-    await settingsApi.putCompliance({ ack_ms: now, notice_version: noticeVersion.value })
-    ackMs.value = now
-    acked.value = true
+    await systemApi.noticeAck(noticeVersion.value)
+    // 以 Agent 为准:写完重读一次,别让界面记住一个服务端没落下的勾
+    await loadNotice()
   }
 
   async function finish(autoLaunch: boolean, trayOnClose: boolean): Promise<void> {
@@ -62,7 +72,7 @@ export const useSetupStore = defineStore('setup', () => {
   }
 
   return {
-    done, step, noticeText, noticeVersion, scrolledToBottom, acked, ackMs, loading,
+    done, step, noticeText, noticeVersion, scrolledToBottom, acked, ackMs, loading, error,
     loadConfig, loadNotice, ack, finish, rerun,
   }
 })

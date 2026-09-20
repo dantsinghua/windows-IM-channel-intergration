@@ -21,7 +21,7 @@ import {
   ALERT_CODES, CAPABILITY_TEXT, LOGIN_PHASE_TITLE, QIDIAN_READ_DEGRADED_CODES,
   STATE_CODES, capabilityText, stateCardSubtitle, stateCardTitle,
 } from '@/i18n/zh-CN/codes'
-import type { AuditRow, Job } from '@/api/types'
+import { auditDetail, auditTsText, type AuditRow, type Job } from '@/api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -87,7 +87,12 @@ async function reload(): Promise<void> {
   try { recent.value = (await auditApi.list({ kind: 'command', account_id: id.value, limit: 20 })).items } catch { recent.value = [] }
   if (a.value) {
     editingLabel.value = a.value.label
-    settingsForm.value = { ...(a.value.settings ?? {}) }
+    // 🔴 总控裁决④:Account 不带 `settings` 子对象。账号级设置只经 #22 写,
+    // 读侧目前只有 Account 顶层的这几项(其余键保存后立即生效,页面不假装回显服务端值)。
+    settingsForm.value = {
+      auto_recover: a.value.auto_recover,
+      quota_mb: a.value.quota_mb,
+    }
   }
   if (a.value && ['login_required', 'degraded', 'error'].includes(a.value.state)) {
     await accounts.refreshPrompt(id.value).catch(() => undefined)
@@ -472,11 +477,11 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
         <table class="tbl">
           <thead><tr><th>时间</th><th>能力</th><th>结果码</th><th>耗时</th><th /></tr></thead>
           <tbody>
-            <tr v-for="r in recent" :key="r.id" :data-testid="T.recent(r.trace_id ?? r.id)">
-              <td class="qt-small">{{ r.ts }}</td>
-              <td>{{ capabilityText(r.op ?? '') }}</td>
-              <td>{{ r.code }}</td>
-              <td>{{ r.cost_ms ?? '—' }} ms</td>
+            <tr v-for="r in recent" :key="r.id" :data-testid="T.recent(r.trace_id ?? String(r.id))">
+              <td class="qt-small">{{ auditTsText(r) }}</td>
+              <td>{{ capabilityText(auditDetail(r).op ?? r.action ?? '') }}</td>
+              <td>{{ r.result_code ?? '—' }}</td>
+              <td>{{ auditDetail(r).cost_ms ?? '—' }} ms</td>
               <td><a-button size="small" @click="router.push({ path: '/cmd', query: { replay: r.trace_id } })">重放</a-button></td>
             </tr>
             <tr v-if="!recent.length"><td colspan="5" class="qt-muted">暂无指令</td></tr>

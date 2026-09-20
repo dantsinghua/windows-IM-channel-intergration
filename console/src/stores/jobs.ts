@@ -5,7 +5,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { jobsApi } from '@/api/client'
-import type { Job, QtEvent } from '@/api/types'
+import { normalizeJob, type Job, type QtEvent } from '@/api/types'
 import { useEventsStore } from './events'
 
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'expired'])
@@ -18,7 +18,9 @@ export const useJobsStore = defineStore('jobs', () => {
     return !!j && TERMINAL.has(j.state)
   }
 
-  function put(j: Job): void {
+  function put(raw: Job): void {
+    // S-05 的一次性兼容:后端当前给 `*_ms`,规格是 ISO `*_at`(后端改完删 normalizeJob)
+    const j = normalizeJob(raw)
     byId.value[j.job_id] = { ...byId.value[j.job_id], ...j }
     if (isTerminal(byId.value[j.job_id])) stopPolling(j.job_id)
   }

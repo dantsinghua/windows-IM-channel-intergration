@@ -22,7 +22,8 @@ const accounts = useAccountsStore()
 
 const sampling = ref(false)
 const sampleLeft = ref(0)
-const samplePick = ref<Set<string>>(new Set())
+/** 勾选态按 `probe_targets_observed.id` 记(R6-58 (cu):不得用行下标) */
+const samplePick = ref<Set<number>>(new Set())
 const sampleApplyOpen = ref(false)
 const wxStatus = ref<Record<string, any> | null>(null)
 const wxDisk = ref<{ partition?: string; free_mb?: number } | null>(null)
@@ -38,7 +39,8 @@ const anyOnline = computed(() => accounts.items.some((a) => a.state === 'running
 function versionText(k: string): string {
   switch (k) {
     case 'console': return session.appVersion?.console ?? '—'
-    case 'agent': return v.value?.agent ?? '—'
+    // 裁决①:`agent` 是 `{version}` 对象(按裸字符串渲染会显示 [object Object])
+    case 'agent': return v.value?.agent?.version ?? '—'
     case 'winagent': return v.value?.winagent?.version ?? '—'
     case 'winagent-user': return v.value?.winagent?.user_agent ? '在线' : '不在线'
     case 'kernel': return `${v.value?.kernel ?? '—'}(${KERNEL_STATE_TEXT[v.value?.kernel_state ?? ''] ?? '—'})`
@@ -48,19 +50,29 @@ function versionText(k: string): string {
   }
 }
 
+/**
+ * 九项环境快照。🔴 数据源按 #74 的两半:
+ * Windows 侧(net_state/代理/VPN/子网/宿主 IP)在 `windows`,WSL 侧(MTU/时钟/内核)在 `wsl`。
+ * `windows` 为 null(WinAgent 不可达)时显示「未知」+ 原因,不显示成「无」。
+ */
 function snapText(k: string): string {
   const s = snap.value
   if (!s) return '—'
+  const w = s.windows
+  const unknown = w ? '—' : `未知(${store.windowsError ?? 'WinAgent 不可达'})`
   switch (k) {
-    case 'netstate': return NET_STATE_TEXT[s.net_state] ?? s.net_state
-    case 'proxy': return s.proxy ?? '无'
-    case 'vpn': return s.vpn_adapter ?? '无'
-    case 'subnet': return s.wsl_subnet ?? '—'
-    case 'hostip': return s.host_ip ?? '—'
-    case 'mtu': return String(s.mtu ?? '—')
-    case 'clock': return `${s.clock_drift_s ?? 0} s`
-    case 'wslconfig': return JSON.stringify(s.wslconfig ?? {})
-    default: return s.pending_restart ? '是' : '否'
+    case 'netstate': return w?.net_state ? NET_STATE_TEXT[w.net_state] ?? w.net_state : unknown
+    case 'proxy': return w ? w.proxy ?? '无' : unknown
+    case 'vpn': return w ? w.vpn_adapter ?? '无' : unknown
+    case 'subnet': return w ? w.wsl_subnet ?? '—' : unknown
+    case 'hostip': return w ? w.host_ip ?? '—' : unknown
+    case 'mtu': return String(s.wsl?.mtu ?? '—')
+    case 'clock': {
+      const ms = s.wsl?.clock?.drift_ms
+      return ms == null ? '未探测' : `${(ms / 1000).toFixed(1)} s`
+    }
+    case 'wslconfig': return s.wslconfig ? JSON.stringify(s.wslconfig) : '未读到(会话代理不在线)'
+    default: return s.reboot_required ? '是' : '否'
   }
 }
 
@@ -95,18 +107,22 @@ async function runSample(): Promise<void> {
   const t = setInterval(() => { sampleLeft.value = Math.max(0, sampleLeft.value - 1) }, 1000)
   try {
     await store.runSample(30)
-    samplePick.value = new Set(store.samples.map((_, i) => String(i)))
+    // 01 §2.7.9:提交的是整张表的当前勾选态(已采纳项默认勾上 + 新候选也勾上),不是本次新增的那几个
+    samplePick.value = new Set(store.observed.map((r) => r.id))
   } finally {
     clearInterval(t)
     sampling.value = false
   }
 }
 
+/**
+ * #76b:`observed_ids` 是**采纳后的全集**(取消勾选一个已采纳项 = 把它从数组里拿掉;
+ * 全不勾提交 `[]` 合法 = 清空全部正式目标)。
+ */
 async function applySample(): Promise<void> {
-  await systemApi.adoptProbeTargets([...samplePick.value])
+  await store.adoptObserved([...samplePick.value])
   sampleApplyOpen.value = false
   message.success('已写入探测目标,正在跑一轮探测')
-  await store.runProbe()
 }
 
 async function waAction(op: string, args: Record<string, unknown>, okText: string): Promise<void> {
@@ -158,7 +174,11 @@ async function onDiagDone(job: Job): Promise<void> {
 
 onMounted(async () => {
   await store.loadAll()
+  // 后端未就绪的块各自吞掉,页面照常显示已取到的部分(不白屏、不无限转圈)
   await store.loadPublicEndpoint().catch(() => undefined)
+  await store.loadSelftest().catch(() => undefined)
+  // 页面直开就显示上一次的采样候选(#76 observed 承载上次结果)
+  await store.loadObserved().catch(() => undefined)
   await loadWx()
   if (!accounts.items.length) void accounts.load()
 })
@@ -167,6 +187,15 @@ onMounted(async () => {
 <template>
   <div class="qt-page qt-stack">
     <PageState :loading="store.loading && !v" :error="store.error" @retry="store.loadAll()">
+      <a-alert
+        v-if="store.agentDownReason"
+        type="warning"
+        show-icon
+        :message="store.agentDownReason"
+        class="mb"
+      >
+        <template #action><a-button size="small" @click="store.loadAll()">重试</a-button></template>
+      </a-alert>
       <!-- 版本 -->
       <section class="qt-card box">
         <div class="qt-section-title">版本</div>
@@ -236,12 +265,12 @@ onMounted(async () => {
           </span>
         </div>
         <div class="qt-row">
-          <span :data-testid="T.dockerCidr">docker 网段 <b>{{ snap?.docker_cidr ?? '—' }}</b></span>
+          <span :data-testid="T.dockerCidr">docker 网段 <b>{{ store.dockerCidr ?? '—' }}</b></span>
           <span v-if="store.dockerConflict.state === 'ok'" class="qt-ok qt-small">无冲突</span>
         </div>
         <!-- N-21:常驻黄字,不是一闪而过的 toast -->
         <div v-if="store.dockerConflict.state === 'conflict'" class="warnbar" :data-testid="T.dockerConflict">
-          {{ (ALERT_CODES.DOCKER_POOL_ALL_CONFLICT.zh ?? '').replace('{docker_cidr}', snap?.docker_cidr ?? '') }}
+          {{ (ALERT_CODES.DOCKER_POOL_ALL_CONFLICT.zh ?? '').replace('{docker_cidr}', store.dockerCidr ?? '') }}
           <span v-if="store.dockerConflict.source === 'runtime_vpn'">
             本次是连上 VPN 后才重叠,重启 WSL 大概率避开;反复重叠请 IT 评估。
           </span>
@@ -264,61 +293,96 @@ onMounted(async () => {
         </div>
         <ProbeTable :rows="store.probes" @rerun="rerunTarget" />
 
-        <div class="qt-section-title mt">实测采样(上次 {{ store.sampledAt?.slice(11, 16) ?? '—' }})</div>
+        <div class="qt-section-title mt">实测采样(上次 {{ store.observedAt?.slice(11, 16) ?? '—' }})</div>
         <table class="tbl" :data-testid="T.sampleTable">
-          <thead><tr><th>账号</th><th>通道</th><th>实际连接</th><th>端口</th><th>协议</th><th>样本</th><th>写入</th></tr></thead>
+          <thead>
+            <tr><th>账号</th><th>通道</th><th>实际连接</th><th>端口</th><th>协议</th><th>样本</th><th>已在配置</th><th>写入</th></tr>
+          </thead>
           <tbody>
-            <tr v-for="(s, i) in store.samples" :key="`${s.account_id}-${i}`" :data-testid="T.sampleRow(s.account_id, i)">
-              <td>{{ s.account_id }}</td>
-              <td>{{ s.channel }}</td>
+            <tr
+              v-for="s in store.observed"
+              :key="s.id"
+              :data-testid="T.sampleRow(s.account_id ?? 'unknown', s.id)"
+            >
+              <td>{{ s.account_id ?? '—' }}</td>
+              <td>{{ s.channel ?? '—' }}</td>
               <td class="qt-mono qt-small">{{ s.remote_host ? `${s.remote_host}→` : '' }}{{ s.remote_ip }}</td>
               <td>{{ s.port }}</td>
-              <td>{{ s.proto }}</td>
-              <td>{{ s.samples }}</td>
+              <td>{{ s.proto ?? '—' }}</td>
+              <td>{{ s.samples ?? '—' }}</td>
+              <td>{{ s.in_config ? '是' : '新增' }}</td>
               <td>
                 <a-checkbox
-                  :data-testid="T.sampleRowPick(s.account_id, i)"
-                  :checked="samplePick.has(String(i))"
-                  @change="(e: any) => { const n = new Set(samplePick); e.target.checked ? n.add(String(i)) : n.delete(String(i)); samplePick = n }"
+                  :data-testid="T.sampleRowPick(s.account_id ?? 'unknown', s.id)"
+                  :checked="samplePick.has(s.id)"
+                  @change="(e: any) => { const n = new Set(samplePick); e.target.checked ? n.add(s.id) : n.delete(s.id); samplePick = n }"
                 />
               </td>
             </tr>
-            <tr v-if="!store.samples.length"><td colspan="7" class="qt-muted">还没有采样结果</td></tr>
+            <tr v-if="!store.observed.length"><td colspan="8" class="qt-muted">还没有采样结果</td></tr>
           </tbody>
         </table>
-        <a-button
-          :disabled="!samplePick.size"
-          :data-testid="T.sampleApply"
-          @click="sampleApplyOpen = true"
-        >写入探测目标(需确认)</a-button>
+        <div class="qt-row">
+          <a-button
+            :data-testid="T.sampleApply"
+            @click="sampleApplyOpen = true"
+          >写入探测目标(需确认)</a-button>
+          <span class="qt-small qt-muted">
+            提交的是整张表的当前勾选态(全集);取消勾一个已采纳项 = 取消采纳,全不勾 = 清空全部正式目标。
+          </span>
+        </div>
+        <div v-if="store.observedTargets.length" class="qt-small qt-muted">
+          当前正式目标:<span v-for="t in store.observedTargets" :key="t" class="qt-mono">{{ t }} </span>
+        </div>
       </section>
 
       <!-- 公网端点 -->
       <section class="qt-card box">
         <div class="qt-section-title">公网端点</div>
         <div class="qt-row wrap">
-          <span class="kvi" :data-testid="T.pubep('ip')">出口 IP <b>{{ store.publicEndpoint?.public_ip ?? '—' }}</b></span>
-          <span class="kvi" :data-testid="T.pubep('host')">配置域名 <b>{{ store.publicEndpoint?.configured_host ?? '—' }}</b></span>
+          <!-- 🔴 键集按 02 #102:`{public_ip, public_ip_v6?, configured_domain?, checked_at, changed_at,
+               probe:{url, unreachable_rounds}}`;`matches / dns_resolved_ip / history` 在 docs 里不存在。 -->
+          <span class="kvi" :data-testid="T.pubep('ip')">
+            出口 IP <b>{{ store.publicEndpoint?.public_ip ?? '—' }}</b>
+            <span v-if="store.publicEndpoint?.public_ip_v6" class="qt-small qt-muted">
+              / v6 {{ store.publicEndpoint.public_ip_v6 }}
+            </span>
+          </span>
+          <span class="kvi" :data-testid="T.pubep('host')">
+            配置域名 <b>{{ store.publicEndpoint?.configured_domain ?? '—' }}</b>
+          </span>
           <span
             class="kvi"
             :data-testid="T.pubep('dns')"
-            :class="{ 'qt-danger': store.publicEndpoint && !store.publicEndpoint.matches }"
+            :class="{ 'qt-danger': (store.publicEndpoint?.probe?.unreachable_rounds ?? 0) > 0 }"
           >
-            解析 <b>{{ store.publicEndpoint?.matches ? '一致' : '不一致' }}</b>
-            <span v-if="store.publicEndpoint && !store.publicEndpoint.matches">
-              —— 域名解析 ≠ 当前出口,使用方侧 DDNS/反代需更新
+            出口探测
+            <b v-if="(store.publicEndpoint?.probe?.unreachable_rounds ?? 0) > 0">
+              连续不可达 {{ store.publicEndpoint?.probe?.unreachable_rounds }} 轮
+            </b>
+            <b v-else>正常</b>
+            <span class="qt-small qt-muted">
+              ({{ store.publicEndpoint?.probe?.url ?? '未配置探测源' }};域名解析是否与出口一致请在使用方侧核对 ——
+              Agent 不下发解析比对结果)
             </span>
           </span>
-          <span class="kvi" :data-testid="T.pubep('changed')">最近变更 <b>{{ store.publicEndpoint?.last_changed_at ?? '—' }}</b></span>
+          <span class="kvi" :data-testid="T.pubep('changed')">
+            最近变更 <b>{{ store.publicEndpoint?.changed_at ?? '—' }}</b>
+            <span class="qt-small qt-muted">· 上次探测 {{ store.publicEndpoint?.checked_at ?? '—' }}</span>
+          </span>
         </div>
         <a-collapse>
-          <a-collapse-panel key="h" :header="`历史 ${store.publicEndpoint?.history?.length ?? 0}`" :data-testid="T.pubepHistory">
+          <!-- 历史来自 `NET_PUBLIC_ENDPOINT_CHANGED` 事件(01 §2.7.9),不是 #102 的出参 -->
+          <a-collapse-panel key="h" :header="`历史 ${store.endpointHistory.length}`" :data-testid="T.pubepHistory">
             <div
-              v-for="(h, i) in store.publicEndpoint?.history ?? []"
+              v-for="(h, i) in store.endpointHistory"
               :key="i"
               class="qt-small"
               :data-testid="T.pubepHistoryRow(i)"
             >{{ h.at }} {{ h.from_ip }} → {{ h.to_ip }}</div>
+            <div v-if="!store.endpointHistory.length" class="qt-small qt-muted">
+              本次会话内未收到出口变更事件。
+            </div>
           </a-collapse-panel>
         </a-collapse>
         <p class="qt-small qt-muted">本机 API 不绑 IP;公网入站请在使用方侧用域名 + DDNS/反代,IP 变了只需改解析。</p>
@@ -368,10 +432,13 @@ onMounted(async () => {
       :data-testid="T.sampleApplyModal"
       @ok="applySample"
     >
-      <p>将新增/替换以下探测目标(命名 {channel}_{host|ip}:{port},同名即替换):</p>
+      <p>提交后的正式探测目标 = 下面这些(全集;命名 {channel}_{host|ip}:{port},同名即替换):</p>
       <ul>
-        <li v-for="i in [...samplePick]" :key="i" class="qt-mono qt-small">
-          {{ store.samples[Number(i)]?.channel }}_{{ store.samples[Number(i)]?.remote_ip }}:{{ store.samples[Number(i)]?.port }}
+        <li v-for="s in store.observed.filter((x) => samplePick.has(x.id))" :key="s.id" class="qt-mono qt-small">
+          {{ s.channel ?? 'any' }}_{{ s.remote_host || s.remote_ip }}:{{ s.port }}
+        </li>
+        <li v-if="!samplePick.size" class="qt-small qt-danger">
+          一个都没勾 —— 提交后会**清空**全部正式探测目标。
         </li>
       </ul>
     </a-modal>
@@ -387,5 +454,6 @@ onMounted(async () => {
 .warnbar { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); margin-top: var(--qt-space-2); }
 .actions { margin-top: var(--qt-space-3); }
 .mt { margin-top: var(--qt-space-4); }
+.mb { margin-bottom: var(--qt-space-3); }
 .hidden { display: none; }
 </style>

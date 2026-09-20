@@ -6,13 +6,21 @@
  * - **令牌由主进程在 `webRequest` 网络层注入**,渲染进程从不接触 Authorization(§2.3)
  * - 401 → 让主进程重取令牌后重放一次;429 → 读 `Retry-After` 退避重试一次;
  *   **507 单独识别为 `DISK_FULL`,不当 500 自动重试**(R-02)
+ * - 🔴 幂等键落**请求 body 的 `idempotency_key`**(02 §3.4 #2/#28/#43;全 `docs/` 不存在
+ *   `X-Idempotency-Key` 这个头)
+ * - 🔴 **业务结果 ≠ 传输错误**(02 §3.4 #28 R6-52):`requestCommand()` 只按 HTTP 状态判失败,
+ *   `200 + ok:false + 业务结果码` 原样回完整 `CommandResult` 给页面渲染
  */
 
 import { ulid } from './ulid'
 import type { Envelope, ApiError } from './types'
 
-/** 控制台所需的最低 API 次版本(02 §3.8) */
-export const API_MIN_VERSION = '1.3'
+/**
+ * 控制台所需的最低 API 次版本(02 §3.8)。
+ * 🔴 取值唯一出处 = `docs/07` `[api] api_version="1.0"`(= 02 §3.9 配置总表同一行)。
+ * 凭空往高写会让**每个**请求被 middleware 判 `426 UPGRADE_REQUIRED`(E-01)。
+ */
+export const API_MIN_VERSION = '1.0'
 
 /** 渲染进程只连 Agent 17600;17610 被主进程 webRequest 阻断(R-07/§11.19) */
 export const AGENT_BASE = '/api/v1'
@@ -22,14 +30,20 @@ export class ApiFailure extends Error {
   readonly status: number
   readonly traceId: string
   readonly detail: ApiError
+  /**
+   * 原始信封。`409 IDEMPOTENT_REPLAY` 时 #28 的响应体仍是完整 `CommandResult`(02 §3.4 #28 / B-06),
+   * 页面可从这里取首次结果显示,不必再发一次。
+   */
+  readonly envelope: Envelope<unknown> | null
 
-  constructor(code: string, status: number, traceId: string, detail: ApiError) {
+  constructor(code: string, status: number, traceId: string, detail: ApiError, envelope: Envelope<unknown> | null = null) {
     super(detail.message || code)
     this.name = 'ApiFailure'
     this.code = code
     this.status = status
     this.traceId = traceId
     this.detail = detail
+    this.envelope = envelope
   }
 
   /** 错误提示末尾显示 trace_id 前 8 位,方便对日志(01 §2.5) */
@@ -46,7 +60,7 @@ export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   query?: Record<string, unknown>
   body?: unknown
-  /** 写类指令的幂等键(不传则不带) */
+  /** 写类指令的幂等键;**并进 body 的 `idempotency_key`**(不传则不带) */
   idempotencyKey?: string
   signal?: AbortSignal
   /** 期望二进制(截图/媒体/导出流) */
@@ -60,12 +74,41 @@ export interface HttpHooks {
   onTokenLost?: () => void
   /** 收到响应头里的 api 版本 */
   onApiVersion?: (v: string) => void
+  /** 426:版本协商不通过(02 §3.8)——要给出明确 UI 提示,不能只弹一句「请求失败」 */
+  onUpgradeRequired?: (info: { needMin: string; serverVersion: string | null; message: string }) => void
 }
 
 let hooks: HttpHooks = {}
 
 export function configureHttp(h: HttpHooks): void {
   hooks = { ...hooks, ...h }
+}
+
+/** 最近一次请求的 trace_id(成功响应带 `trace_id` 时用服务端的,否则回落本地 ULID) */
+export interface TraceEntry {
+  at: string
+  method: string
+  path: string
+  status: number
+  code: string
+  traceId: string
+}
+
+const TRACE_MAX = 50
+const traces: TraceEntry[] = []
+
+function recordTrace(e: TraceEntry): void {
+  traces.unshift(e)
+  if (traces.length > TRACE_MAX) traces.length = TRACE_MAX
+}
+
+/** 「复制 trace」与本地日志用(总控裁决⑤:成功响应带 `trace_id`,客户端保留) */
+export function recentTraces(): readonly TraceEntry[] {
+  return traces
+}
+
+export function lastTraceId(): string {
+  return traces[0]?.traceId ?? ''
 }
 
 function buildUrl(path: string, query?: Record<string, unknown>): string {
@@ -83,6 +126,21 @@ function buildUrl(path: string, query?: Record<string, unknown>): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/**
+ * 幂等键并进 body(02 §3.4 #2/#28/#43)。
+ * body 里已经写了 `idempotency_key` 就不覆盖(#28/#36 是调用方自己给的那把键)。
+ */
+function withIdempotencyKey(body: unknown, key?: string): unknown {
+  if (!key) return body
+  if (body === undefined) return { idempotency_key: key }
+  if (!isPlainObject(body)) return body
+  return body.idempotency_key === undefined ? { ...body, idempotency_key: key } : body
 }
 
 /** HTTP 状态 → 结果码(00 §10 / 02 §3.4) */
@@ -107,14 +165,30 @@ async function readEnvelope(res: Response): Promise<Envelope<unknown>> {
   const text = await res.text()
   if (!text) return { ok: res.ok }
   try {
-    return JSON.parse(text) as Envelope<unknown>
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    // 后端全局异常处理器缺位时 FastAPI 回 `{"detail":"Not Found"}`(不是 00 §10 信封)——
+    // 归一成信封,页面才能拿到人话而不是「请求失败」四个字。
+    if (!res.ok && typeof parsed.detail === 'string' && parsed.ok === undefined) {
+      return {
+        ok: false,
+        error: { message: String(parsed.detail), retryable: false, needs_human: false },
+      }
+    }
+    return parsed as Envelope<unknown>
   } catch {
     return { ok: false, error: { message: text.slice(0, 500), retryable: false, needs_human: false } }
   }
 }
 
-/** 底层请求:返回完整信封(调用方决定怎么取 data) */
-export async function requestEnvelope<T>(path: string, opts: RequestOptions = {}): Promise<Envelope<T>> {
+interface Attempted {
+  res: Response
+  env: Envelope<unknown>
+  traceId: string
+  serverTrace: string
+}
+
+/** 发一次请求(含 401 重取 / 429 退避),回 `{res, env}`,**不判 `ok`** */
+async function perform(path: string, opts: RequestOptions): Promise<Attempted> {
   const traceId = ulid()
   const method = opts.method ?? 'GET'
   const headers: Record<string, string> = {
@@ -122,11 +196,11 @@ export async function requestEnvelope<T>(path: string, opts: RequestOptions = {}
     'X-QT-Api-Min': API_MIN_VERSION,
     Accept: 'application/json',
   }
-  if (opts.idempotencyKey) headers['X-Idempotency-Key'] = opts.idempotencyKey
+  const payload = withIdempotencyKey(opts.body, opts.idempotencyKey)
   let bodyInit: BodyInit | undefined
-  if (opts.body !== undefined) {
+  if (payload !== undefined) {
     headers['Content-Type'] = 'application/json'
-    bodyInit = JSON.stringify(opts.body)
+    bodyInit = JSON.stringify(payload)
   }
 
   const url = buildUrl(path, opts.query)
@@ -153,30 +227,79 @@ export async function requestEnvelope<T>(path: string, opts: RequestOptions = {}
       continue
     }
 
-    const env = (await readEnvelope(res)) as Envelope<T>
+    const env = await readEnvelope(res)
     const serverTrace = (env.trace_id as string) || traceId
 
-    if (!res.ok || env.ok === false) {
-      const code = (env.code as string) || statusToCode(res.status)
-      const detail: ApiError = env.error ?? {
-        message: `请求失败(HTTP ${res.status})`,
-        retryable: false,
-        needs_human: false,
-      }
-      throw new ApiFailure(code, res.status, serverTrace, detail)
+    // 426:版本协商不通过 —— 给出「要 X、服务端是 Y」的明确提示(02 §3.8)
+    if (res.status === 426) {
+      hooks.onUpgradeRequired?.({
+        needMin: API_MIN_VERSION,
+        serverVersion: apiVersion,
+        message: env.error?.message
+          ?? `控制台需要 API ${API_MIN_VERSION},当前 Agent ${apiVersion ?? '未知'};请用安装包整体升级。`,
+      })
     }
-    env.trace_id = serverTrace
-    return env
+
+    recordTrace({
+      at: new Date().toISOString(),
+      method,
+      path,
+      status: res.status,
+      code: (env.code as string) || (res.ok ? 'OK' : statusToCode(res.status)),
+      traceId: serverTrace,
+    })
+
+    return { res, env, traceId, serverTrace }
   }
+}
+
+function toFailure(a: Attempted): ApiFailure {
+  const code = (a.env.code as string) || statusToCode(a.res.status)
+  const detail: ApiError = a.env.error ?? {
+    message: `请求失败(HTTP ${a.res.status})`,
+    retryable: false,
+    needs_human: false,
+  }
+  return new ApiFailure(code, a.res.status, a.serverTrace, detail, a.env)
+}
+
+/** 底层请求:返回完整信封(调用方决定怎么取 data);`ok:false` 与 HTTP 错误都抛 */
+export async function requestEnvelope<T>(path: string, opts: RequestOptions = {}): Promise<Envelope<T>> {
+  const a = await perform(path, opts)
+  if (!a.res.ok || a.env.ok === false) throw toFailure(a)
+  const env = a.env as Envelope<T>
+  env.trace_id = a.serverTrace
+  return env
 }
 
 /** 常用形态:返回 `data`(单对象端点若顶层平铺则原样回信封,02 §3.4「单对象端点的信封」) */
 export async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const env = await requestEnvelope<T>(path, opts)
   if (env.data !== undefined) return env.data as T
-  // 顶层平铺 + ok 的端点(#7/#9/#10/#19/#69/#72/#28)
+  // 顶层平铺 + ok 的端点(#7/#9/#10/#19/#69/#72)
   const { ok: _ok, code: _code, error: _error, trace_id: _t, ...rest } = env
   return rest as unknown as T
+}
+
+/**
+ * 🔴 指令类端点(#28 / #29 / #36)专用通道 —— 02 §3.4 #28 R6-52。
+ *
+ * 「HTTP 状态说的是这次调用有没有被受理执行,结果码说的是执行成了没有」:
+ * - **只有** HTTP 层错误(鉴权/参数/目标/并发/容量/磁盘/内部)抛 `ApiFailure`;
+ * - `200`/`202` 一律把**整个信封**原样回给页面 —— `ok:false` 的
+ *   `SEND_FAILED` / `SEND_CALLED_BUT_UNCONFIRMED` / `GATE_BLOCKED` / `LOGIN_REQUIRED` /
+ *   `CAPTCHA_REQUIRED` / `UNSUPPORTED` / `NOT_APPLICABLE` / `TIMEOUT` 是**正常业务结果**,
+ *   页面按 `code`/`cost_ms`/`source`/`state_before`/`state_after`/`data` 渲染。
+ *
+ * 绝不套用 `request()`:`CommandResult` 顶层自带业务 `data` 键,
+ * 「有 data 就返回 data」会把 `CommandResult` 拆成它的 `data`(E-04)。
+ */
+export async function requestCommand<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  const a = await perform(path, opts)
+  if (!a.res.ok) throw toFailure(a)
+  const env = a.env as Envelope<unknown>
+  env.trace_id = a.serverTrace
+  return env as unknown as T
 }
 
 /** 列表端点:统一 `{data, next_cursor}`(C-42) */

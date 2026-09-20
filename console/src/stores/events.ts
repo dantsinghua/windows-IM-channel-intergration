@@ -38,6 +38,13 @@ export const useEventsStore = defineStore('events', () => {
   const syncing = ref(false)
   /** 断线时刻,用于 qt-acct-stale-banner 的「N 秒前」 */
   const disconnectedAt = ref<number | null>(null)
+  /**
+   * 事件流「需要重新取令牌」:
+   * ① 服务端回 4401(令牌无效);② 连续 N 次握手就断(从未 open)——
+   * 令牌无效时 Starlette 会把 4401 退化成拒绝握手,客户端只看得到 1006(E-05,后端会改),
+   * 所以这一层防御不能少,否则界面只会安静地无限重连。
+   */
+  const authLost = ref<{ reason: '4401' | 'handshake'; failures?: number; code?: number } | null>(null)
 
   let client: EventsClient | null = null
   const handlers = new Map<EventKind, ((ev: QtEvent) => void)[]>()
@@ -119,6 +126,12 @@ export const useEventsStore = defineStore('events', () => {
     if (client) return
     client = new EventsClient({
       onEvent: ingest,
+      onAuthFailed: () => {
+        authLost.value = { reason: '4401' }
+      },
+      onHandshakeGivenUp: (info) => {
+        authLost.value = { reason: 'handshake', failures: info.failures, code: info.code }
+      },
       onStatus: (s) => {
         status.value = s
         if (s === 'open') {
@@ -140,6 +153,13 @@ export const useEventsStore = defineStore('events', () => {
     client = null
   }
 
+  /** 门禁「重试」按钮:上层重新取到令牌后重连事件流 */
+  function retry(): void {
+    authLost.value = null
+    if (client) client.retry()
+    else start()
+  }
+
   /** P-MSG 不在前台时把 message 收窄为当前筛选的账号(01 §2.8) */
   function narrowMessages(accounts: string[]): void {
     client?.resubscribe({ events: ALL_EVENTS, accounts: accounts.length ? accounts : ['*'] })
@@ -155,8 +175,9 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   return {
-    status, lastSeq, ring, alerts, syncing, disconnectedAt,
+    status, lastSeq, ring, alerts, syncing, disconnectedAt, authLost,
     firing, unreadCount, connected, watermarkAlert,
-    on, onReplayTruncated, start, stop, narrowMessages, markSynced, injectForTest, dismissResolved, pushAlert,
+    on, onReplayTruncated, start, stop, retry, narrowMessages, markSynced, injectForTest,
+    dismissResolved, pushAlert,
   }
 })

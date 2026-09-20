@@ -2,6 +2,16 @@
  * 开发用 mock 后端 —— 按 02 §3.4 的信封回假数据 + WS `/api/v1/events` 事件流。
  * 只为 `npm run dev:web` 能在浏览器里独立跑起来,**不是** Agent 的实现。
  *
+ * 🔴 **口径:mock 向真 Agent 与 02 §3.4 看齐,不是反过来。**
+ * 一次端到端联调(见 `.omc/handoffs/e2e-console-agent.md`)暴露出:mock 因为不校验版本头、
+ * 不校验幂等键、信封与字段名自成一套,把前端养出了一堆只在 mock 下成立的假设。
+ * 因此本文件现在:
+ *  - 校验 `X-QT-Api-Min`(> `API_VERSION` 即 `426 UPGRADE_REQUIRED`);
+ *  - 写端点校验 **body 里的 `idempotency_key`**,重放回 `409 IDEMPOTENT_REPLAY`;
+ *  - `#28` 回顶层平铺的 `CommandResult`,并能造出 `ok:false` 的业务结果码;
+ *  - 审计、邮件设置、公网端点、探测 observed 等一律按 02 的键集。
+ * 形状由 `console/tests/unit/mock-shape.spec.ts` 守着(改这里会先让那条测试变红)。
+ *
  * 监听 127.0.0.1:17600(与 [endpoint] agent 一致),vite dev server 把 /api/v1 代理过来。
  */
 import { createServer } from 'node:http'
@@ -10,6 +20,18 @@ import { CAPABILITIES, makeAccounts, makeMessages, makeMetrics, makeResources, n
 
 const PORT = Number(process.env.MOCK_PORT ?? 17600)
 
+/** 与 `docs/07` `[api] api_version="1.0"` 同值 —— 前端的 `X-QT-Api-Min` 必须 ≤ 它 */
+const API_VERSION = '1.0'
+
+/** `X-QT-Api-Min: a.b` 是否被本 mock 满足(§3.8:主版本须相同、次版本不得更高) */
+function apiMinSatisfied(want) {
+  if (!want) return true
+  const [wMajor, wMinor] = String(want).split('.').map((x) => Number(x))
+  const [hMajor, hMinor] = API_VERSION.split('.').map((x) => Number(x))
+  if (!Number.isFinite(wMajor) || !Number.isFinite(wMinor)) return true
+  return wMajor === hMajor && wMinor <= hMinor
+}
+
 const state = {
   accounts: makeAccounts(),
   resources: makeResources(),
@@ -17,28 +39,86 @@ const state = {
   ...makeMessages(60),
   jobs: new Map(),
   seq: 0,
+  // 🔴 各组的键名 = 02 §3.9 配置总表 / `docs/07`(真后端回的就是 AgentConfig 的字段名)
   settings: {
-    api: { lan_enabled: false, bind: '127.0.0.1', ip_allow: '', https: false },
-    retention: { files_days: 7, text_days: 30, raw_enabled: false, audit_days: 30 },
-    resources: { qidian_mb: 2560, qq_mb: 614, wechat_mb: 1536, base_mb: 2048, mem_warn_mb: 6144, mem_critical_mb: 3072 },
-    asr: { endpoint: 'http://10.0.0.8:9000/asr', key: '', concurrency: 2, min_confidence: 0.6 },
+    api: {
+      bind: '127.0.0.1', port: 17600, ws_impl: 'websockets', rate_default_per_min: 120,
+      http_sync_max_wait_ms: 25000, unauth_health_sources: ['127.0.0.1/32', '::1/128', 'wsl_gateway'],
+      public_ip_probe_urls: ['https://api.ipify.org'], public_ip_check_interval_s: 600,
+      public_domain: '', api_version: '1.0',
+    },
+    retention: {
+      messages_days: 30, media_days: 7, files_days: 7, raw_days: 7, mail_archive_days: 7,
+      mail_inbox_rows_days: 30, commands_days: 30, audit_days: 30, idempotency_days: 7,
+      export_jobs_days: 7, health_raw_h: 48, health_1m_d: 7, health_1h_d: 30,
+      disk_warn_mb: 5120, disk_high_mb: 2048, disk_critical_mb: 1024,
+      cleanup_at: '03:00', cleanup_batch: 500,
+    },
+    resources: {
+      pools: {
+        wsl: { total_mb: 11264, reserved_mb: 2048 },
+        windows: { total_mb: 16384, reserved_mb: 4096, wechat_mb: 1536 },
+      },
+      quota_mb: { qidian: 2560, qq: 614, wechat: 1536 },
+    },
+    asr: { endpoint: 'http://10.0.0.8:9000/asr', concurrency: 2, min_confidence: 0.6 },
     ocr: { engine: 'offline', model_dir: '/opt/qtrade/ocr', min_conf: 0.8, lang: 'zh' },
+    // 🔴 R6-58 (ac):`mail` 组逐字四键 + scopes 每块 {override, route_id, enabled, inbound, outbound}
     mail: {
-      enabled: true, require_signature: true, archive: true,
+      enabled: true,
+      require_signature: true,
+      template_version: 'v1',
       scopes: {
         default: {
-          override: true, proto: 'imap', host: 'imap.163.com', port: 993, ssl: true,
-          user: 'ops@corp', pass: '', poll: 60,
-          'smtp-host': 'smtp.163.com', 'smtp-port': 465, 'smtp-from': 'ops@corp', 'smtp-pass': '',
-          recipients: 'team@corp', 'template-id': 'tpl-ibquote',
-          allow_ops: ['read_messages', 'list_sessions', 'get_state', 'screenshot', 'send_text', 'send_image'],
-          senders: [{ addr: 'ops@corp', shortname: 'ops', keyed: true }],
+          override: true,
+          route_id: 'r_default',
+          enabled: true,
+          inbound: {
+            protocol: 'imap', host: 'imap.163.com', port: 993, ssl: true, user: 'ops@corp',
+            // 密码类只写不读:读回来只有 *_ref
+            secret_ref: 'vault://mail/route/r_default/imap',
+            folders: ['INBOX'], processed_folder: 'QTrade/processed', poll_interval_s: 60,
+            idle: false, keep_raw: true,
+            allowed_senders: ['ops@corp'], require_signature: true,
+            allow_ops: ['read_messages', 'list_sessions', 'get_state', 'screenshot', 'send_text', 'send_image'],
+            scope_subject_prefix: ['[QTrade]'],
+          },
+          outbound: {
+            enabled: true, host: 'smtp.163.com', port: 465, ssl: true, user: 'ops@corp',
+            secret_ref: 'vault://mail/route/r_default/smtp',
+            from: 'ops@corp', recipients: ['team@corp'], cc: [],
+            send_rate_per_min: 6, compat_title: true, receipt_to_sender: true,
+            template_id: 'tpl-ibquote',
+          },
         },
-        qidian: { override: false }, qq: { override: false }, wechat: { override: false },
+        qidian: { override: false, route_id: null, enabled: true, inbound: {}, outbound: {} },
+        qq: { override: false, route_id: null, enabled: true, inbound: {}, outbound: {} },
+        wechat: { override: false, route_id: null, enabled: true, inbound: {}, outbound: {} },
       },
     },
-    compliance: { ack_ms: null, notice_version: 'v1' },
   },
+  /** #67/#68 的短名表(`GET /mail/hmac-keys`);短名**不随 mail 组下发**(R6-58 (ac)) */
+  hmacKeys: [{ sender: 'ops@corp', short_name: 'ops', created_at: now() }],
+  /** 建号/工作流的幂等键 → 结果(R6-54:重放回 409 IDEMPOTENT_REPLAY + 同一份 data) */
+  idempotency: new Map(),
+  /** #76 `?kind=observed` 的候选行(行 id = probe_targets_observed.id) */
+  observed: [
+    {
+      id: 1, account_id: 'qd01', channel: 'qidian', remote_host: null, remote_ip: '14.215.177.39',
+      port: 8080, proto: 'TCP', samples: 12, first_seen_at: now(), last_seen_at: now(),
+      adopted_at: null, in_config: false,
+    },
+    {
+      id: 2, account_id: 'qq01', channel: 'qq', remote_host: 'msfwifi.3g.qq.com', remote_ip: '58.250.137.36',
+      port: 8080, proto: 'TCP', samples: 7, first_seen_at: now(), last_seen_at: now(),
+      adopted_at: now(), in_config: true,
+    },
+  ],
+  probeTargets: ['msfwifi.3g.qq.com:8080'],
+  webhooks: [],
+  selftestRunId: null,
+  /** #87 写的 compliance(读侧 02 #88 没有 compliance 组,控制台本地判,见 stores/setup.ts) */
+  compliance: { ack_ms: null, notice_version: 'v1' },
   pendingConfirms: [
     {
       id: 'mi_0001', op: 'account_stop', from_addr: 'ops@corp', account_id: 'qd01',
@@ -59,27 +139,62 @@ function emit(event, payload, extra = {}) {
   for (const ws of sockets) { try { ws.send(frame) } catch { /* 客户端已走 */ } }
 }
 
-function ok(res, data, extra = {}) {
-  res.writeHead(200, {
+function ok(res, data, extra = {}, status = 200) {
+  res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'X-QT-Api-Version': '1.3',
+    'X-QT-Api-Version': API_VERSION,
     'X-QT-Agent-Version': '1.0.3-mock',
   })
   res.end(JSON.stringify({ ok: true, data, trace_id: `01MOCK${Date.now()}`, ...extra }))
 }
 
-function flat(res, obj) {
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'X-QT-Api-Version': '1.3' })
+/** 顶层平铺 + ok 的端点(R6-55:#7/#9/#10/#19/#69/#72/#28) */
+function flat(res, obj, status = 200) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-QT-Api-Version': API_VERSION,
+  })
   res.end(JSON.stringify({ ok: true, ...obj, trace_id: `01MOCK${Date.now()}` }))
 }
 
+/** 错误信封(00 §10):`code` 在**顶层**,`error` 四键齐全 */
 function fail(res, status, code, message, extra = {}) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-QT-Api-Version': API_VERSION,
+  })
   res.end(JSON.stringify({
     ok: false, code,
     error: { message, retryable: status >= 500, needs_human: false, ...extra },
     trace_id: `01MOCK${Date.now()}`,
   }))
+}
+
+/** `409 IDEMPOTENT_REPLAY`:错误信封 + `data` 回首次的结果(02 #2 R6-54 / #28 B-06) */
+function replay(res, code, message, data) {
+  res.writeHead(409, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-QT-Api-Version': API_VERSION,
+  })
+  res.end(JSON.stringify({
+    ok: false, code, data,
+    error: { message, retryable: false, needs_human: false },
+    trace_id: `01MOCK${Date.now()}`,
+  }))
+}
+
+/**
+ * 写端点的幂等键校验(02 §3.4 #2/#28/#43;E-02)。
+ * 返回 `null` 表示放行;否则已经把响应写完了。
+ */
+function requireIdempotencyKey(res, body, path) {
+  const key = body?.idempotency_key
+  if (typeof key === 'string' && key && key.length <= 128) return null
+  fail(res, 400, 'INVALID_ARGS', `POST ${path} 必带 idempotency_key(≤128 字符)`, {
+    reason: 'idempotency_key_required',
+    details: [{ pointer: '/idempotency_key', message: '必填' }],
+  })
+  return true
 }
 
 function readBody(req) {
@@ -136,9 +251,23 @@ const server = createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', '*')
   if (m === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
+  // ── 版本协商(02 §3.8):控制台声明的最低次版本高于本端 ⇒ 426,像真 Agent 一样把请求挡住
+  const wantMin = req.headers['x-qt-api-min']
+  if (!apiMinSatisfied(wantMin)) {
+    return fail(res, 426, 'UPGRADE_REQUIRED', `需要 API ${wantMin},当前 ${API_VERSION}`, {
+      needs_human: true,
+    })
+  }
+
   // ── 账号
   if (p === '/accounts' && m === 'GET') return ok(res, state.accounts, { next_cursor: null })
   if (p === '/accounts' && m === 'POST') {
+    // E-02:幂等键在 **body**,不带就 400(与真 Agent 同判据)
+    if (requireIdempotencyKey(res, body, '/accounts')) return
+    const idemKey = `accounts:${body.idempotency_key}`
+    const replayed = state.idempotency.get(idemKey)
+    // R6-54:重放 `409 IDEMPOTENT_REPLAY`,**`data` 是同一个 Account**(不重复建号、不消耗 seq)
+    if (replayed) return replay(res, 'IDEMPOTENT_REPLAY', '同一幂等键已建过号', replayed)
     const seq = state.accounts.filter((a) => a.channel === body.channel).length + 1
     const prefix = { qidian: 'qd', qq: 'qq', wechat: 'wx' }[body.channel]
     const a = {
@@ -150,12 +279,14 @@ const server = createServer(async (req, res) => {
       last_seen_at: null, settings: {},
     }
     state.accounts.push(a)
+    state.idempotency.set(idemKey, a)
     setTimeout(() => {
       a.state = 'login_required'
       a.state_code = body.channel === 'qq' ? 'WAIT_QRCODE' : 'WAIT_SMS'
       pushAccountState(a)
     }, 1200)
-    return ok(res, a)
+    // #2 成功是 201 Account
+    return ok(res, a, {}, 201)
   }
   let mm
   if ((mm = /^\/accounts\/([^/]+)$/.exec(p))) {
@@ -174,12 +305,13 @@ const server = createServer(async (req, res) => {
       a.state = { starting: 'running', stopping: 'stopped', stopped: 'stopped', disabled: 'disabled' }[next] ?? next
       pushAccountState(a)
     }, 1500)
-    return flat(res, { state: next })
+    return flat(res, { state: next }, 202)
   }
   if ((mm = /^\/accounts\/([^/]+)\/prompt$/.exec(p))) {
     const a = acct(mm[1])
-    if (!a || a.state !== 'login_required') return ok(res, { kind: null })
-    return ok(res, { kind: a.state_code, text: '请完成验证', countdown_s: 90 })
+    if (!a || a.state !== 'login_required') return flat(res, { kind: null, login_session_id: null })
+    // R6-56:响应顶层另带 login_session_id(prompt 对象本身不变)
+    return flat(res, { kind: a.state_code, text: '请完成验证', countdown_s: 90, login_session_id: 'ls_01MOCK' })
   }
   if ((mm = /^\/accounts\/([^/]+)\/login\/cancel$/.exec(p)) && m === 'POST') {
     const slot = state.resources.pools.windows.wechat_slots
@@ -193,19 +325,19 @@ const server = createServer(async (req, res) => {
     const a = acct(mm[1]); if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
     a.state = 'logging_in'; pushAccountState(a)
     setTimeout(() => { a.state = 'running'; a.state_code = ''; pushAccountState(a) }, 1500)
-    return flat(res, { state: 'logging_in', login_session_id: 'ls_01MOCK' })
+    return flat(res, { state: 'logging_in', login_session_id: 'ls_01MOCK' }, 202)
   }
   if ((mm = /^\/accounts\/([^/]+)\/capabilities$/.exec(p))) {
     const a = acct(mm[1])
     const matrix = {}
     for (const c of CAPABILITIES) matrix[c.op] = c.channels[a?.channel ?? 'qidian']
-    return ok(res, { capabilities: a?.capabilities ?? [], matrix })
+    return flat(res, { capabilities: a?.capabilities ?? [], matrix })
   }
   if ((mm = /^\/accounts\/([^/]+)\/purge$/.exec(p)) && m === 'POST') {
-    return flat(res, { job_id: newJob('account_purge', () => ({ purged: true })) })
+    return flat(res, { job_id: newJob('account_purge', () => ({ purged: true })) }, 202)
   }
   if ((mm = /^\/accounts\/([^/]+)\/export-identity$/.exec(p)) && m === 'POST') {
-    return flat(res, { job_id: newJob('identity_export', () => ({ download_url: '/api/v1/exports/mock/file' })) })
+    return flat(res, { job_id: newJob('identity_export', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
   }
   if (/^\/accounts\/[^/]+\/(credential|settings|runtime\/.+|webui\/.+|stream\/input)$/.test(p)) {
     const a = acct(p.split('/')[2])
@@ -232,18 +364,21 @@ const server = createServer(async (req, res) => {
   if (p === '/accounts/batch' && m === 'POST') {
     const results = {}
     for (const id of body.ids ?? []) results[id] = { ok: true, code: 'OK' }
-    return ok(res, { results })
+    return flat(res, { results })
   }
   if (p === '/device-profiles/templates') {
+    // #24:字段名统一 `profile_key`,另带 `release/weight`
     return ok(res, [
-      { profile_key: 'xiaomi-mi11', brand: 'Xiaomi', model: 'MI 11' },
-      { profile_key: 'huawei-p40', brand: 'HUAWEI', model: 'P40' },
-    ])
+      { profile_key: 'xiaomi-mi11', brand: 'Xiaomi', model: 'MI 11', release: '13', weight: 5 },
+      { profile_key: 'huawei-p40', brand: 'HUAWEI', model: 'P40', release: '12', weight: 3 },
+    ], { next_cursor: null })
   }
 
   // ── 能力 / 指令
-  if (p === '/capabilities') return ok(res, CAPABILITIES, { capabilities_version: 'mock-1' })
+  if (p === '/capabilities') return ok(res, CAPABILITIES, { capabilities_version: 'mock-1', next_cursor: null })
   if ((mm = /^\/accounts\/([^/]+)\/commands$/.exec(p)) && m === 'POST') {
+    const a = acct(mm[1])
+    if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
     const text = String(body.args?.text ?? '')
     // R6-48:含控制字符在入口被拒
     if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) {
@@ -251,22 +386,71 @@ const server = createServer(async (req, res) => {
         reason: 'text_has_control_chars', details: [{ pointer: '/text', message: 'control chars' }],
       })
     }
+    const isWrite = (CAPABILITIES.find((c) => c.op === body.op)?.kind ?? 'write') !== 'read'
+    if (isWrite && requireIdempotencyKey(res, body, `/accounts/${mm[1]}/commands`)) return
+    const idemKey = `cmd:${mm[1]}:${body.idempotency_key}`
+    const before = state.idempotency.get(idemKey)
+    // B-06:重放的响应体仍是**完整 CommandResult**,`trace_id` 是首次那条
+    if (before) return replay(res, 'IDEMPOTENT_REPLAY', '同一幂等键已执行过', before)
+
+    /*
+     * 🔴 R6-52:**HTTP 状态说「有没有被受理执行」,结果码说「执行成了没有」**。
+     * 业务失败(SEND_FAILED / UNCONFIRMED / GATE_BLOCKED …)一律 `200 + ok:false + CommandResult`,
+     * 不是 4xx/5xx —— mock 必须能造出这一支,否则前端永远发现不了自己把它当异常吞了。
+     * 用正文里的关键词触发,方便开发时自测。
+     */
+    let code = body.op?.startsWith('send') ? 'DELIVERED' : 'OK'
+    if (text.includes('#fail')) code = 'SEND_FAILED'
+    else if (text.includes('#unconfirmed')) code = 'SEND_CALLED_BUT_UNCONFIRMED'
+    else if (text.includes('#gate')) code = 'GATE_BLOCKED'
+    const okResult = code === 'DELIVERED' || code === 'OK'
     const result = {
-      ok: true, code: body.op?.startsWith('send') ? 'DELIVERED' : 'OK',
-      data: { message_id: `msg_${Date.now()}`, confirmed_by: 'ingest_merge', confirm_ms: 742, needs_review: false },
-      cost_ms: 865, trace_id: `01MOCK${Date.now()}`,
-      source: 'qidian_db', state_before: 'READY', state_after: 'READY',
+      ok: okResult,
+      code,
+      data: {
+        message_id: `msg_${Date.now()}`,
+        ext_msg_id: okResult ? `qd:${Date.now()}` : null,
+        confirmed_by: code === 'SEND_CALLED_BUT_UNCONFIRMED' ? null : 'ingest_merge',
+        confirm_ms: 742,
+      },
+      cost_ms: code === 'SEND_CALLED_BUT_UNCONFIRMED' ? 15009 : 865,
+      trace_id: `01MOCK${Date.now()}`,
+      source: 'qidian_db',
+      state_before: 'READY',
+      state_after: 'READY',
+      ...(okResult ? {} : {
+        error: {
+          message: {
+            SEND_FAILED: '发送失败:目标会话不可达',
+            SEND_CALLED_BUT_UNCONFIRMED: '已调用发送但未读回确认',
+            GATE_BLOCKED: '被发送闸拦下(超过每分钟上限)',
+          }[code],
+          retryable: code !== 'GATE_BLOCKED',
+          needs_human: code === 'GATE_BLOCKED',
+        },
+      }),
     }
+    if (isWrite) state.idempotency.set(idemKey, result)
     emit('command_done', { trace_id: result.trace_id, code: result.code, cost_ms: result.cost_ms })
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+    // #28 的响应体**本身就是信封**:顶层平铺,不再包一层 data
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-QT-Api-Version': API_VERSION,
+    })
     return res.end(JSON.stringify(result))
   }
   if (p === '/broadcast/commands' && m === 'POST') {
+    if (requireIdempotencyKey(res, body, '/broadcast/commands')) return
     const results = {}
     for (const id of body.account_ids ?? []) {
-      results[id] = { ok: true, code: 'DELIVERED', cost_ms: 700, trace_id: `01MOCK${id}` }
+      results[id] = {
+        ok: true, code: 'DELIVERED', cost_ms: 700, trace_id: `01MOCK${id}`,
+        source: 'qidian_db', state_before: 'READY', state_after: 'READY',
+        data: { message_id: `msg_${id}_${Date.now()}` },
+      }
     }
-    return ok(res, { broadcast_id: 'bc_mock', results })
+    // #36:`200 {broadcast_id, results}` 顶层平铺
+    return flat(res, { broadcast_id: 'bc_mock', results })
   }
 
   // ── 会话 / 消息
@@ -284,14 +468,21 @@ const server = createServer(async (req, res) => {
     return ok(res, rows.slice(0, Number(q.get('limit') ?? 50)), { next_cursor: null })
   }
   if (p === '/messages/export' && m === 'POST') {
-    return flat(res, { job_id: newJob('messages_export', () => ({ download_url: '/api/v1/exports/mock/file' })) })
+    // #51 入参逐字 `{fmt:'jsonl|csv|eml', with_media:'none|zip', filter}`
+    if (!['jsonl', 'csv', 'eml'].includes(String(body.fmt))) {
+      return fail(res, 400, 'INVALID_ARGS', 'fmt 只能是 jsonl|csv|eml', {
+        reason: 'bad_field', details: [{ pointer: '/fmt', message: 'jsonl|csv|eml' }],
+      })
+    }
+    return flat(res, { job_id: newJob('messages_export', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
   }
 
   // ── 作业
   if ((mm = /^\/jobs\/([^/]+)$/.exec(p))) {
     const j = state.jobs.get(mm[1])
     if (!j) return fail(res, 404, 'TARGET_NOT_FOUND', '作业不存在')
-    return flat(res, j)
+    // #107 的时间键是 ISO `*_at`(00 §6「API/事件时间一律 ISO 8601 带时区偏移」)
+    return ok(res, j)
   }
   if ((mm = /^\/jobs\/([^/]+)\/cancel$/.exec(p)) && m === 'POST') {
     const j = state.jobs.get(mm[1]); if (j) { j.state = 'cancelled'; emit('job', { ...j }) }
@@ -310,9 +501,15 @@ const server = createServer(async (req, res) => {
     return ok(res, { id: mm[1], name: '每日报价采集', version: 3, steps: 4, enabled: true, yaml: 'name: 每日报价采集\nsteps:\n  - op: list_sessions\n  - op: read_messages\n' })
   }
   if ((mm = /^\/workflows\/([^/]+)\/run$/.exec(p)) && m === 'POST') {
+    // #43 `{args, idempotency_key?}` → `202 {run_id}`;幂等键在 body(E-02)
+    if (requireIdempotencyKey(res, body, `/workflows/${mm[1]}/run`)) return
+    const idemKey = `wf:${mm[1]}:${body.idempotency_key}`
+    const before = state.idempotency.get(idemKey)
+    if (before) return replay(res, 'IDEMPOTENT_REPLAY', '同一幂等键已触发过该工作流', before)
     const runId = `run_${Date.now().toString(36)}`
+    state.idempotency.set(idemKey, { run_id: runId })
     setTimeout(() => emit('workflow', { run_id: runId, status: 'started' }), 300)
-    return flat(res, { run_id: runId })
+    return flat(res, { run_id: runId }, 202)
   }
   if ((mm = /^\/workflows\/runs\/([^/]+)$/.exec(p))) {
     return ok(res, {
@@ -327,37 +524,87 @@ const server = createServer(async (req, res) => {
 
   // ── 资源 / 系统
   if (p === '/resources') return flat(res, state.resources)
-  if (p === '/resources/precheck') return ok(res, { can_add: state.resources.can_add[body.channel] ?? 0 })
-  if (p === '/resources/calibrate') return ok(res, { suggestions: { qidian: 2400, qq: 420, wechat: 1500 } })
-  if (p === '/system/cleanup/run') return flat(res, { job_id: newJob('system_cleanup', () => ({ freed_mb: 512 })) })
-  if (p === '/system/metrics') return ok(res, state.metrics)
+  // 🔴 裁决③:#70 的 `can_add` 是 **bool**(#69 的同名键才是数量)
+  if (p === '/resources/precheck') {
+    const n = state.resources.can_add[body.channel] ?? 0
+    return flat(res, {
+      can_add: n > 0,
+      reason: n > 0 ? null : 'pool_exhausted',
+      alternatives: n > 0 ? [] : [{ action: 'stop_account', id: 'qd03' }],
+    })
+  }
+  // #71/#25:R6-58 (x) 一律 `202 {job_id}`,结果经 #107 取
+  if (p === '/resources/calibrate') {
+    return flat(res, { job_id: newJob('resources_calibrate', () => ({ suggestions: { qidian: 2400, qq: 420, wechat: 1500 } })) }, 202)
+  }
+  if (p === '/system/cleanup/run') return flat(res, { job_id: newJob('system_cleanup', () => ({ freed_mb: 512 })) }, 202)
+  // #77 的响应列是字面键集(hardware/ours/…)⇒ 顶层平铺(R6-55),与真后端一致
+  if (p === '/system/metrics') return flat(res, state.metrics)
   if (p === '/system/version') {
-    return ok(res, {
-      agent: '1.0.3-mock', winagent: { version: '1.0.2-mock', online: true, user_agent: true },
+    // 🔴 裁决①:`agent` 是 `{version}` 对象(真后端现实现),不是裸字符串
+    return flat(res, {
+      agent: { version: '1.0.3-mock', api_version: API_VERSION },
+      winagent: { version: '1.0.2-mock', online: true, user_agent: true },
       kernel: '6.6.123-binder', kernel_state: 'OURS', wsl: '2.4.10', wsl_state: 'WSL2_STORE',
-      docker: '27.3.1', distro: 'qtrade', api_version: '1.3', capabilities_version: 'mock-1',
-      schema_version: 12, wa_schema_version: 4, migration: { state: 'idle' },
+      docker: '27.3.1', distro: 'qtrade', images: {}, api_version: API_VERSION,
+      capabilities_version: 'mock-1', schema_version: 12, wa_schema_version: 4,
+      migration: { state: 'idle' },
     })
   }
   if (p === '/system/health') {
-    return ok(res, {
-      ok: true, agent: { version: '1.0.3-mock', api_version: '1.3', uptime_s: 3600, db_mb: 120, wal_mb: 8 },
-      dockerd: true, winagent: { online: true, version: '1.0.2-mock', user_agent: true },
-      disk_free_mb: 43008, checks: { H01: 'ok', H03: 'ok', H12: 'firing' },
+    // #72 顶层平铺;R6-58 (y):`checks` 另带 per-account 子键(01 §2.7.3.4 的账号健康行取这里)
+    return flat(res, {
+      agent: { version: '1.0.3-mock', api_version: API_VERSION, uptime_s: 3600, db_mb: 120, wal_mb: 8 },
+      dockerd: true,
+      winagent: { online: true, version: '1.0.2-mock', user_agent: true },
+      accounts: { running: 3, n: state.accounts.length },
+      disk_free_mb: 43008,
+      mem: { avail_mb: 6246, level: 'normal' },
+      checks: {
+        H01: 'ok', H03: 'ok', H12: 'firing',
+        accounts: {
+          qd01: { H04: 'ok', H05: 'ok', H06: 'ok', H07: 'unknown', H08: 'ok' },
+          qq01: { H04: 'ok', H05: 'unknown', H06: 'ok', H07: 'unknown', H08: 'ok' },
+        },
+      },
+      scheduler: { retention_cleanup: { runs: 3, skipped: 0, errors: 0 } },
       alerts: [],
     })
   }
   if (p === '/system/env') {
-    return ok(res, {
-      net_state: 'VPN_ACTIVE_WITH_PROXY', proxy: 'winhttp proxy.corp:8080', vpn_adapter: 'Corp VPN',
-      wsl_subnet: '172.23.16.0/20', host_ip: '172.23.16.1', mtu: 1400, clock_drift_s: 0.3,
-      pending_restart: false, kernel_state: 'OURS', wsl_state: 'WSL2_STORE',
+    // 🔴 #74:Windows 侧(= /wa/v1/net)与 WSL 侧分成两半;WinAgent 不可达时 windows 为 null
+    return flat(res, {
+      windows: {
+        net_state: 'VPN_ACTIVE_WITH_PROXY',
+        proxy: 'winhttp proxy.corp:8080',
+        vpn_adapter: 'Corp VPN',
+        wsl_subnet: '172.23.16.0/20',
+        host_ip: '172.23.16.1',
+        docker_conflict: { state: 'ok' },
+      },
+      windows_error: null,
+      wsl: {
+        iface: 'eth0',
+        mtu: 1400,
+        resolv_conf: { source: 'custom', nameservers: ['223.5.5.5'] },
+        docker: { default_address_pools: [{ base: '10.213.0.0/16', size: 24 }] },
+        ksm: { run: 0 },
+        zram: { disksize_mb: 0 },
+        kernel_release: '6.6.123-binder',
+        clock: { drift_ms: 300, last_probe_at: now() },
+        adb_server: { running: true, reason: null },
+      },
       wslconfig: { memory: '8GB' },
-      docker_cidr: '10.213.0.0/16', docker_conflict: { state: 'ok' },
+      reboot_required: false,
+      winagent: { online: true, version: '1.0.2-mock', user_agent: true },
     })
   }
   if (p === '/system/notice') {
-    return ok(res, {
+    return flat(res, {
+      // 真后端顺带回「勾过没有」(ack_ms / acked_at / acked_version),控制台据此判,不本地存
+      ack_ms: state.compliance.ack_ms,
+      acked_at: state.compliance.ack_ms ? new Date(state.compliance.ack_ms).toISOString() : null,
+      acked_version: state.compliance.ack_ms ? state.compliance.notice_version : null,
       notice_version: 'v1',
       text: [
         '1. 本软件通过自动化方式操作企点/QQ/微信客户端。',
@@ -367,14 +614,25 @@ const server = createServer(async (req, res) => {
       ].join('\n'),
     })
   }
+  // #87 勾选合规告知(写 settings compliance.*)
+  if (p === '/system/notice/ack' && m === 'POST') {
+    state.compliance = { ack_ms: Date.now(), notice_version: String(body.notice_version ?? 'v1') }
+    return flat(res, { ok: true })
+  }
   if (p === '/system/probes') {
+    const kind = url.searchParams.get('kind') ?? 'result'
+    // 🔴 R6-58 (dc):`?kind=observed` 出参**两键** `{data, targets}`,行里带 `id` 与 `in_config`
+    if (kind === 'observed') {
+      return ok(res, state.observed, { targets: state.probeTargets, kind })
+    }
+    // 🔴 行键名按真后端(= 04 `probe_results` 列):结论是 `status`、诊断是 `detail`
     return ok(res, [
-      { target: 'apk_url', result: 'OK' },
-      { target: 'mail_imap', result: 'OK' },
-      { target: 'mail_pop3', result: 'SKIPPED' },
-      { target: 'qidian_msf', result: 'PROXY_REQUIRED' },
-      { target: 'winagent_from_wsl', result: 'OK' },
-    ], { next_cursor: null })
+      { side: 'wsl', target: 'apk_url', status: 'OK', level_reached: 'tls', detail: null, at: now() },
+      { side: 'wsl', target: 'mail_imap', status: 'OK', level_reached: 'tls', detail: null, at: now() },
+      { side: 'wsl', target: 'mail_pop3', status: 'SKIPPED', level_reached: 'none', detail: '目标未配置', at: now() },
+      { side: 'wsl', target: 'qidian_msf', status: 'PROXY_REQUIRED', level_reached: 'tcp', detail: null, at: now() },
+      { side: 'windows', target: 'winagent_from_wsl', status: 'OK', level_reached: 'http', detail: null, at: now() },
+    ], { next_cursor: null, kind })
   }
   if (p === '/system/probe' && m === 'POST') {
     if (body.mode === 'sample') {
@@ -386,29 +644,59 @@ const server = createServer(async (req, res) => {
         ],
       })
     }
-    return ok(res, { run_id: 'probe_mock', results: [{ target: 'apk_url', result: 'OK' }] })
-  }
-  if (p === '/system/selftest' && m === 'POST') return flat(res, { run_id: 'st_mock' })
-  if (p === '/system/selftest') {
-    return ok(res, [
-      { item: 'agent', label: 'Agent 健康', level: 'ok' },
-      { item: 'winagent', label: 'WinAgent 健康', level: 'ok' },
-      { item: 'kernel', label: '内核 binder', level: 'ok' },
-      { item: 'dockerd', label: 'dockerd', level: 'ok' },
-      { item: 'wslconfig', label: '.wslconfig memory=8GB(建议 11GB)', level: 'warn', message: '建议调到 11GB' },
-    ], { next_cursor: null })
-  }
-  if (p === '/system/diagnostics' && m === 'POST') {
-    return flat(res, { job_id: newJob('diagnostics', () => ({ download_url: '/api/v1/exports/mock/file' })) })
-  }
-  if (p === '/system/public-endpoint') {
-    return ok(res, {
-      public_ip: '113.88.12.34', checked_at: now(), configured_host: 'qt.example.com',
-      dns_resolved_ip: '113.88.12.34', matches: true, last_changed_at: now(),
-      history: [{ at: now(), from_ip: '113.88.12.10', to_ip: '113.88.12.34' }],
+    return flat(res, {
+      run_id: `probe_${Date.now().toString(36)}`,
+      results: [{ side: 'wsl', target: 'apk_url', status: 'OK', level_reached: 'tls', detail: null }],
     })
   }
-  if (p === '/system/docker-proxy' || p === '/system/wsl-restart') return flat(res, { ok: true, applied: true })
+  // #78 → 202 {run_id}
+  if (p === '/system/selftest' && m === 'POST') {
+    state.selftestRunId = `st_${Date.now().toString(36)}`
+    return flat(res, { run_id: state.selftestRunId }, 202)
+  }
+  // #79b 不带 run_id = 最近一轮;从没跑过回 `{ok:true, data:null, run_id:null}`(不是 404)
+  if (p === '/system/selftest') {
+    if (!state.selftestRunId && !url.searchParams.get('run_id')) {
+      return ok(res, null, { run_id: null })
+    }
+    const runId = state.selftestRunId ?? url.searchParams.get('run_id')
+    // 🔴 #79 的 data 是**一轮的对象**(不是行数组);行由控制台 `selftestRows()` 派生
+    return ok(res, {
+      run_id: runId,
+      redroid_boot_ms: 8200,
+      napcat_ok: true,
+      winagent_ok: true,
+      winagent_version: '1.0.2-mock',
+      probes: [
+        { side: 'wsl', target: 'apk_url', status: 'OK', level_reached: 'tls', detail: null },
+        { side: 'wsl', target: 'mail_pop3', status: 'SKIPPED', level_reached: 'none', detail: '目标未配置' },
+      ],
+      started_at: now(),
+      finished_at: now(),
+      skipped: [],
+    }, { run_id: runId })
+  }
+  if (p === '/system/diagnostics' && m === 'POST') {
+    return flat(res, { job_id: newJob('diagnostics', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
+  }
+  if (p === '/system/public-endpoint') {
+    // 🔴 #102 逐字键集:没有 matches / dns_resolved_ip / history / configured_host
+    return flat(res, {
+      public_ip: '113.88.12.34',
+      public_ip_v6: null,
+      configured_domain: String(state.settings.api.public_domain || '') || null,
+      checked_at: now(),
+      changed_at: now(),
+      probe: { url: state.settings.api.public_ip_probe_urls?.[0] ?? null, unreachable_rounds: 0 },
+    })
+  }
+  // #85:有账号在跑时不立刻应用(回 pending + 原因 + 在跑的账号)
+  if (p === '/system/docker-proxy') {
+    const running = state.accounts.filter((a) => a.state === 'running').map((a) => a.id)
+    if (running.length) return flat(res, { pending: true, reason: 'accounts_running', running })
+    return flat(res, { applied: true, proxy: body.enable ? 'http://127.0.0.1:7890' : null })
+  }
+  if (p === '/system/wsl-restart') return flat(res, { ok: true })
 
   // ── 邮件
   if (p === '/mail/status') {
@@ -416,6 +704,11 @@ const server = createServer(async (req, res) => {
       enabled: true,
       routes: [{
         route_id: 'r_default', channel: null, account_id: null, scope: 'default',
+        // #56 逐字:另带 `route:{id,channel,account_id,outbound_template_id,inbound_template_id}`
+        route: {
+          id: 'r_default', channel: null, account_id: null,
+          outbound_template_id: 'tpl-ibquote', inbound_template_id: null,
+        },
         inbound: {
           protocol_configured: 'imap', protocol_active: 'pop3',
           fallback: { since_at: now(), reason: 'IMAP 登录失败' },
@@ -461,30 +754,118 @@ const server = createServer(async (req, res) => {
   if (p === '/mail/cleanup/log') {
     return ok(res, [{ id: 'c1', at: now(), deleted: 12, archived: 30, status: 'ok' }], { next_cursor: null })
   }
-  if (p === '/mail/cleanup/run') return flat(res, { job_id: newJob('mail_cleanup', () => ({ freed_mb: 20 })) })
-  if (p === '/mail/test') return ok(res, { ok: true, imap_ok: false, pop3_ok: true })
-  if (p === '/mail/hmac-keys' && m === 'POST') return ok(res, { secret: `hmac_${Math.random().toString(36).slice(2)}` })
-  if (/^\/mail\/hmac-keys\/[^/]+$/.test(p) && m === 'DELETE') return flat(res, { ok: true })
-  if (/^\/mail\/templates\/[^/]+\/preview$/.test(p)) {
-    return ok(res, { subject: '[QTrade] 微信 某某群 2026-09-20 10:03', body_text: '渠道: 微信\n会话: 某某群\n正文: 3M 报价 1.62', warnings: [] })
+  if (p === '/mail/cleanup/run') return flat(res, { job_id: newJob('mail_cleanup', () => ({ freed_mb: 20 })) }, 202)
+  if (p === '/mail/test') return flat(res, { imap_ok: false, pop3_ok: true })
+  // 短名表的唯一来源(R6-58 (ac)):不回密钥
+  if (p === '/mail/hmac-keys' && m === 'GET') return ok(res, state.hmacKeys, { next_cursor: null })
+  if (p === '/mail/hmac-keys' && m === 'POST') {
+    if (!/^[A-Za-z0-9._-]{1,32}$/.test(String(body.short_name ?? ''))) {
+      return fail(res, 400, 'INVALID_ARGS', '短名只能是字母/数字/点/下划线/连字符,长度 1~32', {
+        reason: 'short_name_invalid',
+      })
+    }
+    if (state.hmacKeys.some((k) => k.short_name === body.short_name)) {
+      return fail(res, 400, 'INVALID_ARGS', '短名已被占用(全局唯一)', { reason: 'short_name_taken' })
+    }
+    state.hmacKeys.push({ sender: body.sender, short_name: body.short_name, created_at: now() })
+    return ok(res, { secret: `hmac_${Math.random().toString(36).slice(2)}` })
+  }
+  if ((mm = /^\/mail\/hmac-keys\/([^/]+)$/.exec(p)) && m === 'DELETE') {
+    const i = state.hmacKeys.findIndex((k) => k.short_name === mm[1])
+    if (i < 0) return fail(res, 404, 'TARGET_NOT_FOUND', '该短名不存在')
+    state.hmacKeys.splice(i, 1)
+    return flat(res, { ok: true })
+  }
+  // #104 路径带 {id}(后端实现成 `/mail/templates/preview` 的写法是后端该改)
+  if (/^\/mail\/templates\/[^/]+\/preview$/.test(p) && m === 'POST') {
+    return flat(res, {
+      subject: '[QTrade] 微信 某某群 2026-09-20 10:03',
+      body_text: '渠道: 微信\n会话: 某某群\n正文: 3M 报价 1.62',
+      fields_used: ['channel', 'session_name', 'text'],
+      warnings: [],
+    })
   }
 
   // ── 设置
-  if ((mm = /^\/settings\/([a-z-]+)$/.exec(p))) {
+  /*
+   * #76b `PUT /settings/probe`:入参**只收** `observed_ids`(整数数组,**采纳后的全集**,`[]` 合法);
+   * 传 `targets` 一律 400 `use_observed_ids`。出参逐字四键。
+   */
+  if (p === '/settings/probe' && m === 'PUT') {
+    if (body.targets !== undefined) {
+      return fail(res, 400, 'INVALID_ARGS', '请改用 observed_ids(值 = 行的 probe_targets_observed.id)', {
+        reason: 'use_observed_ids',
+      })
+    }
+    const ids = body.observed_ids
+    if (!Array.isArray(ids) || ids.some((x) => !Number.isInteger(x))) {
+      return fail(res, 400, 'INVALID_ARGS', 'observed_ids 必须是整数数组', { reason: 'bad_field' })
+    }
+    if (new Set(ids).size !== ids.length) {
+      return fail(res, 400, 'INVALID_ARGS', 'observed_ids 有重复 id', { reason: 'duplicate_ids' })
+    }
+    const unknown = ids.filter((id) => !state.observed.some((r) => r.id === id))
+    if (unknown.length) return fail(res, 404, 'TARGET_NOT_FOUND', `不存在的采样行 id:${unknown.join(',')}`)
+    const picked = new Set(ids)
+    for (const row of state.observed) {
+      // 全集语义:不在集合里的已采纳行取消采纳;已采纳的再次入选不刷新时刻(幂等)
+      if (picked.has(row.id)) {
+        if (!row.adopted_at) row.adopted_at = now()
+        row.in_config = true
+      } else {
+        row.adopted_at = null
+        row.in_config = false
+      }
+    }
+    const adoptedRows = state.observed.filter((r) => picked.has(r.id))
+    state.probeTargets = adoptedRows.map((r) => `${r.remote_host || r.remote_ip}:${r.port}`)
+    const byChannel = { qidian_hosts: [], qq_hosts: [], wechat_hosts: [] }
+    for (const r of adoptedRows) {
+      const k = `${r.channel}_hosts`
+      if (byChannel[k]) byChannel[k].push(`${r.remote_host || r.remote_ip}:${r.port}`)
+    }
+    return flat(res, {
+      adopted: adoptedRows.map((r) => r.id),
+      adopted_rows: adoptedRows,
+      targets: state.probeTargets,
+      hosts_by_channel: byChannel,
+    })
+  }
+
+  // 🔴 #88 的 `group` 枚举逐字(不是任意 `[a-z-]+` —— 那会把 `/settings/api-clients` 也吞掉)
+  if ((mm = /^\/settings\/(api|winagent|runtime|pool|bus|adapters|asr|ocr|messages|media|retention|events|mail|log|resources|compliance)$/.exec(p))) {
     const g = mm[1]
-    if (m === 'GET') return ok(res, state.settings[g] ?? {})
-    if (m === 'PUT') { state.settings[g] = { ...(state.settings[g] ?? {}), ...body }; return ok(res, state.settings[g]) }
+    // `compliance` 不在 #88 的 group 枚举里 ⇒ 404(与真 Agent 一致;合规告知走 #86/#87)
+    if (!Object.prototype.hasOwnProperty.call(state.settings, g)) {
+      return fail(res, 404, 'TARGET_NOT_FOUND', `没有这个设置组:${g}(枚举见 02 #88)`)
+    }
+    if (m === 'GET') return ok(res, state.settings[g], { group: g })
+    if (m === 'PUT') {
+      // #89 是**整组替换**(缺省键回默认);v1 除 resources 外一律 restart_required
+      state.settings[g] = { ...body }
+      return ok(res, state.settings[g], { group: g, restart_required: g !== 'resources', config_written: true })
+    }
   }
   if (p === '/settings/api-clients') {
     if (m === 'GET') {
       return ok(res, [
-        { app_id: 'console', name: '控制台', prefix6: 'qt_abc', level: 'admin', ip_allow: ['127.0.0.1'], created_at: now(), last_used_at: now() },
-        { app_id: 'ibquote', name: 'ibquote fetcher', prefix6: 'qt_xyz', level: 'read', ip_allow: ['10.0.0.0/8'], created_at: now() },
+        {
+          app_id: 'console', name: '控制台', auth_kind: 'bearer', level: 'admin', ip_allow: [],
+          allow_ops: ['*'], allow_accounts: ['*'], rate_per_min: 120, api_version_min: 1,
+          enabled: true, secret_ref: null, builtin: true,
+          created_at: now(), updated_at: now(), last_used_at: now(), revoked_at: null,
+        },
+        {
+          app_id: 'ibquote', name: 'ibquote fetcher', auth_kind: 'bearer', level: 'read',
+          ip_allow: ['10.0.0.0/8'], allow_ops: ['read_messages'], allow_accounts: ['*'],
+          rate_per_min: 60, api_version_min: 1, enabled: true, secret_ref: null, builtin: false,
+          created_at: now(), updated_at: now(), last_used_at: null, revoked_at: null,
+        },
       ], { next_cursor: null })
     }
-    return ok(res, { app_id: `app_${Date.now().toString(36)}`, token: `qt_${Math.random().toString(36).slice(2)}` })
+    return flat(res, { app_id: `app_${Date.now().toString(36)}`, token: `qt_${Math.random().toString(36).slice(2)}` })
   }
-  if (/^\/settings\/api-clients\/[^/]+\/rotate$/.test(p)) return ok(res, { token: `qt_${Math.random().toString(36).slice(2)}` })
+  if (/^\/settings\/api-clients\/[^/]+\/rotate$/.test(p)) return flat(res, { token: `qt_${Math.random().toString(36).slice(2)}`, grace_minutes: 10 })
   if (/^\/settings\/api-clients\/[^/]+$/.test(p) && m === 'DELETE') return flat(res, { ok: true })
   if (p === '/settings/mail/routes') {
     if (m === 'GET') return ok(res, [], { next_cursor: null })
@@ -505,22 +886,38 @@ const server = createServer(async (req, res) => {
     return ok(res, { ...body, updated_at: now() })
   }
   if (p === '/settings/webhooks') {
-    if (m === 'GET') return ok(res, [], { next_cursor: null })
-    return ok(res, { id: `wh_${Date.now().toString(36)}` })
+    if (m === 'GET') return ok(res, state.webhooks ?? [], { next_cursor: null })
+    state.webhooks = [...(state.webhooks ?? []), { id: `wh_${Date.now().toString(36)}`, url: body.url, enabled: true }]
+    return flat(res, { id: state.webhooks[state.webhooks.length - 1].id })
   }
   if (/^\/settings\/webhooks\/[^/]+$/.test(p)) return flat(res, { ok: true })
-  if (p === '/settings/public-endpoint' || p === '/settings/probe') return flat(res, { ok: true, adopted: [], targets: [] })
 
   // ── 审计
   if (p === '/audit') {
+    /*
+     * 🔴 R6-58 (ag):列集定死十列 —— `id, ts_ms, kind, transport, actor, action, account_id,
+     * trace_id, result_code, detail_json`。`cost_ms / ip / http_status / method / path / sig_ok`
+     * **在 `detail_json` 里**,不是独立列(此前 mock 把它们平铺,养出了前端按 `ts/op/code` 取值的错)。
+     */
     const kind = url.searchParams.get('kind') ?? 'command'
-    const rows = Array.from({ length: 12 }, (_, i) => ({
-      id: `au${i}`, ts: new Date(Date.now() - i * 60000).toISOString(), kind,
-      account_id: 'qd01', op: 'send_text', action: 'command.run', actor: 'token:console',
-      transport: 'local', ip: '127.0.0.1', code: 'DELIVERED', cost_ms: 820,
-      http_status: 200, method: 'POST', path: '/api/v1/accounts/qd01/commands', sig_ok: true,
-      args_digest: 'ab12cd34', trace_id: `01TRACE${i}`, source: 'agent',
-    }))
+    const rows = Array.from({ length: 12 }, (_, i) => {
+      const isApi = kind === 'api'
+      const detail = isApi
+        ? { http_status: 200, cost_ms: 2, ip: '127.0.0.1', method: 'GET', path: '/api/v1/accounts' }
+        : { cost_ms: 820, ip: '127.0.0.1', op: 'send_text', args_digest: 'ab12cd34', source: 'agent' }
+      return {
+        id: 300 - i,
+        ts_ms: Date.now() - i * 60000,
+        kind,
+        transport: 'local',
+        actor: 'token:console',
+        action: isApi ? 'GET /api/v1/accounts' : 'send_text',
+        account_id: kind === 'command' ? 'qd01' : null,
+        trace_id: `01TRACE${i}`,
+        result_code: isApi ? '200' : 'DELIVERED',
+        detail_json: JSON.stringify(detail),
+      }
+    })
     return ok(res, rows, { next_cursor: null })
   }
 
@@ -538,7 +935,13 @@ const server = createServer(async (req, res) => {
 })
 
 const wss = new WebSocketServer({ server, path: '/api/v1/events' })
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // 先 accept 再 close(4401):这正是后端要改成的行为(E-05);mock 提前照这个语义来
+  const q = new URL(req?.url ?? '/', `http://127.0.0.1:${PORT}`).searchParams
+  if (q.get('token') === 'bad') {
+    ws.close(4401, 'invalid token')
+    return
+  }
   sockets.add(ws)
   ws.on('close', () => sockets.delete(ws))
   ws.on('message', (raw) => {

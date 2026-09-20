@@ -41,7 +41,7 @@ function pct(v?: number | null): string { return v == null ? '—' : `${v}%` }
 function budgetOf(ch: string) {
   const rows = (m.value?.budget_vs_actual ?? []).filter((b) => accounts.byId[b.id]?.channel === ch)
   const quota = rows.reduce((s, r) => s + r.quota_mb, 0)
-  const rss = rows.reduce((s, r) => s + r.rss_mb, 0)
+  const rss = rows.reduce((s, r) => s + (r.rss_mb ?? 0), 0)
   const drift = quota ? Math.round(((rss - quota) / quota) * 100) : 0
   return { quota, rss, drift, loose: Math.abs(drift) > DRIFT_THRESHOLD }
 }
@@ -114,19 +114,23 @@ onMounted(() => { void refresh() })
         <!-- 左:整机硬件 -->
         <section class="qt-card box" :data-testid="T.col('host')">
           <div class="qt-section-title">整机硬件</div>
+          <!-- 02 #77 的 `hardware` 组后端本期还没下发:显示「—」并说明,不白屏也不假装有数 -->
+          <p v-if="m && !m.hardware" class="qt-small qt-muted">
+            整机硬件快照暂不可用(Agent 未下发 <code>hardware</code> 组);下方各项显示「—」。
+          </p>
 
           <h4>内存</h4>
-          <div class="kv"><span>物理总量</span><b :data-testid="T.memHost('total')">{{ mb(m?.hardware.mem.total_mb) }}</b></div>
-          <div class="kv"><span>已用</span><b :data-testid="T.memHost('used')">{{ mb(m?.hardware.mem.used_mb) }}</b></div>
-          <div class="kv"><span>可用</span><b :data-testid="T.memHost('avail')">{{ mb(m?.hardware.mem.avail_mb) }}</b></div>
-          <div class="kv"><span>vmmem(WSL VM)</span><b :data-testid="T.memVmmem">{{ mb(m?.hardware.mem.vmmem_mb) }}</b></div>
+          <div class="kv"><span>物理总量</span><b :data-testid="T.memHost('total')">{{ mb(m?.hardware?.mem?.total_mb) }}</b></div>
+          <div class="kv"><span>已用</span><b :data-testid="T.memHost('used')">{{ mb(m?.hardware?.mem?.used_mb) }}</b></div>
+          <div class="kv"><span>可用</span><b :data-testid="T.memHost('avail')">{{ mb(m?.hardware?.mem?.avail_mb) }}</b></div>
+          <div class="kv"><span>vmmem(WSL VM)</span><b :data-testid="T.memVmmem">{{ mb(m?.hardware?.mem?.vmmem_mb) }}</b></div>
 
           <h4>CPU</h4>
-          <div class="kv"><span>逻辑核</span><b :data-testid="T.cpuHost('cores')">{{ m?.hardware.cpu.logical_cores ?? '—' }}</b></div>
-          <div class="kv"><span>总负载</span><b :data-testid="T.cpuHost('load')">{{ pct(m?.hardware.cpu.load_pct) }}</b></div>
+          <div class="kv"><span>逻辑核</span><b :data-testid="T.cpuHost('cores')">{{ m?.hardware?.cpu?.logical_cores ?? '—' }}</b></div>
+          <div class="kv"><span>总负载</span><b :data-testid="T.cpuHost('load')">{{ pct(m?.hardware?.cpu?.load_pct) }}</b></div>
 
           <h4>磁盘</h4>
-          <div v-for="d in m?.hardware.disks ?? []" :key="d.mount" class="kv">
+          <div v-for="d in m?.hardware?.disks ?? []" :key="d.mount" class="kv">
             <span>{{ d.mount }}</span>
             <b>
               <span :data-testid="T.diskPart(d.mount, 'total')">{{ mb(d.total_mb) }}</span> /
@@ -159,12 +163,18 @@ onMounted(() => { void refresh() })
           <div v-for="a in m?.ours.accounts ?? []" :key="a.id" class="kv">
             <span>{{ a.id }} 容器</span>
             <b>
-              anon <span :data-testid="T.memAcct(a.id, 'anon')">{{ mb(a.anon_mb) }}</span> /
-              current <span :data-testid="T.memAcct(a.id, 'current')">{{ mb(a.current_mb) }}</span>
+              anon <span :data-testid="T.memAcct(a.id, 'anon')">{{ mb(a.anon_mb ?? a.rss_mb) }}</span> /
+              current <span :data-testid="T.memAcct(a.id, 'current')">{{ mb(a.current_mb ?? a.rss_mb) }}</span>
+              <span v-if="a.cpu_pct != null" class="qt-small qt-muted">· CPU {{ pct(a.cpu_pct) }}</span>
             </b>
           </div>
-          <div class="kv"><span>微信 PC</span><b :data-testid="T.memWechat">{{ mb(m?.ours.wechat.wechat_pc_mb) }}</b></div>
-          <div class="kv"><span>chatlog</span><b :data-testid="T.memChatlog">{{ mb(m?.ours.wechat.chatlog_mb) }}</b></div>
+          <!-- R6-58 (aa):每进程明细(采样缺失时后端给 null,照原样显示「—」不编造) -->
+          <div v-for="d in m?.ours.procs_detail ?? []" :key="d.name" class="kv">
+            <span>{{ d.name }}</span>
+            <b>{{ mb(d.rss_mb) }} · CPU {{ pct(d.cpu_pct) }}</b>
+          </div>
+          <div class="kv"><span>微信 PC</span><b :data-testid="T.memWechat">{{ mb(m?.ours.wechat?.wechat_pc_mb) }}</b></div>
+          <div class="kv"><span>chatlog</span><b :data-testid="T.memChatlog">{{ mb(m?.ours.wechat?.chatlog_mb) }}</b></div>
 
           <div v-for="ch in CHANNELS" :key="ch" class="budget" :data-testid="T.memBudget(ch)">
             <div class="qt-row">

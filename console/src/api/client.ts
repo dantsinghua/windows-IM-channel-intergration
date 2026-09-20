@@ -3,13 +3,14 @@
  * 路径与入参逐字按 02 写,页面只调这里、不自己拼 URL。
  */
 
-import { request, requestList, requestBlob, requestEnvelope, newIdempotencyKey } from './http'
+import { request, requestCommand, requestList, requestBlob, requestEnvelope, newIdempotencyKey } from './http'
+import { normalizeMailStatus, selftestRows } from './types'
 import type {
-  Account, ApiClientRow, AuditRow, CapabilityDef, CommandResult, DeviceProfileTemplate, Job,
-  MailCleanupRow, MailInboxDetail, MailInboxRow, MailOutboxRow, MailRouteOverride, MailStatus,
-  MailTemplate, Message, MetricsSnapshot, PendingConfirm, Prompt, ProbeRow, PublicEndpoint,
-  ResourcePool, SampleRow, SelftestRow, SessionRow, SystemEnv, SystemHealth, SystemVersion,
-  WorkflowDef, WorkflowRun,
+  Account, AdoptProbeResult, ApiClientRow, AuditRow, CapabilityDef, CommandOutcome,
+  CommandResult, DeviceProfileTemplate, Job, MailCleanupRow, MailInboxDetail, MailInboxRow,
+  MailOutboxRow, MailRouteOverride, MailTemplate, Message, MetricsSnapshot,
+  ObservedProbeRow, PendingConfirm, Prompt, ProbeRow, PublicEndpoint, ResourcePool, SampleRow,
+  SelftestRow, SelftestRun, SessionRow, SystemEnv, SystemHealth, SystemVersion, WorkflowDef, WorkflowRun,
 } from './types'
 import type { Channel } from '@/i18n/zh-CN/codes'
 
@@ -22,7 +23,11 @@ export const accountsApi = {
 
   get: (id: string) => request<Account>(`/accounts/${id}`),
 
-  /** #2 `{channel,label,profile_key?,login:{mode,account?,secret?,remember?}}` */
+  /**
+   * #2 `{channel,label,profile_key?,login:{mode,account?,secret?,remember?}}`。
+   * 🔴 幂等键进 **body 的 `idempotency_key`**(02 §3.4 #2 入参列 / R6-54);不带 ⇒ `400 INVALID_ARGS`
+   * `reason=idempotency_key_required`(E-02)。
+   */
   create: (body: {
     channel: Channel
     label: string
@@ -80,7 +85,11 @@ export const accountsApi = {
       method: 'POST', body: { target: 'new', confirm },
     }),
 
-  /** #22 账号级设置 */
+  /**
+   * #22 账号级设置。
+   * 🔴 总控裁决④:**`Account` 对象不带 `settings` 子对象**,账号级设置只走本端点写
+   * (键集见 02 #22;`auto_recover`/`quota_mb` 等落在 Account 顶层,详情页从那里读)。
+   */
   patchSettings: (id: string, body: Record<string, unknown>) =>
     request<Account>(`/accounts/${id}/settings`, { method: 'PATCH', body }),
 
@@ -130,16 +139,40 @@ export const commandsApi = {
         version: (env.capabilities_version as string) ?? '',
       })),
 
-  /** #28 单账号指令 */
+  /**
+   * #28 单账号指令。
+   * 🔴 走 `requestCommand`(不是 `request`):`200 + ok:false + 业务结果码` 是**正常业务结果**,
+   * 要把完整 `CommandResult` 交给页面;同步等待超 `http_sync_max_wait_ms` / `async:true` 时
+   * 回 `202 {ok:true, trace_id, accepted:true, pending?}`(R6-52/R6-53),用 `accepted` 判别。
+   */
   run: (accountId: string, body: {
     op: string
     args: Record<string, unknown>
     idempotency_key?: string
     confirm?: boolean
     timeout_ms?: number
-  }) => request<CommandResult>(`/accounts/${accountId}/commands`, {
+    async?: boolean
+  }) => requestCommand<CommandOutcome>(`/accounts/${accountId}/commands`, {
     method: 'POST', body, idempotencyKey: body.idempotency_key,
   }),
+
+  /** #29 直发(等价 #28 且 `confirm` 恒 true) */
+  send: (accountId: string, body: {
+    session: string
+    text?: string
+    image_ref?: string
+    file_ref?: string
+    idempotency_key: string
+    timeout_ms?: number
+  }) => requestCommand<CommandOutcome>(`/accounts/${accountId}/send`, {
+    method: 'POST', body, idempotencyKey: body.idempotency_key,
+  }),
+
+  /** #31 按 trace_id 回查一条指令与结果 */
+  get: (accountId: string, traceId: string) =>
+    request<{ command: Record<string, unknown>; result: CommandResult }>(
+      `/accounts/${accountId}/commands/${traceId}`,
+    ),
 
   /** #36 广播:必须显式勾选账号,没有「全部」 */
   broadcast: (body: {
@@ -148,11 +181,11 @@ export const commandsApi = {
     args: Record<string, unknown>
     idempotency_key: string
     confirm?: boolean
-  }) => request<{ broadcast_id: string; results: Record<string, CommandResult> }>('/broadcast/commands', {
-    method: 'POST', body, idempotencyKey: body.idempotency_key,
-  }),
+  }) => requestCommand<{ broadcast_id: string; results: Record<string, CommandResult> }>(
+    '/broadcast/commands', { method: 'POST', body, idempotencyKey: body.idempotency_key },
+  ),
 
-  /** #24 机型档案库 */
+  /** #24 机型档案库(字段名统一 `profile_key`,带 `release/weight`) */
   deviceProfiles: () => requestList<DeviceProfileTemplate>('/device-profiles/templates'),
 }
 
@@ -180,8 +213,12 @@ export const messagesApi = {
   /** #55 取媒体一律按 sha256,`ref` 只用于显示 */
   media: (sha256: string) => requestBlob(`/media/${sha256}`),
 
-  /** #51 异步导出 → job */
-  export: (body: { filter: MessageQuery; format: 'csv' | 'json'; include_media: boolean }) =>
+  /**
+   * #51 异步导出 → `202 {job_id}`。
+   * 🔴 入参逐字按 02 #51:`{fmt:'jsonl|csv|eml', with_media:'none|zip', filter:{…#48 的过滤}}`
+   * (原先写的 `format`/`include_media` 两个键在 docs 里不存在)。
+   */
+  export: (body: { filter: MessageQuery; fmt: 'jsonl' | 'csv' | 'eml'; with_media: 'none' | 'zip' }) =>
     request<{ job_id: string }>('/messages/export', { method: 'POST', body }),
 }
 
@@ -197,6 +234,7 @@ export const jobsApi = {
 export const workflowsApi = {
   list: () => requestList<WorkflowDef>('/workflows'),
   get: (id: string) => request<WorkflowDef>(`/workflows/${id}`),
+  /** #43 `{args, idempotency_key?}` → `202 {run_id}`;幂等键进 **body**(E-02) */
   run: (id: string, body: { args: Record<string, unknown>; account_ids: string[] }) =>
     request<{ run_id: string }>(`/workflows/${id}/run`, { method: 'POST', body, idempotencyKey: newIdempotencyKey() }),
   getRun: (runId: string) => request<WorkflowRun>(`/workflows/runs/${runId}`),
@@ -216,8 +254,13 @@ export const resourcesApi = {
     }),
   /** #109 即时全量**本地**清理;202 {job_id},绝不删远端邮件 */
   cleanupRun: () => request<{ job_id: string }>('/system/cleanup/run', { method: 'POST' }),
+  /**
+   * #70 新增向导预检。
+   * 🔴 总控裁决③:`can_add` 是 **bool**(「这个通道现在还能不能再加一个」);
+   * #69 `ResourcePool.can_add` 才是**数量**,同名不同义,不要互相赋值。
+   */
   precheck: (channel: Channel) =>
-    request<{ can_add: number; reason?: string; alternatives?: unknown[] }>('/resources/precheck', {
+    request<{ can_add: boolean; reason?: string; alternatives?: unknown[] }>('/resources/precheck', {
       method: 'POST', body: { channel },
     }),
 }
@@ -225,12 +268,45 @@ export const resourcesApi = {
 /* ───────────────── 系统 / 环境(一律经 Agent,C-32) ───────────────── */
 
 export const systemApi = {
+  /**
+   * #73。总控裁决①:`agent` 的形状**以后端现实现为准** = `{version}`(不是裸字符串);
+   * `kernel/wsl/docker` 后端当前可能恒 `null` —— 页面按「未知」渲染,不写死。
+   */
   version: () => request<SystemVersion>('/system/version'),
   health: () => request<SystemHealth>('/system/health'),
   env: () => request<SystemEnv>('/system/env'),
-  notice: () => request<{ notice_version: string; text: string }>('/system/notice'),
+
+  /**
+   * #86 合规告知文案与版本(免鉴权 loopback)。
+   * 真后端顺带回了 `ack_ms/acked_at/acked_version` —— 「这一版勾过没有」就从这里读,
+   * 不必再去猜(#88 的 group 枚举里没有 compliance 组)。
+   */
+  notice: () => request<{
+    notice_version: string
+    text: string
+    ack_ms?: number | null
+    acked_at?: string | null
+    acked_version?: string | null
+  }>('/system/notice'),
+  /** #87 勾选合规告知 → 写 `settings compliance.ack_ms / compliance.notice_version` */
+  noticeAck: (noticeVersion: string) =>
+    request<{ ok: boolean }>('/system/notice/ack', { method: 'POST', body: { notice_version: noticeVersion } }),
+
+  /** #76 `?kind=result`(缺省):探测结论 */
   probes: (kind?: 'result' | 'observed') =>
     requestList<ProbeRow>('/system/probes', { query: kind ? { kind } : undefined }),
+
+  /**
+   * #76 `?kind=observed`:实测采样候选。
+   * 🔴 R6-58 (dc) 出参**两键** `{data, targets}` —— `targets` 是当前正式探测目标,
+   * 行里带 `id` 与 `in_config`;丢掉 `targets` 就做不出 01 §2.7.9「默认只勾新增项」。
+   */
+  observedProbes: () =>
+    requestEnvelope<ObservedProbeRow[]>('/system/probes', { query: { kind: 'observed' } })
+      .then((env) => ({
+        items: (env.data as ObservedProbeRow[]) ?? [],
+        targets: (env.targets as string[]) ?? [],
+      })),
   probe: (targets?: string[]) =>
     request<{ run_id: string; results: ProbeRow[] }>('/system/probe', {
       method: 'POST', body: { targets, trigger: 'manual' },
@@ -240,18 +316,47 @@ export const systemApi = {
     request<{ sampled_at: string; rows: SampleRow[] }>('/system/probe', {
       method: 'POST', body: { mode: 'sample', duration_s: durationS },
     }),
-  /** 把采样行采纳为正式探测目标(经 Agent 转 WinAgent,控制台不直调 /wa/v1/probes) */
-  adoptProbeTargets: (observedIds: string[]) =>
-    request<{ adopted: string[]; targets: string[] }>('/settings/probe', {
+  /**
+   * #76b 把采样行采纳为正式探测目标(经 Agent 转 WinAgent,控制台不直调 /wa/v1/probes)。
+   * 🔴 R6-58 (z)/(db):`observed_ids` 是**采纳后的全集、不是增量** —— 不在集合里的已采纳行会被取消采纳,
+   * `[]` 合法 = 清空全部采纳;传 `targets` 一律 `400 use_observed_ids`。
+   */
+  adoptProbeTargets: (observedIds: number[]) =>
+    request<AdoptProbeResult>('/settings/probe', {
       method: 'PUT', body: { observed_ids: observedIds },
     }),
+
+  /** #78 起一轮自检 → `202 {run_id}` */
   selftestRun: () => request<{ run_id: string }>('/system/selftest', { method: 'POST' }),
+  /**
+   * #79b `GET /system/selftest[?run_id=]` —— 不带 `run_id` 取**最近一轮**。
+   * 🔴 从没跑过时后端回 `{ok:true, data:null, run_id:null}`(不是 404):
+   * 页面要显示「暂无」,不能弹红。
+   */
   selftestResult: (runId?: string) =>
-    requestList<SelftestRow>('/system/selftest', { query: runId ? { run_id: runId } : undefined }),
+    requestEnvelope<SelftestRun | SelftestRow[] | null>('/system/selftest', {
+      query: runId ? { run_id: runId } : undefined,
+    }).then((env) => ({
+      // #79 的 data 是**一轮的对象**(`{redroid_boot_ms, napcat_ok, winagent_ok, probes}`);
+      // 01 §4 的自检表要行 ⇒ 在 selftestRows 里派生,没跑过的项一律 warn + 原因,不假装 ok
+      items: selftestRows(env.data as SelftestRun | SelftestRow[] | null),
+      run: (Array.isArray(env.data) ? null : (env.data as SelftestRun | null)) ?? null,
+      runId: (env.run_id as string | null) ?? null,
+    })),
   diagnostics: (withScreenshots: boolean) =>
     request<{ job_id: string }>('/system/diagnostics', { method: 'POST', body: { with_screenshots: withScreenshots } }),
+  /**
+   * #85 写 docker 代理。真后端在有账号在跑时回 `{pending:true, reason:'accounts_running', running:[…]}`
+   * (不立刻应用),两种出参都要接住。
+   */
   dockerProxy: (enable: boolean) =>
-    request<{ applied: boolean; proxy?: string }>('/system/docker-proxy', { method: 'POST', body: { enable } }),
+    request<{
+      applied?: boolean
+      proxy?: string | null
+      pending?: boolean
+      reason?: string | null
+      running?: string[]
+    }>('/system/docker-proxy', { method: 'POST', body: { enable } }),
   /** C-03:Agent 自 drain 后调 WinAgent;基线 §11-6 绝不自动 */
   wslRestart: () =>
     request<{ ok: boolean }>('/system/wsl-restart', { method: 'POST', body: { mode: 'shutdown', confirm: true } }),
@@ -262,7 +367,10 @@ export const systemApi = {
 /* ───────────────── 邮件 ───────────────── */
 
 export const mailApi = {
-  status: () => request<MailStatus>('/mail/status'),
+  /** #56。两形都接住(后端当前把它做成了列表端点),见 `normalizeMailStatus` 的说明 */
+  status: () => requestEnvelope<unknown>('/mail/status').then((env) => normalizeMailStatus(
+    env.data !== undefined ? env.data : { enabled: env.enabled, routes: env.routes, route: env.route },
+  )),
   inbox: (q?: Record<string, unknown>) => requestList<MailInboxRow>('/mail/inbox', { query: q }),
   inboxDetail: (id: string) => request<MailInboxDetail>(`/mail/inbox/${id}`),
   reparse: (id: string) => request<{ ok: boolean }>(`/mail/inbox/${id}/reparse`, { method: 'POST' }),
@@ -276,6 +384,12 @@ export const mailApi = {
     request<{ ok: boolean; imap_ok?: boolean; pop3_ok?: boolean }>('/mail/test', {
       method: 'POST', body: { which, route_id: routeId },
     }),
+  /**
+   * `GET /mail/hmac-keys`:短名表(R6-58 (ac) 指名的唯一来源;`senders[].shortname` 不随
+   * `GET /settings/mail` 下发)。**只回短名与发件人,不回密钥**。
+   */
+  hmacKeys: () => requestList<{ sender: string; short_name: string; created_at?: string }>('/mail/hmac-keys'),
+
   /** #67 入参只有 sender + short_name,**无 route**(短名全局唯一) */
   createHmacKey: (sender: string, shortName: string) =>
     request<{ secret: string }>('/mail/hmac-keys', { method: 'POST', body: { sender, short_name: shortName } }),
@@ -319,29 +433,40 @@ export const settingsApi = {
       method: 'POST', body: { sample_message_id: sampleMessageId },
     }),
 
-  putPublicEndpoint: (configuredHost: string) =>
-    request<{ ok: boolean }>('/settings/public-endpoint', { method: 'PUT', body: { configured_host: configuredHost } }),
+  /**
+   * #102 的落点逐字 = **`PUT /settings/api {public_domain}`**
+   * (`PUT /settings/public-endpoint` 在 docs 里不存在,后端也没有)。
+   * 🔴 #89 是**整组替换**:先把当前 `api` 组读回来再并上 `public_domain`,否则会把整组打回默认。
+   */
+  putPublicDomain: async (publicDomain: string) => {
+    const cur = await request<Record<string, unknown>>('/settings/api')
+    return request<Record<string, unknown>>('/settings/api', {
+      method: 'PUT', body: { ...cur, public_domain: publicDomain },
+    })
+  },
   webhooks: () => requestList<{ id: string; url: string; enabled: boolean }>('/settings/webhooks'),
   addWebhook: (url: string) => request<{ id: string }>('/settings/webhooks', { method: 'POST', body: { url } }),
   removeWebhook: (id: string) => request<{ ok: boolean }>(`/settings/webhooks/${id}`, { method: 'DELETE' }),
 
-  compliance: () => request<{ ack_ms: number | null; notice_version: string | null }>('/settings/compliance'),
-  putCompliance: (body: { ack_ms: number; notice_version: string }) =>
-    request<{ ok: boolean }>('/settings/compliance', { method: 'PUT', body }),
+  /* 🔴 `/settings/compliance` 在 02 #88 的 group 枚举里**不存在** —— 合规告知(01-P3)走
+     #86 `GET /system/notice` + #87 `POST /system/notice/ack`,见 `systemApi.notice/noticeAck`。 */
 }
 
 /* ───────────────── 审计 ───────────────── */
 
 export const auditApi = {
+  /**
+   * #95。🔴 服务端**只认** `kind|actor|account_id|action|since|until|limit|cursor|fmt`
+   * (02 #95 参数列)。未知参数会被静默忽略 —— 把 `op`/`code`/`trace_id` 当查询串发出去,
+   * 筛选器会「假装生效」。这三项改在客户端本地过滤,见 `stores/audit.ts`。
+   */
   list: (q: {
     kind?: 'command' | 'api' | 'system' | 'stream_input'
     account_id?: string
-    op?: string
-    code?: string
+    action?: string
     actor?: string
     since?: string
     until?: string
-    trace_id?: string
     limit?: number
     cursor?: string
   }) => requestList<AuditRow>('/audit', { query: q as Record<string, unknown> }),

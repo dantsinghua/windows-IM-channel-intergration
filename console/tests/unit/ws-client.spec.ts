@@ -1,4 +1,7 @@
-/** 事件流客户端:首帧订阅、seq 去重、since_seq 续传、replay 截断、退避重连、心跳判死 */
+/**
+ * 事件流客户端:首帧订阅、seq 去重、since_seq 续传、replay 截断、退避重连、心跳判死、
+ * **握手连败即停手**(E-05 的前端侧防御)。
+ */
 import { describe, expect, it } from 'vitest'
 import { ALL_EVENTS, EventsClient, backoffMs, type WebSocketLike } from '@/api/ws'
 import type { QtEvent } from '@/api/types'
@@ -211,5 +214,87 @@ describe('连接状态', () => {
     const before = FakeWs.instances.length
     h.runTimers(3)
     expect(FakeWs.instances.length).toBe(before)
+  })
+})
+
+describe('握手连败防御(E-05 前端侧)', () => {
+  /** 令牌无效时服务端在 accept() 之前 close(4401),客户端只看得到 1006 —— 不能就这么无限重连下去 */
+  function handshakeHarness(max = 3) {
+    FakeWs.instances = []
+    const timers = new Map<number, { fn: () => void; ms: number }>()
+    let timerId = 0
+    const givenUp: { failures: number; code: number }[] = []
+    const authFailed: number[] = []
+    const client = new EventsClient(
+      {
+        onEvent: () => undefined,
+        onStatus: () => undefined,
+        onReplayTruncated: () => undefined,
+        onAuthFailed: () => authFailed.push(1),
+        onHandshakeGivenUp: (i) => givenUp.push(i),
+      },
+      {
+        factory: (u) => new FakeWs(u),
+        now: () => 0,
+        setTimeoutFn: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id },
+        clearTimeoutFn: (h) => { timers.delete(h as number) },
+        jitter: () => 1,
+        maxHandshakeFailures: max,
+      },
+    )
+    const runTimers = (times = 1): void => {
+      for (let i = 0; i < times; i++) {
+        const next = [...timers.keys()].sort((a, b) => a - b)[0]
+        if (next === undefined) return
+        const t = timers.get(next)!
+        timers.delete(next)
+        t.fn()
+      }
+    }
+    return { client, givenUp, authFailed, runTimers }
+  }
+
+  it('连续 N 次「从未 open 就 1006」⇒ 停止重连并回调 onHandshakeGivenUp', () => {
+    const h = handshakeHarness(3)
+    h.client.connect()
+    FakeWs.instances[0].close(1006)   // 第 1 次
+    h.runTimers(1)
+    FakeWs.instances[1].close(1006)   // 第 2 次
+    h.runTimers(1)
+    FakeWs.instances[2].close(1006)   // 第 3 次 ⇒ 停手
+    expect(h.givenUp).toEqual([{ failures: 3, code: 1006 }])
+    const before = FakeWs.instances.length
+    h.runTimers(5)
+    expect(FakeWs.instances.length).toBe(before)
+  })
+
+  it('open 过一次就把计数清零(正常掉线照常无限重连)', () => {
+    const h = handshakeHarness(3)
+    h.client.connect()
+    FakeWs.instances[0].close(1006)
+    h.runTimers(1)
+    FakeWs.instances[1].open()
+    FakeWs.instances[1].close(1006)
+    h.runTimers(1)
+    expect(h.givenUp).toEqual([])
+    expect(FakeWs.instances.length).toBe(3)
+  })
+
+  it('retry() 清零后可以重新连(门禁「重新取令牌」用)', () => {
+    const h = handshakeHarness(2)
+    h.client.connect()
+    FakeWs.instances[0].close(1006)
+    h.runTimers(1)
+    FakeWs.instances[1].close(1006)
+    expect(h.givenUp).toHaveLength(1)
+    h.client.retry()
+    expect(FakeWs.instances).toHaveLength(3)
+  })
+
+  it('4401 仍然照常回调 onAuthFailed', () => {
+    const h = handshakeHarness(5)
+    h.client.connect()
+    FakeWs.instances[0].close(4401)
+    expect(h.authFailed).toHaveLength(1)
   })
 })

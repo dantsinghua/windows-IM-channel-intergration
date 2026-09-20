@@ -8,6 +8,9 @@
  * - **只有**首帧回 `{"replay":"truncated","from_seq":N}` 才需要全量拉 `/accounts` `/resources` `/mail/status`
  * - 心跳:客户端每 20s ping,40s 无任何帧判断线
  * - 关闭码 4401 = 令牌无效;4400 = 首帧订阅非法
+ * - 🔴 **握手连败防御**:令牌无效时服务端在 `accept()` 之前 `close(4401)`,Starlette 会把它退化成
+ *   「拒绝握手」,客户端只看得到 `1006`(E-05,判给后端改)。前端这一侧不能因此无限重连 ——
+ *   连续 `maxHandshakeFailures` 次「从未 open 过就关闭」即停手并转「需要重新取令牌」。
  */
 
 import type { EventKind, QtEvent } from './types'
@@ -27,6 +30,11 @@ export interface EventsClientHooks {
   onReplayTruncated: (fromSeq: number) => void
   /** 令牌失效(4401) */
   onAuthFailed?: () => void
+  /**
+   * 连续 N 次握手就断(从未 open) —— 停止重连,交由上层走「重新取令牌」。
+   * `code` 是最后一次的关闭码(令牌无效时通常是 `1006`,见文件头说明)。
+   */
+  onHandshakeGivenUp?: (info: { failures: number; code: number }) => void
 }
 
 export interface EventsClientOptions {
@@ -41,6 +49,8 @@ export interface EventsClientOptions {
   jitter?: () => number
   heartbeatMs?: number
   deadAfterMs?: number
+  /** 连续多少次「从未 open 就关闭」后停手(默认 5) */
+  maxHandshakeFailures?: number
 }
 
 export interface WebSocketLike {
@@ -77,6 +87,12 @@ export class EventsClient {
   private heartbeatHandle: unknown = null
   private lastFrameAt = 0
   private stopped = false
+  /** 本次连接是否曾 open 过 —— 区分「握手就被拒」与「连上后掉线」 */
+  private everOpened = false
+  /** 连续握手失败次数(open 成功即归零) */
+  handshakeFailures = 0
+  /** 已因握手连败停手,等上层重新取令牌后 `retry()` */
+  gaveUp = false
 
   /** 已收到的最大 seq —— 重连 since_seq 用(G-08) */
   lastSeq = 0
@@ -93,12 +109,20 @@ export class EventsClient {
       jitter: options.jitter ?? randomJitter,
       heartbeatMs: options.heartbeatMs ?? 20000,
       deadAfterMs: options.deadAfterMs ?? 40000,
+      maxHandshakeFailures: options.maxHandshakeFailures ?? 5,
     }
   }
 
   connect(): void {
     this.stopped = false
     this.open()
+  }
+
+  /** 上层重新取到令牌后调用:清零计数并重连 */
+  retry(): void {
+    this.handshakeFailures = 0
+    this.gaveUp = false
+    this.connect()
   }
 
   close(): void {
@@ -134,8 +158,11 @@ export class EventsClient {
     this.setStatus('connecting')
     const ws = this.opts.factory(this.opts.url)
     this.ws = ws
+    this.everOpened = false
     ws.onopen = () => {
       this.attempt = 0
+      this.everOpened = true
+      this.handshakeFailures = 0
       this.lastFrameAt = this.opts.now()
       this.setStatus('open')
       this.sendSubscribe()
@@ -144,9 +171,20 @@ export class EventsClient {
     ws.onmessage = (ev) => this.handleFrame(ev.data)
     ws.onerror = () => { /* onclose 会接着来,这里不重复调度 */ }
     ws.onclose = (ev) => {
-      if (ev?.code === 4401) this.hooks.onAuthFailed?.()
+      const code = ev?.code ?? 0
+      if (code === 4401) this.hooks.onAuthFailed?.()
       this.clearTimers()
       this.setStatus('closed')
+      if (!this.everOpened) {
+        this.handshakeFailures += 1
+        if (this.handshakeFailures >= this.opts.maxHandshakeFailures) {
+          // 握手一次都没成过 —— 再退避重连也只是刷日志;停手并交回上层
+          this.gaveUp = true
+          this.stopped = true
+          this.hooks.onHandshakeGivenUp?.({ failures: this.handshakeFailures, code })
+          return
+        }
+      }
       this.scheduleReconnect()
     }
   }

@@ -6,6 +6,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { messagesApi, type MessageQuery } from '@/api/client'
+import { normalizeSession } from '@/api/types'
 import type { Message, QtEvent, SessionRow } from '@/api/types'
 import { useEventsStore } from './events'
 
@@ -46,7 +47,8 @@ export const useMessagesStore = defineStore('messages', () => {
 
   async function loadSessions(): Promise<void> {
     const { items: rows } = await messagesApi.sessions({ account_id: filter.value.account_id })
-    sessions.value = rows
+    // 裁决②:统一按 `last_msg_at`;`last_ts` 的一次性兼容在 normalizeSession 里(后端改完删)
+    sessions.value = rows.map(normalizeSession)
   }
 
   async function search(reset = true): Promise<void> {
