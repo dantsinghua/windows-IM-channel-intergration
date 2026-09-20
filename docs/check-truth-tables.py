@@ -313,6 +313,53 @@ def check_merge_window_literal():
         print("  ✅ 现行册无字面 60s 合并窗,全部引用 [bus] out_merge_window_s")
     return red
 
+# ---------------------------------------------------------------- LITERAL(不走行级 NEGATION)
+# 为什么要这一族:FORBIDDEN 走「整行出现任一否定词就跳过」,而本套文档里「不存在 / 替换 / 作废」这类词
+# 在**可抄行与验收行**里极常见 —— 04 §8b A1-21 那一行就带着「`tcpdump` 进程在窗口外不存在」,
+# 放进 FORBIDDEN 会被整行吞掉、变成空规则(R6-51 ⑫ 与本轮删掉的那条「qidian_hosts 旧入参」都是这个坑)。
+# 故:**正则必须足够窄、窄到不可能出现在正确写法里**,然后绕开 NEGATION 直接判。
+LITERALS = [
+    # 终审第一轮 MAJOR 3:01 §3 端点摘要表漏改(裁决只点了 §2.7.9/§4/§9 三处)。
+    # 窄:只盯 `settings/probe {targets`,正确写法是 `{observed_ids`,不可能误命中。
+    ("#76b 旧入参 settings/probe {targets",
+     "0[1-7]-*.md",
+     r"settings/probe\s*\{\s*targets",
+     "R6-58 (z)/(db):入参逐字 `{observed_ids:[行 id…]}`(采纳后的全集,`[]`=清空);照旧写法一调就 400 use_observed_ids。"),
+
+    # 终审第一轮 MAJOR 5:04 §8b A1-21 写 `candidates[]` + 一整套 02 §3.2 DDL 里不存在的列名。
+    # 上一轮的 FORBIDDEN 只盯初稿那一种形态 `candidates:[{channel`,打不中 `candidates[]` —— 规则不空,但过窄。
+    # 现按终审给的验收标准放宽为两种形态,并用「同行须含 实测采样|sample」把 docker_pool_candidates /
+    # mail_cleanup_log.candidates / 06 伪代码局部变量 candidates 三类正当用法排除掉。
+    ("实测采样出参旧键 candidates(应为 rows)",
+     "0[1-7]-*.md",
+     r"(?=.*(?:实测采样|sample))candidates(?:\[\]|:\s*\[)",
+     "R6-58 (de):sample 出参逐字 `{sampled_at, duration_s, rows, skipped}`,行的字段名用 02 §3.2 DDL 的列;`candidates`/`run_id`/`resolved_by` 均作废。"),
+]
+
+
+def check_literals():
+    red = []
+    print()
+    print("=" * 78)
+    print("⑬ LITERAL2 —— 窄字面旧写法(**不走行级 NEGATION**,专治「验收行自带否定词」那类空规则)")
+    print("=" * 78)
+    for title, pat_glob, pat, why in LITERALS:
+        hits = []
+        for f in sorted(glob.glob(os.path.join(HERE, pat_glob))):
+            for i, ln in enumerate(lines_of(io.open(f, encoding="utf-8").read()), 1):
+                if re.search(pat, ln):
+                    hits.append((os.path.basename(f)[:2], i, ln.strip()[:110]))
+        if hits:
+            red.append(title)
+            print(f"\n  ❌ {title}  —— {len(hits)} 处")
+            print(f"     理由:{why}")
+            for vol, i, ln in hits[:8]:
+                print(f"       {vol}:{i}  {ln}")
+        else:
+            print(f"  ✅ {title}")
+    return red
+
+
 # ---------------------------------------------------------------- PAIRED
 # (标题, 声明方文件, 声明方正则, 消费方文件, 消费方正则, 说明)
 PAIRED = [
@@ -508,6 +555,14 @@ PAIRED = [
 
     # (cz):落库与出 JSON 两处共用 models.json_safe();02 §2.2.2 声明 → §3.10 的 screenshot 行必须给出 result_schema,
     #       否则「图片体怎么回流」在目录里是空白,实现方又会把裸 bytes 塞进 data 直接 dumps。
+    # 终审第一轮 CRITICAL 1:(cw) 只写了产生方 00 §7.5,01 三处仍靠事件 ⇒ 零承接。
+    #   这一类「裁决说『不推事件』」最凶:后端不发、前端等,**测试不红、日志不报**,只有真机跑到才暴露。
+    #   负向验证:把 01 里的承接句抹掉的副本上 ⇒ 红(2026-09-20 实测)。
+    ("(cw) paused/cancelled 不推事件:00 §7.5 声明 → 01 必须有轮询 #45 的承接句",
+     "00-*.md", r"R6-58 \(cw\)",
+     "01-*.md", r"轮询 `?#45",
+     "R6-58 (cw):01 §2.5/§2.8/§2.7.6/§8b M5-1 四处都得改成轮询承接;只改 00 = 运行中切微信时 P-FLOW 永远停在 running。"),
+
     ("screenshot 的 result_schema:02 §2.2.2 定序列化出口 → §3.10 必须给形状",
      "02-*.md", r"models\.json_safe\(\)",
      "02-*.md", r"`result_schema` = `\{png_b64, width, height\}`",
@@ -532,6 +587,8 @@ DEAD_KEYNAMES = [
     ("calibrated_at_ms",        "calibrated_ms",         "R6-58 (bk):同上,列名逐字以 02 §3.1 DDL 为准"),
     # (av):02 §7.2 [api] bind_loopback/bind_wsl_adapter 与 04 §7 [net] listen_* 是同一件事的两套键。
     ("bind_wsl_adapter",        "listen_wsl_adapter",    "R6-58 (av):服务监听地址的键收敛到 04 §7 [net];02 §7.2 [api] 那一套作废"),
+    # 终审第一轮补:(av) 一次作废了【两个】键,上一轮只收了 bind_wsl_adapter,bind_loopback 回潮抓不到。
+    ("bind_loopback",           "listen_loopback",       "R6-58 (av):同上 —— 改名类裁决必须把旧名【逐个】进表,漏一个就漏一条回潮路径"),
 ]
 
 
@@ -927,6 +984,54 @@ def check_dynamic_sets():
 QIDIAN_CONFIRM_MIN_MS = 15000   # R6-38:须盖住主库出向落库滞后 7~12 s(06 §2.9.5)+ 1 s 加速轮询
 
 
+def check_result_codes_to_01():
+    """终审第一轮 CRITICAL 2:00 §8.3 结果码表是**结果码的唯一来源**,01 §2.10 是它的中文对照表;
+    本轮新登记 `CONFIRM_REQUIRED` 而 01 没跟(连一直漏着的 `CONFIRM_EXPIRED` 一起补上了)。
+
+    🔴 **值集从 00 §8.3 现读**(不写死清单)—— 写死的清单管不了「owner 新增」,而这正是出事的那一类
+    (与 ⑨ DYNAMIC 同一个道理;R6-33 的教训)。
+    ⚠️ 只切 §8.3 那一段再取值:00 里还有 §8.1 state_code / §8.2 安装态 / §8.5 环境矩阵三张表,
+    全文扫会把它们一起算进来、一次误报几十个 —— 误报比漏报更伤。
+    """
+    red = []
+    print()
+    print("=" * 78)
+    print("⑭ DYNAMIC2 —— 00 §8.3 结果码全集(现读)→ 01 §2.10 中文对照表必须逐个收录")
+    print("=" * 78)
+    src00 = next(iter(glob.glob(os.path.join(HERE, "00-*.md"))), None)
+    src01 = next(iter(glob.glob(os.path.join(HERE, "01-*.md"))), None)
+    if not src00 or not src01:
+        print("  ⚠️  文件缺失,跳过")
+        return red
+    t00 = io.open(src00, encoding="utf-8").read()
+    i = t00.find("### 8.3")
+    j = t00.find("### 8.4", i + 1)
+    if i < 0 or j < 0:
+        red.append("00 §8.3 切不出来")
+        print("  ❌ 00 §8.3 段落切不出来(标题变了?)——规则失效,必须修")
+        return red
+    codes = set()
+    for ln in lines_of(t00[i:j]):
+        if not ln.startswith("|") or ln.startswith("|---") or "`code`" in ln:
+            continue
+        first = ln.split("|")[1]                      # 只取第一格(码名格)
+        codes.update(re.findall(r"`([A-Z][A-Z0-9_]{2,})`", first))
+    if not codes:
+        red.append("00 §8.3 取不到结果码")
+        print("  ❌ 00 §8.3 一个码都没取到(表格形态变了?)——规则失效,必须修")
+        return red
+    t01 = io.open(src01, encoding="utf-8").read()
+    missing = sorted(c for c in codes if c not in t01)
+    if missing:
+        red.append(f"01 缺 {len(missing)} 个结果码")
+        print(f"\n  ❌ 01 缺 {len(missing)}/{len(codes)} 个 —— {', '.join(missing)}")
+        print("     理由:01 §2.10 明令「不能靠解析中文」;码表缺一个,控制台拿到它就渲染不出引导"
+              "(与 WINAGENT_USER_OFFLINE 那次事故同型)。")
+    else:
+        print(f"  ✅ 01 收录完整({len(codes)}/{len(codes)}) —— {', '.join(sorted(codes))}")
+    return red
+
+
 def check_qidian_confirm_window():
     """⑩ 企点确认窗 ≥ 落库滞后上限。凡写出 confirm_timeout_qidian_ms 取值的地方都要 ≥ 15000。"""
     red, seen = [], 0
@@ -1053,6 +1158,8 @@ def main():
     red += check_qidian_confirm_window()
     red += check_norm_definition()
     red += check_merge_window_literal()
+    red += check_literals()
+    red += check_result_codes_to_01()
     red += check_versions()
     print()
     print("=" * 78)

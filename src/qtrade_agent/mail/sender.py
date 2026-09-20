@@ -306,7 +306,7 @@ class MailSender:
             in_reply_to=row.get("in_reply_to"), references_hdr=row.get("references_hdr"),
             ref_inbox_id=row.get("ref_inbox_id"), ref_message_id=row.get("ref_message_id"),
             ref_trace_id=row.get("ref_trace_id"), template_id=row.get("template_id"),
-            template_version=row["template_version"], template_profile=row.get("template_profile", "custom"),
+            template_version=row["template_version"], template_profile=row.get("template_profile", "qtrade-v1"),
             dedup_key=dedup_key, now_ms=now)
 
     def discard(self, outbox_id: int) -> None:

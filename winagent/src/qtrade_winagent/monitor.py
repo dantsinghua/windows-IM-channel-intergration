@@ -38,6 +38,10 @@ VMMEM_NAMES = ("vmmem", "vmmemWSL")                     # Win10 是 vmmem,Win11 
 
 FAIL_STREAK_CRIT = 3                                    # 04 H01/H02:连续 3 次失败才 crit(R-09 去抖)
 
+# 02 §3.6 #2 / R6-58 (ao):`GET /wa/v1/health.checks` 恒八键(逐字按文档顺序 H01/H09–H11/H14–H16/H20;
+# H12 等模块内部还有别的健康项,但不进本端点的 checks——那些不是 (ao) 钉的这八个)
+HEALTH_CHECK_KEYS = ("H01", "H09", "H10", "H11", "H14", "H15", "H16", "H20")
+
 
 @dataclass
 class DiskTarget:
@@ -350,3 +354,12 @@ class Monitor:
         chatlog_mb = procs["chatlog.exe"].rss_mb if "chatlog.exe" in procs else 0.0
         return {"total_mb": mem["total_mb"], "available_mb": mem["available_mb"], "wsl_vm_mb": vm or 0.0,
                 "wechat_mb": wechat_mb, "chatlog_mb": chatlog_mb}
+
+    def health_checks(self) -> dict[str, Optional[bool]]:
+        """``GET /wa/v1/health.checks``(02 §3.6 #2)。🔴 **R6-58 (ao):恒八键,没跑过的给 ``None``** ——
+        不是「只放已跑过的项」的动态字典(那样逼控制台先判 key 存在性再判值,两处判据必然分叉)。
+
+        ``self.state.checks`` 本身仍是内部动态字典(还记着本模块不对外的 H12 等项),本方法只是
+        按 ``HEALTH_CHECK_KEYS`` 固定八键裁一份出去,不改内部记账方式。
+        """
+        return {k: self.state.checks.get(k) for k in HEALTH_CHECK_KEYS}

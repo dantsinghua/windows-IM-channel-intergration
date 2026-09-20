@@ -382,7 +382,7 @@ class MailStore:
                        references_hdr: Optional[str] = None, ref_inbox_id: Optional[int] = None,
                        ref_message_id: Optional[str] = None, ref_trace_id: Optional[str] = None,
                        route_id: Optional[int] = None, template_id: Optional[int] = None,
-                       template_profile: str = "custom", now_ms: Optional[int] = None) -> Optional[int]:
+                       template_profile: str = "qtrade-v1", now_ms: Optional[int] = None) -> Optional[int]:
         """入队一封出站邮件;``dedup_key`` 撞唯一键返回 ``None``(§3.1:防同一条消息/回执重复入队)。"""
         now = now_ms or self._now()
         with self._store._tx() as c:

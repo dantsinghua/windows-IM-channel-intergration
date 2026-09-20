@@ -37,6 +37,10 @@ class WinWeChat:
         self._narrator_pid: Optional[int] = None
         self._dll: Optional[str] = None
 
+    def set_main_wnd_class(self, class_name: str) -> None:
+        """R6-58 (at) ②:服务侧算好的「该 wxid 行值 / 配置默认」经管道传入,切换本次 FindWindow 要用的类名。"""
+        self._cls = class_name
+
     # ---------------------------------------------------------------- 定位
     def locate(self) -> dict[str, Any]:
         require_windows("微信定位")

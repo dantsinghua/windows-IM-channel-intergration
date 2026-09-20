@@ -242,12 +242,46 @@ if (Test-Path -LiteralPath $enginePath) {
     }
 }
 
+# ── G-10:rootfs 内容清单 ────────────────────────────────────────────────────
+# §2.2.1:`rootfs_contents` 是 rootfs.tar **内部**的二进制清单,「rootfs 构建时写入
+# /etc/qtrade/contents.json,**两处必须逐字一致**」。`installer/rootfs/build-rootfs.sh`
+# 在 rootfs.tar 旁边落一份同内容的 contents.json,这里**原样搬进来** ——
+# 🔴 一个字段都不在这里改写、补默认值或重新排序,否则「逐字一致」当场就破了。
+#
+# 空着会怎样:安装期 `IMAGES_LOADED` 要按 `rootfs_contents` 在发行版内复核
+# (`sha256sum` 各路径 + `docker images --digests` 比对),清单为空 = 那一步**什么都没校验**,
+# 换过的镜像/被删的 adb 都能一路装完不报错(§2.2.1 末段)。
+function Get-QtRootfsContents {
+    param([bool] $RootfsCollected)
+    $p = ''
+    if ($env:QT_SRC_ROOTFS_CONTENTS) { $p = $env:QT_SRC_ROOTFS_CONTENTS }
+    elseif ($SourceRoot) { $p = [IO.Path]::Combine($SourceRoot, 'rootfs\out\contents.json') }
+
+    if ($p -and (Test-Path -LiteralPath $p)) {
+        $obj = [IO.File]::ReadAllText($p) | ConvertFrom-Json
+        Write-Host ('  [OK]   rootfs_contents                      <- {0}' -f $p)
+        return $obj
+    }
+    # rootfs.tar 自己都没收上来时,清单缺失是「缺件」的附带结果,不再单独喊一遍。
+    if (-not $RootfsCollected) { return [ordered]@{} }
+    if (-not $AllowMissing) {
+        throw ('收了 wsl/rootfs.tar 却找不到它的内容清单 contents.json(找过:{0});' +
+               'G-10 要求 manifest.rootfs_contents 与发行版内 /etc/qtrade/contents.json 逐字一致,' +
+               '空清单会让安装期 IMAGES_LOADED 的镜像复核形同虚设。' +
+               '它由 installer/rootfs/build-rootfs.sh 落在 rootfs.tar 旁边,或用 QT_SRC_ROOTFS_CONTENTS 指定' -f $p)
+    }
+    Write-Host ('  [WARN] 缺 rootfs_contents 清单({0});轻量包放行,正式包不行' -f $p) -ForegroundColor Yellow
+    return [ordered]@{}
+}
+$rootfsCollected = [bool](@($copied | Where-Object { $_.Item.Dest -eq 'wsl/rootfs.tar' }).Count)
+$RootfsContents = Get-QtRootfsContents -RootfsCollected $rootfsCollected
+
 $manifest = [ordered]@{
     package_version        = $PackageVersion
     built_at               = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
     kernel_lines           = [ordered]@{ '6.6' = 'kernel/bzImage-6.6' }
     files                  = $files
-    rootfs_contents        = [ordered]@{}   # 由 rootfs 构建写入 /etc/qtrade/contents.json,CI 在此登记同一份(G-10)
+    rootfs_contents        = $RootfsContents   # G-10,见上面 Get-QtRootfsContents 的说明
     wechat_version_matrix  = @(
         [ordered]@{ version = '4.1.12.26'; dll = 'wx_key2.dll'; status = 'verified'; source = 'bundled' }
         [ordered]@{ version = '4.1.11.52'; dll = 'wx_key1.dll'; status = 'failed'; source = 'bundled' }

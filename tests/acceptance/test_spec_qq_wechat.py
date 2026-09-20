@@ -847,12 +847,18 @@ async def test_qq_非本系统发出的我方消息单独入库(tmp_path):
 async def test_qq_发送限速在bus不在适配器(tmp_path):
     """02 §2.2.3 qq 行:`NapCatGateway` 的限速(`MIN_SEND_INTERVAL=1.5 + random*1.5`)**上提到 `bus`**,不在适配器里重写;
     02 §7.1 `[bus] send_min_interval_ms=1500`。两条连发的间隔不得小于该下限。"""
-    async with qq_rig(tmp_path) as r:
+    # 夹具时钟冻结(auto_step_ms=0):bus 用注入时钟算「距上次发出还差多少」,自动步进的假时钟每被读一次就走 50 ms,
+    # 会把应睡时长不定量地吃掉(墙钟偶发红的真因);冻结后应睡 = 完整下限,墙钟断言才是确定的。
+    async with qq_rig(tmp_path, clock=Clock(auto_step_ms=0)) as r:
         assert r.agent.cfg.bus.send_min_interval_ms == 1500 and r.agent.cfg.bus.send_rand_extra_ms == 1500
+        # 限速是真实等待(bus 的 asyncio.sleep),不是可拨时钟的账。
+        # 总控订正(R6-59 后):限速量的是「两次**发出**之间」的间隔;原写法从第一条 submit **返回后**起表,
+        # 把第一条的读回确认耗时从窗口里扣掉了,属墙钟偶发红(实测 1277 ms)。改为 t0 ≤ 第一次发出、
+        # 结束 ≥ 第二次发出,故 (结束 − t0) ≥ 两次发出间隔 ≥ 下限,恒成立且不放松判据。
+        t0 = time.monotonic()
         await submit(r, send_cmd("第一条"))
-        t1 = time.monotonic()                      # 限速是真实等待(bus 的 asyncio.sleep),不是可拨时钟的账
         await submit(r, send_cmd("第二条"))
-        assert (time.monotonic() - t1) * 1000 >= r.agent.cfg.bus.send_min_interval_ms
+        assert (time.monotonic() - t0) * 1000 >= r.agent.cfg.bus.send_min_interval_ms
         assert r.qq.__class__.__module__.endswith("adapters.qq.adapter")
         assert not hasattr(r.qq, "_rate_limit"), "限速不得在适配器里重写(02 §2.2.3 qq 行)"
 

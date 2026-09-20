@@ -145,7 +145,9 @@ class UserAgent:
         return self._wx().status(screen_locked=bool(p.get("screen_locked")))
 
     async def _wechat_login_start(self, p: dict[str, Any]) -> Any:
-        return await self._wx().login_start(account_id=p.get("account_id"), login_session_id=p.get("login_session_id"))
+        # main_wnd_class:R6-58 (at) ②——服务侧按 account_id 算好的「该 wxid 行值 / 配置默认」,这里只应用
+        return await self._wx().login_start(account_id=p.get("account_id"), login_session_id=p.get("login_session_id"),
+                                            main_wnd_class=p.get("main_wnd_class"))
 
     async def _wechat_login_cancel(self, p: dict[str, Any]) -> Any:
         return await self._wx().login_cancel(login_session_id=p.get("login_session_id"))
@@ -154,11 +156,15 @@ class UserAgent:
         return await self._wx().poll()                  # 每次查询顺带推一格状态机(轮询驱动)
 
     async def _wechat_bind(self, p: dict[str, Any]) -> Any:
-        s = self._wx().session
+        wx = self._wx()
+        s = wx.session
         if s is not None:
             s.wxid = p.get("wxid") or s.wxid
             s.account_id = p.get("account_id") or s.account_id
-        return {"ok": True, "wxid": p.get("wxid"), "account_id": p.get("account_id")}
+        # main_wnd_class:R6-58 (at) ①——把这次探测到的主窗口类名随响应带回,服务侧据此 record_main_wnd_class
+        # (方向仍是「服务发请求、结果随响应带回」,本类自己不碰 DB)
+        return {"ok": True, "wxid": p.get("wxid"), "account_id": p.get("account_id"),
+                "main_wnd_class": wx.detected_main_wnd_class()}
 
     async def _wechat_logout(self, p: dict[str, Any]) -> Any:
         return await self._wx().logout()

@@ -1,0 +1,21 @@
+[Unit]
+Description=QTrade：在 dockerd 首启前写 /etc/docker/daemon.json（选定地址池）
+Documentation=file:///opt/qtrade/bin/qtrade-docker-config.sh
+# 🔴 docs/03 §2.7.3 R5-9：这一条 Before= 是整个选段机制的成败所在。
+# 旧写法把「写 daemon.json」挂在 After=docker.service 的 oneshot 里 ⇒ dockerd 已用
+# 默认段起过、docker0(172.17)已建，事后 restart 也改不回来，选段白做。
+Before=docker.service
+Before=docker.socket
+After=local-fs.target
+ConditionPathExists=!/etc/qtrade/.docker-configured
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/qtrade/bin/qtrade-docker-config.sh
+# 读不到 install.env 时脚本自己落保守默认并退 0 —— 让 dockerd 照常起来，
+# 段不对在 P-ENV 里看得见(04 DOCKER_POOL_ALL_CONFLICT)，比整台机器起不来强。
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

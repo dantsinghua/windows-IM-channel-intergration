@@ -1,0 +1,30 @@
+[Unit]
+Description=QTrade Agent（多实例 IM 控制台后端）
+Documentation=file:///opt/qtrade/agent
+# docs/02 §2.1 第 3 步：dockerd 未就绪 Agent 仍要起来，runtime 模块置 not_ready、
+# 账号恢复延后 —— 所以是 After= 而不是 Requires=。
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+# 🔴 G-02：只改 /etc/localtime 对 systemd 服务不够，服务不继承交互 shell 的环境。
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/qtrade/platform-tools:/opt/qtrade/agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/qtrade/agent/venv/bin/python -m qtrade_agent.main \
+    --config /etc/qtrade/agent.toml \
+    --db /var/lib/qtrade/agent.db
+Restart=always
+RestartSec=5
+# 迁移失败时 Agent 主动拒绝启动(02 §2.1 第 4 步：数据安全高于可用性)。
+# 那是 exit≠0 的正常路径，Restart=always 会重试 —— 由 StartLimit 把它挡成「失败」
+# 而不是无限重启刷日志。
+StartLimitIntervalSec=300
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qtrade-agent
+
+[Install]
+WantedBy=multi-user.target

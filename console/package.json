@@ -12,7 +12,7 @@
     "build:renderer": "vite build",
     "build:electron": "vite build --config vite.electron.config.ts",
     "build": "npm run build:renderer && npm run build:electron",
-    "build:dir": "npm run build && electron-builder --dir",
+    "build:dir": "npm run build && electron-builder --dir --win --x64",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run"

@@ -1,0 +1,18 @@
+[Unit]
+Description=QTrade 首启：docker load 预载镜像 → 写 .imported → 起 Agent
+Documentation=file:///opt/qtrade/bin/qtrade-firstboot.sh
+# docs/03 §2.7.3 ②：必须在 dockerd 就绪之后。
+After=docker.service
+Requires=docker.service
+After=qtrade-docker-config.service
+ConditionPathExists=!/etc/qtrade/.imported
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/qtrade/bin/qtrade-firstboot.sh
+# docker load 两个镜像共约 3.5 GB，慢盘上要几分钟；给足余量。
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

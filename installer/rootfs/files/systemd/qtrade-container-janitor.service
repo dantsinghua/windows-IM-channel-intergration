@@ -1,0 +1,15 @@
+[Unit]
+Description=QTrade：容器停止即清可再生缓存（E-19 ②）
+Documentation=file:///opt/qtrade/bin/qtrade-container-janitor.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/qtrade/bin/qtrade-container-janitor.sh
+Restart=always
+RestartSec=10
+SyslogIdentifier=qtrade-janitor
+
+[Install]
+WantedBy=multi-user.target

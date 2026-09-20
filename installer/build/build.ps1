@@ -440,11 +440,20 @@ if ($StubKind -eq 'qtrade') {
     Write-Ok ('自编存根自检通过(x86 / 静态 CRT / 含 InstallPath,sha256 {0})' -f $stubCheck.Sha256.Substring(0, 16))
 }
 $cfg = Join-Path $BuildDir $SfxConfigName
+# 🔴 **必须流式拼接,不能 `[IO.File]::ReadAllBytes($part)`** ——
+#    PowerShell 5.1 跑在 .NET Framework 上,`ReadAllBytes` 要把整个文件塞进一个
+#    `byte[]`,而 `byte[]` 的长度上限是 `Int32.MaxValue`(2 GiB)。真载荷的 payload.7z
+#    是 **2.05 GB**(rootfs.tar 一项就 2.16 GB,且它已是 docker 层、LZMA2 压不动),
+#    于是最后一步直接抛
+#      「使用"1"个参数调用"ReadAllBytes"时发生异常:该文件太长。此操作当前仅限于支持大小小于 2 GB 的文件。」
+#    ——存根和配置已经写进去了,EXE 留下一个 ~200 KB 的**残次品**,看着像出包成功。
+#    2026-09-20 首次用真载荷出包时踩到;此前只出过 1.7 MB 的轻量验证包,永远碰不到这条线。
+#    `CopyTo` 按块搬,与文件大小无关。
 $fs = [IO.File]::Create($FinalExe)
 try {
     foreach ($part in @($SfxStub, $cfg, $ArchivePath)) {
-        $bytes = [IO.File]::ReadAllBytes($part)
-        $fs.Write($bytes, 0, $bytes.Length)
+        $in = [IO.File]::OpenRead($part)
+        try { $in.CopyTo($fs, 1MB) } finally { $in.Dispose() }
     }
 } finally { $fs.Close() }
 Write-Ok ('单文件安装包:{0}({1:N0} 字节)' -f $FinalExe, (Get-Item -LiteralPath $FinalExe).Length)

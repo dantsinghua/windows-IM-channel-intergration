@@ -316,6 +316,21 @@ def test_main_wnd_class_row_value_overrides_config_once_measured():
     db.close()
 
 
+def test_effective_main_wnd_class_for_account_resolves_via_wxid_lookup():
+    """②取用顺序的 account_id 版(``login/start`` 只有 account_id):按 account_id 找到 wxid 再取行值。"""
+    db = Db(":memory:").open()
+    st = WeChatStore(db)
+    assert st.wxid_for_account("wx01") is None
+    assert st.effective_main_wnd_class_for_account("wx01", default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    assert st.effective_main_wnd_class_for_account(None, default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    st.bind(wxid="wxid_a", account_id="wx01")
+    assert st.wxid_for_account("wx01") == "wxid_a"
+    assert st.effective_main_wnd_class_for_account("wx01", default="Qt51514QWindowIcon") == "Qt51514QWindowIcon"
+    st.record_main_wnd_class("wxid_a", "WeChatMainWndForPC")
+    assert st.effective_main_wnd_class_for_account("wx01", default="Qt51514QWindowIcon") == "WeChatMainWndForPC"
+    db.close()
+
+
 def test_record_main_wnd_class_ignores_empty_value_and_unbound_wxid():
     db = Db(":memory:").open()
     st = WeChatStore(db)
@@ -349,6 +364,32 @@ def test_main_window_class_name_is_none_when_window_absent():
     wx, s, _clk = mk_session()
     assert wx.main_window()["class_name"] is None
     assert s.status()["wechat"]["main_wnd_class"] is None
+
+
+def test_detected_main_wnd_class_helper_mirrors_main_window():
+    """服务侧调度用的只读探测口:经现有 ``main_window()`` 协议,不碰 DB。"""
+    wx, s, _clk = mk_session()
+    assert s.detected_main_wnd_class() is None
+    wx.running_pid, wx.window_class = 5101, "Qt51514QWindowIcon"
+    assert s.detected_main_wnd_class() == "Qt51514QWindowIcon"
+
+
+async def test_login_start_applies_main_wnd_class_override_before_ritual():
+    """②取用顺序落地处:``login_start(main_wnd_class=...)`` 先把它应用到后端,再进入状态机。"""
+    wx, s, _clk = mk_session()
+    wx.ui_visible = True
+    await s.login_start(account_id="wx01", main_wnd_class="WeChatMainWndForPC")
+    assert wx.search_class == "WeChatMainWndForPC"
+    assert "set_main_wnd_class:WeChatMainWndForPC" in wx.calls
+
+
+async def test_login_start_without_main_wnd_class_leaves_backend_untouched():
+    """不传 ``main_wnd_class``(全新登录,服务侧没有行值可推)时不调用 setter,沿用会话代理启动时的配置默认。"""
+    wx, s, _clk = mk_session()
+    wx.ui_visible = True
+    await s.login_start(account_id="wx01")
+    assert wx.search_class is None
+    assert not any(c.startswith("set_main_wnd_class:") for c in wx.calls)
 
 
 def test_version_match_all_branches():

@@ -470,6 +470,7 @@ class FakeWeChat:
     window_visible: bool = True
     window_minimized: bool = False
     window_class: Optional[str] = None       # R6-58 (at):main_window() 探测到的主窗口类名,测试可编程
+    search_class: Optional[str] = None       # R6-58 (at) ②:set_main_wnd_class() 收到的搜索类名,测试可断言
     ui_visible: bool = False
     narrator_pid: Optional[int] = None
     chatlog_pid: Optional[int] = None
@@ -501,6 +502,10 @@ class FakeWeChat:
         return {"exists": self.running_pid is not None, "visible": self.window_visible,
                 "minimized": self.window_minimized, "pid": self.running_pid,
                 "class_name": self.window_class if self.running_pid is not None else None}
+
+    def set_main_wnd_class(self, class_name: str) -> None:
+        self.calls.append(f"set_main_wnd_class:{class_name}")
+        self.search_class = class_name
 
     def ui_tree_visible(self) -> bool:
         return self.ui_visible

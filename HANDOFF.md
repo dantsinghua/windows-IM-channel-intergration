@@ -10,7 +10,7 @@
 - **参考记忆快照**:`.claude/skills/qtrade-redroid-resume/reference/`(一致性教训、企点读库实测、中文头等规范)。
 
 **接手第一步(任何机器)**:
-1. `git clone` / `git pull` 后跑**四套**:根 `~/.venvs/qtrade/bin/python -m pytest -q`(**1934** 条全绿)、`cd winagent && pytest -q`(**307**)、`pytest -q installer/tests`(**90**)、控制台先 `rsync -a --exclude node_modules --exclude dist console/ ~/work/qtrade-build/console/` 再在那边 `npm test`(**71**;仓库里不装 `node_modules`)、在 `docs/` 跑 `python3 check-truth-tables.py`(应 exit 0)——两者任一红就先别开工。
+1. `git clone` / `git pull` 后跑**四套**:根 `~/.venvs/qtrade/bin/python -m pytest -q`(**1934** 条全绿)、`cd winagent && pytest -q`(**314**)、`pytest -q installer/tests`(**95**)、控制台先 `rsync -a --exclude node_modules --exclude dist console/ ~/work/qtrade-build/console/` 再在那边 `npm test`(**71**;仓库里不装 `node_modules`)、在 `docs/` 跑 `python3 check-truth-tables.py`(应 exit 0)——两者任一红就先别开工。
 2. 读 `.claude/skills/qtrade-redroid-resume/SKILL.md` §5「🔴 代码现状总表」与「接手下一步」,再读该批要动的规格段落。
 3. 问安琳两件事:分支 `claude/lucid-dijkstra-uu5max` 合不合 `main`;要不要把 **R6-58/R6-59** 这一版回给 cursor 做第九轮评审。
 

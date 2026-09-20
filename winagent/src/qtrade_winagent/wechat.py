@@ -119,6 +119,17 @@ class WeChatStore:
                 return row["main_wnd_class"]
         return default
 
+    def wxid_for_account(self, account_id: str) -> Optional[str]:
+        row = self._db.one("SELECT wxid FROM wechat_profiles WHERE account_id=? AND deleted_ms IS NULL", (account_id,))
+        return row["wxid"] if row else None
+
+    def effective_main_wnd_class_for_account(self, account_id: Optional[str], *, default: str) -> str:
+        """②取用顺序的 ``account_id`` 版(``POST /wa/v1/wechat/login/start`` 只有 ``account_id``,还没有 ``wxid``):
+        先按 ``account_id`` 找到已绑定的 ``wxid`` 再走 ``effective_main_wnd_class``;全新登录(``account_id`` 为
+        None)或查无此账号(尚未 bind 过)时直接用 ``default``。
+        """
+        return self.effective_main_wnd_class(self.wxid_for_account(account_id) if account_id else None, default=default)
+
     def record_main_wnd_class(self, wxid: str, class_name: Optional[str]) -> None:
         """把该 wxid 实测到的微信主窗口类名(经 ``WeChatBackend.main_window()`` 探测)写回本列。
 
@@ -329,12 +340,24 @@ class WeChatSession:
         return {"visible": bool(w.get("exists") and w.get("visible")), "minimized": bool(w.get("minimized")),
                 "locked": False}
 
+    # ---------------------------------------------------------------- R6-58 (at):经现有协议探测到的主窗口类名
+    def detected_main_wnd_class(self) -> Optional[str]:
+        """给服务侧调度用的只读探测口(经现有 ``main_window()`` 协议;本类不碰 DB,落库由服务侧
+        ``WeChatStore.record_main_wnd_class`` 做)。窗口不存在/未识别时为 None。"""
+        return self._wx.main_window().get("class_name")
+
     # ---------------------------------------------------------------- #31 login/start
-    async def login_start(self, *, account_id: Optional[str] = None,
-                          login_session_id: Optional[str] = None) -> dict[str, Any]:
-        """→ ``202 {login_session_id}``。按 05 §2.4.4 ①~⑥ 推进;**取钥按 §2.4.4a 的 a)→b)→c) 顺序**。"""
+    async def login_start(self, *, account_id: Optional[str] = None, login_session_id: Optional[str] = None,
+                          main_wnd_class: Optional[str] = None) -> dict[str, Any]:
+        """→ ``202 {login_session_id}``。按 05 §2.4.4 ①~⑥ 推进;**取钥按 §2.4.4a 的 a)→b)→c) 顺序**。
+
+        ``main_wnd_class``:R6-58 (at) ②取用顺序落地处 —— 服务侧按 ``account_id`` 算好的「该 wxid 行值 / 配置
+        默认」,经管道参数传入;非空时先切到该类名再进入状态机(不传 = 沿用会话代理启动时的配置默认,不切)。
+        """
         if not self._cfg.enabled:
             raise WaError(NOT_READY, "微信模块未启用(winagent.toml [wechat] enabled=false)", reason="wechat_disabled")
+        if main_wnd_class:
+            self._wx.set_main_wnd_class(main_wnd_class)
         now = self._clock()
         s = LoginSession(login_session_id=login_session_id or new_login_session_id(now), account_id=account_id,
                          started_ms=now, phase_started_ms=now)
@@ -373,6 +396,7 @@ class WeChatSession:
         s = self.session
         if s is None or s.cancelled:
             return {"phase": "idle"}
+        was_ready = s.phase == "ready"
         now = self._clock()
         if s.phase == "narrator":
             # 自讲述人启动起满 narrator_min_seconds 且微信已登录 ⇒ 关讲述人 → 重新探可见性(05 §2.4.3 ④)
@@ -415,7 +439,13 @@ class WeChatSession:
                     s.dll = dll
                     s.key_rounds += 1
                     self._set_phase(s, "keytry", WAIT_KEY_IMG)
-        return self.login_status()
+        out = self.login_status()
+        # R6-58 (au) 跟进:record_login 只应在「本轮取钥刚成功、相位刚进 ready」那一次触发,不能每次轮询都记一遍
+        # login_count(轮询是高频的);服务侧看这个一次性标记决定要不要调 WeChatStore.record_login(05 §2.4.4 ⑤⑥)
+        out["just_became_ready"] = bool(s.phase == "ready" and not was_ready)
+        if out["just_became_ready"]:
+            out["wechat_version"] = self._wx.locate().get("version")
+        return out
 
     # ---------------------------------------------------------------- #33 login/status
     def login_status(self) -> dict[str, Any]:

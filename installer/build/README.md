@@ -139,9 +139,10 @@ QTrade-Setup-<ver>.exe(≈3 GB,单文件,签名)
 | 件 | 怎么产 |
 |---|---|
 | **WinAgent** | 在 `winagent/` 跑 `build/build.ps1`(PyInstaller 单目录),产出 `dist/qtrade-winagent-svc/` 与 `dist/qtrade-winagent-user/`。两个目录由 `collect-payload.ps1` 合并进 `winagent/app/`,合并后必须同时有 `qtrade-winagent-svc.exe`(服务,LocalSystem)与 `qtrade-winagent-user.exe`(会话代理,不提权)—— R-14 实名,docs/02 §2.4、docs/03 §2.8.1。 |
-| **控制台** | 在 `console/` 跑 `npm run build:dir`(= `electron-builder --dir`)。`electron-builder.yml` 的 `directories.output: release` + `target: dir` ⇒ 产物在 `console/release/win-unpacked/`。**不出 NSIS/MSI**(§2.1 末:安装引导归 7z-SFX + Inno 引擎)。 |
+| **控制台** | 在 `console/` 跑 `npm run build:dir`(= `electron-builder --dir`)。`electron-builder.yml` 的 `directories.output: release` + `target: dir` ⇒ 产物在 `console/release/win-unpacked/`。**不出 NSIS/MSI**(§2.1 末:安装引导归 7z-SFX + Inno 引擎)。<br>🔴 **在 Linux/WSL 上构建时必须显式 `npx electron-builder --dir --win --x64`** —— `build:dir` 不带 `--win`,electron-builder 默认按**当前平台**打,在 WSL 里出的是 `release/linux-unpacked/`,`collect-payload.ps1` 找 `console/release/win-unpacked` 就会报缺件(2026-09-20 实测踩过)。在 Windows 上跑 `npm run build:dir` 不受影响。 |
 | **Agent wheel** | 仓库根跑 `python -m build`(或 `pip wheel . -w dist`),出 `dist/qtrade_agent-*.whl`。真值登记在 `manifest.rootfs_contents.agent_wheel`,由 rootfs 构建写进发行版的 `/etc/qtrade/contents.json`,**两处必须逐字一致**(G-10)。 |
-| **内核 / rootfs / kcheck** | 由 `qtrade-redroid-installer` 那套产出(原机在 WSL 里的 `~/work/qtrade-redroid-installer/{kernel,rootfs}/`)。🔴 那些路径**在 WSL 里,Windows 侧打包机看不到** —— 用 `-SourceRoot` 或 `QT_SRC_KERNEL` / `QT_SRC_ROOTFS` / `QT_SRC_KCHECK` 指到打包机能访问的位置。 |
+| **rootfs / kcheck** | 由**本仓库的 `installer/rootfs/`** 产出(`build-rootfs.sh` / `build-kcheck.sh`,详见那边的 `README.md`)。两个脚本都用 `--out` 直接写进 `-SourceRoot` 指的产物根;`build-rootfs.sh` 还会在 `rootfs.tar` 旁边落一份 `contents.json`,那就是 CI 要填进 `manifest.rootfs_contents` 的东西(G-10,两处逐字一致)。 |
+| **内核 bzImage** | 由 `qtrade-redroid-installer` 那套产出(原机在 WSL 里的 `~/work/qtrade-redroid-installer/kernel/out/bzImage`,现役 v4 = `C:\Users\anlin\.qtrade-redroid\bzImage.v4`,两者 sha256 相同)。🔴 那个路径**在 WSL 里,Windows 侧打包机看不到** —— 用 `-SourceRoot` 或 `QT_SRC_KERNEL` 指到打包机能访问的位置。 |
 | **微信安装包 / chatlog+wx_key / adb / scrcpy / VC 运行库** | 第三方件。原机的取钥工具在 `/mnt/c/Users/anlin/Desktop/盈米/蜂鸟项目/南银理财/weChatlog/`(SKILL §3)。 |
 
 ### 缺件怎么办
@@ -206,6 +207,28 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
      而 `x64compatible` 会把「能跑 x64 模拟的 ARM64」放进来,正是必须拒绝的那一类;`x64os` 才是「真 x64 操作系统」。
    - `[UninstallRun]` 缺 `RunOnceId` → 补 `RunOnceId: "QTradeUninstallEngine"`。
 6. **尚未真跑过产出的 EXE**(禁区);它只做过 `7z l` / `7z t` 的结构与完整性校验。
+7. **🔴 已修:2 GB 以上的归档拼不进 EXE(2026-09-20 首次真载荷出包时踩到)**。
+   原来的拼接写 `$bytes = [IO.File]::ReadAllBytes($part)`,而 PowerShell 5.1 跑在 .NET Framework 上、
+   `byte[]` 长度上限是 `Int32.MaxValue`(2 GiB)。真载荷的 `payload.7z` 是 **2,203,995,915 字节**,
+   于是最后一步抛「该文件太长。此操作当前仅限于支持大小小于 2 GB 的文件。」——
+   **存根和 SFX 配置已经写进去了**,`out\QTrade-Setup-1.0.0.exe` 留下一个 ~209 KB 的残次品,
+   它能双击、外观与正常包无异,只在解压时失败。已改成 `OpenRead` + `CopyTo($fs, 1MB)` 流式拼接。
+   ⚠️ 这条线**以后每次出正式包都会踩**:§2.2.2 估「rootfs 3.3 GB → LZMA2 后 ~1.5 GB」的前提是
+   「镜像层多为压缩前的原始文件系统」,但 `docker save` 出来的 tar 里镜像层**本身已经 gzip 压过**,
+   LZMA2 再压几乎没收益(实测 rootfs.tar 2.16 GB 进归档仍 2.0 GB 出头)。
+   **§2.2.2 的估算表建议按实测更正。**
+   教训:这一类缺陷 90 条 Pester + 95 条 pytest 都覆盖不到 —— 它们手里没有 2 GB 的文件。
+8. **🔴 已修:`manifest.rootfs_contents` 之前恒为空**(同日一并发现)。
+   `collect-payload.ps1` 原来写 `rootfs_contents = [ordered]@{}` 加一句「CI 在此登记同一份」的注释,
+   但**没有任何代码真去登记**,于是出的每个包这一项都是 `{}`。后果是安装期 `IMAGES_LOADED` 那步
+   「按 `rootfs_contents` 在发行版内复核(`sha256sum` 各路径 + `docker images --digests` 比对)」
+   **什么都没校验** —— 换过的 redroid 镜像、被替换的 adb 都能一路装完不报错,
+   而这正是 G-10 要防的(§2.2.1 末段)。
+   现在 `collect-payload.ps1` 从 `<SourceRoot>\rootfs\out\contents.json`
+   (`installer/rootfs/build-rootfs.sh` 落的,也可用 `QT_SRC_ROOTFS_CONTENTS` 指定)
+   **原样读入、一个字段都不改写**,以满足「两处逐字一致」;收了 `rootfs.tar` 却找不到清单时,
+   不带 `-AllowMissing` 直接 throw。已实测 `manifest.rootfs_contents` 与发行版内
+   `/etc/qtrade/contents.json` **逐字相等**。
 
 
 ---

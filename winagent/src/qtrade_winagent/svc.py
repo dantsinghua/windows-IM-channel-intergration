@@ -179,7 +179,7 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
                 "user_session": d.hub.user_session_view(),
                 "modules": {"vault": "ok", "monitor": "ok", "netprobe": "ok", "power": "ok",
                             "wslctl": "ok" if d.hub.user_agent_online else "offline", "wechat": wechat_mod},
-                "checks": dict(d.monitor.state.checks),
+                "checks": d.monitor.health_checks(),        # R6-58 (ao):恒八键,没跑过的给 None(不是动态字典)
                 "host": d.monitor.host_snapshot()}
 
     # ================================================================== #3 version(A/C,svc)
@@ -590,8 +590,13 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
             auth(request, (ROLE_AGENT,), action="wechat.login_start")
             _wechat_enabled_guard()
             body = await _json(request)
+            # R6-58 (at) ②取用顺序落地处:按 account_id 算好「该 wxid 行值 / 配置默认」随管道参数带下去,
+            # 会话代理只应用(WeChatBackend.set_main_wnd_class),自己不碰 DB
+            main_wnd_class = d.wechat_store.effective_main_wnd_class_for_account(
+                body.get("account_id"), default=d.cfg.wechat.main_wnd_class)
             out = await via_pipe("wechat.login.start", {"account_id": body.get("account_id"),
-                                                        "login_session_id": body.get("login_session_id")},
+                                                        "login_session_id": body.get("login_session_id"),
+                                                        "main_wnd_class": main_wnd_class},
                                  timeout_s=TIMEOUT_S["wechat_login_start"], request=request)
         except WaError as e:
             return fail(e, request)
@@ -611,9 +616,18 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
     async def wechat_login_status(request: Request):                              # type: ignore[no-untyped-def]
         try:
             auth(request, (ROLE_AGENT,), action="wechat.login_status")
-            return await via_pipe("wechat.login.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+            out = await via_pipe("wechat.login.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
         except WaError as e:
             return fail(e, request)
+        # R6-58 (au) 跟进:05 §2.4.4 ⑤⑥ 取钥成功即算一次完整登录 ——「刚进 ready」这一次(一次性标记,
+        # 不是每次轮询都记)落 wechat_profiles.login_count/last_login_ms/last_wxkey_dll(结果随响应带回,
+        # 由服务落库;会话代理不碰 DB)。两个内部字段用完即弹出,不进 #33 的公开响应形状。
+        just_became_ready = out.pop("just_became_ready", False)
+        wechat_version = out.pop("wechat_version", None)
+        if just_became_ready and out.get("wxid") and out.get("account_id"):
+            d.wechat_store.record_login(wxid=out["wxid"], account_id=out["account_id"],
+                                        wechat_version=wechat_version, wxkey_dll=(out.get("key") or {}).get("dll"))
+        return out
 
     @app.post("/wa/v1/wechat/update-block")
     async def wechat_update_block(request: Request):                              # type: ignore[no-untyped-def]
@@ -640,7 +654,10 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
             out = d.wechat_store.bind(wxid=str(body["wxid"]), account_id=str(body["account_id"]))
             if d.hub.user_agent_online:                                            # 让后续 login/status 带上 wxid
                 try:
-                    await via_pipe("wechat.bind", out, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+                    bind_resp = await via_pipe("wechat.bind", out, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+                    # R6-58 (at) ①:该 wxid 此刻实测到的主窗口类名随响应带回(经现有 main_window() 协议探测),
+                    # 服务侧落库;落空(未测到)时 record_main_wnd_class 自己会跳过,不覆盖已有实测值
+                    d.wechat_store.record_main_wnd_class(out["wxid"], bind_resp.get("main_wnd_class"))
                 except WaError:
                     pass
         except KeyError as e:

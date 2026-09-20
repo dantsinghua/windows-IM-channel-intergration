@@ -67,6 +67,19 @@ async def test_health_shape_and_user_agent_flag(rig):
     assert set(b["host"]) == {"total_mb", "available_mb", "wsl_vm_mb", "wechat_mb", "chatlog_mb"}
     assert b["modules"]["wslctl"] == "offline" and b["modules"]["wechat"] == "offline"
     assert set(b["modules"]) == {"vault", "monitor", "netprobe", "power", "wslctl", "wechat"}
+    # R6-58 (ao):checks 恒八键,一项都没跑过时全部是 None,不是空字典/动态字典
+    assert set(b["checks"]) == {"H01", "H09", "H10", "H11", "H14", "H15", "H16", "H20"}
+    assert all(v is None for v in b["checks"].values())
+
+
+async def test_health_checks_stay_eight_keys_once_some_have_run(rig):
+    """跑过的项在 ``checks`` 里给真布尔值,其余仍是 ``None``;键集不随跑过哪些项变化。"""
+    rig.deps.monitor.check_pending_reboot()                                # H14
+    async with client(rig) as c:
+        b = (await c.get("/wa/v1/health")).json()
+    assert b["checks"]["H14"] is True
+    assert set(b["checks"]) == {"H01", "H09", "H10", "H11", "H14", "H15", "H16", "H20"}
+    assert b["checks"]["H01"] is None and b["checks"]["H20"] is None
 
 
 async def test_health_user_agent_true_after_handshake(rig_with_user):
@@ -360,6 +373,67 @@ async def test_wechat_bind_then_profiles(rig_with_user):
         assert bad.status_code == 400
         profiles = (await c.get("/wa/v1/wechat/profiles")).json()["profiles"]
     assert [p["account_id"] for p in profiles] == ["wx01"]
+
+
+# ---------------------------------------------------------------- main_wnd_class 端到端(R6-58 (at),经现有 Fake 管道)
+async def test_wechat_bind_records_detected_main_wnd_class_over_the_pipe(rig_with_user):
+    """①经命名管道回传:会话代理探测到的 class_name 随 ``wechat.bind`` 响应带回,服务侧落库。"""
+    rig_with_user.wechat.running_pid = 5101
+    rig_with_user.wechat.window_class = "Qt51514QWindowIcon"
+    async with client(rig_with_user) as c:
+        assert (await c.post("/wa/v1/wechat/bind", json={"wxid": "wxid_a", "account_id": "wx01"})).json()["ok"] is True
+    row = rig_with_user.deps.wechat_store.profiles()[0]
+    assert row["main_wnd_class"] == "Qt51514QWindowIcon"
+
+
+async def test_wechat_bind_keeps_existing_main_wnd_class_when_nothing_detected(rig_with_user):
+    """没探测到(窗口不存在)时不覆盖已有实测值 —— 服务侧 ``record_main_wnd_class`` 的空值防呆经管道也生效。"""
+    rig_with_user.deps.wechat_store.bind(wxid="wxid_a", account_id="wx01")
+    rig_with_user.deps.wechat_store.record_main_wnd_class("wxid_a", "Qt51514QWindowIcon")
+    async with client(rig_with_user) as c:                                    # running_pid 仍是 None ⇒ 探测不到
+        assert (await c.post("/wa/v1/wechat/bind", json={"wxid": "wxid_a", "account_id": "wx01"})).json()["ok"] is True
+    row = rig_with_user.deps.wechat_store.profiles()[0]
+    assert row["main_wnd_class"] == "Qt51514QWindowIcon"
+
+
+async def test_wechat_login_start_pushes_row_value_over_config_default(rig_with_user):
+    """②取用顺序落地:该 account_id 已绑定的 wxid 有实测值时,``login/start`` 把它推给会话代理(而不是配置默认)。"""
+    rig_with_user.deps.wechat_store.bind(wxid="wxid_a", account_id="wx01")
+    rig_with_user.deps.wechat_store.record_main_wnd_class("wxid_a", "WeChatMainWndForPC")
+    async with client(rig_with_user) as c:
+        r = await c.post("/wa/v1/wechat/login/start", json={"account_id": "wx01"})
+        assert r.status_code == 202
+    assert rig_with_user.wechat.search_class == "WeChatMainWndForPC"
+
+
+async def test_wechat_login_start_falls_back_to_config_default_for_fresh_login(rig_with_user):
+    """②取用顺序落地:全新登录(未 bind 过 / 无 account_id)时会话代理收到的是配置默认,不是某个陈旧行值。"""
+    async with client(rig_with_user) as c:
+        assert (await c.post("/wa/v1/wechat/login/start", json={})).status_code == 202
+    assert rig_with_user.wechat.search_class == rig_with_user.deps.cfg.wechat.main_wnd_class
+
+
+async def test_wechat_login_status_records_login_once_when_ready(rig_with_user):
+    """record_login 按 05 §2.4.4 ⑤⑥ 在「刚进 ready」这一次经管道接上;重复轮询不重复计数(一次性标记)。"""
+    wx = rig_with_user.wechat
+    wx.ui_visible = True                                                       # 跳过讲述人仪式,直接 qrcode
+    async with client(rig_with_user) as c:
+        assert (await c.post("/wa/v1/wechat/login/start", json={"account_id": "wx01"})).status_code == 202
+        wx.wxid = "wxid_a"
+        st = (await c.get("/wa/v1/wechat/login/status")).json()                # → identified
+        assert st["phase"] == "identified"
+        await c.post("/wa/v1/wechat/bind", json={"wxid": "wxid_a", "account_id": "wx01"})
+        (await c.get("/wa/v1/wechat/login/status")).json()                     # → keytry / WAIT_KEY_IMG
+        wx.img_key = True
+        (await c.get("/wa/v1/wechat/login/status")).json()                     # → WAIT_KEY_RELOGIN
+        wx.data_key = True
+        st = (await c.get("/wa/v1/wechat/login/status")).json()                # → ready(刚进)
+        assert st["phase"] == "ready"
+        assert "just_became_ready" not in st and "wechat_version" not in st    # 内部一次性字段不进 #33 公开响应
+        st2 = (await c.get("/wa/v1/wechat/login/status")).json()               # 再轮一次,仍是 ready
+        assert st2["phase"] == "ready"
+    row = rig_with_user.deps.wechat_store.profiles()[0]
+    assert row["login_count"] == 1 and row["last_wxkey_dll"] == "wx_key2.dll"  # 没有被第二次轮询重复计数
 
 
 async def test_wechat_send_rejected_without_key_and_ok_with(rig_with_user):

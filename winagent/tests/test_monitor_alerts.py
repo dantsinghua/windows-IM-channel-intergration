@@ -9,7 +9,7 @@ from qtrade_winagent.backends import ProcInfo
 from qtrade_winagent.config import AlertConfig, MonitorConfig
 from qtrade_winagent.db import Db
 from qtrade_winagent.fakes import FakeProbe, FakeSys
-from qtrade_winagent.monitor import DiskTarget, Monitor
+from qtrade_winagent.monitor import HEALTH_CHECK_KEYS, DiskTarget, Monitor
 
 from tests.conftest import Clock
 
@@ -235,4 +235,28 @@ def test_h09_h10_h11_h16_flip_with_facts():
     assert m.check_session_locked() is True and ab.is_firing(A.H11_SESSION_LOCKED, "host")
     m.check_bind(expected={"127.0.0.1", "172.23.16.1"}, actual={"127.0.0.1"})
     assert ab.is_firing(A.H16_WINAGENT_BIND_MISMATCH, "host")
+    db.close()
+
+
+# ---------------------------------------------------------------- health_checks(R6-58 (ao):恒八键)
+def test_health_checks_is_fixed_eight_keys_with_none_when_unrun():
+    """一项都没跑过时:``health_checks()`` 仍是那八个键,值全 ``None`` —— 不是空字典。"""
+    db, _sysb, _ab, m, _clk = mk()
+    assert HEALTH_CHECK_KEYS == ("H01", "H09", "H10", "H11", "H14", "H15", "H16", "H20")
+    assert m.health_checks() == {k: None for k in HEALTH_CHECK_KEYS}
+    db.close()
+
+
+def test_health_checks_fills_in_as_checks_run_and_excludes_h12():
+    """跑过的项给真布尔值,没跑过的仍是 ``None``;H12(本模块内部还有的项)不进本端点的八键。"""
+    db, sysb, _ab, m, _clk = mk()
+    m.check_pending_reboot()                                         # H14:未待重启 ⇒ True
+    sysb.locked = True
+    m.check_session_locked()                                         # H11:锁屏 ⇒ False
+    m.check_disks()                                                  # H12(不在八键内)
+    out = m.health_checks()
+    assert out["H14"] is True and out["H11"] is False
+    assert out["H01"] is None and out["H09"] is None and out["H10"] is None
+    assert out["H15"] is None and out["H16"] is None and out["H20"] is None
+    assert "H12" not in out and set(out) == set(HEALTH_CHECK_KEYS)
     db.close()

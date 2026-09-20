@@ -432,7 +432,9 @@ class FakeWinAgent:
                                     # 02 §3.6 #2:modules 恒含六个键(B-2:原来只有三个,按 wslctl 做降级判断的测试会假绿)
                                     "modules": {"vault": "ok", "monitor": "ok", "netprobe": "ok", "power": "ok", "wslctl": "ok",
                                                 "wechat": "enabled" if self.wechat_enabled else "disabled"},
-                                    "checks": {}, "host": self.host}).encode()
+                                    # R6-58 (ao):checks **恒八键**、没跑过的给 null(与 winagent monitor.HEALTH_CHECK_KEYS 同序)
+                                    "checks": {k: None for k in ("H01", "H09", "H10", "H11", "H14", "H15", "H16", "H20")},
+                                    "host": self.host}).encode()
         if path == "/wa/v1/time":
             return 200, rh, _dumps({"now_ms": self._now(), "tz_offset_min": 480, "last_resume_ms": self.last_resume_ms,
                                     "w32time": {"source": "time.windows.com", "last_sync_ms": self._now() - 3600_000}}).encode()
