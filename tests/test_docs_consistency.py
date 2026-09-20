@@ -187,6 +187,15 @@ def test_health_and_monitor_defaults_match_doc_04(key, value):
     assert int(m.group(1)) == value
 
 
+def test_agent_probe_enabled_default_matches_doc_04():
+    """04 §7 `[probe]` 是 `agent_probe_enabled` 的 owner(裁决 00 §15g R6-62 Ⅶ①):缺省 `false` = 缺省不出网。"""
+    m = re.search(r"^agent_probe_enabled\s*=\s*(true|false)", _doc(DOC04), re.M)
+    assert m, "04 §7 [probe] 找不到 agent_probe_enabled"
+    default = AgentConfig().probe.agent_probe_enabled
+    assert default is False
+    assert m.group(1) == ("true" if default else "false")
+
+
 def test_restart_backoff_matches_doc_04():
     m = re.search(r"^container_restart_backoff_s\s*=\s*\[([\d,]+)\]", _doc(DOC04), re.M)
     assert tuple(int(x) for x in m.group(1).split(",")) == AgentConfig().health.container_restart_backoff_s
