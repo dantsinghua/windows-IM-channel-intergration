@@ -316,8 +316,11 @@ class Store:
                     v = int(v)
                 c.execute(f"UPDATE resource_pools SET {k}=?, updated_ms=? WHERE pool=?", (v, now, pool))
 
-    def pool_used_mb(self) -> int:
-        return int(self.con.execute(self.POOL_USED_SQL).fetchone()[0])
+    def pool_used_mb(self, *, exclude_id: Optional[str] = None) -> int:
+        """R6-55:``exclude_id`` = start/restart 时排除自身(created 已计入 used,不排除则预算恰好只够一个时自己起不来)。"""
+        if exclude_id is None:
+            return int(self.con.execute(self.POOL_USED_SQL).fetchone()[0])
+        return int(self.con.execute(self.POOL_USED_SQL + " AND id<>?", (exclude_id,)).fetchone()[0])
 
     def pool_claim_wsl(self, quota_mb: int, *, now_ms: Optional[int] = None) -> bool:
         """行级 claim(R-08 §2.3.1 ③):条件 UPDATE + rowcount 判定,防两个并发新增同时通过预检;不用内存锁。"""

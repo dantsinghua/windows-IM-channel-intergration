@@ -152,7 +152,8 @@ class AccountService:
                                  detail={"channel": channel, "seq": seq, "quota_mb": quota_mb, "remember": bool(row["remember"])}, now_ms=self._clock())
         return row
 
-    def _raise_exhausted(self, channel: str, reason: str, alts: list[dict[str, Any]]) -> None:
+    def _raise_exhausted(self, channel: str, reason: str, alts: list[dict[str, Any]], *, exclude_account_id: Optional[str] = None) -> None:
+        free = self._pool.free_mb(exclude_account_id=exclude_account_id)
         if channel == "wechat":
             if reason == "slot_held":
                 holder = alts[0]["holder"] if alts else ""
@@ -161,8 +162,8 @@ class AccountService:
             if reason == "winagent_offline":
                 raise ApiError(503, "NOT_READY", "WinAgent 离线,微信不可用", reason=reason, retryable=True)
             raise ApiError(409, "RESOURCE_EXHAUSTED", f"微信不可新增:{reason}", reason=reason, extra={"alternatives": alts})
-        raise ApiError(409, "RESOURCE_EXHAUSTED", f"资源不足,无法新增 {channel}(剩余 {self._pool.free_mb()} MB,需 {self._pool.quota(channel)} MB)",
-                       reason=reason, extra={"alternatives": alts, "free_mb": self._pool.free_mb(), "need_mb": self._pool.quota(channel)})
+        raise ApiError(409, "RESOURCE_EXHAUSTED", f"资源不足,无法新增 {channel}(剩余 {free} MB,需 {self._pool.quota(channel)} MB)",
+                       reason=reason, extra={"alternatives": alts, "free_mb": free, "need_mb": self._pool.quota(channel)})
 
     # ------------------------------------------------------------------ #9 start / #11 restart
     async def start(self, id: str, *, actor: str) -> dict[str, Any]:
@@ -175,9 +176,9 @@ class AccountService:
             if row["state"] in ("login_required", "logging_in", "running", "degraded", "starting", "provisioning"):
                 return {"state": row["state"], "already": True}
             raise ApiError(409, "NOT_APPLICABLE", f"当前状态 {row['state']} 不可 start", reason="bad_state")
-        ok, reason, alts = self._pool.can_add(row["channel"])
+        ok, reason, alts = self._pool.can_add(row["channel"], exclude_account_id=id)      # R6-55:排除自身(created 已计入 used)
         if not ok:
-            self._raise_exhausted(row["channel"], reason, alts)
+            self._raise_exhausted(row["channel"], reason, alts, exclude_account_id=id)
         if row["channel"] == "wechat":
             if not self._health.winagent_online:
                 raise ApiError(503, "NOT_READY", "WinAgent 离线", reason="winagent_offline", retryable=True)
@@ -256,9 +257,9 @@ class AccountService:
             raise ApiError(409, "NOT_APPLICABLE", "账号已停用", reason="account_disabled")
         if self.busy(id):
             raise ApiError(409, "NOT_APPLICABLE", "账号正在切换状态", reason="busy")
-        ok, reason, alts = self._pool.can_add(row["channel"]) if row["state"] in ("stopped", "created", "error") else (True, "", [])
+        ok, reason, alts = self._pool.can_add(row["channel"], exclude_account_id=id) if row["state"] in ("stopped", "created", "error") else (True, "", [])
         if not ok:
-            self._raise_exhausted(row["channel"], reason, alts)
+            self._raise_exhausted(row["channel"], reason, alts, exclude_account_id=id)
 
         async def seq() -> None:
             if row["state"] in STOPPABLE:

@@ -230,6 +230,19 @@ def test_stop_sequence_purges_after_stopped(api):
     assert r.status_code == 200 and r.json()["already"] is True
 
 
+def test_created_account_can_start_when_budget_fits_exactly_one(api):
+    """R6-55:created 已计入 used,start 的 can_add 须排除自身,否则预算恰好只够一个时它自己永远起不来。"""
+    rig = api(wsl_total_mb=2048 + 2560)               # budget 恰好一个企点
+    c = rig.client
+    assert create(c, "唯一", key="a").status_code == 201
+    r = c.post("/api/v1/accounts/qd01/start", headers=H(TOKEN_WRITE))
+    assert r.status_code == 202
+    rig.idle("qd01")
+    assert rig.store.get_account_full("qd01")["state"] == "login_required"
+    r = create(c, "二", key="b")
+    assert r.status_code == 409 and r.json()["error"]["free_mb"] == 0
+
+
 def test_start_from_stopped_must_pass_can_add_again(api):
     rig = api(wsl_total_mb=2048 + 2560 + 700)         # 只够一个企点 + 一个 qq
     c = rig.client

@@ -51,7 +51,7 @@ CREATE TABLE accounts (
   auto_recover    INTEGER NOT NULL DEFAULT 1 CHECK (auto_recover IN (0,1)),  -- 启用但不自动拉起 = 0(C-44)
   login_mode      TEXT NOT NULL CHECK (login_mode IN ('password','qrcode','manual')),
   credential_ref  TEXT,                          -- 'vault://account/qd01';不保存密码则 NULL
-  remember        INTEGER NOT NULL DEFAULT 0 CHECK (remember IN (0,1)),  -- R4-6:默认**不存**(基线「默认不存凭据」/#12「remember 默认 false」)。DEFAULT 1 会让用户不勾「记住」也落密文,涉及凭据以基线为准。只有 #13 PUT credential 显式传 remember=true 才置 1
+  remember        INTEGER NOT NULL DEFAULT 0 CHECK (remember IN (0,1)),  -- R4-6:默认**不存**(基线「默认不存凭据」/#12「remember 默认 false」)。DEFAULT 1 会让用户不勾「记住」也落密文,涉及凭据以基线为准。只有 #2 login.remember=true(带 secret)或 #13 PUT credential 显式传 remember=true 才置 1(R6-55)
   quota_mb        INTEGER NOT NULL,              -- 资源池预算,创建时从 resource_pools.quota_json 拷贝
   capabilities_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(capabilities_json)),
   identity_json   TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(identity_json)),  -- QQ:qq_data 指纹摘要;微信:wxid;企点:见 device_profiles

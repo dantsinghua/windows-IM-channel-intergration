@@ -72,14 +72,14 @@ class Pool:
         w = self._store.pool_get("wsl")
         return int(w["total_mb"]) - int(w["reserved_mb"])
 
-    def used_mb(self) -> int:
-        return self._store.pool_used_mb()
+    def used_mb(self, *, exclude_account_id: Optional[str] = None) -> int:
+        return self._store.pool_used_mb(exclude_id=exclude_account_id)
 
-    def free_mb(self) -> int:
-        return self.wsl_budget() - self.used_mb()
+    def free_mb(self, *, exclude_account_id: Optional[str] = None) -> int:
+        return self.wsl_budget() - self.used_mb(exclude_account_id=exclude_account_id)
 
-    def can_add(self, channel: str, *, extra_mb: int = 0) -> tuple[bool, str, list[dict[str, Any]]]:
-        """返回 ``(ok, reason, alternatives)``;``extra_mb`` 供 PATCH quota_mb 增量校验。"""
+    def can_add(self, channel: str, *, extra_mb: int = 0, exclude_account_id: Optional[str] = None) -> tuple[bool, str, list[dict[str, Any]]]:
+        """返回 ``(ok, reason, alternatives)``;``extra_mb`` 供 PATCH quota_mb 增量校验;``exclude_account_id`` = start/restart 排除自身(R6-55)。"""
         if channel not in CHANNELS:
             return False, "unknown_channel", []
         if channel == "wechat":
@@ -96,19 +96,20 @@ class Pool:
                 return False, "windows_budget", []
             return True, "", []
         need = self.quota(channel) if not extra_mb else extra_mb
-        free = self.free_mb()
+        free = self.free_mb(exclude_account_id=exclude_account_id)
         if free >= need:
             return True, "", []
-        return False, "wsl_budget", self._alternatives(channel, need, free)
+        return False, "wsl_budget", self._alternatives(channel, need, free, exclude_account_id)
 
-    def _alternatives(self, channel: str, need: int, free: int) -> list[dict[str, Any]]:
+    def _alternatives(self, channel: str, need: int, free: int, exclude_account_id: Optional[str] = None) -> list[dict[str, Any]]:
         """C.3.3「可改开 QQ / 停用一个企点」:每项 ``{kind, channel?, account_ids?, need_mb, free_mb}``。"""
         alts: list[dict[str, Any]] = []
         for other in ("qq", "qidian"):
             if other != channel and free >= self.quota(other):
                 alts.append({"kind": "add_other_channel", "channel": other, "need_mb": self.quota(other), "free_mb": free})
         rows = self._store.list_accounts()
-        running = [r["id"] for r in rows if r["host"] == "wsl" and r["enabled"] and r["state"] not in ("stopped", "disabled", "error")]
+        running = [r["id"] for r in rows if r["host"] == "wsl" and r["enabled"] and r["state"] not in ("stopped", "disabled", "error")
+                   and r["id"] != exclude_account_id]
         if running:
             alts.append({"kind": "stop_one", "account_ids": running, "need_mb": need, "free_mb": free})
         return alts

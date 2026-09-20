@@ -4,9 +4,9 @@
 
 | 目录 | 内容 |
 |---|---|
-| `docs/` | 详细设计(唯一真值 = `00` 基线 + `01~06` 六册 + `07` 配置总表;裁决表 `00` §15g 当前至 **R6-53**);`check-truth-tables.py` 真值表对账器,改文档后必跑 |
-| `src/qtrade_agent/` | Agent(WSL 侧 systemd 服务)代码。2026-09-19 第八轮评审收口后开工。首批 = M2 骨架里能在无 redroid 环境下编码与单测的部分:`store`(DDL 逐字抽自 02 §3.1、`ingest` 三元组、同事务顺序、出向合并)、`adapters/qidian`(XOR 解码、`msgtype` 路由、`poll_maindb`/`check_group_gaps`)、`bus`(R6-48 入口校验、出向先落库、幂等三态、队列外等确认)、`events`/`alerts`、`text.norm/clean_text`;第二批 = `scheduler`、`health`(内存态)、`api/`(FastAPI:鉴权/错误信封/版本头/accounts/commands/send/sessions/messages/audit/WS events)、`app.py` 装配、`main.py`(`python3 -m qtrade_agent.main`) |
-| `tests/` | pytest 277 条:开发者单测 65 条(含「发送 → 读库合并 → DELIVERED」集成用例与「代码 ↔ 文档」对账)+ `tests/acceptance/` 独立验收 212 条(三位只读规格、不看开发者测试的撰写者按 06 §2.9.5/§2.12、02 §2.2/§2.8/§3.4/§8b、00 §7/§10 逐条写;基线 §15g R6-51/R6-53 是它们的收口) |
+| `docs/` | 详细设计(唯一真值 = `00` 基线 + `01~06` 六册 + `07` 配置总表;裁决表 `00` §15g 当前至 **R6-55**);`check-truth-tables.py` 真值表对账器,改文档后必跑 |
+| `src/qtrade_agent/` | Agent(WSL 侧 systemd 服务)代码。2026-09-19 第八轮评审收口后开工。首批 = M2 骨架里能在无 redroid 环境下编码与单测的部分:`store`(DDL 逐字抽自 02 §3.1、`ingest` 三元组、同事务顺序、出向合并)、`adapters/qidian`(XOR 解码、`msgtype` 路由、`poll_maindb`/`check_group_gaps`)、`bus`(R6-48 入口校验、出向先落库、幂等三态、队列外等确认)、`events`/`alerts`、`text.norm/clean_text`;第二批 = `scheduler`、`health`(内存态)、`api/`(FastAPI:鉴权/错误信封/版本头/accounts/commands/send/sessions/messages/audit/WS events)、`app.py` 装配、`main.py`(`python3 -m qtrade_agent.main`);第三批 = `runtime/`(docker/adb 后端协议 + 命令行实现 + 可编程假实现、端口按序号推导、`_purge_ephemeral`、`ensure_root` 三步逐字)、`pool`(02 §2.2.5 配额算法)、`accounts`(生命周期状态机 + `error_since_ms` 两个动作 + 启动恢复;端点 #2/#4/#5/#6/#7/#9/#10/#11/#19/#69)、`vault_client`/`winagent_client`/`timesync`(02 §2.5 契约、H13 校时)。开发容器里一律注入假后端,绝不碰真 docker/adb/WinAgent |
+| `tests/` | pytest 420 条:开发者单测 125 条(含「发送 → 读库合并 → DELIVERED」集成用例、冷启动序列不跳段、`ensure_root` 逐字、与「代码 ↔ 文档」对账)+ `tests/acceptance/` 独立验收 295 条(四位只读规格、不看开发者测试的撰写者按 06 §2.9.5/§2.12、02 §2.2/§2.5/§2.6/§2.8/§3.4/§3.6/§8b、00 §3/§7/§8.1/§10、05 §2.1.1/§2.5、04 H02/H06/H13 逐条写;基线 §15g R6-51/R6-53/R6-55 是它们的收口) |
 | `.claude/skills/qtrade-redroid-resume/` | 断点续接 skill:接手先读它全文 |
 | `HANDOFF.md` / `CLAUDE.md` | 交接入口 / 项目级规范 |
 
