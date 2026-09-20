@@ -19,7 +19,7 @@ from . import __version__
 from .config import WinAgentConfig, load as load_cfg
 from .errors import BUSY, FORBIDDEN, VERSION_MISMATCH, WaError
 from .logfmt import get_logger
-from .main_svc import DEFAULT_ROOT, expand, read_toml, setup_logging
+from .main_svc import DEFAULT_ROOT, contain, expand, read_toml, setup_logging
 from .pipe import BUSY_RETRY_S
 from .user import UserAgent
 
@@ -42,9 +42,11 @@ def build_user_agent(cfg: WinAgentConfig, *, session_id: str, user_sid: str, roo
         wx = WinWeChat(exe_path=cfg.wechat.exe_path, chatlog_dir=os.path.expandvars(cfg.wechat.chatlog_dir),
                        chatlog_port=cfg.wechat.chatlog_port, main_wnd_class=cfg.wechat.main_wnd_class,
                        process_close_grace_s=cfg.wechat.process_close_grace_s)
+    # `.wslconfig` 备份是会话代理这一侧唯一的写入落点;fake(``--dev``)时一律重基到 ``root`` 下,
+    # 与服务侧 ``build_real_deps`` 同一条自包含口径(不靠「%ProgramData% 展不开」的巧合)。
     return UserAgent(cfg, pipe=pipe, wsl=wsl, wechat=wx, power=power, session_id=session_id,
                      user_sid=user_sid, version=__version__,
-                     backup_dir=expand(cfg.wsl.backup_dir, root))
+                     backup_dir=(contain if fake else expand)(cfg.wsl.backup_dir, root))
 
 
 async def run_forever(ua: UserAgent) -> int:
@@ -83,15 +85,19 @@ def current_user_sid() -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="qtrade-winagent-user")
-    ap.add_argument("--root", default=DEFAULT_ROOT)
+    ap.add_argument("--root", default=None, help="%%ProgramData%%\\QTrade\\winagent(--dev 下必填)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--session-id", default=os.environ.get("SESSIONNAME", "Console"))
     ap.add_argument("--dev", action="store_true")
     args = ap.parse_args(argv)
-    cfg = load_cfg(read_toml(args.config or os.path.join(args.root, "winagent.toml")))
-    sid = os.path.join(args.root, "logs")
-    setup_logging(cfg.log.level, None if args.dev else sid)
-    ua = build_user_agent(cfg, session_id=args.session_id, user_sid=current_user_sid(), root=args.root,
+    if args.dev and not args.root:                                      # 同 main_svc:不许隐式落进生产目录
+        ap.error("--dev 必须显式给 --root(否则默认落进生产目录 %ProgramData%\\QTrade\\winagent);"
+                 "照 README §3 的写法:--dev --root /tmp/wa-dev")
+    root = args.root or DEFAULT_ROOT
+    cfg = load_cfg(read_toml(args.config or os.path.join(root, "winagent.toml")))
+    log_dir = os.path.join(root, "logs")
+    setup_logging(cfg.log.level, None if args.dev else log_dir)
+    ua = build_user_agent(cfg, session_id=args.session_id, user_sid=current_user_sid(), root=root,
                           fake=args.dev)
     return asyncio.run(run_forever(ua))
 

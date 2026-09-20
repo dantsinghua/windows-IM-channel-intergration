@@ -52,18 +52,37 @@ def setup_logging(level: str, log_dir: Optional[str]) -> None:
     root.addHandler(h)
 
 
-def expand(path: str, root: str) -> str:
-    """展开 ``%ProgramData%`` 一类环境变量;**在非 Windows 上展不开就落到 ``--root`` 下**。
+def contain(path: str, root: str) -> str:
+    """**自包含重基**:把配置里的一条**写入**路径钉进 ``root``,不看平台、不看变量展不展得开。
 
-    ``os.path.expandvars`` 只认当前平台的语法,Linux 上 ``%ProgramData%\QTrade\winagent\vault`` 会原样留下,
-    于是被当成**相对当前目录**的路径创建出来(``--dev`` 冒烟时实测在仓库里拉了一坨 ``%ProgramData%\...`` 目录)。
-    这里统一收口:展不开(仍含 ``%``)就取它的末段拼到 ``root`` 下,``--dev`` 因此是自包含的。
+    ``--dev``/假后端装配走这条(README §3:「只起 HTTP + 假后端,**不动任何真系统状态**」)。
+    🔴 它**不能**靠 ``expand()`` 的「展不开才兜底」——那只是 Linux 上的巧合:真 Windows 上
+    ``%ProgramData%`` 展得开,vault / 内核落盘 / ``.wslconfig`` 备份会一起逃出 ``--root``
+    落进生产目录 ``C:\\ProgramData\\QTrade\\``(实测:跑一次 pytest 就在生产熵文件的位置上
+    留下一把 ``FakeCrypto`` 造的假熵)。所以这里是**显式开关**,与能否展开无关。
+
+    取法:先 ``expandvars``,取 ``QTrade`` 段之后的相对段(没有 ``QTrade`` 段则取末段);
+    仍带 ``%`` 的段与 ``.``/``..`` 一律丢弃,保证结果**绝对**且**无未展开变量**。
+    """
+    segs = [s for s in os.path.expandvars(path).replace("\\", "/").split("/") if s]
+    segs = segs[segs.index("QTrade") + 1:] if "QTrade" in segs else segs[-1:]
+    return os.path.abspath(os.path.join(root, *[s for s in segs if "%" not in s and s not in (".", "..")]))
+
+
+def expand(path: str, root: str) -> str:
+    """展开 ``%ProgramData%`` 一类环境变量(**生产语义**);**在非 Windows 上展不开才落到 ``--root`` 下**。
+
+    Windows 上 ``%ProgramData%\\QTrade\\winagent\\vault`` 就该解析成真机那个真实目录——02 §7.2 的
+    ``[vault] dir`` 默认值指的正是它。``os.path.expandvars`` 只认当前平台的语法,Linux 上该串会原样留下,
+    于是被当成**相对当前目录**的路径创建出来(``--dev`` 冒烟时实测在仓库里拉了一坨 ``%ProgramData%\\...`` 目录),
+    故展不开(仍含 ``%``)时兜回 ``root`` 下。
+
+    🔴 **自包含不归这个函数管**:``--dev`` 的落点收口一律走 ``contain()``。
     """
     p = os.path.expandvars(path)
     if "%" not in p:
         return p
-    tail = p.replace("\\", "/").split("QTrade/", 1)[-1] if "QTrade" in p.replace("\\", "/") else os.path.basename(p)
-    return os.path.join(root, *[seg for seg in tail.split("/") if seg])
+    return contain(p, root)
 
 
 def read_toml(path: str) -> dict[str, Any]:
@@ -76,7 +95,15 @@ def read_toml(path: str) -> dict[str, Any]:
 
 
 def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fake: bool = False) -> SvcDeps:
-    """真机用 ``Win*``;``fake=True``(``--dev`` 与测试)用 ``fakes.py``。两条路径**装配代码完全相同**。"""
+    """真机用 ``Win*``;``fake=True``(``--dev`` 与测试)用 ``fakes.py``。两条路径**装配代码完全相同**。
+
+    🔴 ``fake=True`` 时**所有写入落点一律重基到 ``root`` 下**(``place = contain``):``winagent.db`` /
+    vault(``entropy.bin``+``blobs``)/ 内核落盘目录 / ``.wslconfig`` 备份目录。README §3 说 ``--dev``
+    「不动任何真系统状态」,那就不能只靠「Linux 上 ``%ProgramData%`` 展不开」的巧合——真 Windows 上它展得开,
+    这三个目录会直接写进生产的 ``C:\\ProgramData\\QTrade\\``。``monitor`` 的 ``disks`` 是**只读**受检目标,
+    按定义不算落点,仍走生产语义的 ``expand``。
+    """
+    place = contain if fake else expand                                 # 自包含开关:显式,不依赖变量展不展得开
     db = Db(os.path.join(root, "winagent.db")).open()
     audit = Audit(db)
     alerts = AlertBuffer(cfg.alert)
@@ -101,7 +128,7 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
         pipeb = WinPipeBackend(max_frame_kb=cfg.ipc.max_frame_kb)
         hostsb = WinHosts(backup_dir=expand(cfg.wechat.hosts_backup_dir, root),
                           backup_keep=cfg.wechat.hosts_backup_keep)
-    vault = Vault(db, crypto, cfg.vault, root=expand(cfg.vault.dir, root), audit=audit)
+    vault = Vault(db, crypto, cfg.vault, root=place(cfg.vault.dir, root), audit=audit)
     disks = [DiskTarget("programdata", expand(r"%ProgramData%\QTrade", root)),
              DiskTarget("vhdx", expand(r"%LOCALAPPDATA%", root)),
              DiskTarget("wechat_data", "D:\\", product_level=False)]
@@ -110,8 +137,8 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
     netprobe = NetProbe(db, netb, fwb, probeb, cfg.net, cfg.probe, alerts, svc_exe=svc_exe, port=cfg.api.port)
     hub = PipeHub(pipeb, cfg.ipc, pipe_name=cfg.api.pipe_user, install_user_sid=install_user_sid,
                   version=__version__, alerts=alerts, audit=audit)
-    installer = InstallerOps(db, kernel_dir=expand(cfg.wsl.kernel_dir, root),
-                             wsl_backup_dir=expand(cfg.wsl.backup_dir, root), package_version=__version__,
+    installer = InstallerOps(db, kernel_dir=place(cfg.wsl.kernel_dir, root),
+                             wsl_backup_dir=place(cfg.wsl.backup_dir, root), package_version=__version__,
                              crypto=crypto, audit=audit, hub=hub)
     return SvcDeps(cfg=cfg, db=db, audit=audit, vault=vault, monitor=monitor, netprobe=netprobe,
                    power=Power(db, pwrb, sysb, cfg.wechat, audit=audit), hub=hub,
@@ -164,15 +191,22 @@ async def periodic(d: SvcDeps) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="qtrade-winagent-svc")
-    ap.add_argument("--root", default=DEFAULT_ROOT, help="%%ProgramData%%\\QTrade\\winagent")
+    ap.add_argument("--root", default=None, help="%%ProgramData%%\\QTrade\\winagent(--dev 下必填)")
     ap.add_argument("--config", default=None, help="winagent.toml 路径(默认 <root>\\winagent.toml)")
     ap.add_argument("--install-user-sid", default=os.environ.get("QT_INSTALL_USER_SID", ""),
                     help="安装用户 SID(R3-12 仲裁前的安全校验基准)")
     ap.add_argument("--dev", action="store_true", help="用假后端起一份本机实例(仅开发;不碰任何真系统状态)")
     args = ap.parse_args(argv)
-    cfg = load_cfg(read_toml(args.config or os.path.join(args.root, "winagent.toml")))
-    setup_logging(cfg.log.level, None if args.dev else os.path.join(args.root, "logs"))
-    d = build_real_deps(cfg, root=args.root, install_user_sid=args.install_user_sid, fake=args.dev)
+    if args.dev and not args.root:
+        # 不给 --root 时默认 root **就是生产目录**,--dev 的假后端会把 winagent.db/vault/内核/备份写进真机生产位置。
+        # 这里选「拒绝启动」而不是「默认到临时目录」:临时目录是隐式的,假熵会悄悄堆在 %TEMP% 里且仍可能被当真;
+        # 显式给 --root 零歧义、零写入,也正是 README §3 示例的写法。
+        ap.error("--dev 必须显式给 --root(否则默认落进生产目录 %ProgramData%\\QTrade\\winagent);"
+                 "照 README §3 的写法:--dev --root /tmp/wa-dev")
+    root = args.root or DEFAULT_ROOT
+    cfg = load_cfg(read_toml(args.config or os.path.join(root, "winagent.toml")))
+    setup_logging(cfg.log.level, None if args.dev else os.path.join(root, "logs"))
+    d = build_real_deps(cfg, root=root, install_user_sid=args.install_user_sid, fake=args.dev)
 
     async def boot() -> None:
         await load_tokens(d)
