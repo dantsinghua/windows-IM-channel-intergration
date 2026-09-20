@@ -1,6 +1,6 @@
-"""bus(指令总线,02 §2.2.2)—— 本期骨架:登录门 → 参数校验(R6-48)→ 幂等三态 → 每账号串行队列 → 执行 → 队列外等确认(R6-38)→ 审计。
+"""bus(指令总线,02 §2.2.2)—— 登录门 → 参数校验(R6-48)→ 幂等三态 → 安全闸(gate.py:白名单 + 出口词表 + 自定义闸)→ 每账号串行队列 → 执行 → 队列外等确认(R6-38)→ 审计。
 
-未落地(留给后续里程碑):安全闸词表(§6 双闸门)、限流的随机抖动细节、broadcast、工作流触发、邮件入口的键改写。
+未落地(留给后续里程碑):broadcast、工作流触发、邮件入口的键改写。
 """
 from __future__ import annotations
 
@@ -60,11 +60,12 @@ class _Job:
 
 
 class Bus:
-    def __init__(self, *, store: Store, events: Events, adapters: dict[str, Adapter], cfg: AgentConfig, clock=None):
+    def __init__(self, *, store: Store, events: Events, adapters: dict[str, Adapter], cfg: AgentConfig, clock=None, gate=None):
         self.store = store
         self.events = events
         self.adapters = adapters
         self.cfg = cfg
+        self.gate = gate                              # gate.Gate;None = 不装闸(仅旧测试)
         self.clock = clock or (lambda: int(time.time() * 1000))
         self._queues: dict[str, asyncio.Queue] = {}
         self._consumers: dict[str, asyncio.Task] = {}
@@ -181,6 +182,24 @@ class Bus:
             if not self.store.idem_claim(account_id=acct.id, key=key, op=cmd.op, args_hash=args_hash, trace_id=tid, now_ms=now,
                                          ttl_days=self.cfg.bus.idempotency_ttl_days):
                 return _err_result("INVALID_ARGS", tid, CommandError("幂等键并发冲突", reason="idempotency_race"))
+
+        # 安全闸(02 §2.2.2 七段流水第四段;§6 四件套之「对象校验 + 出口词表 + 自定义闸」):幂等之后、路由之前;命中 GATE_BLOCKED
+        # 留痕 commands failed + command_results;幂等行删掉(闸是可配置的,人改白名单/词表后原键重发应能过)
+        if self.gate is not None:
+            row = self.store.get_account(acct.id) or {"id": acct.id, "settings_json": "{}"}
+            gerr = self.gate.check(row, cmd.op, cmd.args)
+            if gerr is not None:
+                res = _err_result("GATE_BLOCKED", tid, gerr, state_before=acct.state, state_after=acct.state)
+                self.store.insert_command(trace_id=tid, account_id=acct.id, op=cmd.op, args_json=json.dumps(redact_args(cmd.args), ensure_ascii=False),
+                                          idempotency_key=key, confirm=cmd.confirm, timeout_ms=cmd.timeout_ms,
+                                          transport=cmd.origin.transport, actor=cmd.origin.actor, ip=cmd.origin.ip, now_ms=now)
+                self.store.finish_command(trace_id=tid, ok=False, code="GATE_BLOCKED", data={}, cost_ms=0, source=None,
+                                          error_message=gerr.message, retryable=False, needs_human=False, confirmed_by=None, confirm_ms=None, now_ms=now)
+                if key:
+                    self.store.idem_delete(acct.id, key)
+                self.events.emit("command_done", payload={"trace_id": tid, "code": "GATE_BLOCKED", "cost_ms": 0, "ok": False, "reason": gerr.reason},
+                                 account_id=acct.id, channel=acct.channel, trace_id=tid, now_ms=now)
+                return res
 
         self.store.insert_command(trace_id=tid, account_id=acct.id, op=cmd.op, args_json=json.dumps(redact_args(cmd.args), ensure_ascii=False),
                                   idempotency_key=key, confirm=cmd.confirm, timeout_ms=cmd.timeout_ms,

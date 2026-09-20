@@ -78,6 +78,48 @@ def test_pool_quota_and_runtime_strings_match_doc_02():
     assert m.group(1) == c.runtime.qidian_resolution and int(m.group(2)) == c.runtime.qidian_dpi
 
 
+DOC04 = glob.glob(os.path.join(ROOT, "docs", "04-*.md"))[0]
+DOC05 = glob.glob(os.path.join(ROOT, "docs", "05-*.md"))[0]
+
+
+@pytest.mark.parametrize("key, value", [
+    ("container_check_s", AgentConfig().health.container_check_s),
+    ("adb_check_s", AgentConfig().health.adb_check_s),
+    ("adb_root_grace_s", AgentConfig().health.adb_root_grace_s),
+    ("napcat_heartbeat_timeout_s", AgentConfig().health.napcat_heartbeat_timeout_s),
+    ("scrcpy_frame_timeout_s", AgentConfig().health.scrcpy_frame_timeout_s),
+    ("clock_drift_warn_s", AgentConfig().health.clock_drift_warn_s),
+    ("container_mem_warn_pct", AgentConfig().health.container_mem_warn_pct),
+    ("container_restart_max", AgentConfig().health.container_restart_max),
+    ("mem_warn_mb", AgentConfig().pool.mem_warn_mb),
+    ("mem_critical_mb", AgentConfig().pool.mem_critical_mb),
+])
+def test_health_and_monitor_defaults_match_doc_04(key, value):
+    """04 §7 [health](agent.toml)与 [monitor](winagent.toml)是这些键的唯一出处;02 [pool] mem_* 只引用。"""
+    m = re.search(r"^%s\s*=\s*(\d+)" % re.escape(key), _doc(DOC04), re.M)
+    assert m, f"04 §7 找不到 {key}"
+    assert int(m.group(1)) == value
+
+
+def test_restart_backoff_matches_doc_04():
+    m = re.search(r"^container_restart_backoff_s\s*=\s*\[([\d,]+)\]", _doc(DOC04), re.M)
+    assert tuple(int(x) for x in m.group(1).split(",")) == AgentConfig().health.container_restart_backoff_s
+
+
+@pytest.mark.parametrize("key, value", [
+    ("login_timeout_s", AgentConfig().accounts.login_timeout_s),
+    ("login_remind_interval_s", AgentConfig().accounts.login_remind_interval_s),
+    ("qr_max_wait_s", AgentConfig().accounts.qr_max_wait_s),
+    ("qq_quick_login_wait_s", AgentConfig().accounts.qq_quick_login_wait_s),
+    ("qq_reconnect_grace_s", AgentConfig().accounts.qq_reconnect_grace_s),
+])
+def test_accounts_defaults_match_doc_05(key, value):
+    """05 §7 [accounts] 是 owner。"""
+    m = re.search(r"^%s\s*=\s*(\d+)" % re.escape(key), _doc(DOC05), re.M)
+    assert m, f"05 §7 找不到 {key}"
+    assert int(m.group(1)) == value
+
+
 def test_port_plan_matches_doc_00_port_table():
     """00 §3 端口表:段基址 + NN;02 §2.2.4 唯一算法。"""
     from qtrade_agent.runtime import port_plan

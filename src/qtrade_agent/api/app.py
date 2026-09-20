@@ -170,7 +170,10 @@ def create_api(agent) -> FastAPI:
                     "accounts": {"running": running, "n": total}, "disk_free_mb": disk_free_mb,
                     "checks": {"H13": "firing" if agent.health.h13_firing() else ("ok" if agent.timesync.last_probe_ms else "unknown"),
                                "H02": "unknown" if agent.health.winagent_online is None else ("ok" if agent.health.winagent_online else "firing"),
-                               "H03": "unknown" if agent.health.dockerd_ok is None else ("ok" if agent.health.dockerd_ok else "firing")},
+                               "H03": "unknown" if agent.health.dockerd_ok is None else ("ok" if agent.health.dockerd_ok else "firing"),
+                               **agent.healthloop.checks(),
+                               "H24": "unknown" if agent.pressure.level == "unknown" else ("ok" if agent.pressure.level == "ok" else "firing")},
+                    "mem": {"level": agent.pressure.level, "avail_mb": agent.pressure.avail_mb},
                     "alerts": [{"code": a.code, "subject": a.subject, "severity": a.severity, "count": a.count} for a in agent.alerts.active.values()],
                     "scheduler": agent.scheduler.snapshot()}
         if is_unauth_health_source(host, cfg.api.unauth_health_sources, agent.wsl_gateway):
@@ -291,6 +294,71 @@ def create_api(agent) -> FastAPI:
         require_account(p, account_id)
         request.state.account_id = account_id
         return {"ok": True, **(await agent.accounts.state_of(account_id))}
+
+    # ------------------------------------------------------------------ 登录阶段(#12/#13/#14/#15/#16b)与 #20/#22/#23
+    @app.post(f"{API_PREFIX}/accounts/batch")
+    async def batch_accounts(request: Request):
+        p = _principal(request, "write")
+        body = await request.json()
+        for aid in (body.get("ids") or []) if isinstance(body.get("ids"), list) else []:
+            if isinstance(aid, str):
+                require_account(p, aid)
+        return {"ok": True, **(await agent.accounts.batch(body, actor=p.actor))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/login")
+    async def login_account(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        body = await _json_or_empty(request)
+        res = await agent.accounts.login(account_id, body, actor=p.actor)
+        return JSONResponse(status_code=202, content={"ok": True, **res})
+
+    @app.put(f"{API_PREFIX}/accounts/{{account_id}}/credential")
+    async def put_credential(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        row = await agent.accounts.set_credential(account_id, await request.json(), actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.delete(f"{API_PREFIX}/accounts/{{account_id}}/credential")
+    async def delete_credential(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        row = await agent.accounts.delete_credential(account_id, actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.get(f"{API_PREFIX}/accounts/{{account_id}}/prompt")
+    async def get_prompt(request: Request, account_id: str, login_session_id: Optional[str] = None):
+        p = _principal(request, "read")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        return {"ok": True, **agent.accounts.prompt(account_id, login_session_id)}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/login/cancel")
+    async def login_cancel(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        body = await _json_or_empty(request)
+        return {"ok": True, **(await agent.accounts.login_cancel(account_id, body.get("login_session_id"), actor=p.actor))}
+
+    @app.get(f"{API_PREFIX}/accounts/{{account_id}}/capabilities")
+    async def account_capabilities(request: Request, account_id: str):
+        p = _principal(request, "read")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        return {"ok": True, **agent.accounts.capabilities_of(account_id)}
+
+    @app.patch(f"{API_PREFIX}/accounts/{{account_id}}/settings")
+    async def patch_settings(request: Request, account_id: str):
+        p = _principal(request, "write")
+        require_account(p, account_id)
+        request.state.account_id = account_id
+        row = await agent.accounts.patch_settings(account_id, await request.json(), actor=p.actor)
+        return {"ok": True, "data": account_view(row, _acct_caps(row))}
 
     @app.get(f"{API_PREFIX}/resources")
     async def resources(request: Request):

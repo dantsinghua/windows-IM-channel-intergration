@@ -41,7 +41,16 @@ class MessagesConfig:
 
 @dataclass(frozen=True)
 class HealthConfig:
+    """04 §7 [health](owner=04;02 §7.1 镜像)。"""
     adb_root_grace_s: int = 15                  # ensure_root 宽限窗(04 owner;06 §2.9.5 引用)
+    container_check_s: int = 10                 # H04 周期
+    adb_check_s: int = 30                       # H06 周期
+    napcat_heartbeat_timeout_s: int = 30
+    scrcpy_frame_timeout_s: int = 10
+    clock_drift_warn_s: int = 2
+    container_mem_warn_pct: int = 90
+    container_restart_backoff_s: tuple[int, ...] = (60, 120, 300, 600)   # H04 退避重拉
+    container_restart_max: int = 5              # 每小时上限,超限停止自愈(02 §5)
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,8 @@ class PoolConfig:
     quota_qq_mb: int = 614
     quota_wechat_mb: int = 1536
     autocalibrate_on_first_login: bool = True
+    mem_warn_mb: int = 2048                     # = 04 [monitor] mem_warn_mb(唯一出处,02 §7.1 只引用;E-19)
+    mem_critical_mb: int = 1024                 # = 04 [monitor] mem_critical_mb
 
 
 @dataclass(frozen=True)
@@ -121,6 +132,16 @@ class WechatConfig:
     slot_error_takeover_s: int = 300
 
 
+@dataclass(frozen=True)
+class AccountsConfig:
+    """05 §7 [accounts](owner=05)。"""
+    login_timeout_s: int = 90                   # 自动填密后等待主界面/验证页
+    login_remind_interval_s: int = 300          # login_required 期间重发提醒事件间隔
+    qr_max_wait_s: int = 1800
+    qq_quick_login_wait_s: int = 20
+    qq_reconnect_grace_s: int = 60
+
+
 H13_INTERVAL_S = 60                             # 04 §2.9 字面:Agent 每 60 s GET /wa/v1/time(不是配置项)
 H13_DRIFT_THRESHOLD_MS = 2000                   # 04 §2.9 字面:|Δ| > 2 s 判漂移
 H05_BOOT_POLL_S = 2                             # 04 H05 字面:起动期每 2 s 查 sys.boot_completed
@@ -139,6 +160,7 @@ class AgentConfig:
     pool: PoolConfig = field(default_factory=PoolConfig)
     winagent: WinAgentConfig = field(default_factory=WinAgentConfig)
     wechat: WechatConfig = field(default_factory=WechatConfig)
+    accounts: AccountsConfig = field(default_factory=AccountsConfig)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -147,8 +169,9 @@ class AgentConfig:
             section = section or {}
             names = klass.__dataclass_fields__.keys()
             vals = {k: section[k] for k in names if k in section}
-            if "unauth_health_sources" in vals and isinstance(vals["unauth_health_sources"], list):
-                vals["unauth_health_sources"] = tuple(vals["unauth_health_sources"])
+            for tup_key in ("unauth_health_sources", "container_restart_backoff_s"):
+                if tup_key in vals and isinstance(vals[tup_key], list):
+                    vals[tup_key] = tuple(vals[tup_key])
             return klass(**vals)
         adapters = d.get("adapters") or {}
         return cls(
@@ -163,6 +186,7 @@ class AgentConfig:
             pool=pick(d.get("pool"), PoolConfig),
             winagent=pick(d.get("winagent"), WinAgentConfig),
             wechat=pick(d.get("wechat"), WechatConfig),
+            accounts=pick(d.get("accounts"), AccountsConfig),
         )
 
     def quota_mb(self, channel: str) -> int:

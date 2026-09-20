@@ -14,8 +14,14 @@ QIDIAN_MSG_GAP = "QIDIAN_MSG_GAP"
 H13_CLOCK_DRIFT = "H13_CLOCK_DRIFT"
 MEM_PRESSURE = "MEM_PRESSURE"
 WA_VERSION_MISMATCH = "WA_VERSION_MISMATCH"
+H04_CONTAINER_EXITED = "H04_CONTAINER_EXITED"
+H05_BOOT_INCOMPLETE = "H05_BOOT_INCOMPLETE"
+H06_ADB_OFFLINE = "H06_ADB_OFFLINE"
+CONTAINER_OOM_KILLED = "CONTAINER_OOM_KILLED"
+ACCOUNT_OFFLINE = "ACCOUNT_OFFLINE"
 
-# 02 §3.7:企点四码永不 crit、不改 state、能力不减;H13 warn(04 F-13:仅对齐失败才告知);MEM_PRESSURE warn(crit 由水位升)
+# 02 §3.7:企点四码永不 crit、不改 state、能力不减;H13 warn(04 F-13:仅对齐失败才告知);MEM_PRESSURE warn(crit 由水位升);
+# H04/H05 crit;H06 warn(3 次无效升 crit,由调用方传 severity);CONTAINER_OOM_KILLED warn;ACCOUNT_OFFLINE warn(05 §2.5.4:1 小时内第 3 次升 error)
 REGISTERED = {
     QIDIAN_NOT_ROOT: "warn",
     QIDIAN_DB_UNAVAILABLE: "warn",
@@ -24,6 +30,11 @@ REGISTERED = {
     H13_CLOCK_DRIFT: "warn",
     MEM_PRESSURE: "warn",
     WA_VERSION_MISMATCH: "warn",
+    H04_CONTAINER_EXITED: "crit",
+    H05_BOOT_INCOMPLETE: "crit",
+    H06_ADB_OFFLINE: "warn",
+    CONTAINER_OOM_KILLED: "warn",
+    ACCOUNT_OFFLINE: "warn",
 }
 
 
@@ -61,6 +72,10 @@ class Alerts:
             a.count += 1
             a.last_seen_ms = now
             a.evidence = evidence or a.evidence
+            if a.severity != sev:                       # 级别翻转(如 H06 三振 warn→crit、MEM_PRESSURE warn→crit)= 状态变化,再发一次 firing
+                a.severity = sev
+                self._events.emit("alert", payload=self._payload(a, "firing"), account_id=account_id, now_ms=now)
+                return True
             return False
         a = ActiveAlert(code, subject, sev, now, now, 1, dict(evidence or {}), list(hint_actions or []))
         self.active[key] = a

@@ -112,7 +112,7 @@ RESULT_CODES: dict[str, tuple[bool, bool]] = {
     "SEND_CALLED_BUT_UNCONFIRMED": (False, False),
     "SEND_FAILED": (True, False),
     "IDEMPOTENT_REPLAY": (False, False),
-    "GATE_BLOCKED": (False, False),
+    "GATE_BLOCKED": (False, True),           # 闸拦下 = 要人改白名单/词表,不是重试能过的
     "UNSUPPORTED": (False, False),
     "NOT_APPLICABLE": (False, False),
     "NOT_READY": (True, False),

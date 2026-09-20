@@ -21,8 +21,11 @@ from .alerts import Alerts
 from .bus.bus import Bus
 from .config import H13_INTERVAL_S, AgentConfig
 from .events import Events
+from .gate import Gate
 from .health import Health
+from .healthloop import H05_STEADY_INTERVAL_S, HealthLoop
 from .pool import Pool
+from .pressure import MemoryWatermark
 from .runtime import AdbBackend, AdbCliBackend, ContainerBackend, DockerCliBackend, Runtime
 from .runtime.runtime import Fs
 from .scheduler import Scheduler
@@ -80,6 +83,9 @@ class AgentApp:
         self.winagent: WinAgentClient
         self.timesync: TimeSync
         self.accounts: AccountService
+        self.gate: Gate
+        self.pressure: MemoryWatermark
+        self.healthloop: HealthLoop
         self._started = False
 
     # ------------------------------------------------------------------ 装配
@@ -99,9 +105,18 @@ class AgentApp:
         self.poller = QidianPoller(store=self.store, events=self.events, alerts=self.alerts, cfg=self.cfg, h13_firing=self.health.h13_firing,
                                    clock=self.clock, maindb_factory=self._maindb_for_uid)
         self.adapters = {"qidian": QidianAdapter(self.poller, sender=self._sender, store=self.store)}
-        self.bus = Bus(store=self.store, events=self.events, adapters=self.adapters, cfg=self.cfg, clock=self.clock)
+        self.gate = Gate(self.store)
+        self.bus = Bus(store=self.store, events=self.events, adapters=self.adapters, cfg=self.cfg, clock=self.clock, gate=self.gate)
+        from .api.app import load_capabilities
+        caps, _ = load_capabilities()
         self.accounts = AccountService(store=self.store, events=self.events, pool=self.pool, runtime=self.runtime, vault=self.vault, cfg=self.cfg,
-                                       adapters=self.adapters, health=self.health, clock=self.clock, login_fn=self._login_fn)
+                                       adapters=self.adapters, health=self.health, clock=self.clock, login_fn=self._login_fn,
+                                       caps_by_op={c["op"]: c for c in caps})
+        self.accounts._alerts = self.alerts
+        self.pressure = MemoryWatermark(store=self.store, accounts=self.accounts, alerts=self.alerts, cfg=self.cfg, clock=self.clock)
+        self.accounts.pressure = self.pressure
+        self.healthloop = HealthLoop(store=self.store, runtime=self.runtime, accounts=self.accounts, alerts=self.alerts, health=self.health,
+                                     cfg=self.cfg, clock=self.clock)
         self.timesync = TimeSync(self.winagent, health=self.health, alerts=self.alerts, clock=self.clock, aligner=self._aligner, on_resume=self.on_host_resume)
         self.scheduler.register("qidian_poll_all", self.cfg.qidian.poll_interval_s, self.qidian_poll_all)
         self.scheduler.register("qidian_gaps_all", self.cfg.qidian.gap_check_interval_s, self.qidian_gaps_all)
@@ -109,6 +124,10 @@ class AgentApp:
         self.scheduler.register("winagent_probe", min(H02_INTERVAL_S, self.cfg.winagent.probe_interval_s), self.winagent_probe, run_immediately=True)
         self.scheduler.register("dockerd_probe", H03_INTERVAL_S, self.dockerd_probe, run_immediately=True)
         self.scheduler.register("h13_clock_sync", H13_INTERVAL_S, self.h13_probe, run_immediately=True)
+        self.scheduler.register("health_containers", self.cfg.health.container_check_s, self.healthloop.check_containers)      # H04
+        self.scheduler.register("health_adb", self.cfg.health.adb_check_s, self.healthloop.check_adb)                          # H06
+        self.scheduler.register("health_boot", H05_STEADY_INTERVAL_S, self.healthloop.check_boot)                              # H05 稳态
+        self.scheduler.register("login_remind", 60, self.accounts.login_remind)                                                # 05 §2.5.4
         return self
 
     def _maindb_for_uid(self, self_uid: str) -> MainDb:
@@ -163,6 +182,7 @@ class AgentApp:
             self.health.set_winagent(False)
             if self.health.winagent_online is False:
                 self.pool.set_windows(known=False)
+                self.pressure.evaluate(None)                                   # 读不到整机内存 = unknown,不阻断
             return
         h = await self.winagent.health()
         if h is None:
@@ -175,6 +195,9 @@ class AgentApp:
                               wechat_enabled=(modules.get("wechat") == "enabled"), known=True)
         if host.get("wsl_vm_mb"):
             self.pool.set_wsl_total(int(host["wsl_vm_mb"]), source="winagent")
+        # E-19 内存水位:整机可用内存 → warn/critical;critical 时只对显式开了 auto_stop_on_pressure 的账号按 LRU 逐停
+        self.pressure.evaluate(host.get("available_mb"))
+        await self.pressure.enforce()
 
     async def dockerd_probe(self) -> None:
         self.health.set_dockerd(await self.runtime.dockerd_ok())
