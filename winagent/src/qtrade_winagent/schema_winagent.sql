@@ -27,7 +27,9 @@ CREATE TABLE install_history (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   at_ms           INTEGER NOT NULL,
   from_state      TEXT,
-  to_state        TEXT NOT NULL,
+  to_state        TEXT NOT NULL,                 -- 🔴 R6-58 (au):**无 CHECK 是有意的** —— 取值 = 00 §8.2 的安装状态机键,**外加内核流程的七个非安装态迁移名**(登记在此,
+                                                 --   实现方不得另起同义名):KERNEL_APPLYING / KERNEL_APPLIED / KERNEL_APPLY_FAILED /
+                                                 --   KERNEL_VERIFIED / KERNEL_VERIFY_FAILED / KERNEL_ROLLING_BACK / KERNEL_ROLLED_BACK(#26/#27/#46 写)。
   package_version TEXT NOT NULL,
   actor           TEXT NOT NULL DEFAULT 'installer' CHECK (actor IN ('installer','winagent','console','user')),
   note            TEXT,
@@ -84,6 +86,9 @@ CREATE TABLE wechat_profiles (
   login_count     INTEGER NOT NULL DEFAULT 0,
   last_wechat_version TEXT,
   last_wxkey_dll  TEXT,                          -- 最近一次试钥成功的 DLL
+  main_wnd_class  TEXT,                          -- 🔴 R6-58 (at) 新增:微信主窗口类名(4.x 为 'Qt51514QWindowIcon',3.x 为 'WeChatMainWndForPC')。
+                                                 --   05 §7 把它当落点引用,而本表此前没有这一列 ⇒ 实现方只能改读 winagent.toml [wechat] main_wnd_class。
+                                                 --   口径:**winagent.toml 的值是默认/兜底,本列是该 wxid 实测到的值**;NULL = 没测过,按配置值走。
   ritual_done_ms  INTEGER,                       -- 讲述人仪式完成时刻(B.7);NULL=未做
   created_ms      INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
   deleted_ms      INTEGER
@@ -163,7 +168,10 @@ CREATE TABLE vault_index (
 --     power.backup_json     改 powercfg 前的**用户原值**(keep_awake_mode=powercfg 时写,关模块/卸载时还原);power.keepawake_current 当前生效值
 --     wechat.hosts_block    hosts 屏蔽:{enabled, domains:[两个下载域名], marker_lines:[写入的标记行], applied_at, last_result}(B-2)
 --     wechat.enabled_snapshot 微信模块总开关的本机快照(真值在 winagent.toml [wechat] enabled,这里只留最近读到的值供降级展示)
---     probe.targets         正式探测目标(PUT /settings/probe 采纳后写);probe.interval_s 探测周期
+--     probe.targets         正式探测目标(PUT /settings/probe 采纳后写)。🔴 R6-58 (dd):值形状逐字 = ["host:port", …]
+--                           —— 与 #76b/#48 回的 targets、04 §2.8.4 的 [probe] *_hosts 元素**同一种形状**,
+--                           同一事实不许两种形状(否则采纳一次就要在两处之间翻译一次,翻译必出错)。
+--                           probe.interval_s 探测周期
 --     crashdump.backup_json  crash dump 两键(DumpCount/DumpType 或 core_pattern 语义相关)的**用户原值**,卸载/关模块时还原
 CREATE TABLE settings (
   key         TEXT PRIMARY KEY,

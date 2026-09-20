@@ -9,20 +9,93 @@ from qtrade_agent.alerts import H13_CLOCK_DRIFT
 from qtrade_agent.config import WinAgentConfig
 from qtrade_agent.timesync import TimeSync
 from qtrade_agent.vault_client import VaultUnavailable, WinAgentVault
-from qtrade_agent.winagent_client import FakeWinAgent, WinAgentClient, WinAgentUnavailable, resolve_base_url
+from qtrade_agent.winagent_client import (VAULT_MAX_VALUE_BYTES, FakeWinAgent, WinAgentClient, WinAgentUnavailable,
+                                          base_url_candidates, default_gateway, resolve_base_url)
 from tests.conftest import Clock, make_rig
 
 
 # ---------------------------------------------------------------- 地址 / 令牌
 def test_resolve_base_url_order(tmp_path):
+    """04 §2.6.3 的回退链:``url`` → ``host.json`` → **eth0 默认网关** → ``resolv.conf``(最后兜底)。
+
+    🔴 默认网关**排在 resolv.conf 之前**:04 §2.6.3 逐条论证 `nameserver` 不可靠(公司 VPN 改写 Windows DNS、
+    §2.6.5 的 DNS 对策会主动写公司 DNS)。原实现少了网关这一环,开 VPN 的现场会把 VPN DNS 当宿主机地址。
+    """
     hint = tmp_path / "host.json"
     resolv = tmp_path / "resolv.conf"
     resolv.write_text("nameserver 172.20.0.1\n")
     cfg = WinAgentConfig(url="", host_ip_hint_file=str(hint))
-    assert resolve_base_url(cfg, resolv_conf=str(resolv)) == "http://172.20.0.1:17610"
+    gw = lambda: "172.20.0.5"                                                        # noqa: E731
+
+    assert resolve_base_url(cfg, resolv_conf=str(resolv), gateway=gw) == "http://172.20.0.5:17610"
+    assert resolve_base_url(cfg, resolv_conf=str(resolv), gateway=lambda: None) == "http://172.20.0.1:17610"
     hint.write_text(json.dumps({"host_ip": "172.20.0.9"}))
-    assert resolve_base_url(cfg, resolv_conf=str(resolv)) == "http://172.20.0.9:17610"
+    assert resolve_base_url(cfg, resolv_conf=str(resolv), gateway=gw) == "http://172.20.0.9:17610"
     assert resolve_base_url(WinAgentConfig(url="http://127.0.0.1:17610/", host_ip_hint_file=str(hint))) == "http://127.0.0.1:17610"
+
+
+def test_base_url_candidates_are_ordered_and_deduped(tmp_path):
+    hint = tmp_path / "host.json"
+    hint.write_text(json.dumps({"host_ip": "172.20.0.5"}))                           # 与网关同值 ⇒ 去重
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 10.8.0.1\n")                                       # 典型的「VPN DNS」
+    cfg = WinAgentConfig(url="", host_ip_hint_file=str(hint))
+    assert base_url_candidates(cfg, resolv_conf=str(resolv), gateway=lambda: "172.20.0.5") == [
+        ("host_json", "http://172.20.0.5:17610"), ("resolv_conf", "http://10.8.0.1:17610")]
+    # [winagent] url 显式配置 ⇒ 唯一答案,不再自动发现
+    assert base_url_candidates(WinAgentConfig(url="http://1.2.3.4:17610")) == [("url", "http://1.2.3.4:17610")]
+
+
+def test_default_gateway_parses_proc_net_route(tmp_path):
+    """`/proc/net/route` 的 Gateway 列是**小端 hex**;多条默认路由按 Metric 最小的取(与 `ip route show default` 一致)。"""
+    route = tmp_path / "route"
+    route.write_text(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t0114A8C0\t0003\t0\t0\t200\t00000000\t0\t0\t0\n"      # 192.168.20.1 metric 200
+        "eth0\t0014A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"        # 直连路由:跳过
+        "eth0\t00000000\t0110A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")     # 192.168.16.1 metric 100
+    assert default_gateway(route_file=str(route)) == "192.168.16.1"
+    assert default_gateway(route_file=str(tmp_path / "nope")) is None
+
+
+async def test_discover_prefers_the_reachable_candidate(tmp_path):
+    """04 §2.6.3:「`host.json` 与默认网关不一致时以**能 ping 通 `/wa/v1/ping`** 的那个为准,并记 warn」。"""
+    hint = tmp_path / "host.json"
+    hint.write_text(json.dumps({"host_ip": "10.8.0.1"}))            # 陈旧/错的首选项(VPN 起来后 host.json 没人更新)
+    cfg = WinAgentConfig(url="", host_ip_hint_file=str(hint), token_file=str(tmp_path / "t.token"))
+    (tmp_path / "t.token").write_text("wa-token\n")
+    wa = FakeWinAgent()
+    reachable = "http://172.20.0.5:17610"
+
+    async def only_gateway_answers(method, url, headers, body, timeout_s):
+        if not url.startswith(reachable):
+            raise OSError("no route to host")
+        return await wa(method, url, headers, body, timeout_s)
+
+    cl = WinAgentClient(cfg, transport=only_gateway_answers, resolv_conf=str(tmp_path / "none"),
+                        gateway=lambda: "172.20.0.5")
+    assert cl.base_url == "http://10.8.0.1:17610"                   # 首选项仍是 host.json
+    assert await cl.discover() == reachable                         # 择优后落到网关
+    assert cl.base_url_source == "gateway"
+    assert (await cl.ping())["agent_id"] == "fake"
+
+
+async def test_discover_keeps_first_choice_when_nothing_answers(tmp_path):
+    cfg = WinAgentConfig(url="", host_ip_hint_file=str(tmp_path / "none.json"), token_file=str(tmp_path / "t.token"))
+
+    async def dead(method, url, headers, body, timeout_s):
+        raise OSError("connection refused")
+
+    cl = WinAgentClient(cfg, transport=dead, resolv_conf=str(tmp_path / "none"), gateway=lambda: "172.20.0.5")
+    assert await cl.discover() == "http://172.20.0.5:17610"
+    assert cl.base_url_source == "gateway"
+
+
+def test_explicit_base_url_is_never_rediscovered(tmp_path):
+    """测试/`[winagent] url` 显式给的地址 ⇒ `forget_base_url()` 不动它(否则契约测试会被环境的真路由表带跑)。"""
+    cl = WinAgentClient(WinAgentConfig(), transport=FakeWinAgent(), base_url="http://x:17610")
+    cl.forget_base_url()
+    assert cl.base_url == "http://x:17610" and cl.base_url_source == "explicit"
 
 
 async def test_token_file_required_except_ping(tmp_path):
@@ -189,3 +262,39 @@ async def test_dockerd_probe_and_health_endpoint_checks(tmp_path):
     await rig.agent.dockerd_probe()
     assert rig.agent.health.dockerd_ok is False
     rig.store.close()
+
+
+# ---------------------------------------------------------------- 假后端保真度(winagent 交接 B-2 / B-3)
+async def test_fake_health_reports_all_six_modules(tmp_path):
+    """02 §3.6 #2:`health.modules` 恒含六个键。假后端少键会让「按 modules.wslctl 做降级」的测试假绿(B-2)。"""
+    (tmp_path / "t.token").write_text("wa-token\n")
+    cl = WinAgentClient(WinAgentConfig(token_file=str(tmp_path / "t.token")), transport=FakeWinAgent(),
+                        base_url="http://x:17610")
+    h = await cl.health()
+    assert set(h["modules"]) == {"vault", "monitor", "netprobe", "power", "wslctl", "wechat"}
+
+
+async def test_fake_vault_rejects_oversize_value(tmp_path):
+    """05 §2.2.2:Vault 单条明文上限 4 KB(B-3)。"""
+    (tmp_path / "t.token").write_text("wa-token\n")
+    v = WinAgentVault(WinAgentClient(WinAgentConfig(token_file=str(tmp_path / "t.token")), transport=FakeWinAgent(),
+                                     base_url="http://x:17610"))
+    await v.put("account/qd01", "x" * VAULT_MAX_VALUE_BYTES)
+    with pytest.raises(VaultUnavailable) as e:
+        await v.put("account/qd02", "x" * (VAULT_MAX_VALUE_BYTES + 1))
+    assert e.value.reason == "http_400"
+
+
+async def test_fake_vault_read_checks_source(tmp_path):
+    """02 §3.6 #11:读只接受 loopback / WSL 子网(B-3)。"""
+    (tmp_path / "t.token").write_text("wa-token\n")
+    wa = FakeWinAgent()
+    v = WinAgentVault(WinAgentClient(WinAgentConfig(token_file=str(tmp_path / "t.token")), transport=wa,
+                                     base_url="http://x:17610"))
+    await v.put("account/qd01", "s3cr3t")
+    wa.client_ip = "172.20.0.9"                       # WSL 子网:放行
+    assert await v.read("account/qd01") == "s3cr3t"
+    wa.client_ip = "203.0.113.7"                      # 公网来源:403
+    with pytest.raises(VaultUnavailable) as e:
+        await v.read("account/qd01")
+    assert e.value.reason == "http_403"

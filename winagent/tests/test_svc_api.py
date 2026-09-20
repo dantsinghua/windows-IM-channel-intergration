@@ -195,7 +195,8 @@ async def test_probe_sample_mode(rig):
     rig.probe.conns = [{"ip": "203.205.1.1", "port": 443, "hostname": "long.weixin.qq.com", "channel": "wechat"}]
     async with client(rig, token=CONSOLE_TOKEN) as c:
         b = (await c.post("/wa/v1/probe", json={"mode": "sample", "pid_names": ["Weixin.exe"], "duration_s": 3})).json()
-    assert b["candidates"][0]["hostname"] == "long.weixin.qq.com" and b["duration_s"] == 3
+    assert b["rows"][0]["hostname"] == "long.weixin.qq.com" and b["duration_s"] == 3   # 04 §3.4 的行形状
+    assert rig.db.query("SELECT * FROM probe_targets_observed") == []                  # 不落库,由 Agent 回写
 
 
 async def test_firewall_ensure_and_delete_pair(rig):

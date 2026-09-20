@@ -14,7 +14,7 @@ from starlette.testclient import TestClient
 from qtrade_agent.adapters.qq import FakeOneBot
 from qtrade_agent.adapters.wechat import FakeWeChatWinAgent
 from qtrade_agent.app import AgentApp
-from qtrade_agent.config import AgentConfig
+from qtrade_agent.config import AgentConfig, RuntimeConfig
 from qtrade_agent.maintenance import BackupConfig, FakeDisk
 from qtrade_agent.runtime import FakeAdb, FakeContainers
 from qtrade_agent.runtime.runtime import FakeFs
@@ -54,8 +54,9 @@ def make_agent(tmp_path, *, cfg: Optional[AgentConfig] = None, clock: Optional[C
                free_mb: int = 100_000, qq_online: bool = True, qq_self_id: int = 415011447) -> tuple[AgentApp, dict[str, Any]]:
     """建一个全假后端的 ``AgentApp`` 并 ``open()``;返回 ``(agent, 假件字典)``。"""
     clock = clock or Clock(auto_step_ms=50)
-    # 备份目录必须落在 tmp:缺省 `/var/lib/qtrade/backup` 在开发容器里没有写权限,也不该去碰
-    cfg = cfg or AgentConfig(backup=BackupConfig(backup_dir=str(tmp_path / "backup")))
+    # 备份目录与账号卷目录都必须落在 tmp:缺省 `/var/lib/qtrade/**` 在开发容器里没有写权限,也不该去碰
+    cfg = cfg or AgentConfig(backup=BackupConfig(backup_dir=str(tmp_path / "backup")),
+                             runtime=RuntimeConfig(accounts_dir=str(tmp_path / "accounts")))
     wechat = FakeWeChatWinAgent()
     http = FakeHttp()
     disk = FakeDisk(free=free_mb)

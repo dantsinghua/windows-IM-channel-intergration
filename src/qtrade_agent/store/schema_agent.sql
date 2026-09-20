@@ -244,7 +244,7 @@ CREATE TABLE workflows (
 
 CREATE TABLE workflow_runs (
   run_id          TEXT PRIMARY KEY,              -- ULID
-  workflow_id     TEXT NOT NULL REFERENCES workflows(id),
+  workflow_id     TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,   -- 🔴 R6-58 (g):没有 CASCADE 则「run 留 30 天(§2.8.4)」与「#42 删工作流」互斥 —— 跑过一次的工作流就再也删不掉(外键拒绝)。删工作流 = 连带删它的全部 run(steps 再经下表的 CASCADE 连带删);有 status ∈ {running,paused} 的 run 时 #42 一律 409,不靠外键兜
   workflow_version INTEGER NOT NULL,
   trigger         TEXT NOT NULL CHECK (trigger IN ('api','schedule','email','console')),
   actor           TEXT NOT NULL,
@@ -387,7 +387,7 @@ CREATE INDEX ix_media_gc ON media (ref_count, first_seen_ms) WHERE ref_count = 0
 -- cursors:所有游标/水位一张表(§2.8.3;C-24:与消息落库同事务推进)
 CREATE TABLE cursors (
   owner           TEXT NOT NULL,                 -- account_id | 'mail:<mailbox>' | 'events'
-  kind            TEXT NOT NULL,                 -- 'chatlog_seq:<talker>' | 'onebot_seq:<session>' | 'qidian_rowid:<native_id>'(R6-36:企点主库读取正线,单库多水位、一会话表一条,value_int=该表最大 _id、value={"last_uniseq"};原 'qidian_docid' 单库单水位作废)| 'qidian_bootstrap'(R6-38/R6-39:每企点账号一行,value=登录 uin、value_int=历史闸基准 ms,§2.8.3)
+  kind            TEXT NOT NULL,                 -- 'chatlog_seq:<talker>' | 'onebot_seq:<native_id>'(R6-58 (v):原 '<session>' 写法作废,owner 列已带账号)| 'ws_last_event'(R6-58 (v):QQ meta_event 水位,只给监控看)| 'qidian_rowid:<native_id>'(R6-36:企点主库读取正线,单库多水位、一会话表一条,value_int=该表最大 _id、value={"last_uniseq"};原 'qidian_docid' 单库单水位作废)| 'qidian_bootstrap'(R6-38/R6-39:每企点账号一行,value=登录 uin、value_int=历史闸基准 ms,§2.8.3)
                                                  --   | 'qidian_anchor:<session>' / 'sessions_scan'(两者均**仅控件树兜底路**,R6-25;sessions_scan 出处 06 §2.9.3)
                                                  --   | 'imap_uid' | 'pop3_uidl_recent' | 'ws_seq' | …(全集见 §2.8.3)
   value           TEXT,                          -- 字符串态(锚块 JSON / uidvalidity / UIDL 数组)
@@ -556,14 +556,16 @@ CREATE TABLE mail_templates (
   subject_pattern TEXT NOT NULL,                 -- 带 {占位符} 的主题模板(06 §2.14:28 通用 + 3 回执专用)
   body_fields_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(body_fields_json)),
                                                  -- 有序数组 [{key,label,order,required,empty:'omit'|'dash'}]
-  compat_profile  TEXT NOT NULL DEFAULT 'custom'
-                  CHECK (compat_profile IN ('ibquote-163-v1','collector-v1','custom')),
+  compat_profile  TEXT NOT NULL DEFAULT 'qtrade-v1'
+                  CHECK (compat_profile IN ('ibquote-163-v1','collector-v1','qtrade-v1')),
+                                                 -- 🔴 R6-58 (h):R-13 已把 `custom` 改名 `qtrade-v1`,本 CHECK 此前没跟上 ⇒ 写 qtrade-v1 直接 INSERT 失败、整张表不可用。
+                                                 --   两处枚举(本 CHECK 与 §3.4.6 #103 入参)同步;`custom` 这个取值**作废**,API 层收到 `custom` 回 400 `profile_custom_removed`。
   version         INTEGER NOT NULL DEFAULT 1,    -- 渲染时写进 mail_outbox.template_version;PUT 必须递增
   builtin         INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0,1)),  -- 随包三份默认模板 builtin=1,不可删只能另存
   created_ms      INTEGER NOT NULL, updated_ms INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX ix_mail_templates_kind ON mail_templates (kind, builtin);
--- 初始三行(builtin=1,06 §2.14 给正文):'ibquote 兼容-出站'(ibquote-163-v1)、'collector 兼容-出站'(collector-v1)、'QTrade 原生-出站'(custom)+ 对应入站模板
+-- 初始三行(builtin=1,06 §2.14 给正文):'ibquote 兼容-出站'(ibquote-163-v1)、'collector 兼容-出站'(collector-v1)、'QTrade 原生-出站'(qtrade-v1,R6-58 (h))+ 对应入站模板
 
 CREATE TABLE mail_routes (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -590,7 +592,10 @@ CREATE TABLE mail_inbox (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   route_id        INTEGER REFERENCES mail_routes(id) ON DELETE SET NULL,   -- 经哪条路由收到(E-5);路由删除后置 NULL、邮件行保留
   mailbox         TEXT NOT NULL,                 -- 邮箱账户(user@host)
-  protocol        TEXT NOT NULL CHECK (protocol IN ('imap','pop3')),   -- 实际取信协议(E-1 回落期间为 pop3,与路由配置的 imap 可不同)
+  protocol        TEXT NOT NULL CHECK (protocol IN ('imap','pop3')),   -- 🔴 R6-58 (i):本列 = **路由配置的**协议(`mail_routes.inbound_json.protocol`);E-1 回落期间实际用哪个看下面的 effective_protocol
+  effective_protocol TEXT CHECK (effective_protocol IS NULL OR effective_protocol IN ('imap','pop3')),
+                                                 -- 🔴 R6-58 (i) 新增(06 §3.1 v0.3 E-1):取信时**实际**用的协议。回落期间 = 'pop3' 而 protocol 仍是 'imap';
+                                                 --   两列不等 ⟺ 正处于 E-1 回落(§2.2.9)。**不要把这两列当同一件事**——同设置两个键名会让一处静默失效
   folder          TEXT NOT NULL DEFAULT '',      -- IMAP 文件夹;POP3 空串
   uidvalidity     INTEGER, uid INTEGER,          -- IMAP 键
   uidl            TEXT,                          -- POP3 键
@@ -612,6 +617,8 @@ CREATE TABLE mail_inbox (
                      'OVERSIZE','CONFIRM_REQUIRED','CONFIRM_EXPIRED','ROUTE_MISMATCH')),   -- ⚠️ 单一来源 = 06 §2.3.5;这四个曾漏收(OVERSIZE=R4-18;CONFIRM_REQUIRED/CONFIRM_EXPIRED=v0.4 R-03;ROUTE_MISMATCH=v0.3 E-5),06 一旦写这些 status,旧 CHECK 会直接 INSERT 失败——新增终态码必须两处同步
   reason          TEXT,                          -- 机器码+人话
   req_id          TEXT, account_id TEXT, op TEXT, -- 解析结果(列表筛选)
+  idempotency_key TEXT,                          -- 🔴 R6-58 (i) 新增(06 §3.1,C-10):Transport 改写后的幂等键 `mail:{短名}:{req_id}`,关联 `idempotency` 表。
+                                                 --   没有这一列时只能用 (req_id, from_addr) 反查定位,重投/改名场景下会定位错行
   nonce           TEXT,                          -- ⚠️ R6-7:这是**指令邮件的防重放 nonce**(HMAC 信封里的,v1 在用),唯一 (from_addr, nonce);随 nonce_ttl_h 清。
                                                  --   与「危险指令二次确认」的 confirm_nonce **不是一回事**:v1 的确认只有 console 一条路、approve/reject 按 {id} 操作、
                                                  --   **不核验任何 nonce**,故本表 **v1 无 confirm_nonce 列、也无 confirm_via 列**(R4-12 判 oob M6+ 不实现)。
@@ -648,6 +655,7 @@ CREATE INDEX ix_inbox_status ON mail_inbox (status, received_ms);
 CREATE INDEX ix_inbox_cleanup ON mail_inbox (mailbox, folder, received_ms) WHERE deleted_ms IS NULL;
 CREATE INDEX ix_inbox_bodyhash ON mail_inbox (body_sha256);
 CREATE INDEX ix_inbox_reqid ON mail_inbox (req_id) WHERE req_id IS NOT NULL;
+CREATE INDEX ix_inbox_idem ON mail_inbox (idempotency_key) WHERE idempotency_key IS NOT NULL;  -- R6-58 (i)
 CREATE INDEX ix_inbox_route ON mail_inbox (route_id, received_ms DESC) WHERE route_id IS NOT NULL;
 CREATE INDEX ix_inbox_confirm_pending ON mail_inbox (confirm_expires_ms) WHERE status = 'CONFIRM_REQUIRED';  -- R6-7:过期 reaper 每 60s 的扫描面,只覆盖待确认行
 -- 🔴 R6-7 待确认过期 reaper(规范 SQL;归 `scheduler` 注册的 `mail_confirm_reaper`,**每 60 s 一轮**——与 `wechat_slot_reaper`、
@@ -684,7 +692,8 @@ CREATE TABLE mail_outbox (
   ref_inbox_id    INTEGER, ref_message_id TEXT, ref_trace_id TEXT,   -- 回执→指令邮件;信息邮件→messages.id;→trace
   template_id      INTEGER REFERENCES mail_templates(id) ON DELETE SET NULL,   -- 用哪份模板渲染(E-4)
   template_version TEXT NOT NULL,                -- = mail_templates.version 渲染那一刻的值(E-4)
-  template_profile TEXT NOT NULL DEFAULT 'custom',   -- 渲染那一刻模板的 compat_profile,冻结(E-4)
+  template_profile TEXT NOT NULL DEFAULT 'qtrade-v1', -- 渲染那一刻模板的 compat_profile,冻结(E-4);取值与 mail_templates.compat_profile 同一枚举(R6-58 (h):`custom` 作废)
+  render_notes    TEXT,                          -- 🔴 R6-58 (i) 新增(06 §3.1 v0.3 E-4):必填字段为空按 `empty` 处理的记录(06 §2.14.3),供追溯「这封为什么缺了那一栏」
   status          TEXT NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED','SENDING','SENT','RETRY','DEAD','DISCARDED')),
   attempts        INTEGER NOT NULL DEFAULT 0,
   next_attempt_ms INTEGER NOT NULL DEFAULT 0,

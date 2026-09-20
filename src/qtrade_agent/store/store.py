@@ -451,6 +451,37 @@ class Store:
         r = self.con.execute("SELECT * FROM jobs WHERE kind=? ORDER BY created_ms DESC LIMIT 1", (kind,)).fetchone()
         return dict(r) if r else None
 
+    def job_cancel(self, job_id: str, *, actor: str = "token:console", now_ms: Optional[int] = None) -> bool:
+        """#108:只取消 ``queued/running``;rowcount==1 判成功(终态由调用方先判并回 409)。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            cur = c.execute("UPDATE jobs SET state='cancelled', updated_ms=? WHERE job_id=? AND state IN ('queued','running')",
+                            (now, job_id))
+            ok = cur.rowcount == 1
+        if ok:
+            self.insert_audit(kind="api", transport="http", actor=actor, action="job.cancel", result_code="OK",
+                              detail={"job_id": job_id}, now_ms=now)
+        return ok
+
+    def pool_calibration_note(self, *, run_id: str, account_id: str, channel: str, quota_mb: Optional[int],
+                              evidence: dict[str, Any], actor: str = "token:console", now_ms: Optional[int] = None) -> None:
+        """#25 单账号自校准的落点:把这一轮的建议与证据并进 ``resource_pools.calibration_json`` 的 ``per_account`` 子对象。
+
+        **不改 `quota_json`** —— 单账号量出来的只是建议(下调还要过 `quota_auto_lower`),写回整池配额是 #71 的事。
+        """
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            r = c.execute("SELECT calibration_json FROM resource_pools WHERE pool='wsl'").fetchone()
+            blob = json.loads(r[0]) if r and r[0] else {}
+            per = dict(blob.get("per_account") or {})
+            per[account_id] = {"run_id": run_id, "channel": channel, "quota_mb": quota_mb,
+                               "evidence": evidence, "calibrated_ms": now}
+            blob["per_account"] = per
+            c.execute("UPDATE resource_pools SET calibration_json=?, updated_ms=? WHERE pool='wsl'",
+                      (json.dumps(blob, ensure_ascii=False), now))
+        self.insert_audit(kind="api", transport="http", actor=actor, action="resources.calibrate", account_id=account_id,
+                          result_code="OK", detail={"run_id": run_id, "scope": "account", "quota_mb": quota_mb}, now_ms=now)
+
     # ------------------------------------------------------------------ ingest
     #: 02 §2.8.8「写入报错先判磁盘满」:装配方(``app.py``)把 ``maintenance.guard_write`` 挂上来。
     #: 缺省是空壳上下文 ⇒ 未装配 maintenance 时行为与从前逐字相同。

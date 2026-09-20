@@ -154,23 +154,82 @@ class MailCleanup:
         return False
 
     # ------------------------------------------------------------------ §2.6.5 删除动作(协议差异)
-    def on_terminal(self, backend: Any, row: dict[str, Any]) -> None:
+    def on_terminal(self, backend: Any, row: dict[str, Any]) -> Optional[tuple[str, int]]:
         """🔴 门 ④(§2.6.5 IMAP 第 1 步):进入终态后**先判 ``status ∉ NEVER_DELETE`` 再搬**。
 
         ``OUT_OF_SCOPE``/``OVERSIZE`` 既不搬进 ``processed_folder``、也不在原夹留 ``\\Deleted``,
         ``mail_inbox.folder/uid`` 保持原夹原 UID 不变。
+
+        返回 ``(原夹, 原 UID)`` = 走了 ``COPY`` + ``\\Deleted`` 那条路(服务器无 ``MOVE``),
+        原夹里留下的标删由 §2.6.5 第 3 步统一清(``_purge_source_flags``);走 ``MOVE`` 的返回 ``None``。
         """
         if row.get("status") in NEVER_DELETE:
-            return
+            return None
         dest = self.route.inbound.processed_folder
         backend.create_folder(dest)
         uid = int(row["uid"])
-        backend.select(row.get("folder") or "INBOX", readonly=False)
+        src = row.get("folder") or "INBOX"
+        backend.select(src, readonly=False)
         caps = backend.capabilities()                                      # 每轮在已建连接上判定,不做启动时一次判
         new_uid = backend.uid_move(uid, dest) if "MOVE" in caps else backend.uid_copy(uid, dest)
-        if "MOVE" not in caps:
-            backend.store_deleted(uid)
         self.ms.inbox_update(int(row["id"]), folder=dest, uid=new_uid)     # 移动后 UID 变化(COPYUID 给出)
+        if "MOVE" in caps:
+            return None
+        backend.store_deleted(uid)
+        return src, uid
+
+    def _purge_source_flags(self, backend: Any, marked: dict[str, list[int]]) -> list[dict[str, Any]]:
+        """§2.6.5 第 3 步:原夹(INBOX/Junk)里 ``COPY`` 路径留下的 ``\\Deleted`` 标记怎么清。
+
+        每轮对原夹(``folders`` 与本轮 ``COPY`` 过的夹)各看一次:
+        有 ``UIDPLUS`` → ``UID EXPUNGE`` **只清我们这几封**;无 ``UIDPLUS`` → 先 ``UID SEARCH DELETED``,
+        **标删集合 ⊆ 本轮我们标删的 UID 集合才 ``EXPUNGE``**,否则本轮不清、记 ``DELETE_DEFERRED`` 下轮再看
+        (99c 收紧:人用客户端在同一夹标删的**别人的邮件**绝不能被我们连带真删)。
+        """
+        out: list[dict[str, Any]] = []
+        caps = backend.capabilities()
+        folders = list(dict.fromkeys(list(marked) + list(self.route.inbound.folders)))
+        for folder in folders:
+            uids = marked.get(folder, [])
+            try:
+                backend.select(folder, readonly=False)
+                deleted = set(backend.search_deleted())
+            except Exception:                                              # noqa: BLE001 —— 夹不存在/只读,跳过
+                continue
+            if not deleted:
+                continue
+            if "UIDPLUS" in caps:
+                if uids:
+                    backend.uid_expunge(uids)                              # 只清这几封,他人标删的原样留着
+                continue
+            if deleted <= set(uids):
+                backend.expunge_folder()                                   # 夹里标删的全是我们的,等价于只删自己的
+            else:
+                # 无 UIDPLUS 且夹里还有**别人**标删的邮件 ⇒ 整夹 EXPUNGE 会连带真删,本轮不清、下轮再看
+                out.append({"folder": folder, "action": "DELETE_DEFERRED"})
+        return out
+
+    def sweep_terminal(self, backend: Any, protocol: str) -> list[dict[str, Any]]:
+        """🔴 门 ④ 的**调用点**(§2.6.5 IMAP 第 1 步):把已进入终态的邮件搬进 ``processed_folder``。
+
+        「处理完立即 MOVE」在实现上 = **本轮取信之后、同一条连接里**(§2.6.6:清理在 ``mail.inbound`` 同一线程、
+        ``run_cycle()`` 之后、进 IDLE 之前)——这样 `ACCEPTED → DONE → RECEIPT_SENT` 这类跨轮才收口的状态
+        也会在下一轮被搬走,而不是永远留在 INBOX 让第 2 步「到期删除只在专用夹里做」落空。
+        ``NEVER_DELETE`` 两类与 POP3(无文件夹概念)不走这条路。
+        """
+        if protocol != "imap":
+            return []
+        dest = self.route.inbound.processed_folder
+        marked: dict[str, list[int]] = {}
+        for row in self.ms.inbox_terminal_outside(mailbox=self.mailbox, dest=dest):
+            try:
+                src = self.on_terminal(backend, row)
+            except Exception as e:                                         # noqa: BLE001 —— 搬不动不阻塞本轮清理
+                log.warning("mail: 终态邮件搬入 %s 失败(inbox_id=%s):%s", dest, row.get("id"), e)
+                continue
+            if src is not None:                                            # COPY 路径:原夹留了 \Deleted
+                marked.setdefault(src[0], []).append(src[1])
+        return self._purge_source_flags(backend, marked)
 
     def _delete_imap(self, backend: Any, rows: list[dict[str, Any]]) -> tuple[int, int, list[dict[str, Any]]]:
         """§2.6.5 第 2 步:到期删除**只在专用夹里做**;无 ``UIDPLUS`` 才对**该夹**整夹 ``EXPUNGE``。"""
@@ -256,6 +315,7 @@ class MailCleanup:
         archive_enabled = self.cfg.cleanup.archive_before_delete and disk != "high"   # high:停归档
 
         started = now
+        swept = self.sweep_terminal(backend, protocol)   # §2.6.5 第 1 步:终态邮件先搬进 processed_folder
         used, limit, source = self.quota(backend, protocol)
         stats.quota_used_before, stats.quota_limit, stats.quota_source = used, limit, source
 
@@ -282,7 +342,7 @@ class MailCleanup:
         if protocol == "pop3":
             uidl2n = {u: n for n, u in backend.uidl()}
         archived_rows: list[dict[str, Any]] = []
-        detail_items: list[dict[str, Any]] = []
+        detail_items: list[dict[str, Any]] = list(swept)
         for row in cands:
             if archive_enabled and not row.get("archived_ms"):
                 raw = self._raw_of(row, backend, protocol, uidl2n)

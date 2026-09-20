@@ -267,6 +267,12 @@ class AccountService:
         acct = Account(id=id, channel="qq", state=row["state"], self_uid=row.get("self_uid"), self_nick=row.get("self_nick"),
                        state_code=row.get("state_code"))
         await ad.start(acct)                                                     # ⑤ 建连,不阻塞到登录
+        # 00 §8.1 / 05-P5 **序列不跳段**:免扫命中时 `login_required`/`logging_in` 各停留 0 秒,但**两个事件都要发**
+        # (控制台与审计据此还原时间线);与企点 `_login_phase` 同款。
+        ls = new_login_session_id()
+        self.transition(id, "login_required", state_code="WAIT_QRCODE", login_session_id=ls,
+                        prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
+        self.transition(id, "logging_in", login_session_id=ls)
         deadline = self._clock() + self.cfg.accounts.qq_quick_login_wait_s * 1000
         while self._clock() < deadline:
             if await ad.get_state(acct) == "running":                            # ⑤a 免扫命中
@@ -275,12 +281,13 @@ class AccountService:
                     # ⑦ 身份列:`self_nick` 不在 transition/patch_account 的白名单里(它不是人能改的设置项),直接写同一张表
                     self._store.con.execute("UPDATE accounts SET self_nick=?, updated_ms=? WHERE id=?",
                                             (str(info.get("nickname") or ""), self._clock(), id))
-                self.transition(id, "running", state_code=None,
+                self.transition(id, "running", state_code=None, login_session_id=ls,
                                 **({"self_uid": str(info["user_id"])} if info else {}))
                 return
             await asyncio.sleep(1)
+        # ⑤b 窗内没登上:回 `login_required(WAIT_QRCODE)` 等人扫码(**不自动重登**,D-2;二维码转发 05 §10 待定 3)
         self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="免扫码登录未命中,请在 NapCat WebUI 扫码",
-                        prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
+                        login_session_id=ls, prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
 
     @staticmethod
     async def _qq_login_info(ad: Any, account_id: str) -> Optional[dict[str, Any]]:
@@ -309,6 +316,34 @@ class AccountService:
             self.transition(id, "stopped", state_reason="微信槽位被占用", desired_state="stopped")
             return
         await self._wechat_login.run(id, ls)
+
+    # ------------------------------------------------------------------ #97 / #98 QQ WebUI 临时开关(C-35)
+    async def set_webui(self, id: str, enable: bool, *, until_ms: Optional[int] = None, actor: str) -> dict[str, Any]:
+        """改 napcat 的 ``webui.enable`` 并重启容器;``account_runtime.webui_published_until_ms`` 记到期时刻。
+
+        ``running`` 态下改必须重启容器才生效(C-35 / 02 #97),响应里如实带 ``restart``;
+        已是目标状态 ⇒ no-op(``changed:false``),不白重启一次容器。
+        """
+        row = self.get(id)
+        rt = self._store.get_runtime(id) or {}
+        now = self._clock()
+        currently_on = bool(rt.get("webui_published_until_ms") and int(rt["webui_published_until_ms"]) > now)
+        if currently_on == enable:
+            return {"changed": False, "restart": False, "until_ms": rt.get("webui_published_until_ms")}
+        self._store.upsert_runtime(id, kind=self._store.RUNTIME_KIND[row["channel"]],
+                                   webui_published_until_ms=(until_ms if enable else None), now_ms=now)
+        restarted = False
+        if row["state"] in ("running", "degraded", "login_required", "logging_in"):
+            try:
+                await self._runtime.set_napcat_webui(row, enable)          # 改配置 + 重启容器(runtime 的事)
+                restarted = True
+            except AttributeError:
+                # runtime 侧的「改 napcat 配置 + 重启」尚未实现(C-35,见 rulings R6-58 (cx)):
+                # 登记照写、如实回 restart=false,**不假装重启过**
+                log.warning("runtime 未实现 set_napcat_webui:account=%s 的 WebUI 开关只落了登记", id)
+        self._store.insert_audit(kind="system", transport="system", actor=actor, action="settings.update", account_id=id,
+                                 result_code="OK", detail={"webui": enable, "until_ms": until_ms}, now_ms=now)
+        return {"changed": True, "restart": restarted, "until_ms": until_ms if enable else None}
 
     async def _drain_account(self, account_id: str, timeout_s: float) -> bool:
         """#17 切换第 ① 步:等该账号的总线队列跑完(上限 ``[adapters.wechat] switch_drain_timeout_s``)。

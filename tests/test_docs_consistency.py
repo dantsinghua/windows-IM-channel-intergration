@@ -84,13 +84,18 @@ def test_config_defaults_match_doc_02(key, value):
     ("mail_archive_days", AgentConfig().retention.mail_archive_days),
     ("commands_days", AgentConfig().retention.commands_days),
     ("audit_days", AgentConfig().retention.audit_days),
-    ("events_ws_hours", AgentConfig().retention.events_ws_hours),
+    # R6-58 (c):`[retention] events_ws_hours` 已从 02 §7.1 / docs/07 / RetentionConfig 一起删,
+    # `events_outbox` 两类行统一按 `[events] ws_retention_hours`(下面 EventsConfig 那条已对账)。
     ("idempotency_days", AgentConfig().retention.idempotency_days),
     ("mail_inbox_rows_days", AgentConfig().retention.mail_inbox_rows_days),
     ("export_jobs_days", AgentConfig().retention.export_jobs_days),
     ("cleanup_batch", AgentConfig().retention.cleanup_batch),
     # [media] / [db]
     ("orphan_grace_h", AgentConfig().media.orphan_grace_h),
+    # [jobs](R6-16)/ [api] 公网出口探测
+    ("reclaim_after_s", AgentConfig().jobs.reclaim_after_s),
+    ("reclaim_interval_s", AgentConfig().jobs.reclaim_interval_s),
+    ("public_ip_check_interval_s", AgentConfig().api.public_ip_check_interval_s),
 ])
 def test_new_section_defaults_match_doc_02(key, value):
     """第五批接线新并入 config.py 的段(02 §7.1 是这些键的真值/镜像位置)。"""
@@ -109,6 +114,20 @@ def test_adapters_qq_and_wechat_pairs_match_doc_02():
     assert m and int(m.group(1)) == c.wechat_adapter.poll_interval_s
     m = re.search(r"\| `confirm_poll_interval_ms` \| `(\d+)` \| 发送后临时加速", t)
     assert m and int(m.group(1)) == c.wechat_adapter.confirm_poll_interval_ms
+
+
+def test_monitor_sample_interval_matches_doc_02():
+    """`[monitor]` 的 owner 是 04 §7,02 §7.1 只镜像;两个节拍键并列写在一行。"""
+    m = re.search(r"`sample_interval_s` / `slow_interval_s` \| `(\d+)` / `(\d+)`", _doc(DOC02))
+    c = AgentConfig().monitor
+    assert m and (int(m.group(1)), int(m.group(2))) == (c.sample_interval_s, c.slow_interval_s)
+
+
+def test_public_ip_probe_urls_match_doc_02():
+    m = re.search(r"`public_ip_probe_urls` \| `\[([^\]]+)\]`", _doc(DOC02))
+    assert m
+    urls = tuple(x.strip().strip('"') for x in m.group(1).split(","))
+    assert urls == AgentConfig().api.public_ip_probe_urls
 
 
 def test_calibration_and_backup_and_watermark_match_doc_02():

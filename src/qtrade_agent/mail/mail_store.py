@@ -282,6 +282,16 @@ class MailStore:
                f" ORDER BY received_ms ASC LIMIT ?")
         return _rows(self.con.execute(sql, (mailbox, *_TERMINAL_ARGS, *_NEVER_ARGS, limit)))
 
+    def inbox_terminal_outside(self, *, mailbox: str, dest: str) -> list[dict[str, Any]]:
+        """§2.6.5 IMAP 第 1 步的候选:已进入终态、**还没搬进 ``processed_folder``** 的行。
+
+        同样过 ``NEVER_DELETE`` 门(🔴 R6-1 门 ④:那两类连第一步的 MOVE/COPY 都不做,留原夹原位)。
+        """
+        sql = (f"SELECT * FROM mail_inbox WHERE mailbox=? AND deleted_ms IS NULL AND uid IS NOT NULL"
+               f"   AND folder <> ? AND status IN ({_IN_TERMINAL}) AND status NOT IN ({_IN_NEVER})"
+               f" ORDER BY id")
+        return _rows(self.con.execute(sql, (mailbox, dest, *_TERMINAL_ARGS, *_NEVER_ARGS)))
+
     def inbox_kept_count(self, *, mailbox: str) -> int:
         """§2.6.3 ③ 的分母:``count(where status ∉ NEVER_DELETE and deleted_ms is null)``——🔴 R6-26:分母也不含这两类。"""
         r = self.con.execute(

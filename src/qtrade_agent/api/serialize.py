@@ -9,7 +9,7 @@ import json
 from typing import Any, Optional
 
 from ..events import iso8601
-from ..models import CommandResult
+from ..models import CommandResult, json_safe
 
 PORT_BASE = {"adb": 16000, "stream": 16500, "frida": 16600, "ws": 16100, "http": 16200, "webui": 16300}   # 00 §3:段基址 + NN
 
@@ -75,7 +75,8 @@ def session_view(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def result_view(res: CommandResult) -> dict[str, Any]:
-    out: dict[str, Any] = {"ok": res.ok, "code": res.code, "data": res.data, "cost_ms": res.cost_ms, "trace_id": res.trace_id,
+    # `data` 里可能带裸二进制(截图的图片体):出 JSON 前换成 `{__binary__, len}` 占位(models.json_safe)
+    out: dict[str, Any] = {"ok": res.ok, "code": res.code, "data": json_safe(res.data), "cost_ms": res.cost_ms, "trace_id": res.trace_id,
                            "source": res.source, "state_before": res.state_before, "state_after": res.state_after}
     if res.error is not None:
         out["error"] = {"message": res.error.message, "reason": res.error.reason, "retryable": res.error.retryable,

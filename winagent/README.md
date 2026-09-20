@@ -179,12 +179,24 @@ cd winagent
 全部 49 个端点都已落地。执行体与令牌列逐行照 §3.6;`svc` 直接执行,`user` 经管道转会话代理
 (离线一律 `503 NOT_READY`),`svc+user` 混合端点按 R3-15 拆两半、失败带 `stage`/`partial`。
 
+**另加 1 个文档尚未登记的端点 + 2 个参数**(整合裁决 (ci) 补的上游缺口:02 #76b 要 Agent 做的事,`/wa/v1` 侧原本无入口):
+
+| 签名 | 令牌·执行体 | 做什么 |
+|---|---|---|
+| `GET /wa/v1/probes?kind=observed&since=&limit=&channel=&adopted=` | A/C/I · svc(沿用 #15) | 读 `probe_targets_observed`;行原样带 `id`(= `observed_ids` 的稳定 id,裁决 (ch))+ 派生 `in_config` |
+| `PUT /wa/v1/probes {kind:'observed', rows:[…]}` | A · svc(沿用 #16) | 实测采样候选的**唯一写入口**(04 §3.4);按 DDL 唯一索引 upsert、`hits` 累加 |
+| `PUT /wa/v1/probes/adopt {observed_ids:[…]}` | A · svc | 写 `adopted_ms` + `settings['probe.targets']` → `{adopted:[id…], adopted_rows, targets:["host:port"…], hosts_by_channel}` |
+
+⚠️ 随之把 `POST /wa/v1/probe {mode:'sample'}` 改成 **`{rows:[…]}` 不落库**(04 §3.4 逐字)——
+原先 WinAgent 自己也写一份,加上 Agent 回写会把 `hits` 算两倍。
+
 | 组 | 端点 | 执行体 |
 |---|---|---|
 | 探活与版本 | #1 ping / #2 health / #3 version / #4 time | svc(🔴 探活**绝不经管道**,R3-1) |
 | 监控 | #5 metrics / #6 alerts | svc |
 | Vault | #7~#12 | svc(#11 仅 Agent 令牌 + 仅 loopback/WSL 子网 + 须带 `X-Trace-Id`) |
 | 网络 | #13 net / #14 probe / #15 probes / #16 PUT probes / #17 firewall/ensure / #45 DELETE firewall | svc |
+| 实测采样(C-1) | **#15 `?kind=observed`**(读 `probe_targets_observed`,A/C/I)、**#16 `{kind:'observed'}`**(唯一写入口,A)、**`PUT /wa/v1/probes/adopt`**(采纳,A) | svc |
 | 电源 | #18 power / #19 keepawake | svc + user(display 半) |
 | WSL | #20~#25 / #47 | user(#25 混合:服务备份目录 + 会话代理写文件) |
 | 内核 | #26 verify / #27 rollback / #46 apply | svc + user(混合) |

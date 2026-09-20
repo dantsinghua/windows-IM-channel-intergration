@@ -72,7 +72,9 @@ class RetentionConfig:
     mail_archive_days: int = 7
     commands_days: int = 30
     audit_days: int = 30
-    events_ws_hours: int = 24
+    # 🔴 R6-58 (c):原 ``events_ws_hours`` **已删**。``events_outbox`` 两类行(``target='ws'`` 规范行与
+    # ``target='webhook:<id>'`` 副本)的保留期**只有一把尺子** = ``[events] ws_retention_hours``(默认 72,
+    # 见 ``EventsConfig``)。老 ``agent.toml`` 里残留本键不报错(``config.pick`` 按字段名过滤),但没有任何消费者。
     idempotency_days: int = 7
     mail_inbox_rows_days: int = 30
     export_jobs_days: int = 7
@@ -222,7 +224,8 @@ class MaintenanceService:
     def __init__(self, store, *, cfg: Optional[RetentionConfig] = None, backup: Optional[BackupConfig] = None,
                  data_dir: str = "/var/lib/qtrade", disk: Optional[DiskProbe] = None, alerts=None,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000),
-                 media_orphan_grace_h: int = 24, disk_subject: str = "wsl"):
+                 media_orphan_grace_h: int = 24, disk_subject: str = "wsl",
+                 ws_retention_hours: int = 72):
         cfg = cfg or RetentionConfig()
         self.cfg, self.config_warnings = cfg.clamp()
         self.backup_cfg = backup or BackupConfig()
@@ -233,6 +236,7 @@ class MaintenanceService:
         self._clock = clock
         self.media_orphan_grace_h = media_orphan_grace_h
         self.disk_subject = disk_subject                 # §3.7:H12_DISK_LOW 的 subject = host|wsl
+        self.ws_retention_hours = ws_retention_hours     # [events] ws_retention_hours(events_outbox 两类行同一把尺子)
         # §2.8.8 三级水位的运行期开关(其它模块消费:媒体下载/邮件归档/采集入库/导出)
         self.level: str = LEVEL_NORMAL
         self.actions: tuple[str, ...] = ()
@@ -506,10 +510,11 @@ class MaintenanceService:
         c = self.cfg
         rep.bump("commands", self._purge_by_rowid("commands", "submitted_ms", now - min(c.commands_days, days) * 86400_000))
         rep.bump("audit_log", self._purge_by_rowid("audit_log", "ts_ms", now - min(c.audit_days, days) * 86400_000))
-        # events_outbox:target='ws' 的保留由 app 的 outbox_ws_retention 任务按 [events] ws_retention_hours 管,
-        # 这里只清 webhook 副本(§2.2.7 两类行;两键同义不同默认见 .omc/handoffs/agent-infra.md「规格张力」)
+        # events_outbox:`target='ws'` 的保留由 app 的 outbox_ws_retention 任务管;这里清 webhook 副本。
+        # 🔴 总控裁决(rulings R6-58 (ac)):**两类行同一把尺子 = `[events] ws_retention_hours`**;
+        # `[retention] events_ws_hours` 已废弃、不再参与判定。
         rep.bump("events_outbox_webhook",
-                 self._purge_by_rowid("events_outbox", "ts_ms", now - c.events_ws_hours * 3600_000,
+                 self._purge_by_rowid("events_outbox", "ts_ms", now - self.ws_retention_hours * 3600_000,
                                       extra_where="target <> 'ws'"))
         self._purge_mail_inbox(rep, now, min(c.mail_inbox_rows_days, days))
         rep.bump("mail_outbox", self._purge_by_rowid("mail_outbox", "created_ms", now - min(c.mail_inbox_rows_days, days) * 86400_000))

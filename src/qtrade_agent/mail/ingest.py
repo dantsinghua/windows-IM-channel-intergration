@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from ..events import iso8601
+from ..maintenance import DiskFullError
 from ..models import Command, CommandError, CommandOrigin, CommandResult, RESULT_CODES
 from .catalog import Catalog
 from .codes import (ACCEPTED, CONFIRM_REQUIRED, DONE, DUPLICATE, DUPLICATE_NONCE, EXPIRED, INGEST_ERROR,
@@ -92,6 +93,17 @@ class MailIngest:
         """
         return scope_subject_prefixes([self.cfg.template_out], [self.cfg.template_in.subject_pattern])
 
+    def _finish(self, inbox_id: int, status: str, reason: str = "", **cols: Any) -> None:
+        """落状态 + **追加** ``reason``(解析备注在前、状态原因在后)。
+
+        §2.3.3 各条容错规则写的是 ``mail_inbox.reason += …``:``subject_mismatch``/``unknown_key:<键>``/
+        ``duplicate_key``/``body_truncated`` 这些备注在受理路径上也必须留住(§2.3.1「以正文为准,并在
+        ``mail_inbox.reason`` 记 ``subject_mismatch`` 供人看」),后续状态原因只能**追加**、不能覆盖。
+        """
+        row = self.ms.inbox_get(inbox_id) or {}
+        merged = ";".join([p for p in ((row.get("reason") or "").strip(), reason.strip()) if p])
+        self.ms.inbox_update(inbox_id, status=status, reason=merged or None, **cols)
+
     def _looks_like_our_template(self, body_text: str) -> bool:
         """§2.6.4 范围圈定的另一半:正文标题行是本系统两类模板之一。"""
         title_re = title_line_regex(self.cfg.template_in.title_line)
@@ -107,7 +119,11 @@ class MailIngest:
         """一封邮件的完整落库判定;返回 ``mail_inbox.status``。取信侧(fetcher)只管水位与 SIZE 门。"""
         try:
             return self._ingest_raw(mail).status
-        except Exception as e:                                          # noqa: BLE001 —— §5「毒邮件」:隔离不放过
+        except DiskFullError:
+            # 02 §2.8.8:盘满不是「毒邮件」——隔离会再写一次库、且唯一键已见后盘满解除也不会重收。
+            # 原样上抛:本轮取信记失败、水位不推进,下轮自然重收。
+            raise
+        except Exception as e:                                         # noqa: BLE001 —— §5「毒邮件」:隔离不放过
             log.exception("mail: 落库失败 %s", e)
             self._isolate(mail, e)
             return INGEST_ERROR
@@ -165,12 +181,12 @@ class MailIngest:
         pc = parse_command_body(parsed.body_text, template=self.cfg.template_in,
                                 subject=parsed.subject, body_truncated=parsed.body_truncated)
         if pc.status == UNSUPPORTED:
-            self.ms.inbox_update(inbox_id, status=UNSUPPORTED, reason=pc.reason_text, template="none")
+            self._finish(inbox_id, UNSUPPORTED, pc.reason_text, template="none")
             return IngestResult(status=UNSUPPORTED, inbox_id=inbox_id, reason=pc.reason_text)
 
         route = self.routes.route_for_inbox_account(mail.mailbox, pc.account_id, pc.channel)
         if route is None:
-            self.ms.inbox_update(inbox_id, status=ROUTE_MISMATCH, reason="route_unresolved:收到本封的邮箱没有可用路由")
+            self._finish(inbox_id, ROUTE_MISMATCH, "route_unresolved:收到本封的邮箱没有可用路由")
             return IngestResult(status=ROUTE_MISMATCH, inbox_id=inbox_id)
         inb = route.inbound
         self.ms.inbox_update(inbox_id, route_id=route.id, effective_protocol=mail.protocol,
@@ -179,13 +195,13 @@ class MailIngest:
         # ── 闸 ①:发件人白名单(§2.2 第 1 闸)——不命中不处理、**不回执**
         allowed = {a.strip().lower() for a in inb.allowed_senders if a.strip()}
         if parsed.from_addr not in allowed:
-            self.ms.inbox_update(inbox_id, status=SENDER_DENIED, reason="sender_denied:发件人不在 allowed_senders")
+            self._finish(inbox_id, SENDER_DENIED, "sender_denied:发件人不在 allowed_senders")
             self._alert(MAIL_SENDER_DENIED, subject=f"sender:{parsed.from_addr}",
                         evidence={"subject": parsed.subject[:200]})
             return IngestResult(status=SENDER_DENIED, inbox_id=inbox_id)
 
         if pc.status == PARSE_FAILED:
-            self.ms.inbox_update(inbox_id, status=PARSE_FAILED, reason=pc.reason_text)
+            self._finish(inbox_id, PARSE_FAILED, pc.reason_text)
             self._alert(MAIL_PARSE_FAILED, subject=f"inbox:{inbox_id}", evidence={"reason": pc.reason_text})
             if inb.reply_on_parse_failure:
                 # §5「解析失败(模板对不上)」:白名单发件人的给回执 INVALID_ARGS(见 handoff「建议裁决 ④」)
@@ -194,7 +210,11 @@ class MailIngest:
             return IngestResult(status=PARSE_FAILED, inbox_id=inbox_id, reason=pc.reason_text)
 
         short = inb.short_name_of(parsed.from_addr)
-        self.ms.inbox_update(inbox_id, req_id=pc.req_id, account_id=pc.account_id, op=pc.op)
+        # §2.3.1/§2.3.3:解析备注(``subject_mismatch``/``unknown_key:<键>``/``duplicate_key``/``body_truncated``)
+        # **落库即写**——受理路径也要留住它们(`P-MAIL` 靠 `unknown_key` 看模板漂移的早期信号);
+        # 之后每次落状态由 `_finish` 在其后**追加**原因,不覆盖。
+        self.ms.inbox_update(inbox_id, req_id=pc.req_id, account_id=pc.account_id, op=pc.op,
+                             reason=pc.reason_text or None)
 
         # ── 闸 ②:HMAC 验签(§2.3.4)。``nonce`` 列有 UNIQUE(from_addr, nonce):
         #     **查重通过之后**才写本行的 nonce,否则重放那一封自己就会撞唯一键(写在验签前 = 把 DUPLICATE_NONCE 变成落库异常)
@@ -208,37 +228,39 @@ class MailIngest:
         acct = self.store.get_account(pc.account_id)
         channel = acct["channel"] if acct else pc.channel
         if not route.covers(pc.account_id, channel):
-            self.ms.inbox_update(inbox_id, status=ROUTE_MISMATCH,
-                                 reason="route_mismatch:该账号不属于收到本封的路由")
+            self._finish(inbox_id, ROUTE_MISMATCH, "route_mismatch:该账号不属于收到本封的路由")
             self._send_receipt(inbox_id, route, parsed, pc, code="TARGET_NOT_FOUND",
                                error="该账号不属于收到本封邮件的路由")
             return IngestResult(status=ROUTE_MISMATCH, inbox_id=inbox_id)
         if acct is None:
-            self.ms.inbox_update(inbox_id, status=TARGET_NOT_FOUND, reason="target_not_found:账号不存在")
+            self._finish(inbox_id, TARGET_NOT_FOUND, "target_not_found:账号不存在")
             self._send_receipt(inbox_id, route, parsed, pc, code="TARGET_NOT_FOUND", error=f"账号不存在:{pc.account_id}")
             return IngestResult(status=TARGET_NOT_FOUND, inbox_id=inbox_id)
         if pc.channel and pc.channel != acct["channel"]:
-            self.ms.inbox_update(inbox_id, status=DONE, reason="invalid_args:通道与账号实际通道不符")
+            self._finish(inbox_id, DONE, "invalid_args:通道与账号实际通道不符")
             self._send_receipt(inbox_id, route, parsed, pc, code="INVALID_ARGS", error="通道与账号实际通道不符")
             return IngestResult(status=DONE, inbox_id=inbox_id)
 
         # ── op 与参数(§2.8:取值集合与参数名唯一来源 = 02 §3.10 能力目录)
         cap = self.catalog.get(pc.op)
         if cap is None:
-            self.ms.inbox_update(inbox_id, status=PARSE_FAILED, reason="op_unknown:目录里没有这个 op")
+            self._finish(inbox_id, PARSE_FAILED, "op_unknown:目录里没有这个 op")
+            # §2.7:``MAIL_PARSE_FAILED`` 的触发 = 白名单发件人的指令邮件 `PARSE_FAILED`/`SIG_INVALID`/`EXPIRED`
+            # ——`op_unknown`(§2.3.2)也是 `PARSE_FAILED`,同样要让 `P-MAIL` 看见(对方模板/目录对不上)
+            self._alert(MAIL_PARSE_FAILED, subject=f"inbox:{inbox_id}", evidence={"reason": "op_unknown"})
             self._send_receipt(inbox_id, route, parsed, pc, code="INVALID_ARGS", error=f"未知操作:{pc.op}")
             return IngestResult(status=PARSE_FAILED, inbox_id=inbox_id, reason="op_unknown")
 
         # ── 闸 ③:allow_ops(默认 = 所有 danger=false;danger=true 须逐条显式配置)
         if pc.op not in self.catalog.expand_allow_ops(inb.allow_ops):
             reason = REASON_NOT_ALLOWED + f"op {pc.op} 不在 allow_ops"
-            self.ms.inbox_update(inbox_id, status=OP_DENIED, reason=reason)
+            self._finish(inbox_id, OP_DENIED, reason)
             self._send_receipt(inbox_id, route, parsed, pc, code="FORBIDDEN", error="该操作未被允许经邮件触发")
             return IngestResult(status=OP_DENIED, inbox_id=inbox_id, reason=reason)
 
         args, arg_err = self._coerce_args(cap, pc)
         if arg_err is not None:
-            self.ms.inbox_update(inbox_id, status=DONE, reason=f"invalid_args:{arg_err.reason}")
+            self._finish(inbox_id, DONE, f"invalid_args:{arg_err.reason}")
             self._send_receipt(inbox_id, route, parsed, pc, code="INVALID_ARGS", error=arg_err.message)
             return IngestResult(status=DONE, inbox_id=inbox_id, reason=arg_err.reason)
         if cap.op.startswith("send_") and parsed.attachments:
@@ -249,7 +271,7 @@ class MailIngest:
         # ── 幂等键改写(C-10):`mail:{发件人短名}:{req_id}`
         idem_key = f"mail:{short or 'unknown'}:{pc.req_id}"
         if len(idem_key) > IDEM_KEY_MAX:
-            self.ms.inbox_update(inbox_id, status=PARSE_FAILED, reason="req_id:改写后超过 128 字符")
+            self._finish(inbox_id, PARSE_FAILED, "req_id:改写后超过 128 字符")
             return IngestResult(status=PARSE_FAILED, inbox_id=inbox_id)
         self.ms.inbox_update(inbox_id, idempotency_key=idem_key)
 
@@ -261,16 +283,15 @@ class MailIngest:
         if cap.danger:
             now = self.clock()
             # `args_digest` 与 `confirm_expires_ms` **同一事务写**(R6-22/R6-7)
-            self.ms.inbox_update(inbox_id, status=CONFIRM_REQUIRED,
-                                 reason="confirm_required:高危操作已受理,待控制台确认",
-                                 args_digest=args_digest(args),
-                                 confirm_expires_ms=now + inb.danger_confirm_ttl_s * 1000)
+            self._finish(inbox_id, CONFIRM_REQUIRED, "confirm_required:高危操作已受理,待控制台确认",
+                         args_digest=args_digest(args),
+                         confirm_expires_ms=now + inb.danger_confirm_ttl_s * 1000)
             self._send_receipt(inbox_id, route, parsed, pc, code=CONFIRM_REQUIRED,
                                error="已受理,待确认,请到控制台 P-MAIL 待确认列表批准", ok=False)
             return IngestResult(status=CONFIRM_REQUIRED, inbox_id=inbox_id)
 
         cmd = self._build_command(pc, args, idem_key, parsed, cap)
-        self.ms.inbox_update(inbox_id, status=ACCEPTED, trace_id=cmd.trace_id)
+        self._finish(inbox_id, ACCEPTED, "", trace_id=cmd.trace_id)
         self.pending.append(PendingCommand(inbox_id=inbox_id, command=cmd, route=route,
                                            parsed=pc, reply_to=parsed.from_addr,
                                            in_reply_to=parsed.rfc_message_id))
@@ -281,27 +302,27 @@ class MailIngest:
                           short: Optional[str]) -> Optional[IngestResult]:
         inb = route.inbound
         if not (pc.signature and pc.timestamp and pc.nonce):
-            self.ms.inbox_update(inbox_id, status=SIG_INVALID, reason="sig_invalid:缺少签名/时间戳/随机数", sig_ok=0)
+            self._finish(inbox_id, SIG_INVALID, "sig_invalid:缺少签名/时间戳/随机数", sig_ok=0)
             return IngestResult(status=SIG_INVALID, inbox_id=inbox_id)
         key = inb.hmac.get(short or "")
         if key is None:
-            self.ms.inbox_update(inbox_id, status=SIG_INVALID, reason="sig_invalid:该发件人没有登记指令密钥", sig_ok=0)
+            self._finish(inbox_id, SIG_INVALID, "sig_invalid:该发件人没有登记指令密钥", sig_ok=0)
             return IngestResult(status=SIG_INVALID, inbox_id=inbox_id)
         # 时间容差(§2.3.4):邮件是异步的,默认 600 s
         try:
             ts = datetime.fromisoformat(pc.timestamp.replace("Z", "+00:00"))
             drift = abs(self.clock() / 1000 - ts.timestamp())
         except ValueError:
-            self.ms.inbox_update(inbox_id, status=PARSE_FAILED, reason="timestamp:不是合法 ISO 8601")
+            self._finish(inbox_id, PARSE_FAILED, "timestamp:不是合法 ISO 8601")
             return IngestResult(status=PARSE_FAILED, inbox_id=inbox_id)
         if drift > inb.sig_time_tolerance_s:
-            self.ms.inbox_update(inbox_id, status=EXPIRED, reason=f"expired:时间戳与 Agent 时钟差 {int(drift)} s")
+            self._finish(inbox_id, EXPIRED, f"expired:时间戳与 Agent 时钟差 {int(drift)} s")
             self._alert(MAIL_PARSE_FAILED, subject=f"inbox:{inbox_id}", evidence={"reason": "expired"})
             return IngestResult(status=EXPIRED, inbox_id=inbox_id)
         # 防重放:(from_addr, nonce) 唯一(同 nonce 不同 req_id 是重放攻击)
         seen = self.ms.inbox_nonce_seen(parsed.from_addr, pc.nonce)
         if seen is not None and int(seen["id"]) != inbox_id:
-            self.ms.inbox_update(inbox_id, status=DUPLICATE_NONCE, reason="duplicate_nonce:随机数 24h 内重复")
+            self._finish(inbox_id, DUPLICATE_NONCE, "duplicate_nonce:随机数 24h 内重复")
             return IngestResult(status=DUPLICATE_NONCE, inbox_id=inbox_id)
         # ``args`` 用**解析出的原始对象**(展开形式值一律字符串),与发起方(附录 A)算的那份逐字相同;
         # 类型转型发生在验签之后的 ``_coerce_args``,不影响签名。
@@ -310,7 +331,7 @@ class MailIngest:
             timestamp=pc.timestamp, nonce=pc.nonce,
             attachments=[{"name": a.name, "bytes": a.data} for a in parsed.attachments])
         if not verify(canonical, self.secret_of(key.secret_ref), pc.signature):
-            self.ms.inbox_update(inbox_id, status=SIG_INVALID, reason="sig_invalid:签名不符", sig_ok=0)
+            self._finish(inbox_id, SIG_INVALID, "sig_invalid:签名不符", sig_ok=0)
             self._alert(MAIL_PARSE_FAILED, subject=f"inbox:{inbox_id}", evidence={"reason": "sig_invalid"})
             return IngestResult(status=SIG_INVALID, inbox_id=inbox_id)
         return None
@@ -372,12 +393,12 @@ class MailIngest:
         prev_hash = self._args_hash_of_row(first) if first is not None else (prev or {}).get("args_hash")
         if prev_hash is not None and prev_hash != args_hash:
             # §2.5「边界」:同 req_id 不同参数 ⇒ **两者都不执行**,回执 INVALID_ARGS
-            self.ms.inbox_update(inbox_id, status=DUPLICATE, reason="req_id_reused_with_different_body",
+            self._finish(inbox_id, DUPLICATE, "req_id_reused_with_different_body",
                                  first_inbox_id=int(first["id"]) if first else None)
             self._send_receipt(inbox_id, route, parsed, pc, code="INVALID_ARGS",
                                error="指令ID 已被使用且内容不同,请换新 ID")
             return IngestResult(status=DUPLICATE, inbox_id=inbox_id, reason="req_id_reused_with_different_body")
-        self.ms.inbox_update(inbox_id, status=DUPLICATE, reason="duplicate:同 req_id 同参数的重投",
+        self._finish(inbox_id, DUPLICATE, "duplicate:同 req_id 同参数的重投",
                              first_inbox_id=int(first["id"]) if first else None)
         # **回执照发**(发起方重投多半是没收到回执),内容取首封的 CommandResult
         trace = (prev or {}).get("trace_id") or (first or {}).get("trace_id")
@@ -460,11 +481,11 @@ class MailIngest:
         items, self.pending = self.pending, []
         for item in items:
             result = await bus.submit(item.command)
-            self.ms.inbox_update(item.inbox_id, status=DONE, command_id=result.trace_id,
-                                 trace_id=result.trace_id, reason=f"done:{result.code}")
+            self._finish(item.inbox_id, DONE, f"done:{result.code}",
+                         command_id=result.trace_id, trace_id=result.trace_id)
             if item.command.confirm is False:
                 # §2.3.5:`确认=false` 或发起方不要回执 ⇒ RECEIPT_SKIPPED
-                self.ms.inbox_update(item.inbox_id, status=RECEIPT_SKIPPED)
+                self._finish(item.inbox_id, RECEIPT_SKIPPED)
             else:
                 self.send_receipt_for_result(item, result)
             out.append(result)
@@ -488,7 +509,7 @@ class MailIngest:
                 reason=f"ingest_error:{type(err).__name__}", fail_count=1)
             return
         n = self.ms.inbox_fail_bump(int(row["id"]))
-        self.ms.inbox_update(int(row["id"]), status=INGEST_ERROR, reason=f"ingest_error:{type(err).__name__}")
+        self._finish(int(row["id"]), INGEST_ERROR, f"ingest_error:{type(err).__name__}")
         if n >= 3:
             self._alert(MAIL_WATERMARK_STALLED, subject=f"mailbox:{mail.mailbox}",
                         evidence={"fail_count": n, "uid": mail.uid, "uidl": mail.uidl})

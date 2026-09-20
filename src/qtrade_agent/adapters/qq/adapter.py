@@ -173,13 +173,21 @@ class QQAdapter:
         if message_id is None:
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=tid, source="onebot",
                                  error=CommandError(f"{action} 未返回 message_id", retryable=True))
-        confirmed = await self._readback(sess, native, kind, int(message_id))
+        confirmed = await self._readback(sess, native, kind, int(message_id), trace_id=cmd.trace_id)
         # 不论读回成没成都返回 ok —— 确认由 bus 在 [bus] confirm_timeout_qq_ms 内看出向行状态(读不到 ⇒ UNCONFIRMED)
         return CommandResult(ok=True, code="OK", trace_id=tid, source="onebot",
                              data={"native_id": native, "message_id": message_id, "confirmed": confirmed})
 
-    async def _readback(self, sess: QQSession, native_id: str, kind: str, message_id: int) -> bool:
-        """06 §2.12 QQ 行:``get_msg`` 存在 ⇒ 绑定出向行 ``ext_msg_id``、``DELIVERED``、``confirmed_by='get_msg'``。"""
+    async def _readback(self, sess: QQSession, native_id: str, kind: str, message_id: int,
+                        *, trace_id: Optional[str] = None) -> bool:
+        """06 §2.12 QQ 行:``get_msg`` 存在 ⇒ **直接绑定该行** ``ext_msg_id``、``DELIVERED``、``confirmed_by='get_msg'``。
+
+        🔴 「该行」= **本指令的 `SENDING` 行**,入口是 ``store.bind_out_by_trace_id``(rulings R6-58 (g))——
+        QQ 是三通道里唯一手里有**确定** ``message_id`` 的,走 ``store.ingest`` 的模糊合并(fingerprint /
+        同会话同 ``norm(text)`` + 时间窗)是把确定性降级:``capture_text=false`` 且出向行 ``ts`` 与
+        ``get_msg.time`` 跨秒时两支判据都不成立 ⇒ 该行恒 ``UNCONFIRMED``。
+        拿不到 ``trace_id``(不经总线的直调)才退回 ``ingest`` 合并支。
+        """
         try:
             data = await sess.client.call_action("get_msg", {"message_id": message_id})
         except (OneBotClosed, OneBotError) as e:
@@ -187,6 +195,16 @@ class QQAdapter:
             return False
         if not isinstance(data, dict) or not data:
             return False
+        if trace_id:
+            bound = self.store.bind_out_by_trace_id(trace_id, ext_msg_id(native_id, message_id), "get_msg")
+            if bound is not None:
+                row = self.store.message_state(bound)
+                if row is not None:
+                    self.events.emit("message", payload={"id": bound, "ext_msg_id": row["ext_msg_id"], "state": row["state"],
+                                                         "confirmed_by": row["confirmed_by"], "account_id": sess.acct.id,
+                                                         "channel": "qq", "dir": "out"},
+                                     account_id=sess.acct.id, channel="qq", trace_id=trace_id)
+                return True
         event = dict(data)
         event.setdefault("post_type", "message_sent")
         event.setdefault("self_id", sess.acct.self_uid)

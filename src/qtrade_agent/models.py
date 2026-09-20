@@ -129,3 +129,20 @@ RESULT_CODES: dict[str, tuple[bool, bool]] = {
     "CONFIRM_EXPIRED": (False, False),
     "INTERNAL": (True, False),
 }
+
+
+def json_safe(value: Any) -> Any:
+    """把 ``CommandResult.data`` 里的**裸二进制**换成可序列化的占位,供**落库**与**出 JSON** 两处共用。
+
+    截图这类能力的 ``data`` 里确实会带图片体(02 §3.4.2「返回图片体」),而
+    ``command_results.data_json`` 与 HTTP 响应都要 ``json.dumps`` —— 不换就 ``TypeError: Object of type
+    bytes is not JSON serializable``,整条能力经总线直接 ``INTERNAL``(见 rulings R6-58 (cu))。
+    占位保留长度,调用方想要真字节走端点的二进制出口或 ``media/``。
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"__binary__": True, "len": len(bytes(value))}
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value

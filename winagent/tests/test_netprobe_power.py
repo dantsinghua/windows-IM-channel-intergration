@@ -204,15 +204,16 @@ async def test_put_probes_writes_agent_side_results():
     db.close()
 
 
-async def test_sample_connections_writes_observed_and_no_probe_result():
+async def test_sample_returns_rows_and_does_not_persist():
+    """🔴 04 §3.4 逐字:WinAgent 的 ``{mode:'sample'}`` **返回 `{rows:[…]}` 不落库** ——
+    落库由 Agent 聚合三侧后经 ``PUT /probes {kind:'observed'}`` 写一次,两侧各写一遍会把 ``hits`` 算两倍。"""
     db, _n, _f, probe, _a, np_ = mk_np()
     probe.conns = [{"ip": "203.205.254.1", "port": 443, "hostname": "long.weixin.qq.com", "channel": "wechat"}]
     out = await np_.sample_connections(pid_names=("Weixin.exe",), duration_s=99)
     assert out["duration_s"] == 30                                                     # 上限 30
-    rows = db.query("SELECT * FROM probe_targets_observed")
-    assert len(rows) == 1 and rows[0]["hits"] == 1
-    await np_.sample_connections(pid_names=("Weixin.exe",))
-    assert db.one("SELECT hits FROM probe_targets_observed")["hits"] == 2              # 聚合按唯一键累加
+    assert set(out["rows"][0]) >= {"pid_name", "ip", "port", "samples", "hostname", "resolved_by"}
+    assert out["rows"][0]["pid_name"] == "Weixin.exe" and out["rows"][0]["resolved_by"] == "cache"
+    assert db.query("SELECT * FROM probe_targets_observed") == []                      # 不落库
     assert db.query("SELECT * FROM probe_results") == []                               # §2.8.5:sample 不产生 probe_result
     db.close()
 

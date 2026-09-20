@@ -17,7 +17,8 @@ from ..adapters.base import Account, Adapter
 from ..config import AgentConfig
 from ..events import Events
 from ..ids import ulid
-from ..models import Command, CommandError, CommandResult, RESULT_CODES, Message, Session
+from ..maintenance import DiskFullError
+from ..models import Command, CommandError, CommandResult, RESULT_CODES, Message, Session, json_safe
 from ..store import Store
 from .validate import validate_args
 
@@ -100,6 +101,16 @@ class Bus:
                 else:                                   # 内部指令:确认窗内的加速轮 poll(only_sessions)
                     acct, only = item
                     await self.adapters[acct.channel].poll(acct, only_sessions=only)
+            except DiskFullError as e:
+                # 🔴 02 §2.8.8「写入报错**先判磁盘满**(诊断顺序固定)」:`store`/`mail`/`media` 的写失败
+                # 统一回结果码 `DISK_FULL`(HTTP 507,00 §8.3/§10 R-02)、`retryable=false`、`needs_human=true`
+                # ——**非磁盘类写失败才回落 `INTERNAL`**。这条必须排在下面的 `except Exception` **之前**,
+                # 否则盘满会被兜成 `INTERNAL` + `retryable=true`,调用方自动重试正是 §2.8.8 明文禁止的那件事。
+                log.error("bus 写路径磁盘满 account=%s: %s", account_id, e.message)
+                if isinstance(item, _Job) and not item.done.done():
+                    self._finalize(item, _err_result("DISK_FULL", item.cmd.trace_id or "",
+                                                     CommandError(e.message, reason="disk_full",
+                                                                  retryable=False, needs_human=True)))
             except Exception as e:                      # 单条指令的异常不杀消费者
                 log.exception("bus consumer error account=%s: %s", account_id, e)
                 if isinstance(item, _Job) and not item.done.done():
@@ -276,6 +287,17 @@ class Bus:
             await asyncio.sleep(wait / 1000)
 
     async def _confirm(self, job: _Job, native_id: str, started: int, source: str) -> None:
+        # 🔴 这一路是 `create_task` 出去的,**不在 `_consume` 的兜底里**:确认窗内的写(加速 poll 的
+        # `ingest` / `mark_out_state`)若因盘满抛 `DiskFullError` 而没人接,`job.done` 永远不完成 ⇒
+        # `submit` 只能等到 `asyncio.TimeoutError` 回 `TIMEOUT`(**retryable=true**),又成了 §2.8.8 禁止的自动重试。
+        try:
+            await self._confirm_loop(job, native_id, started, source)
+        except DiskFullError as e:
+            log.error("bus 确认窗磁盘满 account=%s: %s", job.acct.id, e.message)
+            self._finalize(job, _err_result("DISK_FULL", job.cmd.trace_id or "",
+                                            CommandError(e.message, reason="disk_full", retryable=False, needs_human=True)))
+
+    async def _confirm_loop(self, job: _Job, native_id: str, started: int, source: str) -> None:
         cmd, acct = job.cmd, job.acct
         timeout = self.cfg.confirm_timeout_ms(acct.channel)
         interval = {"qidian": self.cfg.qidian.confirm_poll_interval_ms,
@@ -314,7 +336,7 @@ class Bus:
         cmd, acct = job.cmd, job.acct
         now = self.clock()
         err = res.error
-        self.store.finish_command(trace_id=cmd.trace_id, ok=res.ok, code=res.code, data=res.data, cost_ms=res.cost_ms, source=res.source,
+        self.store.finish_command(trace_id=cmd.trace_id, ok=res.ok, code=res.code, data=json_safe(res.data), cost_ms=res.cost_ms, source=res.source,
                                   error_message=err.message if err else None, retryable=err.retryable if err else None,
                                   needs_human=err.needs_human if err else None, confirmed_by=confirmed_by, confirm_ms=confirm_ms, now_ms=now)
         if cmd.idempotency_key:

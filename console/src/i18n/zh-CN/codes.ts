@@ -29,6 +29,7 @@ export type ResultCode =
   | 'RATE_LIMITED'
   | 'INTERNAL'
   | 'DISK_FULL'
+  | 'CONFIRM_REQUIRED'
   | 'CONFIRM_EXPIRED'
 
 /** 芯片色令牌(01 §2.9 设计令牌) */
@@ -72,6 +73,9 @@ export const RESULT_CODES: Record<ResultCode, ResultCodeMeta> = {
     tone: 'fail',
     action: '去环境页 / 立即清理',
   },
+  // 🔴 R6-58 (ca):00 §8.3 本轮补登 `CONFIRM_REQUIRED` —— 高危 op 经邮件触发后**已受理、停在待控制台确认、尚未执行**。
+  //   语气用 `pending` 而不是 `fail`:它不是失败,是在等人批;文案里给出下一步该去哪儿点。
+  CONFIRM_REQUIRED: { zh: '已受理,等待在控制台确认后才会执行', tone: 'pending', action: '去邮件页待确认列表' },
   CONFIRM_EXPIRED: { zh: '该确认已过期,已自动作废', tone: 'na' },
 }
 

@@ -30,7 +30,7 @@ from .ids import trace_id as new_trace_id
 from .installer_ops import InstallerOps
 from .logfmt import get_logger
 from .monitor import Monitor
-from .netprobe import NetProbe, ProbeTargetSpec
+from .netprobe import PROBE_KINDS, NetProbe, ProbeTargetSpec
 from .pipe import PipeHub
 from .power import Power
 from .vault import Vault
@@ -326,26 +326,76 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         return JSONResponse({"run_id": run_id}, status_code=202)
 
     @app.get("/wa/v1/probes")
-    async def probes_get(request: Request, run_id: Optional[str] = None, latest: int = 0):   # type: ignore[no-untyped-def]
+    async def probes_get(request: Request, run_id: Optional[str] = None, latest: int = 0,
+                         kind: str = "result", since: Optional[int] = None, limit: int = 200,
+                         channel: Optional[str] = None, adopted: Optional[bool] = None):   # type: ignore[no-untyped-def]
+        """#15 ``?run_id=`` / ``?latest=1`` 读 ``probe_results``;**``?kind=observed`` 读 ``probe_targets_observed``**。
+
+        ``kind=observed`` 是整合裁决 (ci) 补的上游缺口:02 #76b 要 Agent 做的
+        ``GET /system/probes?kind=observed``(04 §3.4)在 ``/wa/v1`` 侧原本无入口,Agent 只能回 503。
+        令牌与执行体**沿用本端点(#15)的 A/C/I + svc**,不另开一格。
+        行原样带 ``id``(= ``observed_ids`` 的稳定 id,裁决 (ch))与派生的 ``in_config``。
+        """
         try:
-            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="probes.read")
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action=f"probes.read.{kind}")
+            if kind not in PROBE_KINDS:
+                raise WaError(INVALID_ARGS, f"kind 必须是 {PROBE_KINDS} 之一", reason="bad_kind")
         except WaError as e:
             return fail(e, request)
+        if kind == "observed":
+            return {"observed": d.netprobe.read_observed(since=since, limit=limit, channel=channel, adopted=adopted),
+                    "targets": d.netprobe.probe_targets()}
         return {"results": d.netprobe.read_results(run_id=run_id, latest=bool(latest))}
 
     @app.put("/wa/v1/probes")
     async def probes_put(request: Request):                                       # type: ignore[no-untyped-def]
-        """#16:Agent 回写 WSL/容器侧探测结果(C-31:``probe_results`` 只在 winagent.db 一份)。"""
+        """#16:Agent 回写探测结果(C-31:``probe_results`` 只在 winagent.db 一份)。
+
+        ``{kind:"observed", rows:[…]}`` 时改落 ``probe_targets_observed``(04 §3.4 逐字)——
+        实测采样的**唯一写入口**:WinAgent 的 ``POST /probe {mode:'sample'}`` 只返回不落库,
+        三侧(容器/WSL/Windows)的候选都由 Agent 聚合后经这里写一次,否则 ``hits`` 会被算两遍。
+        """
         try:
             auth(request, (ROLE_AGENT,), action="probes.write")
             body = await _json(request)
-            n = d.netprobe.write_results(str(body["run_id"]), list(body.get("results") or []),
+            kind = str(body.get("kind") or "result")
+            if kind not in PROBE_KINDS:
+                raise WaError(INVALID_ARGS, f"kind 必须是 {PROBE_KINDS} 之一", reason="bad_kind")
+            if kind == "observed":
+                n = d.netprobe.write_observed(list(body.get("rows") or body.get("results") or []))
+                return {"written": n, "kind": "observed"}
+            n = d.netprobe.write_results(str(body["run_id"]), list(body.get("results") or body.get("rows") or []),
                                          trigger=str(body.get("trigger") or "manual"))
         except KeyError as e:
             return fail(WaError(INVALID_ARGS, f"缺少字段 {e}", reason="missing_field"), request)
         except WaError as e:
             return fail(e, request)
         return {"written": n}
+
+    @app.put("/wa/v1/probes/adopt")
+    async def probes_adopt(request: Request):                                     # type: ignore[no-untyped-def]
+        """**把实测采样候选采纳为正式探测目标**(整合裁决 (ci) 补的第二个上游缺口;02 #76b 的 WinAgent 半)。
+
+        ``{observed_ids:[…]}`` → 写选中行 ``adopted_ms`` + 更新 ``settings['probe.targets']``
+        → ``{adopted:[…], targets:[…], hosts_by_channel:{…}}``。
+        令牌与执行体沿用同类写端点 ``#16 PUT /wa/v1/probes`` 的 **A + svc**
+        (控制台经 Agent 调,不直连 17610,C-32/C-03/R-07)。
+        ``observed_ids`` 是**采纳后的全集**(04 §2.8.4「替换整表不追加」),空数组 = 清空正式目标表。
+        """
+        try:
+            auth(request, (ROLE_AGENT,), action="probes.adopt")
+            body = await _json(request)
+            if "observed_ids" not in body:
+                raise WaError(INVALID_ARGS, "缺少 observed_ids(02 #76b 的入参;不收 targets,见整合裁决 (cg))",
+                              reason="missing_observed_ids")
+            raw = body["observed_ids"]
+            if not isinstance(raw, list) or any(not isinstance(i, int) or isinstance(i, bool) for i in raw):
+                raise WaError(INVALID_ARGS, "observed_ids 必须是整数数组(行的稳定 id = probe_targets_observed.id)",
+                              reason="bad_observed_ids")
+            out = d.netprobe.adopt(raw, actor=ACTOR_AGENT)
+        except WaError as e:
+            return fail(e, request)
+        return out
 
     # ================================================================== #17 / #45 firewall(唯一拥有者)
     @app.post("/wa/v1/firewall/ensure")

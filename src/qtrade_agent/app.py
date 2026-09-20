@@ -33,7 +33,9 @@ from .health import Health
 from .healthloop import H05_STEADY_INTERVAL_S, HealthLoop
 from .hmac_inbound import HmacVerifier
 from .ids import ulid as new_trace_id
-from .maintenance import DiskProbe, MaintenanceService
+from .maintenance import DiskFullError, DiskProbe, MaintenanceService
+from .media import Downloader, MediaStore, UrllibDownloader
+from .monitor import JobsReclaimer, ProcReader, PublicEndpointProbe, Sampler
 from .mail.backends import ImapLibBackend, PopLibBackend, SmtpLibBackend
 from .mail.service import MailService
 from .pool import Pool
@@ -101,7 +103,9 @@ class AgentApp:
                  qq_transport_factory: Optional[Callable[[Account], OneBotTransport]] = None,
                  http: Optional[HttpClient] = None, disk: Optional[DiskProbe] = None, data_dir: Optional[str] = None,
                  imap_factory: Optional[Callable[[Any], Any]] = None, pop3_factory: Optional[Callable[[Any], Any]] = None,
-                 smtp_factory: Optional[Callable[[Any], Any]] = None):
+                 smtp_factory: Optional[Callable[[Any], Any]] = None,
+                 downloader: Optional[Downloader] = None, proc_reader: Optional[ProcReader] = None,
+                 config_path: Optional[str] = None):
         self.cfg = cfg
         self.clock = clock
         self.wsl_gateway = wsl_gateway
@@ -130,7 +134,11 @@ class AgentApp:
         self._imap_factory = imap_factory
         self._pop3_factory = pop3_factory
         self._smtp_factory = smtp_factory
+        self._downloader = downloader
+        self._proc_reader = proc_reader
+        self.config_path = config_path      # #89 写回 agent.toml 的落点;None ⇒ 只落 settings 并回 restart_required
         self._wechat_next_due: dict[str, int] = {}
+        self.jobs: dict[str, asyncio.Task] = {}      # 00 §11.21 [JOB]:在跑的作业 task,#108 取消时要真的 cancel
         self.adapters: dict = {}
         self.bus: Bus
         self.poller: QidianPoller
@@ -154,6 +162,10 @@ class AgentApp:
         self.workflows: WorkflowEngine
         self.hmac: HmacVerifier
         self.mail: MailService
+        self.media: MediaStore
+        self.sampler: Sampler
+        self.reclaimer: JobsReclaimer
+        self.endpoint_probe: PublicEndpointProbe
         self._started = False
 
     # ------------------------------------------------------------------ 装配
@@ -175,12 +187,18 @@ class AgentApp:
         # ---- 三通道适配器(建连都在账号 start 时才发生,open() 只建对象)
         qq_kw = {} if self._qq_transport_factory is None else {"transport_factory": self._qq_transport_factory}
         self.wechat_client = WeChatWinAgent(self.winagent)
+        # 媒体子系统(02 §2.8.2):下载器可注入;真实现经 WinAgent 的 raw 出口取 chatlog 图片,开发容器里注 FakeDownloader
+        self.media = MediaStore(self.store, media_dir=os.path.join(self.data_dir, "media"), clock=self.clock,
+                                downloader=self._downloader if self._downloader is not None else
+                                UrllibDownloader(honor_env_proxy=self.cfg.net.honor_env_proxy,
+                                                 wa_raw=self._wa_media_raw))
         self.wechat_poller = WechatPoller(store=self.store, events=self.events, client=self.wechat_client, cfg=self.cfg,
                                           wechat_cfg=self.cfg.wechat_adapter, clock=self.clock)
         self.adapters = {
             "qidian": QidianAdapter(self.poller, sender=self._sender, store=self.store),
             "qq": QQAdapter(store=self.store, events=self.events, cfg=self.cfg, qq_cfg=self.cfg.qq, clock=self.clock, **qq_kw),
-            "wechat": WechatAdapter(self.wechat_poller, client=self.wechat_client, store=self.store),
+            "wechat": WechatAdapter(self.wechat_poller, client=self.wechat_client, store=self.store,
+                                    media_put=self._wechat_screenshot_media),
         }
         self.gate = Gate(self.store)
         self.bus = Bus(store=self.store, events=self.events, adapters=self.adapters, cfg=self.cfg, clock=self.clock, gate=self.gate)
@@ -216,8 +234,18 @@ class AgentApp:
         self.events.on_emit = self._fanout_webhooks                        # §2.2.7:emit 落 ws 行后同步扇出 webhook 副本
         self.maintenance = MaintenanceService(self.store, cfg=self.cfg.retention, backup=self.cfg.backup, data_dir=self.data_dir,
                                               disk=self._disk, alerts=self.alerts, clock=self.clock,
-                                              media_orphan_grace_h=self.cfg.media.orphan_grace_h)
+                                              media_orphan_grace_h=self.cfg.media.orphan_grace_h,
+                                              ws_retention_hours=self.cfg.events.ws_retention_hours)
         self.store.write_guard = self.maintenance.guard_write              # §2.8.8:写入报错先判磁盘满
+        self.media.write_guard = self.maintenance.guard_write              # 同上,媒体落盘这一路(`store`/`mail`/`media` 三路齐)
+        self.media._disk_allows = lambda: self.maintenance.media_downloads_allowed    # high 水位起转 lazy
+        self.media._ingest_allows = lambda: self.maintenance.ingest_allowed           # critical 起连元数据都不写
+        self.sampler = Sampler(self.store, reader=self._proc_reader, data_dir=self.data_dir, clock=self.clock, disk=self._disk)
+        self.reclaimer = JobsReclaimer(self.store, reclaim_after_s=self.cfg.jobs.reclaim_after_s,
+                                       events=self.events, clock=self.clock)
+        self.endpoint_probe = PublicEndpointProbe(self.store, http=self.http, events=self.events,
+                                                  urls=self.cfg.api.public_ip_probe_urls,
+                                                  interval_s=self.cfg.api.public_ip_check_interval_s, clock=self.clock)
         self.calibrator = PoolCalibrator(self.store, cfg=self.cfg.calib, pool=self.pool, events=self.events, clock=self.clock)
         self.workflows = WorkflowEngine(self.store, bus=self.bus, events=self.events, http=self.http, clock=self.clock,
                                         webhook_timeout_ms=self.cfg.webhook.webhook_timeout_ms)
@@ -251,7 +279,43 @@ class AgentApp:
         self.scheduler.register("mail_inbound", self.cfg.mail.inbound.poll_interval_s, self.mail_inbound_tick)                 # 06 §2.1
         self.scheduler.register("mail_outbound", MAIL_SEND_TICK_S, self.mail_outbound_tick)                                    # 06 §2.4
         self.scheduler.register("mail_confirm_reaper", MAIL_CONFIRM_TICK_S, self.mail_confirm_tick)                            # 06 §2.3.6
+        self.scheduler.register("monitor_sample", self.cfg.monitor.sample_interval_s, self.monitor_tick)                       # 04 §2.4.5
+        self.scheduler.register("jobs_reclaimer", self.cfg.jobs.reclaim_interval_s, self.reclaimer.reclaim_once)               # 02 §3.1 R6-16
+        self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
+        self.scheduler.register("media_fetch", 5, self.media_tick)                                                             # 02 §2.8.2
         return self
+
+    async def _wa_media_raw(self, path: str) -> bytes:
+        """真下载器取微信 chatlog 图片的出口(#40 ``GET /wa/v1/wechat/media/<md5>``,二进制)。"""
+        status, _headers, raw = await self.winagent.request("GET", path, timeout_s=30.0, raw=True)
+        if status != 200:
+            raise RuntimeError(f"winagent media http_{status}")
+        return raw
+
+    def _wechat_screenshot_media(self, acct: Account, png: bytes) -> dict[str, Any]:
+        """微信截图落 ``media/``(02 §2.8.2),只把引用给回 ``CommandResult.data``。"""
+        try:
+            out = self.media.put_bytes(png, kind="image", origin={"kind": "wechat_screenshot", "account_id": acct.id})
+        except Exception as e:                       # 落盘失败不影响截图本身(字节仍在 data.png 里)
+            log.warning("微信截图落 media 失败 account=%s: %s", acct.id, e)
+            return {}
+        return {k: out[k] for k in ("media_id", "sha256") if out.get(k) is not None}
+
+    async def media_tick(self) -> None:
+        """02 §2.8.2:把 ``messages.media_json`` 里新出现的引用建成 ``media`` 行,再把 ``policy=eager`` 的下下来。
+
+        ``lazy``(``file``/``video``)只建行、等 #96 触发;磁盘 high 水位起整轮不下载(``maintenance`` 的开关)。
+        """
+        await asyncio.to_thread(self.media.scan_messages)
+        await self.media.fetch_eager()
+
+    async def monitor_tick(self) -> None:
+        """04 §2.4.5:每 ``[monitor] sample_interval_s`` 采一轮 ``raw``,顺带做 1m/1h 降采样。
+
+        🔴 这是 ``pool_calibrate`` 与 #77 的**唯一数据源** —— 没有它自校准在空库上恒回「无建议」。
+        """
+        await self.sampler.sample_once()
+        await asyncio.to_thread(self.sampler.roll_up)
 
     # ------------------------------------------------------------------ 装配期小工具
     @property
@@ -377,20 +441,157 @@ class AgentApp:
         self.calibrator.maybe_auto_calibrate()
         self.calibrator.check_drift()
 
-    async def run_cleanup_job(self, job_id: str) -> None:
-        """#109 ``POST /system/cleanup/run`` 的作业体:跑一轮全量**本地**清理并把结果落 ``jobs.result_json``,终态推 ``job`` 事件。"""
-        self.store.job_start(job_id)
-        try:
-            rep = await asyncio.to_thread(self.maintenance.cleanup_once)
-            result = {"freed_mb": rep.freed_mb, "deleted": rep.deleted, "files_removed": rep.files_removed,
-                      "retention_days": rep.retention_days, "errors": rep.errors}
-            self.store.job_finish(job_id, ok=True, result=result)
-            self.events.emit("job", payload={"job_id": job_id, "kind": "system_cleanup", "state": "succeeded", "result": result})
-        except Exception as e:
-            log.exception("全量清理作业失败 job=%s: %s", job_id, e)
-            self.store.job_finish(job_id, ok=False, error={"code": "INTERNAL", "message": str(e)})
-            self.events.emit("job", payload={"job_id": job_id, "kind": "system_cleanup", "state": "failed",
-                                             "error": {"code": "INTERNAL", "message": str(e)}})
+    # ------------------------------------------------------------------ 异步作业(00 §11.21 [JOB] 统一契约)
+    # ------------------------------------------------------------------ C-1 实测采样(04 §3.4 / §2.8.4 + 02 #76b 的上游半)
+    #: Windows 侧进程名 → 通道。04 §3.4 的 `sample` 行只给 `pid_name`(Windows 侧只能按 PID 反推),
+    #: `channel`/`account_id` 由**回写方**补(裁决 A-17);认不出的留 NULL = 宿主机进程(02 §3.2 允许)。
+    PID_NAME_CHANNEL = {"wechat.exe": "wechat", "weixin.exe": "wechat"}
+
+    async def sample_observed(self, *, duration_s: float = 5.0) -> dict[str, Any]:
+        """实测采样一轮并回写候选。
+
+        04 §3.4 逐字:WinAgent 的 ``POST /probe {mode:'sample'}`` **只返回不落库**;三侧(容器 / WSL /
+        Windows)的候选由 **Agent 聚合后经 ``PUT /probes {kind:'observed', rows}`` 写一次** ——
+        各写各的会让同一条连接的 ``hits`` 被算两遍(唯一索引按 ``(account_id, ip, port, proto)`` 累加)。
+        回写方补 ``side``(自己从哪侧采的)与能反推的 ``channel``/``account_id``。
+        """
+        out = await self.winagent.sample_probe(duration_s=duration_s)
+        wechat_running = [a["id"] for a in self.store.list_accounts(channel="wechat", state="running")]
+        rows: list[dict[str, Any]] = []
+        for raw in (out.get("rows") or []):
+            row = dict(raw)
+            row["side"] = row.get("side") or "windows"              # Windows 侧采的,WinAgent 不给这一列
+            if not row.get("channel"):
+                ch = self.PID_NAME_CHANNEL.get(str(row.get("pid_name") or "").lower())
+                if ch:
+                    row["channel"] = ch
+            # 微信在 Windows 侧只有一个槽位(05 §2.4):恰好一个 running 才归它,否则留 NULL 不猜
+            if row.get("channel") == "wechat" and not row.get("account_id") and len(wechat_running) == 1:
+                row["account_id"] = wechat_running[0]
+            rows.append(row)
+        written = await self.winagent.write_observed(rows) if rows else 0
+        log.info("实测采样回写 %d/%d 行(sampled_at=%s)", written, len(rows), out.get("sampled_at"))
+        return {"sampled_at": out.get("sampled_at"), "duration_s": out.get("duration_s"), "rows": rows, "written": written}
+
+    def spawn_job(self, job_id: str, kind: str, body: Callable[[], Awaitable[dict[str, Any]]]) -> asyncio.Task:
+        """把一个作业体挂成 task 并登记进 ``self.jobs``(#108 取消时要能真的 cancel 它)。
+
+        终态一律落 ``jobs`` 表并推 ``job`` 事件(``succeeded|failed|cancelled``,00 §7.5)。
+        """
+        async def run() -> None:
+            self.store.job_start(job_id)
+            try:
+                result = await body()
+            except asyncio.CancelledError:
+                self.store.job_cancel(job_id, actor="system:job")
+                self.events.emit("job", payload={"job_id": job_id, "kind": kind, "state": "cancelled"})
+                raise
+            except DiskFullError as e:
+                # §2.8.8:作业体里的写失败同样**先判磁盘满** —— 落 `DISK_FULL`(不是 `INTERNAL`),
+                # 带 free_mb 三数,`retryable=false`(备份/导出/清理作业盘满时自动重跑只会更满)。
+                log.error("作业因磁盘满失败 job=%s kind=%s: %s", job_id, kind, e.message)
+                err = {"code": "DISK_FULL", "message": e.message, "retryable": False, "needs_human": True,
+                       "evidence": e.evidence()}
+                self.store.job_finish(job_id, ok=False, error=err)
+                self.events.emit("job", payload={"job_id": job_id, "kind": kind, "state": "failed", "error": err})
+            except Exception as e:
+                log.exception("作业失败 job=%s kind=%s: %s", job_id, kind, e)
+                self.store.job_finish(job_id, ok=False, error={"code": "INTERNAL", "message": str(e)})
+                self.events.emit("job", payload={"job_id": job_id, "kind": kind, "state": "failed",
+                                                 "error": {"code": "INTERNAL", "message": str(e)}})
+            else:
+                self.store.job_finish(job_id, ok=True, result=result)
+                self.events.emit("job", payload={"job_id": job_id, "kind": kind, "state": "succeeded", "result": result})
+            finally:
+                self.jobs.pop(job_id, None)
+
+        t = asyncio.create_task(run(), name=f"job:{job_id}")
+        self.jobs[job_id] = t
+        return t
+
+    async def cancel_job(self, job_id: str) -> bool:
+        """#108:真把在跑的 task cancel 掉。
+
+        返回 **True = 确实 cancel 了一个在跑的 task**(库里的状态与 ``job`` 事件由作业体收尾时写,调用方不要重复发);
+        **False = 没有在跑的 task**(队列里还没起、或纯同步作业),此时只改库、``job`` 事件由调用方发。
+        """
+        t = self.jobs.pop(job_id, None)
+        if t is not None and not t.done():
+            t.cancel()
+            await self._await_quietly(t, f"job {job_id}")
+            return True
+        self.store.job_cancel(job_id, actor="system:job")
+        return False
+
+    async def export_identity_job_body(self, job_id: str, account_id: str) -> dict[str, Any]:
+        """#99 **仅 QQ**:把 ``accounts/<id>/data``(qq_data 卷)打成 tar,产物路径进 ``jobs.result_json``。
+
+        账号已在 ``stopped``(端点前置判过),直接打包宿主目录;经 ``GET /exports/{job_id}/file`` 下载。
+        """
+        import tarfile
+        src = self.runtime.data_dir(account_id)
+        out_dir = os.path.join(self.data_dir, "exports")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{account_id}-qq_data-{job_id}.tar")
+
+        def pack() -> int:
+            with tarfile.open(path, "w") as tf:
+                tf.add(src, arcname=f"{account_id}/data")
+            return os.path.getsize(path)
+
+        size = await asyncio.to_thread(pack)
+        self.store.insert_audit(kind="system", transport="system", actor="system:export", action="account.export_identity",
+                                account_id=account_id, result_code="OK", detail={"job_id": job_id, "bytes": size},
+                                now_ms=self.clock())
+        return {"file_path": path, "bytes": size, "account_id": account_id}
+
+    async def reconnect_adb(self, row: dict[str, Any]) -> dict[str, Any]:
+        """#100 / 04 H06 自愈同一实现:``adb disconnect`` + ``connect``;回真实的 ``adb_state``。"""
+        serial = row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"
+        await self.runtime._adb.disconnect(serial)
+        ok = await self.runtime._adb.connect(serial)
+        if ok:
+            await self.runtime.ensure_root(row)                     # R6-28:reconnect 成功后复提权
+        devices = await self.runtime._adb.devices()
+        return {"serial": serial, "reconnected": bool(ok), "adb_state": devices.get(serial) or "missing"}
+
+    async def restart_stream(self, row: dict[str, Any]) -> dict[str, Any]:
+        """#101 / 04 H07 自愈同一实现:重建 ``adb forward``。
+
+        ⚠️ scrcpy-server 的拉起在**画面流**里,本期没有执行体 ⇒ 如实回 ``stream_restarted:false``,
+        **不假装重建了 scrcpy**(rulings R6-58 (cw))。
+        """
+        serial = row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"
+        port = row.get("stream_port") or (16500 + int(row["seq"]))
+        forwarded = False
+        fn = getattr(self.runtime._adb, "forward", None)
+        if fn is not None:
+            try:
+                await fn(serial, f"tcp:{port}", "localabstract:scrcpy")
+                forwarded = True
+            except Exception as e:
+                log.warning("#101 重建 adb forward 失败 account=%s: %s", row["id"], e)
+        return {"serial": serial, "stream_port": port, "forward_rebuilt": forwarded, "stream_restarted": False}
+
+    async def cleanup_job_body(self) -> dict[str, Any]:
+        rep = await asyncio.to_thread(self.maintenance.cleanup_once)
+        return {"freed_mb": rep.freed_mb, "deleted": rep.deleted, "files_removed": rep.files_removed,
+                "retention_days": rep.retention_days, "errors": rep.errors}
+
+    async def calibrate_job_body(self, job_id: str, *, apply: bool = False, source: str = "manual",
+                                 account_id: Optional[str] = None, channel: Optional[str] = None) -> dict[str, Any]:
+        """#71 全局 / #25 单账号自校准的作业体。
+
+        🔴 总控裁决(rulings R6-58 (ao)):**#25 与 #71 统一走 00 §11.21 [JOB] 的 `202 {job_id}`**
+        (00 优先于 02 §3.4.6「#71 同步返回建议值」;02 #25 写的 `run_id` 字样同改 `job_id`)。
+        """
+        if account_id is None:
+            return {"scope": "global", **self.calibrator.calibrate(apply=apply, source=source).as_dict()}
+        value, evidence = self.calibrator.suggest_quota_mb(str(channel), now_ms=self.clock())
+        # 单账号只量该通道的 quota_mb,并进 resource_pools.calibration_json.per_account;**不动 quota_json**
+        self.store.pool_calibration_note(run_id=job_id, account_id=account_id, channel=str(channel),
+                                         quota_mb=value, evidence=evidence)
+        return {"scope": "account", "account_id": account_id, "channel": channel, "quota_mb": value, "evidence": evidence}
 
     async def cleanup_job(self) -> None:
         rep = await asyncio.to_thread(self.maintenance.cleanup_once)
@@ -428,6 +629,11 @@ class AgentApp:
     async def winagent_probe(self) -> None:
         """H02:``GET /wa/v1/ping``(无鉴权 2 s)→ 在线再 ``GET /wa/v1/health`` 取 user_agent / host 快照 → pool 的 windows 池输入(02 §2.5 降级 ①)。"""
         pong = await self.winagent.ping()
+        if pong is None:
+            # 04 §2.6.3 末:「Agent 缓存主机 IP,**H02 失败时重新发现**(子网可能变了)」——
+            # 并按同节的择优:host.json 与默认网关不一致时以能 ping 通 /wa/v1/ping 的那个为准(discover 里记 warn)。
+            self.winagent.forget_base_url()
+            pong = await self.winagent.discover() and await self.winagent.ping()
         if pong is None:
             self.health.set_winagent(False)
             if self.health.winagent_online is False:

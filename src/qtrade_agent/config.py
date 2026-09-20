@@ -101,6 +101,22 @@ class ApiConfig:
     http_sync_max_wait_ms: int = 25000          # 同步等待上限(P-10),超过转 202
     unauth_health_sources: tuple[str, ...] = ("127.0.0.1/32", "::1/128", "wsl_gateway")
     api_version: str = "1.0"                    # 只读,随代码(02 §3.8)
+    public_ip_check_interval_s: int = 0         # E-3 公网出口探测周期;🔴 **默认 0 = 关**(§11.22 [SCOPE])
+    public_ip_probe_urls: tuple[str, ...] = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
+
+
+@dataclass(frozen=True)
+class JobsConfig:
+    """02 §7.1 ``[jobs]``(R6-16):``jobs.state='running'`` 超 ``reclaim_after_s`` 由 ``jobs_reclaimer`` 回收。"""
+    reclaim_after_s: int = 900
+    reclaim_interval_s: int = 60
+
+
+@dataclass(frozen=True)
+class MonitorConfig:
+    """02 §7.1 ``[monitor]``(owner=04 §7):Agent 侧 ``health_samples`` 的采样节拍。"""
+    sample_interval_s: int = 10
+    slow_interval_s: int = 60
 
 
 @dataclass(frozen=True)
@@ -179,6 +195,7 @@ class AccountsConfig:
     qr_max_wait_s: int = 1800
     qq_quick_login_wait_s: int = 20
     qq_reconnect_grace_s: int = 60
+    bind_retry_max: int = 12                    # 05 §2.4.2.1 第 4 步:微信 bind 重试上限(07 §[accounts] 登记为配置项)
 
 
 H13_INTERVAL_S = 60                             # 04 §2.9 字面:Agent 每 60 s GET /wa/v1/time(不是配置项)
@@ -210,6 +227,8 @@ class AgentConfig:
     hmac: HmacConfig = field(default_factory=HmacConfig)                         # [api] hmac_clock_skew_s / nonce_ttl_s
     calib: CalibrationConfig = field(default_factory=CalibrationConfig)          # [pool] calibration_*
     mail: MailConfig = field(default_factory=MailConfig)                         # [mail].*(owner=06 §7)
+    jobs: JobsConfig = field(default_factory=JobsConfig)                         # [jobs]
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)                # [monitor](owner=04 §7)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -218,7 +237,7 @@ class AgentConfig:
             section = section or {}
             names = klass.__dataclass_fields__.keys()
             vals = {k: section[k] for k in names if k in section}
-            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms"):
+            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms", "public_ip_probe_urls"):
                 if tup_key in vals and isinstance(vals[tup_key], list):
                     vals[tup_key] = tuple(vals[tup_key])
             return klass(**vals)
@@ -246,6 +265,8 @@ class AgentConfig:
             hmac=pick(d.get("api"), HmacConfig),
             calib=pick(d.get("pool"), CalibrationConfig),
             mail=MailConfig.from_toml_dict({**(d.get("mail") or {}), "retention": d.get("retention")}),
+            jobs=pick(d.get("jobs"), JobsConfig),
+            monitor=pick(d.get("monitor"), MonitorConfig),
         )
 
     def quota_mb(self, channel: str) -> int:

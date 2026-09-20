@@ -251,6 +251,26 @@ FORBIDDEN = [
      "0[345]-*.md",
      r"# >>> QTrade",
      "R6-15:hosts 是逐行行尾标记(04 §2.5.4),不是围栏块。"),
+
+    # ---- R6-58(第五批接线)新增两条。两条都在 docs-before-R6-58 备份上实测能红。----
+    # (x):#25/#71 统一走 00 §11.21 [JOB] 的 `202 {job_id}`;#25 原写的 `202 {run_id}` 作废
+    #      (`run_id` 是 workflow_runs 的主键名,两个概念共用一个键名 ⇒ 控制台拿 run_id 去查 /jobs/{job_id} 恒 404)。
+    # ⚠️ 刻意只盯【同一行里同时出现 calibrate 与 run_id】——#78 selftest 的 `202 {run_id}` 是合法的,
+    #    blanket 规则会把它误报,而「误报比漏报更伤」。
+    ("自校准端点仍写 run_id(应为 job_id)",
+     "0[1-7]-*.md",
+     # ⚠️ 首跑校准:窗口原为 140 字,把 01 §C-40 端点名清单里「…/calibrate 保留;…GET /workflows/runs/{run_id}」
+     #    这种【两个不相干端点排在同一行】误报了一处。收窄到「calibrate 近旁 60 字内的 `202 {run_id}` 字面」——
+     #    盯的是那一格返回体,不是「这行提过 calibrate 也提过 run_id」。
+     r"calibrate[^\n]{0,60}202 \{run_id\}|202 \{run_id\}[^\n]{0,60}calibrate",
+     "R6-58 (x):#25/#71 统一 `202 {job_id}`(00 §11.21 [JOB] 优先于 02 §3.4.6);`run_id` 是 workflow_runs 的主键名,不得共用。"),
+
+    # (v):QQ 游标 kind 迁移 —— owner 列已带账号,再带一次 {account_id}: 前缀会把同一会话写成两种 kind。
+    #     迁移一个 token 到处改,必须在同一次给脚本加旧 token 的 FORBIDDEN(R6-37 教训:否则那个维度是脚本级假绿)。
+    ("QQ 游标旧写法 onebot_seq:<session>",
+     "0[1-7]-*.md",
+     r"onebot_seq:<session>",
+     "R6-58 (v):逐字为 `onebot_seq:<native_id>`(与企点 `qidian_rowid:<native_id>` 同惯例);旧写法会造出两种 kind。"),
 ]
 
 # R6-51(首批验收发现):「入向撞到自己发的」合并窗在 06 §2.12 表里是配置项 out_merge_window_s,同节下文与 02 §2.8.1 却写死 60s;
@@ -436,6 +456,33 @@ PAIRED = [
      "06-*.md", r"MAIL_MSG_OVERSIZE",
      "02-*.md", r"MAIL_MSG_OVERSIZE",
      "同上:告警码单一来源在 02。"),
+
+    # ---- R6-58(第五批接线)新增四条。每条都用「抹掉消费方那一行的副本」实测能红(只在改前备份上跑不够:
+    #      声明方当时也没有该词,只会出 ⚠️,那是空规则)。----
+    # (an):02 §3.6 新增 #48 PUT /wa/v1/probes/adopt 是 #76b 的 WinAgent 半;04 §2.8.4 是「实测采样」的行为 owner,
+    #       它若不点名这个端点,实现方读 04 会以为采纳动作在 Agent 侧自己做(那会与「写 winagent.db」背离)。
+    ("#48 PUT /wa/v1/probes/adopt:02 §3.6 声明 → 04 §2.8.4 必须点名",
+     "02-*.md", r"PUT /wa/v1/probes/adopt",
+     "04-*.md", r"PUT /wa/v1/probes/adopt",
+     "R6-58 (an):上游缺这个端点时 Agent 只能回 503;只在 02 登记而 04 不提,采纳动作会被实现成 Agent 侧另存一份。"),
+
+    # (ca):06 §2.4.2 回执的「送达状态」栏逐字取 00 §8.3 的结果码;CONFIRM_REQUIRED 此前只是 mail_inbox.status 的值。
+    ("结果码 CONFIRM_REQUIRED:06 回执使用 → 00 §8.3 必须登记",
+     "06-*.md", r"送达状态：CONFIRM_REQUIRED",
+     "00-*.md", r"\| \*\*`CONFIRM_REQUIRED`\*\* \|",
+     "R6-58 (ca):回执栏的取值域 = 00 §8.3;不登记则实现方要么编一个码、要么误写成 FORBIDDEN(语义是「等人批」不是「被拒」)。"),
+
+    # (ab):02 §3.4.6 补登的 #79b(不带 run_id 取最近一轮)是给 01 的 P-ENV 自检块用的;01 不承接 = 页面直开仍是空白。
+    ("#79b GET /system/selftest(最近一轮):02 登记 → 01 必须承接",
+     "02-*.md", r"79b",
+     "01-*.md", r"79b",
+     "R6-58 (ab):01 §2.7.9 要「页面直开就显示上次 09:30 ✔」;只在 02 登记而 01 仍只写 POST,前端不会去调它。"),
+
+    # (z):#76b 的入参键名在 01 与 02 曾各写一套(targets vs observed_ids)——前端按 01 写完会在真机撞 400。
+    ("#76b 入参 observed_ids:02 定名 → 01 必须回改",
+     "02-*.md", r"observed_ids",
+     "01-*.md", r"observed_ids",
+     "R6-58 (z):端点 owner 是 02;01 仍写 {targets} 则前端一调就 400 use_observed_ids。"),
 ]
 
 # ---------------------------------------------------------------- KEYNAME
@@ -446,6 +493,16 @@ PAIRED = [
 DEAD_KEYNAMES = [
     ("holder_fault_takeover_s", "slot_error_takeover_s", "02 §7.1 是配置键的家,05 是引用方"),
     ("dll_candidates",          "wxkey_dlls",            "以 02 配置总表为准"),
+    # ---- R6-58(第五批接线)新增四条。每条都在 docs-before-R6-58 备份上实测能红。----
+    # (c):events_outbox 同一张表同一批行曾有两个键两个值(24 vs 72),清理器按哪个写都「有据可依」。
+    ("events_ws_hours",         "ws_retention_hours",    "R6-58 (c):events_outbox 两类行只有一把尺子 = [events] ws_retention_hours=72"),
+    # (d):§2.2.7 用 dead_after_attempts、§7.1 登记的是 webhook_max_attempts —— grep 都对不上。
+    ("dead_after_attempts",     "webhook_max_attempts",  "R6-58 (d):死信阈值键名唯一;行值 webhooks.max_attempts 优先于全局值"),
+    # (bk):04 写 calibration_source/calibrated_at_ms,02 §3.1 的真列是 source/calibrated_ms(且 CHECK 无 'auto')。
+    ("calibration_source",      "source",                "R6-58 (bk):resource_pools 的列名以 02 §3.1 DDL 为准(值域 default|winagent|manual|calibrated)"),
+    ("calibrated_at_ms",        "calibrated_ms",         "R6-58 (bk):同上,列名逐字以 02 §3.1 DDL 为准"),
+    # (av):02 §7.2 [api] bind_loopback/bind_wsl_adapter 与 04 §7 [net] listen_* 是同一件事的两套键。
+    ("bind_wsl_adapter",        "listen_wsl_adapter",    "R6-58 (av):服务监听地址的键收敛到 04 §7 [net];02 §7.2 [api] 那一套作废"),
 ]
 
 
@@ -766,7 +823,9 @@ def check_versions():
     print("=" * 78)
     red = []
     for f in sorted(glob.glob(os.path.join(HERE, "0[1-6]-*.md"))):
-        head = "\n".join(lines_of(io.open(f, encoding="utf-8").read())[:6])
+        # R6-58:各册头部的「变更记录」逐轮累积,冻结句会被往下挤;窗口由 6 行放宽到 12 行。
+        # 只是存在性检查,放宽不会引入误报(冻结句只在头部出现)。
+        head = "\n".join(lines_of(io.open(f, encoding="utf-8").read())[:12])
         vol = os.path.basename(f)[:2]
         has_base = "v1.3" in head
         frozen = ("历史参考" in head) or ("已冻结" in head)

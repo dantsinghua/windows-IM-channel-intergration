@@ -228,7 +228,11 @@ def test_capabilities_matrix_follows_state(api):
     aid = create_and_start(rig)
     r = c.get(f"/api/v1/accounts/{aid}/capabilities", headers=H(TR)).json()
     reads = ["get_state", "list_sessions", "read_messages", "screenshot"]
-    assert r["matrix"] == {**{op: "supported" for op in reads}, "send_text": "not_applicable"} and r["capabilities"] == reads
+    # #20 的 matrix 按 #21 目录**逐 op**给(R6-56),目录会随系统类 op 增长 ⇒ 只断言通道类五项的取值,
+    # 另单独断言系统类 op(admin/danger 十项等)恒 `not_applicable`(它们不是通道适配器的能力)。
+    assert {op: r["matrix"][op] for op in reads + ["send_text"]} == {**{op: "supported" for op in reads}, "send_text": "not_applicable"}
+    assert r["capabilities"] == reads
+    assert {r["matrix"][op] for op in ("account_stop", "settings_write", "workflow_run")} == {"not_applicable"}
     static = c.get(f"/api/v1/accounts/{aid}", headers=H(TR)).json()["data"]["capabilities"]
     assert static == reads + ["send_text"] and set(r["capabilities"]) <= set(static)        # R6-57 ⑧:静态集 ⊇ 当前可用
     rig.agent.accounts.transition(aid, "running")

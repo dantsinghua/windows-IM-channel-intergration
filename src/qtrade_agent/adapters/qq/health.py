@@ -54,6 +54,7 @@ class H08State:
     login_required_sent: bool = False
     reconnects: int = 0
     heartbeat_losses: int = 0
+    disconnected_since_ms: Optional[int] = None      # WS 断连起点(05 §2.5.4 QQ 行 ①:超 qq_reconnect_grace_s 转 login_required)
 
 
 class QQHealth:
@@ -118,8 +119,36 @@ class QQHealth:
             else:
                 status = client.last_status or {}
                 online = status.get("online") if "online" in status else None
-            self.last[aid] = {"silence_ms": silence, "lost": lost, "online": online, "checked_ms": now}
+            # 05 §2.5.4 QQ 行 ①:**WS 断连 `[accounts] qq_reconnect_grace_s`(60 s)内仍连不上 ⇒ login_required**。
+            # 这是与「心跳丢 / get_status.online=false」并列的第三条判据(rulings R6-58 (n-qq));
+            # 判在 H08 这一轮里(04 H08 行只管心跳与 get_status,但 `OneBotClient` 会一直退避重连、自己不会判)。
+            grace_ms = self.cfg.accounts.qq_reconnect_grace_s * 1000
+            if not client.connected:
+                st.disconnected_since_ms = st.disconnected_since_ms or now
+            else:
+                st.disconnected_since_ms = None
+            disconnected_s = ((now - st.disconnected_since_ms) // 1000) if st.disconnected_since_ms else 0
+            self.last[aid] = {"silence_ms": silence, "lost": lost, "online": online, "checked_ms": now,
+                              "connected": client.connected, "disconnected_s": disconnected_s}
+            if st.disconnected_since_ms is not None and now - st.disconnected_since_ms >= grace_ms:
+                await self._reconnect_grace_exceeded(aid, subject, st, disconnected_s=disconnected_s, now=now)
+                continue
             await self._judge(aid, subject, st, lost=lost, online=online, silence=silence, now=now)
+
+    async def _reconnect_grace_exceeded(self, account_id: str, subject: str, st: H08State, *,
+                                        disconnected_s: int, now: int) -> None:
+        """WS 断连超 ``qq_reconnect_grace_s``:crit 告警 + 转 ``login_required``(**不自动重登**,D-2)。"""
+        self._alerts.firing(H08_NAPCAT_HEARTBEAT_LOST, subject=subject, severity="crit", account_id=account_id,
+                            evidence={"connected": False, "disconnected_s": disconnected_s,
+                                      "qq_reconnect_grace_s": self.cfg.accounts.qq_reconnect_grace_s},
+                            hint_actions=["open_acct_detail"])
+        if st.login_required_sent:
+            return
+        st.login_required_sent = True
+        log.warning("H08:账号 %s 的 OneBot WS 断连已 %d s(> qq_reconnect_grace_s),置 login_required(%s);**不自动重登**(D-2)",
+                    account_id, disconnected_s, H08_LOGIN_REQUIRED_STATE_CODE)
+        if self._on_login_required is not None:
+            await self._on_login_required(account_id, H08_LOGIN_REQUIRED_STATE_CODE)
 
     async def _probe_status(self, acct: Account, sess) -> Optional[bool]:
         """先走 WS ``get_status``(重连成功时它是通的);不通再走 04 指定的备用 HTTP 探针(未注入 ⇒ 判不出、回 None)。"""

@@ -272,8 +272,16 @@ class FakeProbe:
         return ProbeStep("http", True, self.latency_ms)
 
     async def connections(self, pid_names: tuple[str, ...], duration_s: int) -> list[dict[str, Any]]:
+        """行形状照 04 §3.4:``{pid_name, ip, port, samples, hostname?, resolved_by}``;缺省补 ``pid_name``。"""
         self.calls.append(("connections", ",".join(pid_names)))
-        return list(self.conns)
+        out = []
+        for c in self.conns:
+            row = dict(c)
+            row.setdefault("pid_name", pid_names[0] if pid_names else None)
+            row.setdefault("samples", 1)
+            row.setdefault("resolved_by", "cache" if row.get("hostname") else "none")
+            out.append(row)
+        return out
 
 
 # ---------------------------------------------------------------- Proc

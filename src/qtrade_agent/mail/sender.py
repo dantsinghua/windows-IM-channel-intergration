@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -27,6 +28,8 @@ from .templates import RenderedMail, render_alert, render_message_mail, render_r
 
 log = logging.getLogger("qtrade.mail.sender")
 
+#: 02 #62 / 06 §2.5 末:这三个状态的行重投 = **复制新行**(原行留痕不动)
+RESEND_COPY_STATES = frozenset({"DEAD", "DISCARDED", "SENT"})
 RATE_HALVE_MS = 10 * 60 * 1000          # §2.1:服务商回 421/"too many"/"频率" 类响应 ⇒ 速率临时减半 10 分钟
 
 
@@ -209,11 +212,11 @@ class MailSender:
                     except MailAuthError as e:
                         self._alert(MAIL_AUTH_FAILED, subject=f"smtp:{route.outbound.host}",
                                     evidence={"last_error": str(e)})
-                        self._retry(row, str(e), now)
+                        self._retry(row, str(e), now, host=route.outbound.host)
                         stats.retried += 1
                         continue
                     except SmtpTemporaryError as e:
-                        self._retry(row, str(e), now)
+                        self._retry(row, str(e), now, host=route.outbound.host)
                         stats.retried += 1
                         continue
                     backend_cache[route.id] = backend
@@ -228,11 +231,11 @@ class MailSender:
                     stats.dead += 1
                     continue
                 except (SmtpTemporaryError, MailAuthError) as e:
-                    self._retry(row, str(e), now)
+                    self._retry(row, str(e), now, host=route.outbound.host)
                     stats.retried += 1
                     stats.errors.append(str(e))
                     continue
-                self._succeed(row, resp, now)
+                self._succeed(row, resp, now, host=route.outbound.host)
                 stats.sent += 1
         finally:
             for b in backend_cache.values():
@@ -242,16 +245,16 @@ class MailSender:
                     pass
         return stats
 
-    def _succeed(self, row: dict[str, Any], resp: str, now: int) -> None:
+    def _succeed(self, row: dict[str, Any], resp: str, now: int, *, host: str = "") -> None:
         self.ms.outbox_update(row["id"], status="SENT", sent_ms=now, smtp_response=resp, last_error=None)
         self._consecutive_failures = 0
         if self.alerts is not None:
-            self.alerts.resolve(MAIL_SMTP_FAILING, subject="smtp:*")
+            self.alerts.resolve(MAIL_SMTP_FAILING, subject=f"smtp:{host}")
         if row.get("kind") == "receipt" and row.get("ref_inbox_id"):
             # §2.3.5 状态流转:DONE → RECEIPT_SENT(回执真的发出去了才改)
             self.ms.inbox_update(int(row["ref_inbox_id"]), status=RECEIPT_SENT)
 
-    def _retry(self, row: dict[str, Any], err: str, now: int) -> None:
+    def _retry(self, row: dict[str, Any], err: str, now: int, *, host: str = "") -> None:
         attempts = int(row.get("attempts") or 0) + 1
         self._consecutive_failures += 1
         if "too many" in err.lower() or "频率" in err or err.startswith("421"):
@@ -262,8 +265,10 @@ class MailSender:
         self.ms.outbox_update(row["id"], status="RETRY", attempts=attempts, last_error=err,
                               next_attempt_ms=now + self._backoff_ms(attempts))
         if self._consecutive_failures >= 3:
-            self._alert(MAIL_SMTP_FAILING, subject="smtp:*", evidence={"last_error": err,
-                                                                       "consecutive": self._consecutive_failures})
+            # §2.7 告警表:`MAIL_SMTP_FAILING` 的 subject = **`smtp:<host>`**——
+            # 多路由/多 SMTP 时各算各的去重键,`P-MAIL` 才认得出是哪台 SMTP 在失败
+            self._alert(MAIL_SMTP_FAILING, subject=f"smtp:{host}",
+                        evidence={"last_error": err, "consecutive": self._consecutive_failures, "host": host})
 
     def _fail_permanent(self, row: dict[str, Any], err: str, now: int, *, attempts: Optional[int] = None) -> None:
         self.ms.outbox_update(row["id"], status="DEAD", last_error=err,
@@ -272,15 +277,29 @@ class MailSender:
 
     # ------------------------------------------------------------------ P-MAIL 动作(§3.2)
     def resend(self, outbox_id: int, *, now_ms: Optional[int] = None) -> Optional[int]:
-        """``POST /mail/outbox/{id}/resend``:死信手动重投(``attempts`` 清零);回执重发是**新行**、``dedup_key`` 带后缀(§2.5/§3.1)。"""
+        """``POST /mail/outbox/{id}/resend``(02 #62)/ `P-MAIL`【重发回执】(§2.5 末)。
+
+        **已经走完投递的行(``DEAD``/``DISCARDED``/``SENT``)一律「复制一行重新入队」**,``dedup_key`` 加后缀
+        ``#2``、多次重发依次递增(``#3``…),**原行一个字不动** —— 原来那封的投递留痕(``sent_ms``/``smtp_response``)
+        是追溯的一环,就地改回 ``QUEUED`` 会把它覆盖掉。
+        还在队列里的(``QUEUED``/``RETRY``/``SENDING``)本来就没发出去,就地清零重来,不产生第二封。
+        """
         row = self.ms.outbox_get(outbox_id)
         if row is None:
             return None
         now = now_ms or self.clock()
-        if row["status"] != "DEAD":
+        if row["status"] not in RESEND_COPY_STATES:
             self.ms.outbox_update(outbox_id, status="QUEUED", attempts=0, next_attempt_ms=0, last_error=None)
             return outbox_id
-        new_id = self.ms.outbox_enqueue(
+        base = re.sub(r"#\d+$", "", row["dedup_key"])
+        for n in range(2, 1000):                        # `dedup_key` 唯一:撞上就往后挪一位(#2 → #3 → …)
+            new_id = self._copy_row(row, f"{base}#{n}", now)
+            if new_id is not None:
+                return new_id
+        return None
+
+    def _copy_row(self, row: dict[str, Any], dedup_key: str, now: int) -> Optional[int]:
+        return self.ms.outbox_enqueue(
             kind=row["kind"], route_id=row.get("route_id"), to_addrs=row["to_addrs"], cc_addrs=row["cc_addrs"],
             subject=row["subject"], body_text=row["body_text"], body_html=row.get("body_html"),
             attachments_json=row.get("attachments_json"), rfc_message_id=new_message_id(),
@@ -288,8 +307,7 @@ class MailSender:
             ref_inbox_id=row.get("ref_inbox_id"), ref_message_id=row.get("ref_message_id"),
             ref_trace_id=row.get("ref_trace_id"), template_id=row.get("template_id"),
             template_version=row["template_version"], template_profile=row.get("template_profile", "custom"),
-            dedup_key=f"{row['dedup_key']}#2", now_ms=now)
-        return new_id
+            dedup_key=dedup_key, now_ms=now)
 
     def discard(self, outbox_id: int) -> None:
         """``POST /mail/outbox/{id}/discard``。"""

@@ -123,7 +123,8 @@ def test_three_consecutive_failures_alert(store, clock):
         enqueue_msg(env, ref_message_id=f"msg_{i}")
     env.smtp.fail_times = 3
     env.service.sender.run_once()
-    assert env.alerts.is_firing("MAIL_SMTP_FAILING", "smtp:*")
+    # §2.7:去重键 (code, subject),subject = smtp:<host> —— 多 SMTP 各算各的
+    assert env.alerts.is_firing("MAIL_SMTP_FAILING", "smtp:smtp.example.com")
 
 
 def test_one_failure_does_not_block_the_next(store, clock):

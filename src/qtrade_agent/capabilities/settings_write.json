@@ -1,0 +1,40 @@
+{
+  "op": "settings_write",
+  "kind": "admin",
+  "danger": true,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "group": {
+        "type": "string"
+      },
+      "value": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "group",
+      "value"
+    ]
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "group": {
+        "type": "string"
+      },
+      "written": {
+        "type": "boolean"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

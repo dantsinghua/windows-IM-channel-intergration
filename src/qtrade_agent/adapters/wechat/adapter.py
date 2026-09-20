@@ -41,10 +41,14 @@ class WechatAdapter:
     # 目录里 wechat='supported' 的五个 op(02 §3.10 / capabilities/*.json);degraded 下的实际可用由 #20 矩阵与本文件的闸共同决定
     capabilities = frozenset({"send_text", "read_messages", "get_state", "screenshot", "list_sessions"})
 
-    def __init__(self, poller: WechatPoller, *, client: WeChatWinAgent, store: Store):
+    def __init__(self, poller: WechatPoller, *, client: WeChatWinAgent, store: Store, media_put=None):
+        """``media_put(acct, png) -> {"media_id":…, "sha256":…}``:装配方注入的落盘器(02 §2.8.2);
+        不注入(或落盘失败回空)时截图的图片体以 ``png_b64`` 回,**任何情况下都不把裸 ``bytes`` 塞进 ``data``**
+        —— 见 ``_screenshot_data``。"""
         self._poller = poller
         self._client = client
         self._store = store
+        self._media_put = media_put
 
     @staticmethod
     def _view(acct: Account) -> WechatAccountView:
@@ -138,8 +142,38 @@ class WechatAdapter:
                 png = await self._client.screenshot()
             except WeChatNotReady as e:
                 return _with_trace(_not_ready(f"微信窗口截图不可用({e.reason})", e.reason), trace)
-            return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"png_len": len(png), "png": png})
+            return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data=self._screenshot_data(acct, png))
         return CommandResult(ok=False, code="UNSUPPORTED", trace_id=trace, source="chatlog")
+
+    def _screenshot_data(self, acct: Account, png: bytes) -> dict[str, Any]:
+        """``screenshot`` 的 ``CommandResult.data`` —— 形态以**能力目录**为准:
+        ``capabilities/screenshot.json`` 的 ``result_schema = {png_b64, width, height}``
+        (02 §3.10:``result_schema`` 就是 ``CommandResult.data``,``send_text`` 那行写得最明白)。
+
+        🔴 **D-1**:``bus._finalize → store.finish_command`` 要把 ``data`` 整体 ``json.dumps`` 落
+        ``command_results.data_json``,裸字节会 ``TypeError`` ⇒ 整条能力经总线恒 ``INTERNAL``。
+        修法是**图片体一律另给 JSON 形态**(``png_b64`` 或 ``media/`` 引用),落库/出 JSON 两处再经
+        ``models.json_safe()`` 把 ``data['png']`` 这类裸字节换成 ``{__binary__, len}`` 占位。
+        ``data['png']`` 只给**进程内**消费方(#33 的二进制出口、直调 ``execute`` 的调用方),
+        不是序列化路径上的键 —— 它冗余于 ``png_b64``,等 #33 端点接上就该删(见 handoff)。
+
+        ``media_put`` 注入时按 02 §2.8.2 落 ``media/`` 并只给引用(``media_id``/``sha256``),
+        此时**不再重复塞 ``png_b64``** —— 图片体已经在 ``media/`` 里,再塞一份会让 ``data_json`` 平白大一倍;
+        没落盘(未注入 / 落盘失败)才带 ``png_b64``,保证 ``result_schema`` 里的图片体始终取得到。
+        """
+        import base64
+        import hashlib
+        data: dict[str, Any] = {"mime": "image/png", "png_len": len(png), "sha256": hashlib.sha256(png).hexdigest()}
+        size = _png_size(png)
+        if size is not None:
+            data["width"], data["height"] = size
+        ref = self._media_put(acct, png) if self._media_put is not None else {}
+        if ref.get("media_id") is not None:
+            data.update({k: v for k, v in ref.items() if k in ("media_id", "sha256")})
+        else:
+            data["png_b64"] = base64.b64encode(png).decode("ascii")
+        data["png"] = png                              # 进程内出口;序列化侧由 models.json_safe() 兜住
+        return data
 
     async def send(self, acct: Account, cmd: Command) -> CommandResult:
         """#38 写 + WinAgent 侧读回;``DELIVERED`` 时把读回行喂 ``store.ingest`` 合并进 ``SENDING`` 行(06 §2.12)。"""
@@ -207,6 +241,13 @@ class WechatAdapter:
 
     async def poll(self, acct: Account, *, only_sessions: Optional[list[str]] = None) -> None:
         await self._poller.poll(self._view(acct), only_sessions)
+
+
+def _png_size(png: bytes) -> Optional[tuple[int, int]]:
+    """PNG 的 IHDR 头给 ``width``/``height``(``result_schema`` 的两个整数键);不是合法 PNG 头就不给这两键。"""
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n" or png[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
 
 
 def _not_ready(message: str, reason: str) -> CommandResult:

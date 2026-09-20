@@ -9,6 +9,15 @@
    🔴 **Agent 不管防火墙**;规则名固定 ``QTrade-WinAgent-17610-from-WSL``;``Program`` 限**服务 exe**(R-14),
    会话代理 exe **不开任何入站口**、绝不出现在规则里。
 
+**实测采样的三段职责(04 §2.8.4 落库行 + §3.4 WinAgent 端点表,C-1)**:
+① WinAgent ``POST /probe {mode:'sample'}`` 只按进程名 ``netstat -ano`` 采远端连接、**返回 `{rows:[…]}` 不落库**;
+② Agent 聚合三侧(容器 ``ss`` / WSL / Windows)后经 ``PUT /wa/v1/probes {kind:'observed'}`` **统一回写**
+   ``probe_targets_observed`` —— 单一写入口,避免两侧各写一遍把 ``hits`` 算成两倍;
+③ 用户在 ``P-ENV`` 勾选后经 Agent ``#76b PUT /settings/probe`` → 本册 ``PUT /wa/v1/probes/adopt {observed_ids}``
+   写 ``adopted_ms`` 并更新 ``settings`` 的 ``probe.targets``。
+🔴 **``probe_targets_observed`` 的字段集以 02 §3.2 的 DDL 为准**(04 §2.8.4/§3.3 自列的那套字段与 DDL 无交集,
+见 `.omc/handoffs/winagent.md` A-1);**行的稳定 id = ``id`` 列**(整合裁决 (ch))。
+
 ``seq``(#13 ``GET /wa/v1/net``)是**单调递增的网络状态序号**(R3-5):C-03 单向化后 Agent 靠轮询它感知网络翻转,
 缺了它网络翻转彻底丢失 —— 所以任何影响 ``net_state``/子网/代理/VPN 的变化都必须 ``bump_seq()``。
 """
@@ -24,7 +33,7 @@ from .alerts import AlertBuffer
 from .backends import Adapter, FirewallBackend, FirewallRuleSpec, NetBackend, ProbeBackend
 from .config import NetConfig, ProbeConfig
 from .db import Db
-from .errors import INVALID_ARGS, WaError
+from .errors import INVALID_ARGS, TARGET_NOT_FOUND, WaError
 from .ids import run_id as new_run_id
 from .logfmt import get_logger
 
@@ -41,6 +50,16 @@ LEVELS = ("none", "dns", "tcp", "tls", "http", "proto")
 RESULTS = ("OK", "DNS_FAIL", "TCP_TIMEOUT", "TCP_REFUSED", "TLS_FAIL", "HTTP_4XX", "HTTP_5XX",
            "PROXY_REQUIRED", "BLOCKED_BY_POLICY", "SKIPPED")
 NET_STATES = ("DIRECT", "SYSTEM_PROXY", "VPN_ACTIVE", "VPN_ACTIVE_WITH_PROXY", "OFFLINE")
+# 02 §3.2 probe_targets_observed 的两个 CHECK
+OBSERVED_CHANNELS = ("qidian", "qq", "wechat")
+OBSERVED_PROTOS = ("tcp", "udp")
+# #15/#16 的 kind:result = probe_results(结论);observed = probe_targets_observed(候选)
+PROBE_KINDS = ("result", "observed")
+# settings 键(02 §3.2 settings 的 key 前缀约定):正式探测目标 / 探测周期
+SETTING_PROBE_TARGETS = "probe.targets"
+SETTING_PROBE_INTERVAL = "probe.interval_s"
+# 04 §2.8.4「写入配置」:按通道分成三组 *_hosts(替换整表不追加)
+HOSTS_KEY_BY_CHANNEL = {"qidian": "qidian_hosts", "qq": "qq_hosts", "wechat": "wechat_hosts"}
 
 
 @dataclass
@@ -322,30 +341,143 @@ class NetProbe:
             return self._db.query("SELECT * FROM probe_results WHERE run_id=? ORDER BY id", (row["run_id"],)) if row else []
         return self._db.query("SELECT * FROM probe_results ORDER BY ts_ms DESC LIMIT 200")
 
-    # ---------------------------------------------------------------- C-1 实测采样(04 §2.8.4)
+    # ---------------------------------------------------------------- C-1 实测采样(04 §2.8.4 / §3.4)
     async def sample_connections(self, *, pid_names: tuple[str, ...], duration_s: Optional[int] = None) -> dict[str, Any]:
-        """``POST /wa/v1/probe {mode:'sample', pid_names:[…]}``:Windows 侧按 PID 过滤采远端连接。
+        """``POST /wa/v1/probe {mode:'sample', pid_names:[…], duration_s}``:Windows 侧按进程名采远端连接。
 
-        **只记 IP:port 与域名,不记任何载荷**(04 §2.8.4「安全」);结果落 ``probe_targets_observed``,
-        **不产生 ``probe_result``**(§2.8.5 边界)。
+        返回 ``{rows:[{pid_name, ip, port, samples, hostname?, resolved_by}]}`` —— **不落库**(04 §3.4 逐字):
+        落库由 Agent 聚合三侧后经 ``PUT /wa/v1/probes {kind:'observed'}`` 一次写入,
+        两侧各写一遍会把 ``hits`` 算成两倍。
+        **只记 IP:port 与域名,不记任何载荷**(04 §2.8.4「安全」);``sample`` 不产生 ``probe_result``(§2.8.5)。
         """
         dur = min(int(duration_s or self._pcfg.sample_duration_s), 30)     # 上限 30
         conns = await self._probe.connections(pid_names, dur)
+        rows = [{"pid_name": c.get("pid_name"), "ip": c["ip"], "port": int(c["port"]),
+                 "samples": int(c.get("samples") or 1), "hostname": c.get("hostname"),
+                 "resolved_by": c.get("resolved_by") or ("cache" if c.get("hostname") else "none"),
+                 "channel": c.get("channel"), "account_id": c.get("account_id"), "proto": c.get("proto", "tcp")}
+                for c in conns]
+        return {"sampled_at": self._clock(), "duration_s": dur, "rows": rows}
+
+    # ---------------------------------------------------------------- #16 PUT /probes {kind:'observed'}
+    def write_observed(self, rows: list[dict[str, Any]]) -> int:
+        """Agent 回写实测采样候选(04 §3.4 ``PUT /probes {kind:"observed", rows}``)。
+
+        按 02 §3.2 的唯一索引 ``(COALESCE(account_id,''), remote_ip, remote_port, proto)`` upsert:
+        新行写 ``first_seen_ms``,老行推 ``last_seen_ms`` 并 ``hits += samples``;
+        ``remote_host`` 只在新值非空时覆盖(域名会变解析,采不到时不要把已有的抹掉)。
+        **``adopted_ms`` 不在本入口写** —— 采纳是 ``adopt()`` 的事。
+        """
         now = self._clock()
-        rid = new_run_id()
+        n = 0
         with self._db.tx() as con:
-            for c in conns:
+            for r in rows:
+                ch = r.get("channel")
+                proto = str(r.get("proto") or "tcp")
+                side = str(r.get("side") or "windows")
+                if ch is not None and ch not in OBSERVED_CHANNELS:
+                    raise WaError(INVALID_ARGS, f"channel 必须是 {OBSERVED_CHANNELS} 之一或 null", reason="bad_enum")
+                if proto not in OBSERVED_PROTOS or side not in SIDES:
+                    raise WaError(INVALID_ARGS, "proto/side 不在 02 §3.2 的 CHECK 枚举内", reason="bad_enum")
+                ip = r.get("remote_ip") or r.get("ip")
+                port = r.get("remote_port") if r.get("remote_port") is not None else r.get("port")
+                if not ip or port is None:
+                    raise WaError(INVALID_ARGS, "每行必须带 remote_ip/ip 与 remote_port/port", reason="missing_field")
+                host = r.get("remote_host") or r.get("hostname")
+                hits = int(r.get("hits") or r.get("samples") or 1)
                 con.execute(
                     "INSERT INTO probe_targets_observed(account_id, channel, remote_host, remote_ip, remote_port, proto, "
-                    "side, first_seen_ms, last_seen_ms, hits) VALUES (?,?,?,?,?,?,?,?,?,1) "
+                    "side, first_seen_ms, last_seen_ms, hits) VALUES (?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(COALESCE(account_id,''), remote_ip, remote_port, proto) DO UPDATE SET "
-                    "last_seen_ms=excluded.last_seen_ms, hits=hits+1, "
+                    "last_seen_ms=excluded.last_seen_ms, hits=probe_targets_observed.hits+excluded.hits, "
+                    "channel=COALESCE(excluded.channel, probe_targets_observed.channel), "
+                    "side=excluded.side, "
                     "remote_host=COALESCE(excluded.remote_host, probe_targets_observed.remote_host)",
-                    (c.get("account_id"), c.get("channel"), c.get("hostname"), c["ip"], int(c["port"]),
-                     c.get("proto", "tcp"), "windows", now, now))
-        return {"run_id": rid, "sampled_at": now, "duration_s": dur,
-                "candidates": [{"channel": c.get("channel"), "hostname": c.get("hostname"), "ip": c["ip"],
-                                "port": int(c["port"]), "samples": 1} for c in conns]}
+                    (r.get("account_id"), ch, host, str(ip), int(port), proto, side, now, now, hits))
+                n += 1
+        return n
+
+    # ---------------------------------------------------------------- #15 GET /probes?kind=observed
+    def read_observed(self, *, since: Optional[int] = None, limit: int = 200, channel: Optional[str] = None,
+                      adopted: Optional[bool] = None) -> list[dict[str, Any]]:
+        """读 ``probe_targets_observed``(``P-ENV`` 实测采样面板与「有 N 个新候选」角标)。
+
+        行**原样带 ``id``** —— 它就是 ``#76b`` 的 ``observed_ids`` 用的稳定 id(整合裁决 (ch));
+        另派生 ``in_config``(= 该行是否已在 ``settings.probe.targets`` 里),04 §2.8.4 的返回体要它来默认只勾新增项。
+        """
+        sql = "SELECT * FROM probe_targets_observed WHERE 1=1"
+        params: list[Any] = []
+        if since is not None:
+            sql, _ = sql + " AND last_seen_ms >= ?", params.append(since)
+        if channel:
+            sql, _ = sql + " AND channel = ?", params.append(channel)
+        if adopted is True:
+            sql += " AND adopted_ms IS NOT NULL"
+        elif adopted is False:
+            sql += " AND adopted_ms IS NULL"
+        sql += " ORDER BY last_seen_ms DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 2000)))
+        rows = self._db.query(sql, tuple(params))
+        in_config = set(self.probe_targets())
+        for r in rows:
+            r["in_config"] = f"{r['remote_host'] or r['remote_ip']}:{int(r['remote_port'])}" in in_config
+        return rows
+
+    # ---------------------------------------------------------------- PUT /probes/adopt(#76b 的 WinAgent 半)
+    def probe_targets(self) -> list[str]:
+        """``settings['probe.targets']`` —— 正式探测目标(02 §3.2 settings 键注释)。没采纳过就是空表。
+
+        元素格式 **``"host:port"``**,与 04 §2.8.4 写进 ``[probe] *_hosts`` 的元素格式一致
+        (那边逐字是 ``["msfxg.3g.qq.com:8080", …]``),这样 ``targets`` 与配置项之间不用再翻译一层。
+        """
+        return list(self._db.get_setting(SETTING_PROBE_TARGETS) or [])
+
+    def adopt(self, observed_ids: list[int], *, actor: str = "agent") -> dict[str, Any]:
+        """把选中的实测采样行采纳为正式探测目标(02 #76b 的 WinAgent 半;签名按整合裁决 (ci))。
+
+        语义(04 §2.8.4「写入配置」逐字「**替换整表不追加**,让用户能删旧项」):
+        ``observed_ids`` 是**采纳后的全集**,不是增量 —— 不在里面的已采纳行会被**取消采纳**(``adopted_ms`` 置回 NULL)。
+        返回 ``{adopted:[行 id…], adopted_rows:[…], targets:["host:port"…], hosts_by_channel:{*_hosts}}``;
+        ``adopted``/``targets`` 两个键的形状对齐 02 #76b 的 ``{adopted:[…], targets:[…]}``,
+        ``adopted_rows``/``hosts_by_channel`` 是附加的便利键(前者给面板渲染,后者是 04 §2.8.4 的 ``*_hosts`` 形状)。
+        **「写入后立即按新表跑一轮 `probe(trigger=manual)`」是 Agent 侧 `#76b` 的编排,不在本端点里做**
+        (本端点只负责 winagent.db 这一半,保持幂等可重试)。
+        """
+        ids = [int(i) for i in observed_ids]
+        if len(set(ids)) != len(ids):
+            raise WaError(INVALID_ARGS, "observed_ids 有重复", reason="duplicate_ids")
+        found = self._db.query(
+            "SELECT * FROM probe_targets_observed WHERE id IN (%s)" % (",".join("?" * len(ids)) or "NULL"), tuple(ids)) if ids else []
+        missing = sorted(set(ids) - {int(r["id"]) for r in found})
+        if missing:
+            raise WaError(TARGET_NOT_FOUND, f"observed_ids 里有不存在的行:{missing}", reason="observed_id_not_found")
+        now = self._clock()
+        with self._db.tx() as con:
+            # ① 不在本次集合里的已采纳行 → 取消采纳(替换整表不追加)
+            if ids:
+                con.execute("UPDATE probe_targets_observed SET adopted_ms=NULL "
+                            "WHERE adopted_ms IS NOT NULL AND id NOT IN (%s)" % ",".join("?" * len(ids)), tuple(ids))
+            else:
+                con.execute("UPDATE probe_targets_observed SET adopted_ms=NULL WHERE adopted_ms IS NOT NULL")
+            # ② 本次集合里未采纳的 → 写 adopted_ms(已采纳的不刷新时刻,和 error_since_ms 同款幂等护栏)
+            for i in ids:
+                con.execute("UPDATE probe_targets_observed SET adopted_ms=? WHERE id=? AND adopted_ms IS NULL", (now, i))
+        rows = self._db.query(
+            "SELECT * FROM probe_targets_observed WHERE adopted_ms IS NOT NULL ORDER BY id") if ids else []
+        targets: list[str] = []
+        hosts: dict[str, list[str]] = {v: [] for v in HOSTS_KEY_BY_CHANNEL.values()}
+        for r in rows:
+            hp = f"{r['remote_host'] or r['remote_ip']}:{int(r['remote_port'])}"
+            if hp not in targets:                                   # 同一 host:port 可能被多个账号各采到一行
+                targets.append(hp)
+            key = HOSTS_KEY_BY_CHANNEL.get(r["channel"] or "")
+            if key and hp not in hosts[key]:
+                hosts[key].append(hp)
+        self._db.put_setting(SETTING_PROBE_TARGETS, targets, updated_by=actor)
+        # ``adopted`` 回**行 id 数组**(与 ``observed_ids`` 同一维度,也与 Agent 侧 FakeWinAgent 的形状一致);
+        # 完整行放 ``adopted_rows``,给 ``P-ENV`` 面板直接渲染,不用再拉一次 ``?kind=observed``。
+        return {"adopted": [int(r["id"]) for r in rows], "adopted_rows": rows,
+                "targets": targets, "hosts_by_channel": hosts}
 
 
 def _row(spec: ProbeTargetSpec, level: str, result: str, latency_ms: int, detail: Optional[str]) -> dict[str, Any]:

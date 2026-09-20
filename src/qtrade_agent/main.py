@@ -23,9 +23,9 @@ def load_config(path: str | None) -> AgentConfig:
         return AgentConfig.from_toml_dict(tomllib.load(f))
 
 
-def build(cfg: AgentConfig, db_path: str | None = None):
+def build(cfg: AgentConfig, db_path: str | None = None, config_path: str | None = None):
     from .app import AgentApp
-    agent = AgentApp(cfg, db_path=db_path).open()
+    agent = AgentApp(cfg, db_path=db_path, config_path=config_path).open()
     api = agent.create_api()
 
     @asynccontextmanager
@@ -48,8 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)-5s %(name)-24s %(message)s")
     import os
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    _agent, api = build(cfg, args.db)
+    has_cfg = os.path.exists(args.config)
+    cfg = load_config(args.config if has_cfg else None)
+    _agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
     import uvicorn
     uvicorn.run(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl, workers=1, log_level=args.log_level.lower())
     return 0

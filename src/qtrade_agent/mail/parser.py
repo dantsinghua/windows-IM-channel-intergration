@@ -300,6 +300,18 @@ def _alias_map(template: InboundTemplateConfig) -> dict[str, str]:
 _KV_LINE = re.compile(r"^([^：:]{1,32})[：:](.*)$")
 
 
+def _join_continuation(current: str, line: str, key: str) -> str:
+    """§2.3.2 续行拼接 —— 两种形式的分隔符不同(总控裁决):
+
+    - **JSON 形式** ``参数：{…}``:**直拼 ``""``**(去掉每行行尾换行、不加空格)。JSON 字符串字面量里不允许裸换行,
+      客户端把一行 JSON 折成多行后必须拼回**同一行**才能 ``json.loads``。
+    - **展开形式** ``参数.text``:按 ``\n`` 拼 —— 多行报价文本就是这么写的,换行是内容的一部分。
+    """
+    if key == "参数":
+        return current + line
+    return (current + "\n" + line).strip("\n")
+
+
 def parse_command_body(body_text: str, *, template: InboundTemplateConfig,
                        subject: str = "", body_truncated: bool = False) -> ParsedCommand:
     """§2.3.2 正文解析 + §2.3.3 容错表(逐条)。
@@ -360,14 +372,23 @@ def parse_command_body(body_text: str, *, template: InboundTemplateConfig,
                 fields[canonical] = m.group(2).strip()
                 cont_key = canonical if (canonical == "参数" or canonical.startswith(ARGS_PREFIX)) else None
                 continue
-            # 未知键:记 unknown_key,**不**当成正文续行(§2.3.3;同名键只告警一次)
+            # 续行状态下,只有**已知键**才终止续行(§2.3.2「续行到下一个已知键为止」)——
+            # 折行的 JSON 里 `"limit":3}` 这种片段本身带冒号,当成未知键会把 JSON 拦腰截断。
+            # §2.3.3 的「未知键不当成正文续行」针对的是**不在续行状态**时的模板漂移行。
+            if cont_key is not None:
+                fields[cont_key] = _join_continuation(fields[cont_key], ln, cont_key)
+                continue
+            # 未知键:记 unknown_key(模板漂移/拼错;同名键只告警一次/进程)
             if name not in warned_unknown:
                 warned_unknown.add(name)
                 out.note(f"unknown_key:{name}")
-            cont_key = None
             continue
         if cont_key is not None and stripped:              # 续行:拼到当前键(到下一个已知键为止)
-            fields[cont_key] = (fields[cont_key] + "\n" + ln).strip("\n")
+            # §2.3.2 两种形式的续行分隔符不同(总控裁决):
+            # - JSON 形式 `参数：{…}`:**直拼 ``""``**(去掉每行行尾换行、不加空格)——JSON 字符串里不允许裸换行,
+            #   客户端把一行 JSON 折成多行后拼回来必须还是那一行;
+            # - 展开形式 `参数.text`:按 ``\n`` 拼(多行报价文本就是这么写的,换行是内容的一部分)。
+            fields[cont_key] = _join_continuation(fields[cont_key], ln, cont_key)
             continue
         # 最后一个已知键之后的自由文本行一律忽略(指令模板没有自由文本字段,可以严格)
 

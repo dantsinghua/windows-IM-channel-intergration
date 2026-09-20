@@ -99,6 +99,22 @@ def create_api(agent) -> FastAPI:
             if want_major != have_major or want_minor > have_minor:
                 resp = JSONResponse(status_code=426, content=_error_body("UPGRADE_REQUIRED", f"需要 API {api_min},当前 {cfg.api.api_version}", reason="api_version"))
                 return _with_version_headers(resp)
+        # §3.4 通用行:「鉴权 `Authorization: Bearer <token>`;**公网入站加 HMAC(§3.5)**」——
+        # HMAC 是与 Bearer **并列的鉴权方式,适用于 `/api/v1` 全部端点**,不只是写指令那两个。
+        # 这里在进路由前把签验一次、把 Principal 挂到 request.state,各端点的 `_principal()` 直接取用;
+        # **级别判定仍留在端点**(middleware 不知道该端点要 R/W/A),所以这里 `required_level=None`。
+        if request.url.path.startswith(API_PREFIX) and has_hmac_headers(dict(request.headers)) and getattr(agent, "hmac", None) is not None:
+            try:
+                res = await agent.hmac.verify(method=request.method, path=request.url.path, query=str(request.url.query or ""),
+                                              body=await request.body(), headers=dict(request.headers),
+                                              client_ip=request.client.host if request.client else None)
+                request.state.principal = res.principal
+                request.state.hmac = res
+            except ApiError as e:
+                resp = JSONResponse(status_code=e.http_status, content=_error_body(e.code, e.message, reason=e.reason,
+                                                                                   retryable=e.retryable, needs_human=e.needs_human, extra=e.extra))
+                resp.headers["Date"] = formatdate(agent.clock() / 1000, usegmt=True)      # §3.5:让对方校时
+                return _with_version_headers(resp)
         try:
             response = await call_next(request)
         except ApiError as e:
@@ -138,22 +154,20 @@ def create_api(agent) -> FastAPI:
             extra={"hint_actions": ["open_env", "run_cleanup"], "evidence": e.evidence()})))
 
     # ------------------------------------------------------------------ 鉴权
-    async def _principal_async(request: Request, required: str = "read") -> Principal:
-        """§3.5:带全套 ``X-QT-*`` 头 ⇒ 走公网入站 HMAC;否则走 Bearer。HMAC 成功时把服务端时间放进 ``Date`` 头(让对方校时)。"""
-        if has_hmac_headers(dict(request.headers)) and getattr(agent, "hmac", None) is not None:
-            res = await agent.hmac.verify(method=request.method, path=request.url.path, query=str(request.url.query or ""),
-                                          body=await request.body(), headers=dict(request.headers),
-                                          client_ip=request.client.host if request.client else None,
-                                          required_level=required)
-            request.state.principal = res.principal
-            request.state.hmac = res
-            return res.principal
-        return _principal(request, required)
-
     def _principal(request: Request, required: str = "read") -> Principal:
+        """Bearer 与 HMAC 两条路都收口在这里:HMAC 已由 middleware 验过并挂在 ``request.state.principal``,
+        **级别判定在这里做**(middleware 不知道各端点要 R/W/A)。"""
+        p: Optional[Principal] = getattr(request.state, "principal", None)
+        if p is not None:
+            require_level(p, required)
+            return p
         auth = request.headers.get("Authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else request.query_params.get("token", "")
         return _principal_from_token(token, required, request)
+
+    async def _principal_async(request: Request, required: str = "read") -> Principal:
+        """兼容别名:HMAC 的签验已提前到 middleware,这里只是保留调用点的 ``await`` 形态。"""
+        return _principal(request, required)
 
     def _principal_from_token(token: str, required: str, request) -> Principal:
         if not token:
@@ -168,6 +182,27 @@ def create_api(agent) -> FastAPI:
         return p
 
     # ------------------------------------------------------------------ system
+    ACCOUNT_HEALTH_CODES = {"H04": "H04_CONTAINER_EXITED", "H05": "H05_BOOT_INCOMPLETE", "H06": "H06_ADB_OFFLINE",
+                            "H07": "H07_SCRCPY_STALLED", "H08": "H08_NAPCAT_HEARTBEAT_LOST"}
+
+    def _per_account_checks() -> dict[str, dict[str, str]]:
+        """``#72 checks.accounts``:每账号的 H04/H05/H06/H07/H08(01 §2.7.3.4 的五个状态点)。
+
+        判据与全局 ``checks`` 同源:该码在 ``alerts.active`` 里对 ``subject='account:<id>'`` 有行 ⇒ ``firing``;
+        该健康项**跑过**(健康循环的 ``last[…]`` 里有这个账号)⇒ ``ok``;否则 ``unknown``。
+        H07(前台流 10 s 无帧)本期没有执行体 ⇒ 恒 ``unknown``,**不假装 ok**。
+        """
+        firing = {(code, subject) for code, subject in agent.alerts.active}
+        ran = {"H04": set(agent.healthloop.last["H04"]), "H05": set(agent.healthloop.last["H05"]),
+               "H06": set(agent.healthloop.last["H06"]), "H07": set(),
+               "H08": set(getattr(agent, "qqhealth", None).last) if getattr(agent, "qqhealth", None) else set()}
+        out: dict[str, dict[str, str]] = {}
+        for row in agent.store.list_accounts():
+            aid = row["id"]
+            out[aid] = {h: ("firing" if (code, f"account:{aid}") in firing else ("ok" if aid in ran[h] else "unknown"))
+                        for h, code in ACCOUNT_HEALTH_CODES.items()}
+        return out
+
     @app.get(f"{API_PREFIX}/system/version")
     async def system_version(request: Request):
         _principal(request, "read")
@@ -199,7 +234,11 @@ def create_api(agent) -> FastAPI:
                                "H02": "unknown" if agent.health.winagent_online is None else ("ok" if agent.health.winagent_online else "firing"),
                                "H03": "unknown" if agent.health.dockerd_ok is None else ("ok" if agent.health.dockerd_ok else "firing"),
                                **agent.healthloop.checks(),
-                               "H24": "unknown" if agent.pressure.level == "unknown" else ("ok" if agent.pressure.level == "ok" else "firing")},
+                               "H24": "unknown" if agent.pressure.level == "unknown" else ("ok" if agent.pressure.level == "ok" else "firing"),
+                               # 01 §2.7.3.4 运行时 Tab 要的 per-account 维度:H04/H05/H06/H07/H08 本来就是
+                               # `subject=account:<id>` 级别的健康项(02 §3.7),而 #72 原来只给全局映射。
+                               # 全局那几个键**原样保留**(02 为准),per-account 作为**补充子键**挂在 checks.accounts 下。
+                               "accounts": _per_account_checks()},
                     "mem": {"level": agent.pressure.level, "avail_mb": agent.pressure.avail_mb},
                     "alerts": [{"code": a.code, "subject": a.subject, "severity": a.severity, "count": a.count} for a in agent.alerts.active.values()],
                     "scheduler": agent.scheduler.snapshot()}
@@ -522,23 +561,69 @@ def create_api(agent) -> FastAPI:
             raise ApiError(404, "TARGET_NOT_FOUND", f"消息不存在:{message_id}")
         return {"ok": True, "data": message_view(row)}
 
-    # ------------------------------------------------------------------ audit(简版)
+    # ------------------------------------------------------------------ #95 审计(02 §3.4.6)
+    AUDIT_KINDS = ("command", "api", "system", "stream_input")      # C-40 加 kind;stream_input = R-06 画面注入留痕
+
     @app.get(f"{API_PREFIX}/audit")
-    async def list_audit(request: Request, kind: Optional[str] = None, account_id: Optional[str] = None, action: Optional[str] = None,
-                         limit: int = Query(100, ge=1, le=1000)):
+    async def list_audit(request: Request, kind: Optional[str] = None, actor: Optional[str] = None,
+                         account_id: Optional[str] = None, action: Optional[str] = None,
+                         since: Optional[str] = None, until: Optional[str] = None,
+                         limit: int = Query(100, ge=1, le=1000), cursor: Optional[str] = None,
+                         fmt: Optional[str] = None):
+        """#95,级别 R(**A 可看全部 actor**,非 A 只看自己)。``?fmt=csv`` 导出;分页用 ``cursor``(G-16 同款)。"""
         p = _principal(request, "read")
+        if kind is not None and kind not in AUDIT_KINDS:
+            raise ApiError(400, "INVALID_ARGS", f"kind 须为 {'|'.join(AUDIT_KINDS)}", reason="bad_kind",
+                           extra={"details": [{"pointer": "/kind"}]})
+        try:
+            since_ms, until_ms = _parse_time(since), _parse_time(until)
+        except ValueError:
+            raise ApiError(400, "INVALID_ARGS", "since/until 须为 ISO 8601 或毫秒", reason="bad_time",
+                           extra={"details": [{"pointer": "/since"}]})
         sql, params = "SELECT * FROM audit_log WHERE 1=1", []
         if kind:
             sql += " AND kind=?"; params.append(kind)
         if account_id:
+            require_account(p, account_id)
             sql += " AND account_id=?"; params.append(account_id)
         if action:
             sql += " AND action=?"; params.append(action)
-        if not p.can("admin"):
-            sql += " AND actor=?"; params.append(p.actor)      # 非 A 级只看自己
+        if since_ms is not None:
+            sql += " AND ts_ms >= ?"; params.append(since_ms)
+        if until_ms is not None:
+            sql += " AND ts_ms <= ?"; params.append(until_ms)
+        if p.can("admin"):
+            if actor:
+                sql += " AND actor=?"; params.append(actor)
+        else:
+            sql += " AND actor=?"; params.append(p.actor)          # 非 A 级只看自己(``?actor=`` 无效)
+        if cursor:
+            try:
+                _ts, last_id = decode_cursor(cursor)
+            except Exception:
+                raise ApiError(400, "INVALID_ARGS", "cursor 非法", reason="bad_cursor", extra={"details": [{"pointer": "/cursor"}]})
+            sql += " AND id < ?"; params.append(int(last_id))
         sql += " ORDER BY id DESC LIMIT ?"; params.append(limit)
         rows = [dict(r) for r in agent.store.con.execute(sql, params).fetchall()]
-        return {"ok": True, "data": rows}
+        if fmt == "csv":
+            return Response(content=_audit_csv(rows), media_type="text/csv; charset=utf-8",
+                            headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
+        if fmt not in (None, "json"):
+            raise ApiError(400, "INVALID_ARGS", "fmt 须为 json|csv", reason="bad_fmt", extra={"details": [{"pointer": "/fmt"}]})
+        nxt = encode_cursor(rows[-1]["ts_ms"], str(rows[-1]["id"])) if len(rows) == limit else None
+        return {"ok": True, "data": rows, "next_cursor": nxt}
+
+    AUDIT_CSV_COLS = ("id", "ts_ms", "kind", "transport", "actor", "action", "account_id", "trace_id", "result_code", "detail_json")
+
+    def _audit_csv(rows: list[dict[str, Any]]) -> str:
+        import csv
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(AUDIT_CSV_COLS)
+        for r in rows:
+            w.writerow([("" if r.get(c) is None else r.get(c)) for c in AUDIT_CSV_COLS])
+        return buf.getvalue()
 
     # ------------------------------------------------------------------ #17 / #18 微信单槽切换(02 §3.4.1)
     @app.post(f"{API_PREFIX}/accounts/{{account_id}}/switch")
@@ -695,14 +780,16 @@ def create_api(agent) -> FastAPI:
 
     @app.post(f"{API_PREFIX}/resources/calibrate")
     async def resources_calibrate(request: Request):
-        """#71,级别 A:``{apply:false}`` 只回建议值;``apply=true`` 写回 ``resource_pools``(``quota_auto_lower=false`` 时只上调)。
+        """#71,级别 A:``{apply:false}`` 只算建议值;``apply=true`` 写回 ``resource_pools``(``quota_auto_lower=false`` 时只上调)。
 
-        🔴 同步返回(§3.4.6 #71 原句「返回建议值」);``calibrate()`` 只读 ``health_samples``,毫秒级。
-        00 §11.21 [JOB] 把本端点列进「凡 202 {job_id}」与此冲突,取 §3.4.6 的逐字口径,见 rulings R6-58 (g)。"""
-        _principal(request, "admin")
+        🔴 **总控裁决(rulings R6-58 (ao)):按 00 §11.21 [JOB] 统一走 ``202 {job_id}``**(00 优先于 02 §3.4.6
+        「返回建议值」的同步写法);结果经 #107 ``GET /jobs/{job_id}`` 取,终态推 ``job`` 事件。"""
+        p = _principal(request, "admin")
         body = await _json_or_empty(request)
-        s = agent.calibrator.calibrate(apply=bool(body.get("apply", False)), source="manual")
-        return {"ok": True, **s.as_dict()}
+        apply = bool(body.get("apply", False))
+        job_id = agent.store.job_create(kind="resources_calibrate", actor=p.actor, params={"apply": apply, "scope": "global"})
+        agent.spawn_job(job_id, "resources_calibrate", lambda: agent.calibrate_job_body(job_id, apply=apply, source="manual"))
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
 
     # ------------------------------------------------------------------ #77 / #81 / #102 / #109 系统
     @app.get(f"{API_PREFIX}/system/metrics")
@@ -713,10 +800,17 @@ def create_api(agent) -> FastAPI:
         snap = agent.pool.snapshot()
         budget = [{"id": r["id"], "quota_mb": int(r["quota_mb"]), "rss_mb": None, "drift_pct": None}
                   for r in agent.store.list_accounts() if r["state"] == "running"]
+        # 01 §2.7.2a 右栏 CPU 要「每容器/每进程 cpu_pct」,而 02 #77 的 ours.procs 只有三个内存键。
+        # 这里**保留 02 的三个内存键不动**(02 为准),另补 `procs_detail:[{name, rss_mb, cpu_pct}]`;
+        # monitor 采样(health_samples 的写入方)本期没人做 ⇒ 值一律 null,**不编造**(04 §2.4.5)。
+        procs = {"agent_mb": None, "winagent_mb": None, "console_mb": None}
+        procs_detail = [{"name": n, "rss_mb": None, "cpu_pct": None} for n in ("agent", "winagent", "console")]
         return {"ok": True, "disk_watermark": agent.maintenance.watermark_snapshot(),
                 "mem_watermark": {"level": agent.pressure.level, "avail_mb": agent.pressure.avail_mb,
                                   "lru_suggest": agent.pressure.lru_suggest() if agent.pressure.blocked() else []},
-                "budget_vs_actual": budget, "pools": snap["pools"], "realtime": snap["realtime"]}
+                "budget_vs_actual": budget, "pools": snap["pools"], "realtime": snap["realtime"],
+                "ours": {"procs": procs, "procs_detail": procs_detail,
+                         "accounts": [{"id": b["id"], "quota_mb": b["quota_mb"], "rss_mb": None, "cpu_pct": None} for b in budget]}}
 
     @app.post(f"{API_PREFIX}/system/backup")
     async def system_backup(request: Request):
@@ -754,7 +848,7 @@ def create_api(agent) -> FastAPI:
             raise ApiError(409, "RESOURCE_EXHAUSTED", "60 秒内已跑过一次全量清理", reason="cleanup_too_frequent",
                            extra={"job_id": last["job_id"]})
         job_id = agent.store.job_create(kind="system_cleanup", actor=p.actor, params={"trigger": "manual"}, now_ms=now)
-        asyncio.create_task(agent.run_cleanup_job(job_id), name=f"job:{job_id}")
+        agent.spawn_job(job_id, "system_cleanup", agent.cleanup_job_body)
         return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
 
     @app.get(f"{API_PREFIX}/jobs/{{job_id}}")
@@ -768,6 +862,553 @@ def create_api(agent) -> FastAPI:
         row["result"] = json.loads(row.pop("result_json") or "null")
         row["error"] = json.loads(row.pop("error_json") or "null")
         return {"ok": True, "data": row}
+
+    @app.post(f"{API_PREFIX}/jobs/{{job_id}}/cancel")
+    async def cancel_job(request: Request, job_id: str):
+        """#108,级别 W:取消 ``queued/running`` 作业;**不可取消的终态 → 409**(00 §11.21 [JOB])。"""
+        p = _principal(request, "write")
+        row = agent.store.job_get(job_id)
+        if row is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"作业不存在:{job_id}")
+        if row["state"] not in ("queued", "running"):
+            raise ApiError(409, "NOT_CANCELLABLE", f"作业已处于终态 {row['state']},不可取消", reason="job_terminal",
+                           extra={"job_id": job_id, "state": row["state"]})
+        cancelled_task = await agent.cancel_job(job_id)          # 在跑的 task 真 cancel(`job` 事件由作业体收尾时发)
+        if not cancelled_task:
+            agent.events.emit("job", payload={"job_id": job_id, "kind": row["kind"], "state": "cancelled"})
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="job.cancel",
+                                 result_code="OK", detail={"job_id": job_id, "kind": row["kind"]}, now_ms=agent.clock())
+        return {"ok": True, "job_id": job_id, "state": "cancelled"}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/calibrate")
+    async def calibrate_account(request: Request, account_id: str):
+        """#25,级别 A:**单账号**自校准 → ``202 {job_id}``,结果写 ``resource_pools.calibration_json``(与 #71 全局校准并存)。
+
+        单账号只量该账号所在通道的 ``quota_mb``(04 §2.5.3 的「running 稳定 ≥10min 后取 p95」),
+        不动 ``wsl/windows`` 的 total/reserved —— 那是整机量,归 #71。
+        """
+        p = _principal(request, "admin")
+        require_account(p, account_id)
+        row = agent.accounts.get(account_id)
+        request.state.account_id = account_id
+        job_id = agent.store.job_create(kind="resources_calibrate", actor=p.actor, account_id=account_id,
+                                        params={"scope": "account", "channel": row["channel"]})
+        agent.spawn_job(job_id, "resources_calibrate",
+                        lambda: agent.calibrate_job_body(job_id, account_id=account_id, channel=row["channel"]))
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
+
+    # ------------------------------------------------------------------ #76b / #79 探测采样与自检(console 交接的两条端点冲突)
+    @app.get(f"{API_PREFIX}/system/probes")
+    async def system_probes(request: Request, kind: str = "result", run_id: Optional[str] = None):
+        """#76:``?kind=result`` 读 ``probe_results``(转 WinAgent ``GET /wa/v1/probes``);
+        ``?kind=observed`` 读 ``probe_targets_observed``(C-1 实测采样)。
+
+        🔴 **采样行的稳定 id = `id` 列**(02 §3.2 `probe_targets_observed` DDL 的 `INTEGER PRIMARY KEY`):
+        #76b 的 `observed_ids` 就是它,控制台不得用「行下标」顶(见 rulings R6-58 (bq))。
+        """
+        _principal(request, "read")
+        if kind not in ("result", "observed"):
+            raise ApiError(400, "INVALID_ARGS", "kind 须为 result|observed", reason="bad_kind", extra={"details": [{"pointer": "/kind"}]})
+        if kind == "observed":
+            # 🔴 `probe_targets_observed` 在 **winagent.db**、Agent 够不着 ⇒ 只能转发。
+            # WinAgent 侧补上 `GET /wa/v1/probes?kind=observed`(rulings (ci))就自然走通;
+            # 还没补时它回 404 ⇒ **诚实报上游缺口**(503 + 明确 reason),不假装有数据。
+            body = await _wa_probes("GET", "/wa/v1/probes?kind=observed", missing_reason="wa_observed_endpoint_missing",
+                                    missing_hint="需补 GET /wa/v1/probes?kind=observed")
+            # `targets` = 正式探测目标(`settings['probe.targets']`,元素 "host:port",裁决 A-16);
+            # 行上的 `in_config` 由 WinAgent 派生 —— 04 §2.8.4 的面板靠它默认只勾新增项。
+            return {"ok": True, "kind": "observed", "data": (body or {}).get("observed") or [],
+                    "targets": (body or {}).get("targets") or []}
+        body = await _wa_probes("GET", "/wa/v1/probes" + (f"?run_id={run_id}" if run_id else "?latest=1"))
+        return {"ok": True, "kind": "result", "data": (body or {}).get("results") or []}
+
+    async def _wa_probes(method: str, path: str, *, json_body: Optional[dict[str, Any]] = None,
+                         missing_reason: Optional[str] = None, missing_hint: str = "") -> Optional[dict[str, Any]]:
+        """转发到 WinAgent 的探测端点;**404 与「不可达 / 其它错」分成两个 reason**,现场一眼能分清是
+        「上游还没这个端点」还是「上游挂了」。"""
+        try:
+            res = await agent.winagent.request(method, path, json=json_body, timeout_s=3.0, retry=(method == "GET"))
+        except Exception as e:
+            raise ApiError(503, "NOT_READY", f"WinAgent 不可达:{e}", reason="winagent_offline", retryable=True)
+        status, body = res
+        if status == 404 and missing_reason:
+            raise ApiError(503, "NOT_READY", f"WinAgent 尚未提供该端点({missing_hint})", reason=missing_reason,
+                           retryable=False, needs_human=True)
+        if status != 200:
+            raise ApiError(503, "NOT_READY", f"WinAgent 回 {status}", reason="winagent_error", retryable=True)
+        return body
+
+    @app.put(f"{API_PREFIX}/settings/probe")
+    async def adopt_probe_targets(request: Request):
+        """#76b,级别 A:``{observed_ids:[…]}`` → 写选中行 ``adopted_ms`` 并更新 ``probe.targets``,回 ``{adopted, targets}``。
+
+        🔴 **入参形态以 02 #76b 为准**(端点 owner 是 02):给的是**采样行 id**,不是 01 §2.7.9 写的 `{targets:[…]}`。
+        传 `targets` 一律 400 并指明改用 `observed_ids`,免得前端按 01 写完才在真机上发现对不上。
+        """
+        p = _principal(request, "admin")
+        body = await _json_or_empty(request)
+        if "targets" in body and "observed_ids" not in body:
+            raise ApiError(400, "INVALID_ARGS", "本端点收的是采样行 id:{observed_ids:[…]}(02 #76b),不是 {targets:[…]}",
+                           reason="use_observed_ids", extra={"details": [{"pointer": "/observed_ids"}]})
+        ids = body.get("observed_ids")
+        # 🔴 裁决 A-14(04 §2.8.4「替换整表不追加,让用户能删旧项」):`observed_ids` 是**采纳后的全集**,
+        #    不在里面的已采纳行会被取消采纳;**`[]` 是合法入参 = 清空正式目标表**,不能当「缺参」挡掉。
+        if not isinstance(ids, list) or any(not isinstance(x, int) or isinstance(x, bool) for x in ids):
+            raise ApiError(400, "INVALID_ARGS", "observed_ids 须为整数数组(采纳后的全集;[] = 清空)",
+                           reason="bad_observed_ids", extra={"details": [{"pointer": "/observed_ids"}]})
+        if len(set(ids)) != len(ids):
+            raise ApiError(400, "INVALID_ARGS", "observed_ids 有重复", reason="duplicate_ids",
+                           extra={"details": [{"pointer": "/observed_ids"}]})
+        body = await _wa_probes("PUT", "/wa/v1/probes/adopt", json_body={"observed_ids": ids},
+                                missing_reason="wa_adopt_endpoint_missing",
+                                missing_hint="需补 PUT /wa/v1/probes/adopt 写 adopted_ms 与 probe.targets")
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "probe", "observed_ids": ids}, now_ms=agent.clock())
+        return {"ok": True, "adopted": (body or {}).get("adopted") or [], "targets": (body or {}).get("targets") or [],
+                "hosts_by_channel": (body or {}).get("hosts_by_channel") or {},
+                "adopted_rows": (body or {}).get("adopted_rows") or []}
+
+    @app.get(f"{API_PREFIX}/system/selftest")
+    async def system_selftest_latest(request: Request, run_id: Optional[str] = None):
+        """01 §2.7.9 要的「页面直开就能看上次结果」:不带 ``run_id`` = **最近一轮**;带则等价于 #79。
+
+        02 只有 ``#79 GET /system/selftest/{run_id}``,没有「最近一轮」入口(见 rulings R6-58 (br));
+        本端点是**补的兄弟端点**,#79 原样保留。没跑过 ⇒ ``{ok:true, data:null}``(不是 404,页面要能显示「暂无」)。
+        """
+        _principal(request, "read")
+        rid = run_id or agent.store.settings_get("system.selftest.last")
+        return {"ok": True, "run_id": rid, "data": agent.store.settings_get(f"system.selftest.{rid}") if rid else None}
+
+    @app.get(f"{API_PREFIX}/system/selftest/{{run_id}}")
+    async def system_selftest_run(request: Request, run_id: str):
+        """#79:按 ``run_id`` 读自检结果;不存在 404。"""
+        _principal(request, "read")
+        data = agent.store.settings_get(f"system.selftest.{run_id}")
+        if data is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"自检轮次不存在:{run_id}")
+        return {"ok": True, "run_id": run_id, "data": data}
+
+    # ------------------------------------------------------------------ #88 / #89 配置分组(02 §3.4.6)
+    #: §3.4.6 #88 的 ``group`` 枚举;值 = ``AgentConfig`` 上的字段名(``adapters``/``log``/``resources`` 另行组装)
+    SETTINGS_GROUPS: dict[str, Optional[str]] = {
+        "api": "api", "winagent": "winagent", "runtime": "runtime", "pool": "pool", "bus": "bus",
+        "adapters": None, "asr": None, "ocr": None, "messages": "messages", "media": "media",
+        "retention": "retention", "events": "events", "mail": None, "log": None, "resources": None,
+    }
+    ADMIN_GROUPS = ("api", "mail")           # #88 的级别列:`api|mail` 组要 A,其余 R
+    SECRET_KEYS = ("secret", "password", "token")
+    DATA_CLASS_DAYS_MAX = 30                 # E-18:数据类 *_days 上限 30(files_days/export_jobs_days 等更严的不受此限)
+    DATA_CLASS_DAYS_KEYS = ("messages_days", "commands_days", "audit_days", "mail_inbox_rows_days")
+
+    def _as_dict(obj: Any) -> dict[str, Any]:
+        import dataclasses
+        out: dict[str, Any] = {}
+        for f in dataclasses.fields(obj):
+            v = getattr(obj, f.name)
+            out[f.name] = list(v) if isinstance(v, tuple) else v
+        return out
+
+    def _group_view(group: str) -> dict[str, Any]:
+        """``*_ref`` 只回引用不回值;密码类字段一个都不出现(#88)。"""
+        if group == "adapters":
+            return {"qidian": _as_dict(cfg.qidian), "qq": _as_dict(cfg.qq), "wechat": _as_dict(cfg.wechat_adapter)}
+        if group in ("asr", "ocr", "log"):
+            # 02 §7.1 有这三段但本期没有消费者(ASR/OCR 是 A.4/A-1 的后续里程碑,log 归 §2.9)⇒ 如实回空对象,不编默认值
+            return {}
+        if group == "resources":
+            snap = agent.pool.snapshot()
+            return {"pools": snap["pools"], "quota_mb": snap["quota_mb"]}
+        if group == "mail":
+            rows = _mail_or_503().ms.routes_list()
+            return {"enabled": cfg.mail.enabled, "require_signature": cfg.mail.inbound.require_signature,
+                    "template_version": cfg.mail.template_version,
+                    "scopes": {s: _mail_scope_view(None if s == "default" else s, rows) for s in MAIL_SCOPES}}
+        field = SETTINGS_GROUPS[group]
+        return {k: v for k, v in _as_dict(getattr(cfg, str(field))).items() if not any(k.endswith(x) for x in SECRET_KEYS)}
+
+    def _validate_retention(body: dict[str, Any]) -> dict[str, Any]:
+        """#89:数据类 ``*_days > 30`` **按 30 截断并 WARN**(E-18);三级水位顺序非法 → 400。"""
+        out, warnings = dict(body), []
+        for k in DATA_CLASS_DAYS_KEYS:
+            v = out.get(k)
+            if isinstance(v, int) and v > DATA_CLASS_DAYS_MAX:
+                out[k] = DATA_CLASS_DAYS_MAX
+                warnings.append(f"{k}={v} 超过 E-18 上限 30,已按 30 截断")
+        warn, high, crit = (out.get("disk_warn_mb"), out.get("disk_high_mb"), out.get("disk_critical_mb"))
+        cur = cfg.retention
+        warn = cur.disk_warn_mb if warn is None else warn
+        high = cur.disk_high_mb if high is None else high
+        crit = cur.disk_critical_mb if crit is None else crit
+        if not (warn >= high >= crit):
+            raise ApiError(400, "INVALID_ARGS", "须满足 disk_warn_mb ≥ disk_high_mb ≥ disk_critical_mb",
+                           reason="watermark_order", extra={"details": [{"pointer": "/disk_high_mb"}]})
+        return {"value": out, "warnings": warnings}
+
+    def _put_resources(body: dict[str, Any], actor: str) -> dict[str, Any]:
+        """``resources`` 组直接写 ``resource_pools``(C-40:替代原 `PATCH /resources`)。"""
+        quota = body.get("quota_mb") or {}
+        if quota and (not isinstance(quota, dict) or any(k not in ("qidian", "qq", "wechat") for k in quota)):
+            raise ApiError(400, "INVALID_ARGS", "quota_mb 的键须为 qidian|qq|wechat", reason="bad_quota",
+                           extra={"details": [{"pointer": "/quota_mb"}]})
+        now = agent.clock()
+        for pool in ("wsl", "windows"):
+            cols: dict[str, Any] = {}
+            blob = (body.get("pools") or {}).get(pool) or {}
+            for k in ("total_mb", "reserved_mb"):
+                if isinstance(blob.get(k), int):
+                    cols[k] = blob[k]
+            if quota:
+                cur = dict(agent.store.pool_get(pool)["quota"])
+                cur.update({k: int(v) for k, v in quota.items()})
+                cols["quota_json"] = json.dumps(cur, ensure_ascii=False)
+            if cols:
+                cols["source"] = "manual"
+                agent.store.pool_set(pool, now_ms=now, **cols)
+        agent.store.insert_audit(kind="api", transport="http", actor=actor, action="settings.update",
+                                 result_code="OK", detail={"group": "resources"}, now_ms=now)
+        return {"data": _group_view("resources"), "restart_required": False}
+
+    async def _stash_secrets(group: str, body: dict[str, Any], actor: str) -> dict[str, str]:
+        """密码类字段**只写不读**:body 里给 ``secret`` 即写 Vault 并回 ``secret_ref``,原值从 body 里摘掉。"""
+        refs: dict[str, str] = {}
+        for key in [k for k in list(body) if any(k.endswith(x) for x in SECRET_KEYS)]:
+            value = body.pop(key)
+            if not isinstance(value, str) or not value:
+                continue
+            name = f"settings/{group}/{key}"
+            await agent.vault.put(name, value, scope="settings")
+            agent.store.settings_set(f"config.{group}.{key}_ref", f"vault://{name}", actor=actor)
+            refs[key] = f"vault://{name}"
+        return refs
+
+    def _write_agent_toml(group: str, body: dict[str, Any]) -> bool:
+        """原子写(临时文件 + rename);``config_path`` 没给(开发容器 / 测试)就只落 ``settings``,回 False。"""
+        path = getattr(agent, "config_path", None)
+        if not path:
+            return False
+        try:
+            merged = dict(agent.store.settings_get("config.__all__") or {})
+            merged[group] = body
+            agent.store.settings_set("config.__all__", merged, actor="system:settings")
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(_toml_dump(merged))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            log.error("写回 agent.toml 失败(%s):配置已落 settings,重启前不会生效", e)
+            return False
+
+    def _toml_dump(groups: dict[str, Any]) -> str:
+        """只发射本项目 `agent.toml` 用得到的标量/数组/字符串(不引第三方 toml 写库)。"""
+        def val(v: Any) -> str:
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, (int, float)):
+                return str(v)
+            if isinstance(v, (list, tuple)):
+                return "[" + ", ".join(val(x) for x in v) + "]"
+            return json.dumps(str(v), ensure_ascii=False)
+        lines = ["# 由 PUT /api/v1/settings/{group} 原子写回(02 §3.4.6 #89);手改后重启生效"]
+        for name, blob in groups.items():
+            if not isinstance(blob, dict):
+                continue
+            lines.append(f"\n[{name}]")
+            lines += [f"{k} = {val(v)}" for k, v in blob.items() if not isinstance(v, dict)]
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------ #94 webhooks CRUD(02 §3.4.6)
+    def _webhook_view(row: dict[str, Any]) -> dict[str, Any]:
+        return {"id": row["id"], "name": row["name"], "url": row["url"], "secret_ref": row["secret_ref"],
+                "events": json.loads(row["events_json"] or '["*"]'), "accounts": json.loads(row["accounts_json"] or '["*"]'),
+                "enabled": bool(row["enabled"]), "timeout_ms": row["timeout_ms"], "max_attempts": row["max_attempts"],
+                "consecutive_fail": row["consecutive_fail"], "dead_ms": row["dead_ms"],
+                "created_at": iso8601(row["created_ms"]), "updated_at": iso8601(row["updated_ms"])}
+
+    def _webhook_or_404(wid: str) -> dict[str, Any]:
+        r = agent.store.con.execute("SELECT * FROM webhooks WHERE id=?", (wid,)).fetchone()
+        if r is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"webhook 不存在:{wid}")
+        return dict(r)
+
+    @app.get(f"{API_PREFIX}/settings/webhooks")
+    async def list_webhooks(request: Request):
+        """#94(列表),级别 A;``secret`` 只回 ``secret_ref``。"""
+        _principal(request, "admin")
+        rows = [dict(r) for r in agent.store.con.execute("SELECT * FROM webhooks ORDER BY id")]
+        return {"ok": True, "data": [_webhook_view(r) for r in rows]}
+
+    @app.post(f"{API_PREFIX}/settings/webhooks", status_code=201)
+    async def create_webhook(request: Request):
+        """#94(建),级别 A:``{name, url, events?, accounts?, timeout_ms?, max_attempts?}`` → **一次性**返回 ``secret``。"""
+        p = _principal(request, "admin")
+        body = await request.json()
+        for key in ("name", "url"):
+            if not isinstance(body.get(key), str) or not body[key].strip():
+                raise ApiError(400, "INVALID_ARGS", f"{key} 必填", reason=f"bad_{key}", extra={"details": [{"pointer": f"/{key}"}]})
+        if not str(body["url"]).startswith(("http://", "https://")):
+            raise ApiError(400, "INVALID_ARGS", "url 须为 http(s)://", reason="bad_url", extra={"details": [{"pointer": "/url"}]})
+        wid, secret, now = ulid(agent.clock()), ulid() + ulid(), agent.clock()
+        await agent.vault.put(f"webhook/{wid}", secret, scope="webhook")
+        agent.store.con.execute(
+            "INSERT INTO webhooks(id, name, url, secret_ref, events_json, accounts_json, enabled, timeout_ms, max_attempts, "
+            "created_ms, updated_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (wid, body["name"].strip(), body["url"], f"vault://webhook/{wid}",
+             json.dumps(body.get("events") or ["*"]), json.dumps(body.get("accounts") or ["*"]),
+             1 if body.get("enabled", True) else 0, int(body.get("timeout_ms") or cfg.webhook.webhook_timeout_ms),
+             int(body.get("max_attempts") or cfg.webhook.webhook_max_attempts), now, now))
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "webhooks", "op": "create", "id": wid}, now_ms=now)
+        return {"ok": True, "data": _webhook_view(_webhook_or_404(wid)), "secret": secret}   # secret 一次性,不再回读
+
+    @app.patch(f"{API_PREFIX}/settings/webhooks/{{webhook_id}}")
+    async def patch_webhook(request: Request, webhook_id: str):
+        """#94(改),级别 A。🔴 ``enabled=1`` 同时清 ``consecutive_fail``/``dead_ms``(rulings R6-58 (al)):
+        死信自动停用后若不清这两列,重新启用的 webhook 会带着旧的失败计数,下一次失败立刻又进死信。"""
+        p = _principal(request, "admin")
+        row = _webhook_or_404(webhook_id)
+        body = await request.json()
+        sets, vals = [], []
+        for key, col in (("name", "name"), ("url", "url"), ("timeout_ms", "timeout_ms"), ("max_attempts", "max_attempts")):
+            if key in body:
+                sets.append(f"{col}=?")
+                vals.append(body[key])
+        for key, col in (("events", "events_json"), ("accounts", "accounts_json")):
+            if key in body:
+                sets.append(f"{col}=?")
+                vals.append(json.dumps(body[key]))
+        if "enabled" in body:
+            sets.append("enabled=?")
+            vals.append(1 if body["enabled"] else 0)
+            if body["enabled"]:
+                sets += ["consecutive_fail=0", "dead_ms=NULL"]
+        if not sets:
+            raise ApiError(400, "INVALID_ARGS", "没有可改的字段", reason="empty_patch")
+        sets.append("updated_ms=?")
+        vals += [agent.clock(), webhook_id]
+        agent.store.con.execute(f"UPDATE webhooks SET {', '.join(sets)} WHERE id=?", vals)
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "webhooks", "op": "patch", "id": webhook_id,
+                                                           "keys": sorted(body)}, now_ms=agent.clock())
+        return {"ok": True, "data": _webhook_view(_webhook_or_404(webhook_id))}
+
+    @app.delete(f"{API_PREFIX}/settings/webhooks/{{webhook_id}}")
+    async def delete_webhook(request: Request, webhook_id: str):
+        """#94(删),级别 A:连带把该 webhook 还没投的 outbox 副本删掉(否则投递器会一直找不到登记方)。"""
+        p = _principal(request, "admin")
+        _webhook_or_404(webhook_id)
+        with agent.store._tx() as c:
+            c.execute("DELETE FROM events_outbox WHERE target=?", (f"webhook:{webhook_id}",))
+            c.execute("DELETE FROM webhooks WHERE id=?", (webhook_id,))
+        await agent.vault.delete(f"webhook/{webhook_id}")
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "webhooks", "op": "delete", "id": webhook_id}, now_ms=agent.clock())
+        return {"ok": True, "deleted": True, "id": webhook_id}
+
+    @app.post(f"{API_PREFIX}/settings/webhooks/{{webhook_id}}/test")
+    async def test_webhook(request: Request, webhook_id: str):
+        """#94(测),级别 A:给该 webhook 投一条测试事件(走正常的 outbox → 投递器,**不绕过签名**)。"""
+        _principal(request, "admin")
+        w = _webhook_or_404(webhook_id)
+        now = agent.clock()
+        seq = agent.store.insert_outbox_event(event_id=ulid(now), target=f"webhook:{webhook_id}", event="alert",
+                                              trace_id=None, account_id=None, channel=None,
+                                              payload_json=json.dumps({"code": "WEBHOOK_TEST", "severity": "info",
+                                                                       "state": "firing", "subject": "host"}, ensure_ascii=False),
+                                              now_ms=now)
+        res = await agent.webhooks.deliver_due(now_ms=now)
+        row = agent.store.con.execute("SELECT status, last_error FROM events_outbox WHERE seq=?", (seq,)).fetchone()
+        return {"ok": True, "id": webhook_id, "url": w["url"], "seq": seq,
+                "status": row["status"] if row else None, "last_error": row["last_error"] if row else None, **res}
+
+    # ------------------------------------------------------------------ #96~#101 媒体与运行时动作
+    @app.post(f"{API_PREFIX}/messages/{{message_id}}/media/{{idx}}/fetch")
+    async def fetch_media(request: Request, message_id: str, idx: int):
+        """#96,级别 W:触发懒加载媒体下载,立即回 ``{media_id, sha256?, state}``;已就绪直接带 ``sha256``。"""
+        p = _principal(request, "write")
+        row = agent.store.get_message_full(message_id)
+        if row is None or not p.allows_account(row["account_id"]):
+            raise ApiError(404, "TARGET_NOT_FOUND", f"消息不存在:{message_id}")
+        try:
+            media = json.loads(row.get("media_json") or "[]")
+        except ValueError:
+            media = []
+        if idx < 0 or idx >= len(media):
+            raise ApiError(404, "TARGET_NOT_FOUND", f"消息 {message_id} 没有第 {idx} 个媒体")
+        item = media[idx]
+        mid = item.get("media_id")
+        if mid is None:
+            mid = agent.media.note(kind=item.get("kind") or "other",
+                                   origin={k: item[k] for k in ("url", "wa_path", "file", "ref") if k in item},
+                                   message_id=message_id)
+            if mid is None:
+                raise ApiError(507, "DISK_FULL", "磁盘 critical 水位,暂停媒体入库", reason="disk_critical", needs_human=True)
+        out = await agent.media.fetch_into(int(mid))
+        return {"ok": True, "media_id": out.get("media_id"), "sha256": out.get("sha256"), "state": out.get("status"),
+                "fail_reason": out.get("fail_reason")}
+
+    @app.get(f"{API_PREFIX}/media/{{sha256}}")
+    async def get_media(request: Request, sha256: str):
+        """#55:按 hash 取媒体字节;到期删了文件(``expired``)→ **410**。"""
+        _principal(request, "read")
+        row = agent.media.by_sha256(sha256)
+        if row is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"媒体不存在:{sha256}")
+        data = agent.media.read_file(int(row["id"]))
+        if data is None:
+            raise ApiError(410, "TARGET_NOT_FOUND", "媒体文件已按保留期删除", reason="expired")
+        return Response(content=data, media_type=row["mime"] or "application/octet-stream")
+
+    def _runtime_action_guard(p: Principal, account_id: str, channels: tuple[str, ...]) -> dict[str, Any]:
+        require_account(p, account_id)
+        row = agent.accounts.get(account_id)
+        if row["channel"] not in channels:
+            raise ApiError(409, "NOT_APPLICABLE", f"{row['channel']} 通道不支持本操作", reason="not_applicable")
+        return row
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/webui/open")
+    async def webui_open(request: Request, account_id: str):
+        """#97,级别 W:QQ 临时开 NapCat WebUI(C-35);``running`` 态下开需重启容器,响应带 ``restart:true``。"""
+        p = _principal(request, "write")
+        row = _runtime_action_guard(p, account_id, ("qq",))
+        request.state.account_id = account_id
+        body = await _json_or_empty(request)
+        minutes = int(body.get("minutes") or cfg.runtime.webui_temp_minutes)
+        until = agent.clock() + minutes * 60_000
+        res = await agent.accounts.set_webui(account_id, True, until_ms=until, actor=p.actor)
+        port = row.get("webui_port") or (16300 + int(row["seq"]))
+        return {"ok": True, "url": f"http://127.0.0.1:{port}/", "until": iso8601(until), **res}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/webui/close")
+    async def webui_close(request: Request, account_id: str):
+        """#98,级别 W:关 WebUI + 重启容器;已关 → 200 no-op。"""
+        p = _principal(request, "write")
+        _runtime_action_guard(p, account_id, ("qq",))
+        request.state.account_id = account_id
+        return {"ok": True, **(await agent.accounts.set_webui(account_id, False, actor=p.actor))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/export-identity")
+    async def export_identity(request: Request, account_id: str):
+        """#99,级别 A,**仅 QQ**:打包 ``accounts/<id>/data`` → ``202 {job_id}``;账号须 ``stopped``(卷一致性)否则 409。
+
+        企点数据卷**不提供导出**(设备档案不可迁移)⇒ ``NOT_APPLICABLE``。"""
+        p = _principal(request, "admin")
+        row = _runtime_action_guard(p, account_id, ("qq",))
+        request.state.account_id = account_id
+        if row["state"] != "stopped":
+            raise ApiError(409, "NOT_APPLICABLE", f"导出前须先停止账号(当前 {row['state']})", reason="not_stopped")
+        job_id = agent.store.job_create(kind="identity_export", actor=p.actor, account_id=account_id)
+        agent.spawn_job(job_id, "identity_export", lambda: agent.export_identity_job_body(job_id, account_id))
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/runtime/reconnect-adb")
+    async def reconnect_adb(request: Request, account_id: str):
+        """#100,级别 W,**仅企点**:``adb disconnect`` + ``connect``(与 04 H06 自愈同一实现)→ ``{ok, adb_state}``。"""
+        p = _principal(request, "write")
+        row = _runtime_action_guard(p, account_id, ("qidian",))
+        request.state.account_id = account_id
+        return {"ok": True, **(await agent.reconnect_adb(row))}
+
+    @app.post(f"{API_PREFIX}/accounts/{{account_id}}/runtime/restart-stream")
+    async def restart_stream(request: Request, account_id: str):
+        """#101,级别 W,**仅企点**:重建 ``adb forward`` 与 scrcpy-server(04 H07 自愈同一实现)。
+
+        ⚠️ 画面流(#34 WS)本期没有执行体 ⇒ 这里只做 ``adb forward`` 的重建并如实回 ``stream_restarted:false``,
+        **不假装重建了 scrcpy**(见 rulings R6-58 (cw))。"""
+        p = _principal(request, "write")
+        row = _runtime_action_guard(p, account_id, ("qidian",))
+        request.state.account_id = account_id
+        return {"ok": True, **(await agent.restart_stream(row))}
+
+    # ------------------------------------------------------------------ #88 / #89 的 mail 组(01 §2.7.10 的四块同构卡片)
+    MAIL_SCOPES = ("default", "qidian", "qq", "wechat")
+
+    def _mail_scope_view(channel: Optional[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """一块卡片 = 一条 ``mail_routes`` 行(全局行 = ``channel IS NULL``);``*_ref``/密码**只回引用不回值**(#88)。"""
+        row = next((r for r in rows if (r["channel"] or None) == channel and r["account_id"] is None), None)
+        inbound = json.loads((row or {}).get("inbound_json") or "{}")
+        outbound = json.loads((row or {}).get("outbound_json") or "{}")
+        for blob in (inbound, outbound):
+            blob.pop("secret", None)
+            blob.pop("password", None)
+        return {"override": row is not None, "route_id": (row or {}).get("id"),
+                "enabled": bool((row or {}).get("enabled", 1)), "inbound": inbound, "outbound": outbound}
+
+    @app.get(f"{API_PREFIX}/settings/mail")
+    async def get_settings_mail(request: Request):
+        """#88 的 ``mail`` 组(级别 A):``[mail]`` 总开关 + 四块同构 ``scopes``(全局默认 + 三通道)。
+
+        02 #88 只写「只含 `[mail]` 总开关与全局路由的默认值」、没给 ``scopes`` 的逐字形状;
+        这里按 01 §2.7.10 的四块卡片给,形态登记在 rulings R6-58 (bs)。``senders[].shortname`` 走 ``/mail/hmac-keys`` 侧反查,不随组下发。
+        """
+        _principal(request, "admin")
+        rows = _mail_or_503().ms.routes_list()
+        return {"ok": True, "data": {"enabled": cfg.mail.enabled,
+                                     "require_signature": cfg.mail.inbound.require_signature,
+                                     "template_version": cfg.mail.template_version,
+                                     "scopes": {s: _mail_scope_view(None if s == "default" else s, rows) for s in MAIL_SCOPES}}}
+
+    @app.put(f"{API_PREFIX}/settings/mail")
+    async def put_settings_mail(request: Request):
+        """#89 的 ``mail`` 组(级别 A):按 ``scopes`` 逐块 upsert ``mail_routes``(全局行 ``channel=NULL``),写完 ``reload()``。"""
+        _principal(request, "admin")
+        mail = _mail_or_503()
+        body = await request.json()
+        scopes = body.get("scopes")
+        if not isinstance(scopes, dict) or any(s not in MAIL_SCOPES for s in scopes):
+            raise ApiError(400, "INVALID_ARGS", f"scopes 的键须为 {'|'.join(MAIL_SCOPES)}", reason="bad_scopes",
+                           extra={"details": [{"pointer": "/scopes"}]})
+        written: dict[str, int] = {}
+        for name, blob in scopes.items():
+            if not isinstance(blob, dict) or not blob.get("override", True):
+                continue
+            written[name] = mail.ms.route_upsert(channel=None if name == "default" else name, account_id=None,
+                                                 inbound_json=blob.get("inbound") or {}, outbound_json=blob.get("outbound") or {},
+                                                 enabled=bool(blob.get("enabled", True)))
+        mail.reload()
+        return {"ok": True, "written": written}
+
+    # ---- #88/#89 的 `{group}` 兜底路由必须**排在全部具体 `/settings/*` 路由之后**(FastAPI 按注册顺序匹配,
+    #      否则 `/settings/webhooks` 会先被 `{group}` 吃掉)
+    @app.get(f"{API_PREFIX}/settings/{{group}}")
+    async def get_settings_group(request: Request, group: str):
+        """#88:分组读;``api``/``mail`` 组要 A,其余 R。``*_ref`` 只回引用、密码类字段不出现。"""
+        if group not in SETTINGS_GROUPS:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"未知配置组:{group}")
+        _principal(request, "admin" if group in ADMIN_GROUPS else "read")
+        return {"ok": True, "group": group, "data": _group_view(group)}
+
+    @app.put(f"{API_PREFIX}/settings/{{group}}")
+    async def put_settings_group(request: Request, group: str):
+        """#89,级别 A:整组替换(缺省键回默认);写回 ``agent.toml``(**原子写:临时文件 + rename**)+ 热加载;
+        不可热加载的项回 ``restart_required:true``;密码类字段**只写不读**(给 ``secret`` 即写 Vault 并回 ``secret_ref``)。
+
+        🔴 ``AgentConfig`` 是 frozen dataclass、进程内**不做半截热改**:本端点把整组值原子落盘 + 落
+        ``settings['config.<group>']``,并一律回 ``restart_required``(哪些项真能热加载由各模块自己声明,
+        02 §3.4.6 没给清单,见 rulings R6-58 (cv))。``resources`` 组直接写 ``resource_pools``。
+        """
+        p = _principal(request, "admin")
+        if group not in SETTINGS_GROUPS:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"未知配置组:{group}")
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ApiError(400, "INVALID_ARGS", "请求体须为对象", reason="bad_body")
+        warnings: list[str] = []
+        if group == "resources":
+            return {"ok": True, "group": group, **_put_resources(body, p.actor)}
+        if group == "mail":
+            return await put_settings_mail(request)
+        if group == "retention":
+            checked = _validate_retention(body)
+            body, warnings = checked["value"], checked["warnings"]
+        secret_refs = await _stash_secrets(group, body, p.actor)
+        agent.store.settings_set(f"config.{group}", body, actor=p.actor)
+        written = _write_agent_toml(group, body)
+        return {"ok": True, "group": group, "data": body, "secret_refs": secret_refs,
+                "restart_required": True, "config_written": written, "warnings": warnings}
+
 
     # ------------------------------------------------------------------ 邮件 /mail(06 §3.2;命名以 06 为准,C-29)
     def _mail_or_503():
@@ -787,6 +1428,179 @@ def create_api(agent) -> FastAPI:
         """#56,级别 R:不带 ``route_id`` 回全部路由。"""
         _principal(request, "read")
         return {"ok": True, "data": _mail_or_503().status(route_id or route)}
+
+    @app.post(f"{API_PREFIX}/mail/fetch")
+    async def mail_fetch(request: Request):
+        """#57,级别 W:``{route_id?}`` 手动触发一轮收 → ``202 {run_id}``(发件队列由投递器自动排空,单封用 #62)。"""
+        p = _principal(request, "write")
+        mail = _mail_or_503()
+        body = await _json_or_empty(request)
+        route_id = body.get("route_id")
+        keys = [r.mailbox_key for r in mail.routes.routes if route_id is None or str(r.id) == str(route_id)]
+        if route_id is not None and not keys:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"路由不存在:{route_id}")
+        run_id = ulid(agent.clock())
+
+        async def one_round() -> None:
+            out = await asyncio.to_thread(lambda: {k: f.run_once() for k, f in mail.fetchers.items() if k in keys})
+            await mail.dispatch(agent.bus)
+            log.info("#57 手动取信 run=%s:%s", run_id, out)
+
+        asyncio.create_task(one_round(), name=f"mail-fetch:{run_id}")
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="mail.fetch",
+                                 result_code="OK", detail={"run_id": run_id, "route_id": route_id}, now_ms=agent.clock())
+        return JSONResponse(status_code=202, content={"ok": True, "run_id": run_id, "mailboxes": sorted(keys)})
+
+    @app.post(f"{API_PREFIX}/mail/test")
+    async def mail_test(request: Request):
+        """#66,级别 A:``{which:'inbound'|'outbound', route_id?}`` 连通 + 登录测试;
+        ``inbound`` 同时报 ``imap_ok``/``pop3_ok`` 两个结论(E-1 回落的前置判断)。
+
+        **只连配置里那一个邮箱**,不发任何邮件;开发容器里后端是 ``FakeImap``/``FakePop3``/``FakeSmtp``。"""
+        _principal(request, "admin")
+        mail = _mail_or_503()
+        body = await _json_or_empty(request)
+        which = body.get("which")
+        if which not in ("inbound", "outbound"):
+            raise ApiError(400, "INVALID_ARGS", "which 须为 inbound|outbound", reason="bad_which",
+                           extra={"details": [{"pointer": "/which"}]})
+        route_id = body.get("route_id")
+        route = next((r for r in mail.routes.routes if route_id is None or str(r.id) == str(route_id)), None)
+        if route is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"路由不存在:{route_id}")
+
+        def probe(factory, label: str) -> dict[str, Any]:
+            if factory is None:
+                return {f"{label}_ok": False, f"{label}_error": "backend_not_wired"}
+            try:
+                backend = factory(route)
+                backend.connect()
+                backend.login()
+                closer = getattr(backend, "logout", None) or getattr(backend, "close", None)
+                if closer is not None:
+                    closer()
+            except Exception as e:
+                return {f"{label}_ok": False, f"{label}_error": repr(e)[:200]}
+            return {f"{label}_ok": True}
+
+        if which == "outbound":
+            out = await asyncio.to_thread(probe, mail.smtp_factory, "smtp")
+        else:
+            imap = await asyncio.to_thread(probe, mail.imap_factory, "imap")
+            pop3 = await asyncio.to_thread(probe, mail.pop3_factory, "pop3")
+            out = {**imap, **pop3}
+        return {"ok": True, "which": which, "route_id": route.id, **out}
+
+    # ------------------------------------------------------------------ #103 邮件模板 CRUD(E-4;表 mail_templates)
+    #: 🔴 R6-58 (h):02 §3.1 的 CHECK 已改成 ``('ibquote-163-v1','collector-v1','qtrade-v1')``,
+    #: ``qtrade-v1`` **直接落库**——原先借用 ``custom`` 格位的映射层(``TEMPLATE_PROFILE_DDL_FALLBACK``)已随之删除。
+    #: ``custom`` 这个取值按 R-13 作废,入参给它一律 ``400 profile_custom_removed``。
+    TEMPLATE_PROFILES_ALLOWED = ("ibquote-163-v1", "collector-v1", "qtrade-v1")
+
+    def _template_row_view(row: dict[str, Any]) -> dict[str, Any]:
+        return {"id": row["id"], "name": row["name"], "kind": row["kind"], "subject_pattern": row["subject_pattern"],
+                "body_fields": json.loads(row["body_fields_json"] or "[]"),
+                # R6-58 (h):库里存什么就回什么,不再有格位借用
+                "compat_profile": row["compat_profile"],
+                "version": row["version"], "builtin": bool(row["builtin"]),
+                "created_at": iso8601(row["created_ms"]), "updated_at": iso8601(row["updated_ms"])}
+
+    def _template_or_404(tpl_id: int) -> dict[str, Any]:
+        r = agent.store.con.execute("SELECT * FROM mail_templates WHERE id=?", (tpl_id,)).fetchone()
+        if r is None:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"邮件模板不存在:{tpl_id}")
+        return dict(r)
+
+    def _template_body(body: dict[str, Any], *, require_all: bool) -> dict[str, Any]:
+        for key in ("name", "kind", "subject_pattern"):
+            if require_all and (not isinstance(body.get(key), str) or not body[key].strip()):
+                raise ApiError(400, "INVALID_ARGS", f"{key} 必填", reason=f"bad_{key}", extra={"details": [{"pointer": f"/{key}"}]})
+        if "kind" in body and body["kind"] not in ("inbound", "outbound"):
+            raise ApiError(400, "INVALID_ARGS", "kind 须为 inbound|outbound", reason="bad_kind", extra={"details": [{"pointer": "/kind"}]})
+        profile = body.get("compat_profile", "qtrade-v1")
+        if profile == "custom":
+            raise ApiError(400, "INVALID_ARGS", "compat_profile 的 'custom' 已被 R-13 删除,请用 'qtrade-v1'",
+                           reason="profile_custom_removed", extra={"details": [{"pointer": "/compat_profile"}]})
+        if profile not in TEMPLATE_PROFILES_ALLOWED:
+            raise ApiError(400, "INVALID_ARGS", f"compat_profile 须为 {'|'.join(TEMPLATE_PROFILES_ALLOWED)}",
+                           reason="bad_profile", extra={"details": [{"pointer": "/compat_profile"}]})
+        fields = body.get("body_fields", [])
+        if not isinstance(fields, list) or any(not isinstance(x, dict) or not x.get("key") for x in fields):
+            raise ApiError(400, "INVALID_ARGS", "body_fields 须为 [{key,label,order,required,empty}]", reason="bad_body_fields",
+                           extra={"details": [{"pointer": "/body_fields"}]})
+        return {"profile": profile, "fields": fields}
+
+    @app.get(f"{API_PREFIX}/settings/mail/templates")
+    async def list_mail_templates(request: Request, kind: Optional[str] = None):
+        """#103(列),级别 A。随包三份**内置模板是代码常量、不入表**(06 §3.1 末句),走 ``/templates/defaults``。"""
+        _principal(request, "admin")
+        sql = "SELECT * FROM mail_templates" + (" WHERE kind=?" if kind else "") + " ORDER BY id"
+        rows = [dict(r) for r in agent.store.con.execute(sql, (kind,) if kind else ())]
+        return {"ok": True, "data": [_template_row_view(r) for r in rows]}
+
+    @app.post(f"{API_PREFIX}/settings/mail/templates", status_code=201)
+    async def create_mail_template(request: Request):
+        """#103(建),级别 A。"""
+        p = _principal(request, "admin")
+        body = await request.json()
+        parsed = _template_body(body, require_all=True)
+        now = agent.clock()
+        stored_profile = parsed["profile"]
+        try:
+            cur = agent.store.con.execute(
+                "INSERT INTO mail_templates(name, kind, subject_pattern, body_fields_json, compat_profile, version, builtin, "
+                "created_ms, updated_ms) VALUES (?,?,?,?,?,1,0,?,?)",
+                (body["name"].strip(), body["kind"], body["subject_pattern"],
+                 json.dumps(parsed["fields"], ensure_ascii=False), stored_profile, now, now))
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                raise ApiError(400, "INVALID_ARGS", f"模板名已存在:{body['name']}", reason="name_taken",
+                               extra={"details": [{"pointer": "/name"}]})
+            raise
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "mail_templates", "op": "create"}, now_ms=now)
+        return {"ok": True, "data": _template_row_view(_template_or_404(int(cur.lastrowid)))}
+
+    @app.put(f"{API_PREFIX}/settings/mail/templates/{{tpl_id}}")
+    async def put_mail_template(request: Request, tpl_id: int):
+        """#103(改),级别 A:``version`` **必须递增**(不递增 → 400);内置模板不可改。"""
+        p = _principal(request, "admin")
+        row = _template_or_404(tpl_id)
+        if row["builtin"]:
+            raise ApiError(409, "NOT_APPLICABLE", "内置模板不可改,请另存一份", reason="builtin_readonly")
+        body = await request.json()
+        parsed = _template_body(body, require_all=False)
+        version = body.get("version")
+        if not isinstance(version, int) or version <= int(row["version"]):
+            raise ApiError(400, "INVALID_ARGS", f"version 必须递增(当前 {row['version']})", reason="version_not_increasing",
+                           extra={"details": [{"pointer": "/version"}]})
+        now = agent.clock()
+        stored_profile = parsed["profile"]
+        agent.store.con.execute(
+            "UPDATE mail_templates SET name=?, kind=?, subject_pattern=?, body_fields_json=?, compat_profile=?, version=?, updated_ms=? "
+            "WHERE id=?",
+            (body.get("name", row["name"]), body.get("kind", row["kind"]), body.get("subject_pattern", row["subject_pattern"]),
+             json.dumps(parsed["fields"], ensure_ascii=False), stored_profile, version, now, tpl_id))
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "mail_templates", "op": "put", "id": tpl_id}, now_ms=now)
+        return {"ok": True, "data": _template_row_view(_template_or_404(tpl_id))}
+
+    @app.delete(f"{API_PREFIX}/settings/mail/templates/{{tpl_id}}")
+    async def delete_mail_template(request: Request, tpl_id: int):
+        """#103(删),级别 A:``builtin=1`` 或**被任一 `mail_routes` 引用** → 409。"""
+        p = _principal(request, "admin")
+        row = _template_or_404(tpl_id)
+        if row["builtin"]:
+            raise ApiError(409, "NOT_APPLICABLE", "内置模板不可删", reason="builtin_readonly")
+        used = agent.store.con.execute(
+            "SELECT COUNT(*) FROM mail_routes WHERE outbound_template_id=? OR inbound_template_id=?", (tpl_id, tpl_id)).fetchone()[0]
+        if used:
+            raise ApiError(409, "RESOURCE_EXHAUSTED", f"模板被 {used} 条邮箱路由引用,先改路由再删", reason="template_in_use",
+                           extra={"routes": used})
+        agent.store.con.execute("DELETE FROM mail_templates WHERE id=?", (tpl_id,))
+        agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",
+                                 result_code="OK", detail={"group": "mail_templates", "op": "delete", "id": tpl_id}, now_ms=agent.clock())
+        return {"ok": True, "deleted": True, "id": tpl_id}
 
     @app.get(f"{API_PREFIX}/mail/inbox")
     async def mail_inbox(request: Request, status: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None,
@@ -968,16 +1782,34 @@ def create_api(agent) -> FastAPI:
     # ------------------------------------------------------------------ WS /events(02 §3.4.7)
     @app.websocket(f"{API_PREFIX}/events")
     async def ws_events(ws: WebSocket):
-        token = ""
-        auth = ws.headers.get("Authorization", "")
-        if auth.lower().startswith("bearer "):
-            token = auth[7:].strip()
-        token = token or ws.query_params.get("token", "")
-        row = agent.store.api_client_by_token(token) if token else None
-        if row is None:
-            await ws.close(code=4401)
-            return
-        p = principal_from_row(row, transport="local" if (ws.client and ws.client.host in ("127.0.0.1", "::1")) else "http")
+        """§3.4.7 握手:``Authorization`` 头或 ``?token=``(浏览器 WS 不能带头);
+        **HMAC 客户端用 ``?app_id&ts&nonce&sig``**(对 ``GET /api/v1/events`` 签)。"""
+        transport = "local" if (ws.client and ws.client.host in ("127.0.0.1", "::1")) else "http"
+        q = ws.query_params
+        p: Optional[Principal] = None
+        if q.get("app_id") and q.get("sig") and getattr(agent, "hmac", None) is not None:
+            # canonical 的 query 里**不含签名四件套本身**(否则自指);与 HTTP 侧同一套 canonical_string
+            rest = "&".join(f"{k}={v}" for k, v in sorted(q.items()) if k not in ("app_id", "ts", "nonce", "sig"))
+            try:
+                res = await agent.hmac.verify(method="GET", path=f"{API_PREFIX}/events", query=rest, body=b"",
+                                              headers={"X-QT-AppId": q["app_id"], "X-QT-Timestamp": q.get("ts", ""),
+                                                       "X-QT-Nonce": q.get("nonce", ""), "X-QT-Signature": q["sig"]},
+                                              client_ip=ws.client.host if ws.client else None)
+                p = res.principal
+            except ApiError:
+                await ws.close(code=4401)
+                return
+        if p is None:
+            token = ""
+            auth = ws.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+            token = token or q.get("token", "")
+            row = agent.store.api_client_by_token(token) if token else None
+            if row is None:
+                await ws.close(code=4401)
+                return
+            p = principal_from_row(row, transport=transport)
         await ws.accept()
         try:
             first = await asyncio.wait_for(ws.receive_json(), timeout=10)

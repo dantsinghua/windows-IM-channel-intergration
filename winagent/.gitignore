@@ -2,6 +2,8 @@
 # 但那里放的是**打包脚本与 spec(源文件,必须入库)**,不是构建产物。
 # 深层 .gitignore 的规则覆盖上层,故在这里显式取消忽略,再单独忽略真正的产物目录。
 !build/
+# OMC 运行期状态(各处自动生成,属忽略的操作性产物;根 .gitignore 没收它,这里补上)
+.omc/
 build/build/
 dist/
 .venv-build/

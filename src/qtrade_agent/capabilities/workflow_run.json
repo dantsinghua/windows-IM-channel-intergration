@@ -1,0 +1,36 @@
+{
+  "op": "workflow_run",
+  "kind": "admin",
+  "danger": true,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "workflow_id": {
+        "type": "string"
+      },
+      "args": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "workflow_id"
+    ]
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

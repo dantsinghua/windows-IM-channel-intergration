@@ -1,0 +1,37 @@
+{
+  "op": "account_switch",
+  "kind": "admin",
+  "danger": true,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "confirm": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "holder_before": {
+        "type": "string"
+      },
+      "target": {
+        "type": "string"
+      },
+      "login_session_id": {
+        "type": "string"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

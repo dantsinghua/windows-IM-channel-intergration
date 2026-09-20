@@ -277,3 +277,73 @@ async def test_binary_endpoints_survive_the_agent_client_raw_mode(tmp_path):
     assert s2 == 200 and png.startswith(b"\x89PNG") and h2.get("content-type") == "image/png"
     await rig.deps.hub.stop()
     rig.db.close()
+
+
+# ---------------------------------------------------------------- 实测采样候选 / 采纳(整合裁决 (ci) 补的两个端点)
+async def test_agent_can_write_read_and_adopt_observed(pair):
+    """02 #76b 要 Agent 做的那两件事,现在在 ``/wa/v1`` 侧有入口了(此前 Agent 只能回 503)。
+
+    这里用 Agent 侧真实客户端的通用 ``request()`` 打 —— 客户端的专用方法名由 integrator 同步加,
+    **HTTP 契约(路径 / 入参键 / 出参键)以本用例为准**。
+    """
+    rig, cl = pair
+    rows = [{"channel": "wechat", "account_id": "wx01", "hostname": "long.weixin.qq.com",
+             "ip": "203.205.254.1", "port": 443, "proto": "tcp", "side": "windows", "samples": 3},
+            {"channel": "qidian", "account_id": "qd01", "hostname": "msfxg.3g.qq.com",
+             "ip": "180.163.1.1", "port": 8080, "proto": "tcp", "side": "container", "samples": 5}]
+    status, body = await cl.request("PUT", "/wa/v1/probes", retry=False, json={"kind": "observed", "rows": rows})
+    assert status == 200 and body == {"written": 2, "kind": "observed"}
+
+    status, body = await cl.request("GET", "/wa/v1/probes?kind=observed", retry=True)
+    assert status == 200 and len(body["observed"]) == 2
+    ids = sorted(int(r["id"]) for r in body["observed"])
+    assert all(r["in_config"] is False for r in body["observed"])          # 默认只勾新增项(04 §2.8.4)
+
+    status, body = await cl.request("PUT", "/wa/v1/probes/adopt", retry=False, json={"observed_ids": ids})
+    assert status == 200
+    assert body["adopted"] == ids                                          # `adopted` = 行 id 数组
+    assert sorted(body["targets"]) == ["long.weixin.qq.com:443", "msfxg.3g.qq.com:8080"]   # `targets` = "host:port"
+    assert body["hosts_by_channel"]["qidian_hosts"] == ["msfxg.3g.qq.com:8080"]
+    assert rig.db.get_setting("probe.targets") == body["targets"]          # 真写进了 winagent.db settings
+
+
+async def test_agent_adopt_is_replace_not_append(pair):
+    """04 §2.8.4「替换整表不追加」—— 控制台取消勾选后,旧目标必须真的消失,否则用户删不掉。"""
+    rig, cl = pair
+    await cl.request("PUT", "/wa/v1/probes", retry=False, json={"kind": "observed", "rows": [
+        {"channel": "wechat", "hostname": "long.weixin.qq.com", "ip": "1.1.1.1", "port": 443,
+         "proto": "tcp", "side": "windows"},
+        {"channel": "qq", "hostname": "msfwifi.3g.qq.com", "ip": "2.2.2.2", "port": 8080,
+         "proto": "tcp", "side": "container"}]})
+    _s, listed = await cl.request("GET", "/wa/v1/probes?kind=observed", retry=True)
+    by_ch = {r["channel"]: int(r["id"]) for r in listed["observed"]}
+    await cl.request("PUT", "/wa/v1/probes/adopt", retry=False,
+                     json={"observed_ids": [by_ch["wechat"], by_ch["qq"]]})
+    _s2, after = await cl.request("PUT", "/wa/v1/probes/adopt", retry=False, json={"observed_ids": [by_ch["qq"]]})
+    assert after["adopted"] == [by_ch["qq"]] and after["targets"] == ["msfwifi.3g.qq.com:8080"]
+
+
+async def test_agent_adopt_is_a_write_class_call_not_retried(pair):
+    """02 §2.5:写类不重试。采纳是写类 —— 重发会把「取消勾选」那一半重放,语义上不能重试。"""
+    rig, _cl = pair
+    calls: list[str] = []
+    inner = agent_transport(rig)
+
+    async def counting(method, url, headers, body, timeout_s):
+        calls.append(f"{method} {url.split('://', 1)[-1].split('/', 1)[1]}")
+        raise OSError("transient")
+    cl2 = WinAgentClient(AgentWinAgentConfig(), transport=counting, base_url="http://winagent.test", token=AGENT_TOKEN)
+    with pytest.raises(WinAgentUnavailable):
+        await cl2.request("PUT", "/wa/v1/probes/adopt", retry=False, json={"observed_ids": []})
+    assert len(calls) == 1
+
+
+async def test_agent_gets_403_not_404_when_using_console_token(pair):
+    """写类沿用 #16 的 A 令牌;控制台经 Agent 调,不直连 17610(R-07)。"""
+    rig, _cl = pair
+    console = WinAgentClient(AgentWinAgentConfig(), transport=agent_transport(rig),
+                             base_url="http://winagent.test", token=CONSOLE_TOKEN)
+    status, body = await console.request("PUT", "/wa/v1/probes/adopt", retry=False, json={"observed_ids": []})
+    assert status == 403 and body["code"] == "FORBIDDEN"
+    status2, _ = await console.request("GET", "/wa/v1/probes?kind=observed", retry=True)
+    assert status2 == 200                                                  # 读端点沿用 #15 的 A/C/I

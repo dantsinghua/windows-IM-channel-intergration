@@ -9,7 +9,9 @@ from typing import Any, Optional
 
 from qtrade_agent.adapters.base import Account
 from qtrade_agent.adapters.wechat import FakeWeChatWinAgent, WechatAdapter, WeChatWinAgent, WechatPoller
+from qtrade_agent.bus.bus import Bus
 from qtrade_agent.config import AgentConfig
+from qtrade_agent.gate import Gate
 from qtrade_agent.events import Events
 from qtrade_agent.pool import Pool
 from qtrade_agent.store import Store
@@ -41,10 +43,18 @@ class WeRig:
     def events_of(self, name: str) -> list[dict[str, Any]]:
         return [e for e in self.store.list_events(event=name)]
 
+    def make_bus(self) -> Bus:
+        """把微信适配器挂到真总线上(登录门 → 校验 → 幂等 → 闸 → 队列 → `_finalize` 落 `command_results`)。
+
+        D-1 这类「`data` 不可 JSON 序列化」的缺陷只有**经总线**才复现:直调 `adapter.execute` 不经
+        `store.finish_command` 的 `json.dumps`。"""
+        return Bus(store=self.store, events=self.events, adapters={"wechat": self.adapter},
+                   cfg=self.cfg, clock=self.clock, gate=Gate(self.store))
+
 
 def make_wechat_rig(tmp_path, *, clock: Optional[Clock] = None, cfg: Optional[AgentConfig] = None,
                     account_id: str = "wx01", state: str = "running", wsl_total_mb: int = 11264,
-                    windows_total_mb: int = 16384) -> WeRig:
+                    windows_total_mb: int = 16384, media_put=None) -> WeRig:
     clock = clock or Clock()
     cfg = cfg or AgentConfig()
     store = Store(str(tmp_path / "agent.db"), clock=clock, out_merge_window_s=cfg.bus.out_merge_window_s,
@@ -59,7 +69,7 @@ def make_wechat_rig(tmp_path, *, clock: Optional[Clock] = None, cfg: Optional[Ag
     wa = WinAgentClient(cfg.winagent, transport=fake, base_url="http://winagent.fake:17610", token=fake.token, clock=clock)
     client = WeChatWinAgent(wa)
     poller = WechatPoller(store=store, events=events, client=client, cfg=cfg, clock=clock)
-    adapter = WechatAdapter(poller, client=client, store=store)
+    adapter = WechatAdapter(poller, client=client, store=store, media_put=media_put)
 
     purged: list[str] = []
     transitions: list[tuple[str, str, Optional[str], str]] = []

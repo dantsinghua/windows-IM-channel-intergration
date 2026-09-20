@@ -1,0 +1,34 @@
+{
+  "op": "system_cleanup_run",
+  "kind": "admin",
+  "danger": false,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "trigger": {
+        "type": "string",
+        "enum": [
+          "manual",
+          "watermark"
+        ]
+      }
+    }
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "job_id": {
+        "type": "string"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

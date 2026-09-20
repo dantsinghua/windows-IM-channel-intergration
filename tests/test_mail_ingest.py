@@ -348,3 +348,19 @@ def test_attachment_becomes_media_reference_in_args(store, clock):
     cmd = env.service.ingest.pending[0].command
     assert cmd.args["image"]["media_ref"] == "quote.png" and len(cmd.args["image"]["sha256"]) == 64
     assert json.loads(last_row(env)["attach_json"])[0]["mime_sniffed"] == "image/jpeg"
+
+
+def test_disk_full_is_not_isolated_as_poison_mail(store, clock, tmp_path, monkeypatch):
+    """02 §2.8.8:盘满不是毒邮件——`DiskFullError` 原样上抛,不落 INGEST_ERROR 隔离行(否则盘满解除后也不会重收)。"""
+    import pytest
+    from qtrade_agent.maintenance import DiskFullError
+
+    env = make_env(store, clock, tmp_path=tmp_path)
+
+    def boom(mail):
+        raise DiskFullError(free_mb=10, db_size_mb=1.0, media_size_mb=1.0)
+
+    monkeypatch.setattr(env.service.ingest, "_ingest_raw", boom)
+    with pytest.raises(DiskFullError):
+        feed(env, command_mail())
+    assert env.inbox_rows() == []

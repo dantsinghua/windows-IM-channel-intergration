@@ -53,7 +53,7 @@ class WechatLoginFlow:
     def __init__(self, *, store, client: WeChatWinAgent, slot, cfg: AgentConfig,
                  transition: Callable[..., dict[str, Any]], clock: Callable[[], int],
                  sleep: Optional[Callable[[float], Awaitable[None]]] = None,
-                 status_interval_s: float = STATUS_INTERVAL_S, bind_retry_max: int = BIND_RETRY_MAX):
+                 status_interval_s: float = STATUS_INTERVAL_S, bind_retry_max: Optional[int] = None):
         self._store = store
         self._client = client
         self._slot = slot
@@ -62,7 +62,9 @@ class WechatLoginFlow:
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
         self._status_interval_s = status_interval_s
-        self._bind_retry_max = bind_retry_max
+        # 05 §7 / docs/07 §[accounts]:``bind_retry_max`` 是 **agent.toml 的配置项**,不是写死的常量;
+        # 构造参数仍可覆盖(单测用),缺省取 ``cfg.accounts.bind_retry_max``。
+        self._bind_retry_max = bind_retry_max if bind_retry_max is not None else cfg.accounts.bind_retry_max
 
     # ------------------------------------------------------------------ 主流程
     async def run(self, account_id: str, login_session_id: str) -> str:

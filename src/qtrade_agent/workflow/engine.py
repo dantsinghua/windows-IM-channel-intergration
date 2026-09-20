@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
 from ..ids import ulid
+from ..maintenance import DiskFullError
 from ..models import Command, CommandOrigin
 from .model import WorkflowDef, WorkflowError, WorkflowParseError, parse_workflow
 
@@ -231,6 +232,13 @@ class WorkflowEngine:
                 except asyncio.CancelledError:
                     self._step_finish(step_id, STEP_FAILED, code=None, note="cancelled")
                     raise
+                except DiskFullError as e:
+                    # §2.8.8:步骤里的写失败先判磁盘满 —— 码是 `DISK_FULL` 不是 `INTERNAL`,且 `needs_human=true`
+                    # ⇒ 与上面 `not ok and needs_human` 那条同口径落 NEEDS_HUMAN(人清完盘再续,不是让它自己重跑)。
+                    self._step_finish(step_id, STEP_NEEDS_HUMAN, code="DISK_FULL", note=e.message[:400])
+                    self._finish_run(run_id, RUN_NEEDS_HUMAN, error=f"{step.id}:DISK_FULL")
+                    self._emit(run_id, wf.name, EV_NEEDS_HUMAN, step_id=step_id)
+                    return
                 except Exception as e:                       # 步骤内异常 = 失败即停(不吞)
                     self._step_finish(step_id, STEP_FAILED, code="INTERNAL", note=repr(e)[:400])
                     self._finish_run(run_id, RUN_FAILED, error=repr(e)[:400])

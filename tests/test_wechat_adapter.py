@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from qtrade_agent.adapters.wechat.adapter import KEY_FAIL_MESSAGE, SCREEN_LOCKED_MESSAGE
-from qtrade_agent.models import Command, Message, Session
+from qtrade_agent.models import Command, Message, Session, json_safe
 from tests.test_wechat_rig import make_wechat_rig
 
 T0 = 1_758_240_000_000
@@ -177,7 +177,7 @@ async def test_execute_get_state_and_list_sessions_and_screenshot(tmp_path):
     s = await rig.adapter.execute(rig.account(), cmd("list_sessions"))
     assert s.ok and s.data["items"] == rig.fake.session_rows
     p = await rig.adapter.execute(rig.account(), cmd("screenshot"))
-    assert p.ok and p.data["png"].startswith(b"\x89PNG")
+    assert p.ok and p.data["mime"] == "image/png" and p.data["png_len"] == len(rig.fake.screenshot_png)
     u = await rig.adapter.execute(rig.account(), cmd("start_stream"))
     assert u.code == "UNSUPPORTED"
     rig.store.close()
@@ -205,3 +205,87 @@ async def test_stop_does_not_log_out_wechat(tmp_path):
     await rig.adapter.stop(rig.account(), graceful=True)
     assert rig.fake.logout_calls == 0
     rig.store.close()
+
+
+# ---------------------------------------------------------------------- D-1:screenshot 的 data 必须可 JSON
+async def test_screenshot_data_matches_capability_result_schema(tmp_path):
+    """``capabilities/screenshot.json`` 的 ``result_schema = {png_b64, width, height}``
+    (02 §3.10:``result_schema`` 就是 ``CommandResult.data``);另带 ``mime``/``png_len``/``sha256`` 便于端点与审计。
+    **裸 bytes 一个都不许有** —— 否则 `store.finish_command` 的 json.dumps 会炸(D-1)。"""
+    import base64
+    import hashlib
+    import json
+    rig = make_wechat_rig(tmp_path)
+    png = _real_png()
+    rig.fake.screenshot_png = png
+    res = await rig.adapter.execute(rig.account(), cmd("screenshot"))
+    assert res.ok and res.code == "OK"
+    assert res.data["mime"] == "image/png" and res.data["png_len"] == len(png)
+    assert res.data["sha256"] == hashlib.sha256(png).hexdigest()
+    assert (res.data["width"], res.data["height"]) == (3, 5)
+    assert base64.b64decode(res.data["png_b64"]) == png
+    # `data['png']` 是**进程内**出口(#33 二进制端点/直调用),序列化侧由 models.json_safe() 换成占位
+    assert res.data["png"] == png
+    json.dumps(json_safe(res.data))                       # 与 store.finish_command 同一条路径
+    rig.store.close()
+
+
+async def test_screenshot_through_bus_is_ok_not_internal(tmp_path):
+    """🔴 D-1 回归:``screenshot`` **经总线**要回 ``OK``(00 §8.3 只读类成功码),
+    并且结果能原样落 ``command_results.data_json``。直调 ``execute`` 复现不了——炸在 ``bus._finalize``。"""
+    import json
+    rig = make_wechat_rig(tmp_path)
+    rig.fake.screenshot_png = _real_png()
+    bus = rig.make_bus()
+    try:
+        res = await bus.submit(Command(account_id="wx01", op="screenshot", args={}))
+        assert res.ok is True and res.code == "OK", res
+        saved = rig.store.get_command_result(res.trace_id)
+        assert json.loads(saved["data_json"])["png_len"] == len(rig.fake.screenshot_png)
+    finally:
+        await bus.close()
+        rig.store.close()
+
+
+async def test_screenshot_through_bus_in_login_required(tmp_path):
+    """00 §8.1 R-06:``login_required`` 的可做集合含 ``screenshot``(操作对象是屏幕不是业务),登录门放行。"""
+    rig = make_wechat_rig(tmp_path, state="login_required")
+    rig.fake.screenshot_png = _real_png()
+    bus = rig.make_bus()
+    try:
+        res = await bus.submit(Command(account_id="wx01", op="screenshot", args={}))
+        assert res.ok is True and res.code == "OK", res
+    finally:
+        await bus.close()
+        rig.store.close()
+
+
+async def test_screenshot_prefers_media_reference_over_b64(tmp_path):
+    """02 §2.8.2:装配方注入 ``media_put`` 时图片体落 ``media/``,``data`` 只给引用、**不再重复塞 png_b64**。"""
+    calls: list[int] = []
+
+    def media_put(acct, png):
+        calls.append(len(png))
+        return {"media_id": 42, "sha256": "deadbeef"}
+
+    rig = make_wechat_rig(tmp_path, media_put=media_put)
+    rig.fake.screenshot_png = _real_png()
+    res = await rig.adapter.execute(rig.account(), cmd("screenshot"))
+    assert calls == [len(rig.fake.screenshot_png)]
+    assert res.data["media_id"] == 42 and res.data["sha256"] == "deadbeef"
+    assert "png_b64" not in res.data
+    rig.store.close()
+
+
+async def test_screenshot_falls_back_to_b64_when_media_put_fails(tmp_path):
+    """落盘失败(``media_put`` 回空)时图片体仍以 ``png_b64`` 给出——``result_schema`` 的图片体不能没有。"""
+    rig = make_wechat_rig(tmp_path, media_put=lambda acct, png: {})
+    rig.fake.screenshot_png = _real_png()
+    res = await rig.adapter.execute(rig.account(), cmd("screenshot"))
+    assert "png_b64" in res.data and "media_id" not in res.data
+    rig.store.close()
+
+
+def _real_png() -> bytes:
+    """一张 3×5 的合法 PNG 头(只需前 24 字节合法,``_png_size`` 读的就是 IHDR)。"""
+    return b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + (3).to_bytes(4, "big") + (5).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00rest"

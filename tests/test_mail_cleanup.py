@@ -42,6 +42,20 @@ def seed_pop3(env, *, status=RECEIPT_SENT, age_days=30, size=None, uidl=None):
     return iid, uidl
 
 
+def gone_from_server(env, iid, orig_uid, *, folder="INBOX") -> bool:
+    """§2.6.5:终态邮件先 MOVE 进 ``processed_folder``、到期在**那里**删 —— 原夹与原 UID 都不再是判据。"""
+    row = env.ms.inbox_get(iid)
+    return row["deleted_ms"] is not None and orig_uid not in env.imap.uids_in(folder) \
+        and row["uid"] not in env.imap.uids_in(row["folder"])
+
+
+def still_on_server(env, iid, orig_uid, *, folder="INBOX") -> bool:
+    """``NEVER_DELETE`` 两类:``deleted_ms`` 为空、**原夹原 UID 一步没动**(连 MOVE 都没做)。"""
+    row = env.ms.inbox_get(iid)
+    return row["deleted_ms"] is None and row["folder"] == folder and row["uid"] == orig_uid \
+        and orig_uid in env.imap.uids_in(folder)
+
+
 # ================================================================ §2.6.1 eligible
 def test_retention_round_archives_then_deletes(store, clock, tmp_path):
     env = env_for(store, clock, tmp_path, retention_days=7)
@@ -52,7 +66,8 @@ def test_retention_round_archives_then_deletes(store, clock, tmp_path):
     assert stats.candidates == 1 and stats.archived == 1 and stats.deleted == 1
     assert row["archived_path"] and os.path.exists(row["archived_path"])
     assert os.path.exists(os.path.join(os.path.dirname(row["archived_path"]), f"{iid}.json"))   # sidecar
-    assert row["deleted_ms"] is not None and uid in env.imap.expunged
+    assert gone_from_server(env, iid, uid)
+    assert row["folder"] == env.cfg.inbound.processed_folder        # §2.6.5 第 1 步:终态先搬进专用夹
 
 
 def test_row_not_yet_old_enough_is_not_touched(store, clock, tmp_path):
@@ -85,10 +100,9 @@ def test_oversize_and_out_of_scope_never_leave_the_server(store, clock, tmp_path
     oos, oos_uid = seed_imap(env, status=OUT_OF_SCOPE, age_days=90, subject="午餐订餐")
     normal, normal_uid = seed_imap(env, status=RECEIPT_SENT, age_days=90)
     stats = env.cleaner.run(env.imap, "imap")
-    assert stats.deleted == 1 and normal_uid in env.imap.expunged
-    assert over_uid not in env.imap.expunged and oos_uid not in env.imap.expunged
-    assert env.ms.inbox_get(over)["deleted_ms"] is None and env.ms.inbox_get(oos)["deleted_ms"] is None
-    assert env.imap.moved == []                       # 也没被搬进 processed_folder
+    assert stats.deleted == 1 and gone_from_server(env, normal, normal_uid)
+    assert still_on_server(env, over, over_uid) and still_on_server(env, oos, oos_uid)
+    assert [u for u, _ in env.imap.moved] == [normal_uid]   # 只有普通那封被搬进 processed_folder
     # 🔴 R6-26:门生效的唯一可观测证据
     assert stats.detail["skipped_oversize"] == 1 and stats.detail["skipped_out_of_scope"] == 1
     log = env.ms.cleanup_log_list()[0]
@@ -103,8 +117,8 @@ def test_capacity_watermark_deletes_oldest_but_never_the_protected(store, clock,
     old, old_uid = seed_imap(env, status=RECEIPT_SENT, age_days=99)
     stats = env.cleaner.run(env.imap, "imap")
     assert stats.trigger == TRIGGER_CAPACITY
-    assert old_uid in env.imap.expunged and over_uid not in env.imap.expunged
-    assert env.ms.inbox_get(over)["deleted_ms"] is None      # 邮箱再满也不删 OVERSIZE
+    assert gone_from_server(env, old, old_uid)
+    assert still_on_server(env, over, over_uid)              # 邮箱再满也不删 OVERSIZE
 
 
 def test_capacity_high_after_cleanup_alerts_instead_of_using_protected(store, clock, tmp_path):
@@ -126,9 +140,9 @@ def test_max_kept_trigger_skips_protected_rows(store, clock, tmp_path):
     oos, oos_uid = seed_imap(env, status=OUT_OF_SCOPE, age_days=100, subject="午餐订餐")
     stats = env.cleaner.run(env.imap, "imap")
     assert stats.trigger == TRIGGER_MAX_KEPT
-    assert normal_uid in env.imap.expunged                     # kept(2) - max_kept(1) = 1 封,删最旧
-    assert normal2_uid not in env.imap.expunged
-    assert over_uid not in env.imap.expunged and oos_uid not in env.imap.expunged
+    assert gone_from_server(env, normal, normal_uid)           # kept(2) - max_kept(1) = 1 封,删最旧
+    assert env.ms.inbox_get(normal2)["deleted_ms"] is None
+    assert still_on_server(env, over, over_uid) and still_on_server(env, oos, oos_uid)
     log = env.ms.cleanup_log_list()[0]
     assert log["trigger"] == "max_kept"                         # 02 DDL 的 CHECK 收得下(R6-31 补的枚举值)
     assert json.loads(log["detail_json"])["skipped_oversize"] == 1
@@ -193,9 +207,10 @@ def test_without_uidplus_foreign_deleted_flag_defers_expunge(store, clock, tmp_p
     env.imap.select("INBOX")
     env.imap.store_deleted(foreign)                                    # 别人标删的,未清
     stats = env.cleaner.run(env.imap, "imap")
-    assert stats.deleted == 0 and foreign not in env.imap.expunged
+    # 我们的那封搬进专用夹后在那里删;**别人标删的那封一步没动**,原夹的标删清理记 DELETE_DEFERRED 下轮再看
+    assert foreign not in env.imap.expunged and foreign in env.imap.uids_in("INBOX")
     assert any(d.get("action") == "DELETE_DEFERRED" for d in stats.detail["items"])
-    assert env.ms.inbox_get(iid)["deleted_ms"] is None
+    assert gone_from_server(env, iid, uid)
 
 
 # ================================================================ 🔴 门 ⑤:POP3 cleanup_pop3
