@@ -109,11 +109,14 @@ class AccountService:
         return t
 
     async def wait_idle(self, id: str) -> None:
-        """等该账号在途的后台序列结束(测试 / recover 用)。"""
+        """等该账号在途的后台序列结束(测试 / recover 用);被取消的序列(login_cancel)不把 CancelledError 冒给等待者(R6-57 ⑩)。"""
         t = self.tasks.get(id)
         if t is not None:
             try:
                 await t
+            except asyncio.CancelledError:
+                if not t.cancelled():
+                    raise                                       # 等待者自己被取消
             except Exception:
                 pass
 
@@ -339,8 +342,12 @@ class AccountService:
                     self.transition(id, "error", state_code="VAULT_UNAVAILABLE", state_reason=f"凭据保险库不可用({e.reason}),登录不进行", login_session_id=ls)
                     raise ApiError(503, "NOT_READY", "凭据保险库不可用,登录不进行", reason="vault_unavailable", retryable=True)
             if not secret:
-                raise ApiError(400, "INVALID_ARGS", "密码型登录需提供 secret(或先 PUT credential 保存)", reason="secret_required",
-                               extra={"details": [{"pointer": "/secret"}]})
+                # 05 §2.5.4 / §2.2.7(R6-57 取代 R6-56 ① 的 400):Vault 无条目 ⇒ login_required(WAIT_PASSWORD),等人在卡片输入,不调执行层
+                self.transition(id, "login_required", state_code="WAIT_PASSWORD", state_reason="无保存的凭据,请输入密码登录", login_session_id=ls,
+                                prompt={"kind": "WAIT_PASSWORD", "text": "请输入密码登录(可勾选保存到保险库)"})
+                self._store.insert_audit(kind="system", transport="system", actor=actor, action="account.login", account_id=id, result_code="OK",
+                                         detail={"mode": mode, "remember": remember, "login_session_id": ls, "outcome": "WAIT_PASSWORD"}, now_ms=self._clock())
+                return {"state": "login_required", "state_code": "WAIT_PASSWORD", "login_session_id": ls}
         row = self._store.get_account_full(id)
         self.transition(id, "logging_in", login_session_id=ls)
         self._spawn(id, self._run_login(id, row, secret, ls))

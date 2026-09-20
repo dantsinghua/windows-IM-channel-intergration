@@ -60,8 +60,9 @@ def test_login_requires_secret_or_saved_credential_and_runs_login_fn(api):
     rig = api(login_fn=login_fn)
     c, st = rig.client, rig.store
     aid = create_and_start(rig, account="u1")
-    r = c.post(f"/api/v1/accounts/{aid}/login", json={}, headers=H(TW))
-    assert r.status_code == 400 and r.json()["error"]["reason"] == "secret_required"
+    r = c.post(f"/api/v1/accounts/{aid}/login", json={}, headers=H(TW))     # 05 §2.5.4/§2.2.7(R6-57):无 Vault 条目 ⇒ WAIT_PASSWORD 等人,不是 400
+    assert r.status_code == 202 and r.json()["state"] == "login_required" and r.json()["state_code"] == "WAIT_PASSWORD" and r.json()["login_session_id"].startswith("ls_")
+    assert seen == [] and st.get_account_full(aid)["state_code"] == "WAIT_PASSWORD"
     r = c.post(f"/api/v1/accounts/{aid}/login", json={"secret": "pw", "remember": False}, headers=H(TW))
     assert r.status_code == 202 and r.json()["state"] == "logging_in" and r.json()["login_session_id"].startswith("ls_")
     ls = r.json()["login_session_id"]
@@ -226,10 +227,13 @@ def test_capabilities_matrix_follows_state(api):
     c = rig.client
     aid = create_and_start(rig)
     r = c.get(f"/api/v1/accounts/{aid}/capabilities", headers=H(TR)).json()
-    assert r["matrix"] == {"get_state": "supported", "read_messages": "supported", "send_text": "not_applicable"} and r["capabilities"] == ["get_state", "read_messages"]
+    reads = ["get_state", "list_sessions", "read_messages", "screenshot"]
+    assert r["matrix"] == {**{op: "supported" for op in reads}, "send_text": "not_applicable"} and r["capabilities"] == reads
+    static = c.get(f"/api/v1/accounts/{aid}", headers=H(TR)).json()["data"]["capabilities"]
+    assert static == reads + ["send_text"] and set(r["capabilities"]) <= set(static)        # R6-57 ⑧:静态集 ⊇ 当前可用
     rig.agent.accounts.transition(aid, "running")
     r = c.get(f"/api/v1/accounts/{aid}/capabilities", headers=H(TR)).json()
-    assert r["matrix"]["send_text"] == "supported" and r["capabilities"] == ["get_state", "read_messages", "send_text"]
+    assert r["matrix"]["send_text"] == "supported" and r["capabilities"] == reads + ["send_text"]
 
 
 def test_patch_settings_columns_json_and_validation(api):

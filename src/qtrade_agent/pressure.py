@@ -95,6 +95,12 @@ class MemoryWatermark:
                 settings = {}
             if not settings.get("auto_stop_on_pressure", False):
                 continue                                                  # 默认 false:只建议不自动停
+            if read_avail is not None:                                    # R6-57 ④:每次 stop 前先读余量,已 ≥ mem_warn_mb 即停手(少停一个比多停一个好)
+                new = read_avail()
+                if new is not None:
+                    self.evaluate(new)
+                    if self.avail_mb is not None and self.avail_mb >= self.cfg.pool.mem_warn_mb:
+                        break
             try:
                 await self._accounts.stop(aid, graceful=True, actor="system:pool")
                 await self._accounts.wait_idle(aid)
@@ -106,10 +112,4 @@ class MemoryWatermark:
             self._store.insert_audit(kind="system", transport="system", actor="system:pool", action="pool.auto_stop_on_pressure", account_id=aid,
                                      result_code="OK", detail={"avail_mb": self.avail_mb, "level": self.level, "last_active_at": item["last_active_at"]},
                                      now_ms=self._clock())
-            if read_avail is not None:
-                new = read_avail()
-                if new is not None:
-                    self.evaluate(new)
-                    if self.avail_mb is not None and self.avail_mb >= self.cfg.pool.mem_warn_mb:
-                        break
         return stopped

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from qtrade_agent.alerts import CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED, H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT
+from qtrade_agent.alerts import (AUTO_RESTART_EXHAUSTED, CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED, H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE,
+                                 QIDIAN_NOT_ROOT)
 from qtrade_agent.config import AgentConfig, HealthConfig
 from tests.conftest import Clock, make_rig
 
@@ -72,9 +73,12 @@ async def test_h04_restart_limit_stops_self_heal_and_hourly_reset(tmp_path):
     await hl.check_containers()
     assert len([c for c in containers.calls if c == ("start", "qtrade-qd01")]) == n_starts
     assert alerts.active[(H04_CONTAINER_EXITED, "account:qd01")].evidence["exhausted"] is True
+    a = alerts.active[(AUTO_RESTART_EXHAUSTED, "account:qd01")]                  # 02 §3.7 独立码(R6-57 ②)
+    assert a.severity == "crit" and a.evidence["restart_count"] == 2 and a.evidence["max"] == 2
     clock.advance(3600_000)                                                        # 每小时清零 → 再给机会
     await hl.check_containers()
     assert hl.restart[aid].count == 0 and hl.restart[aid].exhausted is False
+    assert not alerts.is_firing(AUTO_RESTART_EXHAUSTED, "account:qd01")
     rig.store.close()
 
 

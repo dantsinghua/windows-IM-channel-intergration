@@ -53,12 +53,14 @@ async def test_enforce_only_stops_opted_in_accounts_and_audits(rig3):
     pr.evaluate(900)
     avail["v"] = 900
     _acct(rig3, "qd04", auto_stop=True); _acct(rig3, "qd05", auto_stop=True)
-    avail_seq = iter([2100])
+    avail_seq = iter([900, 2100])                                                      # R6-57 ④:每次 stop 前先读
 
     def read():
         return next(avail_seq, 2100)
     stopped = await pr.enforce(read)
-    assert stopped == ["qd04"] and pr.level == "ok"                                   # 回到 ≥ mem_warn_mb 即止
+    assert stopped == ["qd04"] and pr.level == "ok"                                   # 停一个后回到 ≥ mem_warn_mb 即止
+    pr.evaluate(900)
+    assert await pr.enforce(lambda: 2100) == []                                        # 停前已回到线上:一个都不停
 
 
 def test_create_and_recover_blocked_under_critical(rig3):

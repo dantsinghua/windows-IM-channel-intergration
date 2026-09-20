@@ -16,7 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .alerts import CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED, H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT
+from .alerts import AUTO_RESTART_EXHAUSTED, CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED, H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT
+from .events import iso8601
 from .config import AgentConfig
 
 log = logging.getLogger("qtrade.healthloop")
@@ -90,6 +91,7 @@ class HealthLoop:
             st = self.restart.setdefault(aid, RestartState(window_start_ms=now))
             if now - st.window_start_ms >= 3600_000:                 # restart_count 每小时清零(02 §5)
                 st.count, st.window_start_ms, st.exhausted, st.next_ms = 0, now, False, None
+                self._alerts.resolve(AUTO_RESTART_EXHAUSTED, subject=subject, account_id=aid)
             if row["state"] != "error":
                 self._accounts.transition(aid, "error", state_code="CONTAINER_EXIT",
                                           state_reason=f"容器退出 exit code {info.exit_code}" if info.exists else "容器不存在")
@@ -105,6 +107,10 @@ class HealthLoop:
                     log.error("账号 %s 容器反复退出,已达 %d 次上限,停止自动重启", aid, st.count)
                     self._alerts.firing(H04_CONTAINER_EXITED, subject=subject, account_id=aid,
                                         evidence={"exit_code": info.exit_code, "oom_killed": info.oom_killed, "restart_count": st.count, "exhausted": True})
+                # 02 §3.7 / §5:超限停止自愈并推独立码 AUTO_RESTART_EXHAUSTED(crit);每小时清零时 resolved(R6-57 ②)
+                self._alerts.firing(AUTO_RESTART_EXHAUSTED, subject=subject, account_id=aid, hint_actions=["open_acct_detail"],
+                                    evidence={"restart_count": st.count, "max": self.cfg.health.container_restart_max,
+                                              "window_start_at": iso8601(st.window_start_ms), "exit_code": info.exit_code})
                 continue                                             # 超限:停止自愈
             if st.next_ms is None:
                 st.next_ms = now + backoff[min(st.count, len(backoff) - 1)] * 1000
