@@ -159,9 +159,13 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
     # ================================================================== #24 机型档案库模板
     @app.get(f"{P}/device-profiles/templates")
     async def device_profile_templates(request: Request):
-        """#24,级别 R:内置档案库模板列表 ``[{profile_key, brand, model, release, weight}]``(C-40;字段名统一 ``profile_key``)。"""
+        """#24,级别 R:机型档案库模板列表 ``[{profile_key, brand, model, release, weight}]``(C-40;字段名统一 ``profile_key``)。
+
+        数据源 = ``agent.device_profiles``(装配时按 ``[device_profiles] library`` 从随包 JSON 加载,05 §2.5.1);
+        没装配 ⇒ 退到 ``device_profiles`` 的内置回落清单(**不读盘**)。
+        """
         principal(request, "read")
-        return {"ok": True, "data": device_profiles.templates()}
+        return {"ok": True, "data": device_profiles.templates(getattr(agent, "device_profiles", None))}
 
     # ================================================================== #74 环境快照
     @app.get(f"{P}/system/env")

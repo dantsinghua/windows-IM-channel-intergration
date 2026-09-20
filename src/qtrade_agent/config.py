@@ -188,6 +188,18 @@ class WechatConfig:
 
 
 @dataclass(frozen=True)
+class DeviceProfilesConfig:
+    """05 §7 [device_profiles](owner=05;07 §[device_profiles] 已登记这两键)。
+
+    ``library`` = 随 Agent 包落盘的机型档案库 JSON(05 §2.5.1「随 Agent 包内置 ``device_profiles.json``,只读」)。
+    ⚠️ **本默认值逐字取 05 §7**;installer 实际把该文件落在 ``/opt/qtrade/profiles/device_profiles.json``
+    (`installer/rootfs/Dockerfile:72`),两处路径**不一致**——属文档/installer 侧的裁决项,见交接,本批不擅自改字面值。
+    """
+    library: str = "/opt/qtrade/agent/data/device_profiles.json"
+    allow_template_reuse_after: int = 50
+
+
+@dataclass(frozen=True)
 class AccountsConfig:
     """05 §7 [accounts](owner=05)。"""
     login_timeout_s: int = 90                   # 自动填密后等待主界面/验证页
@@ -229,6 +241,7 @@ class AgentConfig:
     mail: MailConfig = field(default_factory=MailConfig)                         # [mail].*(owner=06 §7)
     jobs: JobsConfig = field(default_factory=JobsConfig)                         # [jobs]
     monitor: MonitorConfig = field(default_factory=MonitorConfig)                # [monitor](owner=04 §7)
+    device_profiles: DeviceProfilesConfig = field(default_factory=DeviceProfilesConfig)   # [device_profiles](owner=05 §7)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -267,6 +280,7 @@ class AgentConfig:
             mail=MailConfig.from_toml_dict({**(d.get("mail") or {}), "retention": d.get("retention")}),
             jobs=pick(d.get("jobs"), JobsConfig),
             monitor=pick(d.get("monitor"), MonitorConfig),
+            device_profiles=pick(d.get("device_profiles"), DeviceProfilesConfig),
         )
 
     def quota_mb(self, channel: str) -> int:

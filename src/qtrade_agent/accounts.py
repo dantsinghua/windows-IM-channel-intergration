@@ -70,6 +70,8 @@ class AccountService:
         self._prompts: dict[str, dict[str, Any]] = {}          # #15:当前等人的提示(内存态;与 account_state.payload.prompt 同一对象)
         self._current_ls: dict[str, str] = {}                  # 进行中的登录尝试 login_session_id(终态即失效)
         self._remind: dict[str, dict[str, Any]] = {}           # login_required 提醒:同 trace_id 每 login_remind_interval_s 重发
+        self._pending_self_uid: dict[str, str] = {}            # 执行层读到的 self_uid,等本次登录判 running 时一并落库(05 §2.1.1 ⑪a)
+        self._pending_ui_degraded: dict[str, Optional[str]] = {}   # 执行层落 default profile:等 running 后置 degraded(UI_UNEXPECTED)
 
     # ------------------------------------------------------------------ 基础
     def caps(self, row: dict[str, Any]) -> list[str]:
@@ -404,6 +406,44 @@ class AccountService:
             return
         await self._run_login(id, row, secret, ls)
 
+    # ------------------------------------------------------------------ 执行层 → 本服务的回填通道(05 §2.1.1 ⑪a / 02 §2.2.3)
+    def note_self_uid(self, account_id: str, self_uid: str) -> None:
+        """登录执行层读到 ``self_uid`` 时调这里(``QidianUi.login_fn(on_self_uid=…)``)。
+
+        05 §2.1.1 ⑪a:企点 ``self_uid`` = 登录 uin 纯数字。**本方法不自己写库** —— 值先记在内存,
+        由 ``_run_login`` 判定 ``running`` 时随同一次 ``transition`` 落库(状态与身份列同一个事务,
+        避免「回填成功但状态没进 running」的半截态)。
+
+        🔴 **换号(同一 ``qdNN`` 先后登录了不同 uin)**:本步**只回填新值**,不做任何破坏性动作 ——
+        识别换号与「删该账号全部 ``qidian_rowid:*`` 水位 + 重做首次 bootstrap + 记 ``qidian.rebootstrap``
+        审计」由 06 §2.9.5 ③ 在下一个全量轮做(R6-50/R6-40,已实现于 ``adapters/qidian/poll.py``)。
+        """
+        if not self_uid:
+            return
+        row = self._store.get_account_full(account_id)
+        old = (row or {}).get("self_uid")
+        if old and old != self_uid:
+            log.warning("账号 %s 的 self_uid 变了(%s → %s):本步只回填,换号处置由 06 §2.9.5 ③ 的全量轮做",
+                        account_id, old, self_uid)
+        self._pending_self_uid[account_id] = self_uid
+
+    def note_default_profile(self, account_id: str, app_version: Optional[str] = None) -> None:
+        """企点定位 profile 落到 ``default.yaml`` 时调这里(``QidianUi(on_default_profile=…)``)。
+
+        02 §2.2.3:没有对应企点版本的专用 profile ⇒ 用 ``default.yaml`` 且账号 ``degraded(state_code=UI_UNEXPECTED)``。
+        🔴 **只能从 ``running``/``degraded`` 迁入**(00 §8.1 只允许 ``running → degraded``)——发送路径调到这里时
+        账号已 ``running``,直接迁;登录路径调到这里时还在 ``logging_in``,**不许跳段**,记下来等 ``running`` 之后再迁。
+        """
+        reason = f"企点定位表无 {app_version or '本'} 版本的 profile,已退到 default.yaml"
+        row = self._store.get_account_full(account_id)
+        state = (row or {}).get("state")
+        if state == "degraded":
+            return
+        if state == "running":
+            self.transition(account_id, "degraded", state_code="UI_UNEXPECTED", state_reason=reason)
+            return
+        self._pending_ui_degraded[account_id] = app_version
+
     @staticmethod
     def _login_account(row: dict[str, Any]) -> Optional[str]:
         try:
@@ -425,7 +465,12 @@ class AccountService:
         finally:
             secret = None                                                       # 密码用完置零
         if result == "running":
-            self.transition(id, "running", state_code=None, login_session_id=ls)
+            uid = self._pending_self_uid.pop(id, None)
+            self.transition(id, "running", state_code=None, login_session_id=ls, **({"self_uid": uid} if uid else {}))
+            if id in self._pending_ui_degraded:                                  # 02 §2.2.3:落 default profile ⇒ degraded(UI_UNEXPECTED)
+                ver = self._pending_ui_degraded.pop(id)
+                self.transition(id, "degraded", state_code="UI_UNEXPECTED",
+                                state_reason=f"企点定位表无 {ver or '本'} 版本的 profile,已退到 default.yaml")
         elif result == "bad_credential":
             if row.get("credential_ref"):
                 try:
@@ -439,6 +484,9 @@ class AccountService:
         else:
             self.transition(id, "login_required", state_code="WAIT_PASSWORD", state_reason="登录执行层未接入", login_session_id=ls,
                             prompt={"kind": "WAIT_PASSWORD", "text": "请在画面完成登录"})
+        if result != "running":                 # 没进 running 的这一轮,回填值不许留到下一次尝试(下轮重新读)
+            self._pending_self_uid.pop(id, None)
+            self._pending_ui_degraded.pop(id, None)
 
     # ------------------------------------------------------------------ #12 人发起登录 / #13 #14 凭据 / #15 prompt / #16b 取消
     async def login(self, id: str, body: dict[str, Any], *, actor: str) -> dict[str, Any]:

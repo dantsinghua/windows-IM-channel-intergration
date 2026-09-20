@@ -29,6 +29,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from ...alerts import QIDIAN_PROFILE_FALLBACK
 from ...text import has_control_chars
 from ...workflow.yaml_min import YamlError, safe_load
 from ..base import Account
@@ -43,9 +44,8 @@ def profiles_root():
     """
     return resources.files(__package__).joinpath("profiles")
 
-#: 02 §2.2.3 的 profile 回退告警(info)。02 §3.7 尚未登记该码 —— ``alerts.firing`` 对未登记码回落
-#: ``warn``,故本模块**显式传 ``severity="info"``**;登记到 02 §3.7 属文档侧,见交接。
-QIDIAN_PROFILE_FALLBACK = "QIDIAN_PROFILE_FALLBACK"
+#: 02 §2.2.3 的 profile 回退告警。**码已登记**(02 §3.7:`info`、subject `account:<id>`),码常量与
+#: severity 的唯一出处 = ``alerts.REGISTERED``;本模块只引用(再导出是为了不改既有 import 点)。
 
 ADB_PORT_BASE = 16000                       # 00 §3 段基址(runtime.PORT_BASE['adb'] 同值,此处只读不改)
 _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
@@ -253,13 +253,17 @@ class QidianUi:
 
     def __init__(self, *, adb, profiles: Optional[dict[str, Profile]] = None, profile_dir: Any = None,
                  store=None, alerts=None, clock: Callable[[], int] = lambda: int(time.time() * 1000),
-                 sleep: Optional[Callable[[float], Awaitable[None]]] = None):
+                 sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+                 on_default_profile: Optional[Callable[[str, Optional[str]], None]] = None):
         self._adb = adb
         self.profiles = profiles if profiles is not None else load_profiles(profile_dir)
         self._store = store
         self._alerts = alerts
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
+        #: 落到 ``default.yaml`` 时通知装配方(02 §2.2.3 要求账号 ``degraded(UI_UNEXPECTED)``;
+        #: 状态迁移是 ``AccountService.transition`` 的职责,本层只报事实、不自己迁移)。
+        self._on_default_profile = on_default_profile
 
     # ------------------------------------------------------------------ profile
     def profile_for(self, acct: Account) -> Profile:
@@ -267,12 +271,19 @@ class QidianUi:
         if p is None:
             raise ProfileError("没有任何可用的企点 profile(含 default.yaml)")
         if how == "fallback" and self._alerts is not None:
+            # 码已登记(02 §3.7 = info,见 alerts.REGISTERED);severity 仍显式传同值 —— 既有开发者测试
+            # 断言的是「本调用给出 info」这件事,行为等价,不动它的断言
             self._alerts.firing(QIDIAN_PROFILE_FALLBACK, subject=f"account:{acct.id}", severity="info", account_id=acct.id,
                                 evidence={"app_version": acct.app_version, "profile": p.version})
         elif how == "default" and acct.app_version:
-            # 02 §2.2.3:落到 default 时账号应 degraded(UI_UNEXPECTED);状态迁移归 accounts,本层只留证。
+            # 02 §2.2.3:落到 default 时账号应 degraded(UI_UNEXPECTED)。状态迁移归 accounts —— 本层只报事实。
             log.warning("企点 profile 落到 default(account=%s app_version=%s):定位表未必匹配,账号应置 degraded(UI_UNEXPECTED)",
                         acct.id, acct.app_version)
+            if self._on_default_profile is not None:
+                try:
+                    self._on_default_profile(acct.id, acct.app_version)
+                except Exception:                        # 通知失败不许影响登录/发送本身
+                    log.exception("profile 落 default 的降级通知失败(account=%s)", acct.id)
         return p
 
     # ------------------------------------------------------------------ adb 原语

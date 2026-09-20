@@ -27,6 +27,7 @@ from .adapters.qq import H08_INTERVAL_S, OneBotTransport, QQAdapter, QQHealth
 from .adapters.wechat import WeChatWinAgent, WechatAdapter, WechatLoginFlow, WechatPoller
 from .alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, Alerts
 from .bus.bus import Bus
+from . import device_profiles as device_profiles_mod
 from .config import H13_INTERVAL_S, AgentConfig
 from .events import TZ_SHANGHAI, Events
 from .gate import Gate
@@ -46,6 +47,7 @@ from .runtime import AdbBackend, AdbCliBackend, ContainerBackend, DockerCliBacke
 from .runtime.runtime import Fs
 from .scheduler import Scheduler
 from .store import Store
+from .sysenv import DockerProxyApplier, WslEnvReader
 from .timesync import Aligner, TimeSync
 from .vault_client import Vault, WinAgentVault, vault_name
 from .webhook import HttpClient, UrllibHttp, WebhookDispatcher
@@ -106,7 +108,8 @@ class AgentApp:
                  imap_factory: Optional[Callable[[Any], Any]] = None, pop3_factory: Optional[Callable[[Any], Any]] = None,
                  smtp_factory: Optional[Callable[[Any], Any]] = None,
                  downloader: Optional[Downloader] = None, proc_reader: Optional[ProcReader] = None,
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None, net_probe: Optional[Any] = None,
+                 docker_proxy: Optional[Any] = None, wsl_env_reader: Optional[Any] = None):
         self.cfg = cfg
         self.clock = clock
         self.wsl_gateway = wsl_gateway
@@ -138,6 +141,12 @@ class AgentApp:
         self._downloader = downloader
         self._proc_reader = proc_reader
         self.config_path = config_path      # #89 写回 agent.toml 的落点;None ⇒ 只落 settings 并回 restart_required
+        # ---- #74 / #75 / #85 的三个可注入执行体(协议见 api/routes_ext:LevelProbe / snapshot() / apply|disable)
+        #: 🔴 **缺省不出网**:`net_probe` 不注入 ⇒ #75 的 WSL 侧逐目标记 SKIPPED(agent_probe_disabled)。
+        #: 开关本该来自 `agent.toml`,但 02 §7.1 / 07 的 `[probe]` 段**没有登记启用键**,本批不造键 ⇒ 只收注入参数(见交接)。
+        self.net_probe = net_probe
+        self._docker_proxy_arg = docker_proxy
+        self._wsl_env_reader_arg = wsl_env_reader
         self._wechat_next_due: dict[str, int] = {}
         self.jobs: dict[str, asyncio.Task] = {}      # 00 §11.21 [JOB]:在跑的作业 task,#108 取消时要真的 cancel
         self.adapters: dict = {}
@@ -178,9 +187,18 @@ class AgentApp:
         self.events = Events(self.store, queue_max=self.cfg.events.ws_queue_max)
         self.alerts = Alerts(self.events, clock=self.clock)
         self.pool = Pool(self.store, self.cfg, clock=self.clock, wsl_total_mb=self._wsl_total_mb)
+        # 机型档案库(05 §2.5.1):**单一来源 = [device_profiles] library 指的随包 JSON**;读不到就回落内置小清单 + ERROR 日志
+        # (回落时的 ERROR 日志由 device_profiles.Library 自己记一条,这里不重复记)
+        self.device_profiles = device_profiles_mod.load(self.cfg)
         self.winagent = WinAgentClient(self.cfg.winagent, transport=self._wa_transport, base_url=self._wa_base_url, token=self._wa_token, clock=self.clock)
         self.vault = self._vault if self._vault is not None else WinAgentVault(self.winagent)
         rt_kw = {} if self._boot_poll_s is None else {"boot_poll_s": self._boot_poll_s}
+        # ---- #74 的 WSL 侧只读采集 / #85 的 docker 代理执行体:只在**真后端**下自动装
+        # (注了假 adb/假容器的开发容器与测试一律不装 —— 它们一个读 /proc、一个写 /etc,都不该在测试里碰真机)
+        real_host = self._adb is None and self._containers is None
+        self.wsl_env_reader = self._wsl_env_reader_arg or (WslEnvReader() if real_host else None)
+        # 🔴 docker_proxy 只写 drop-in、**不重启 dockerd**(sysenv.DockerProxyApplier 的 last_result.restart_required)
+        self.docker_proxy = self._docker_proxy_arg or (DockerProxyApplier() if real_host else None)
         adb_backend = self._adb or AdbCliBackend()          # runtime 与企点 UI 执行层共用同一条 adb 后端
         self.runtime = Runtime(containers=self._containers or DockerCliBackend(), adb=adb_backend, cfg=self.cfg, health=self.health,
                                alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs, **rt_kw)
@@ -198,10 +216,15 @@ class AgentApp:
                                           wechat_cfg=self.cfg.wechat_adapter, clock=self.clock)
         # 企点 UI 执行层(05 §2.1.1 ⑥~⑪ 登录 / 06 §2.9.5 发送):**只有真机后端才自动装**,
         # 注了假 adb 的开发容器/测试一律保持未接(要测 UI 层就显式传 sender/login_fn)。凭据仍由 accounts 从 Vault 取后传进来。
-        self.qidian_ui = QidianUi(adb=adb_backend, store=self.store, alerts=self.alerts, clock=self.clock)
         real_backend = self._adb is None
+        # `on_self_uid` / `on_default_profile` 都是「执行层报事实 → AccountService 落库/迁移」的单向通道;
+        # lambda 延迟取 self.accounts —— 它在本行之后才建(装配顺序:适配器 → accounts)。
+        self.qidian_ui = QidianUi(adb=adb_backend, store=self.store, alerts=self.alerts, clock=self.clock,
+                                  on_default_profile=lambda aid, ver: self.accounts.note_default_profile(aid, ver))
         sender = self._sender or (self.qidian_ui.send_text if real_backend else _sender_not_wired)
-        login_fn = self._login_fn or (self.qidian_ui.login_fn() if real_backend else None)
+        login_fn = self._login_fn or (
+            self.qidian_ui.login_fn(on_self_uid=lambda aid, uid: self.accounts.note_self_uid(aid, uid))
+            if real_backend else None)
         self.adapters = {
             "qidian": QidianAdapter(self.poller, sender=sender, store=self.store),
             "qq": QQAdapter(store=self.store, events=self.events, cfg=self.cfg, qq_cfg=self.cfg.qq, clock=self.clock, **qq_kw),

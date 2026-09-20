@@ -1,7 +1,7 @@
 """qtrade-agent 进程入口:``python -m qtrade_agent.main [--config /etc/qtrade/agent.toml] [--db PATH] [--init-db]``。
 
 uvicorn 单 worker、``ws="websockets"``(02 §2.2:不许 auto)。
-``--init-db`` = 首启建库分支(03 §2.7.3 ②(e)):只建库 + 迁移到最新 + 写 ``schema_version`` 就退出。
+``--init-db`` = 首启建库分支(03 §2.7.3 ②(d)):只建库 + 迁移到最新 + 写 ``schema_version`` 就退出。
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def build(cfg: AgentConfig, db_path: str | None = None, config_path: str | None 
 
 
 def init_db(cfg: AgentConfig, db_path: str | None) -> int:
-    """``--init-db``:建库 + 迁移到最新 + 写 ``schema_version``,然后退出(03 §2.7.3 ②(e))。
+    """``--init-db``:建库 + 迁移到最新 + 写 ``schema_version``,然后退出(03 §2.7.3 ②(d))。
 
     **不起 HTTP、不起调度器、不连 WinAgent/dockerd/adb/邮箱**:只开 ``Store``,与正常启动走的是同一个
     ``Store.open()``(同一套 DDL、同一组 PRAGMA —— ``auto_vacuum=INCREMENTAL`` 必须建库时设,02 §2.8.4)。
