@@ -206,3 +206,65 @@ signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a <file>
      而 `x64compatible` 会把「能跑 x64 模拟的 ARM64」放进来,正是必须拒绝的那一类;`x64os` 才是「真 x64 操作系统」。
    - `[UninstallRun]` 缺 `RunOnceId` → 补 `RunOnceId: "QTradeUninstallEngine"`。
 6. **尚未真跑过产出的 EXE**(禁区);它只做过 `7z l` / `7z t` 的结构与完整性校验。
+
+
+---
+
+## 8. 🔴 SFX 存根到底认什么 —— 实测结论(第四批)
+
+出包的**头号风险**是选错存根。下面每条都有证据,不是文档推断。
+
+### 8.1 官方 7-Zip SfxSetup(LZMA SDK 的 `7zSD.sfx`)
+
+我们用的这一份:`sha256 436be3c4bada675a682802929384b548100f710b3ceaa87c9b2c7150963346b8`(126,976 字节,版权串 `Copyright (c) 1999-2023 Igor Pavlov`)。
+
+| 事实 | 证据 |
+|---|---|
+| **只认 7 个键**:`Title / BeginPrompt / Progress / Directory / RunProgram / ExecuteFile / ExecuteParameters` | ①`SfxSetup.cpp` 里只对这 7 个名字调 `GetTextConfigValue`/`FindTextConfigItem`;②对二进制做 `strings` 也只有这 7 个 |
+| **`InstallPath` 无效**(那是 7zsfxmm 的键,被**静默忽略**) | 哑 EXE 实测:配置写 `InstallPath="%ProgramData%\QTrade"`,运行后 `%ProgramData%\QTrade` **根本没被创建** |
+| **解压到 `%TEMP%\7zS<随机>\`** | 哑 EXE 里的 `hello.cmd` 打印 `CWD=C:\Users\…\Temp\7zSC3753E36` |
+| **跑完即删整个临时目录** | `SfxSetup.cpp` 的 `CTempDir` 析构 `~CTempDir(){ Remove(); }`;实测运行后 `7zS*` 已不存在 |
+| ✅ **`RunProgram` 会被拉起,相对路径基准 = 临时目录根** | `SELF=…\7zSC3753E36\install\engine\hello.cmd` |
+| ✅ **命令行参数原样透传给 RunProgram** | `ARGS=/QT_MODE=install /PROBE=1` |
+| 🔴 **退出码不透传,恒 0** | `SfxSetup.cpp` 末尾 `WaitForSingleObject(...); return 0;`(**根本不读子进程退出码**);实测 `hello.cmd` 退 26,SFX EXE 退 **0** |
+
+### 8.2 第三方 7zsfxmm(`chrislake/7zsfxmm` 1.7.1.3901,LGPL-3.0,2017)
+
+支持 `InstallPath` 等 19 个键(strings 可见),实测确实能解压到指定目录并**留存**。但:
+
+- **两次哑实验都没跑通**:一次挂住(等一个没人点的对话框)、一次退 8、一次挂住且只建了空目录树。要调通得反复试错。
+- **2017 年的件,8 年未更新,无签名**。§2.1 已点名「SFX 存根在某些 EDR 里有历史误报」——第三方改版的误报面只会更大,而目标机是行内/公司电脑,多有 AppLocker/EDR。
+- 退出码是否透传**没测到**(连基本流程都没跑通)。
+
+### 8.3 我们的选择:**官方存根 + `precheck-disk.cmd` 搬运**
+
+理由:
+1. **存根用原厂件**,EDR/AppLocker 面最小 —— 这是 §2.1 反复强调的现场约束。
+2. **解压位置**在 `precheck-disk.cmd` 里解决:同卷 `move` 是元数据改名,**O(1)、不额外占空间**(`%TEMP%` 与 `%ProgramData%` 默认同在系统盘);跨卷才退化成真拷贝,那时门槛抬到 ≈2 倍(12 GB)并提示。
+3. **退出码透传做不到** —— 这条外层解决不了,已提交裁决(见 handoff)。当前兜底:引擎退出码**落盘**到 `%ProgramData%\QTrade\logs\last-exit-code.txt`。
+
+**🔴 自动化/验收不要把 SFX EXE 的退出码当判据 —— 它恒为 0。** 读 `last-exit-code.txt` 或 `install_state.json` 的 `state`。
+
+### 8.4 搬运逻辑的两个坑(都踩过,都做成了门)
+
+- **自举陷阱**:脚本住在 `<src>\install\engine\`。把 `install` 整个 `MOVE` 走之后,cmd.exe 读不到脚本文件了,后面每个 `CALL` 都死在「The system cannot find the batch label specified」,而且停在**半搬运**状态。
+  → 现在 `install` 用**复制**(很小,而且临时目录反正会被存根删),其余顶层项才 `MOVE`。
+- **`.cmd` 必须 CRLF**:LF-only 会让 `for`/`if`/`call`/标签解析错乱,症状是「`) was unexpected at this time`」,**只有真跑才暴露**。
+  → `build.ps1` 的 **G1b** 门逐个校验 `.cmd` 的 CRLF / 无 BOM / 可执行行纯 ASCII。
+
+### 8.5 怎么复现这些实验(不碰生产目录)
+
+生产脚本里**没有**任何「改安装目标」的开关(那既是攻击面,也迟早被误用)。自验的办法是**生成副本**:
+
+```bash
+# 把目标行替换成临时目录,再拿副本去跑
+python3 - <<'EOF'
+import io
+src = io.open('engine/precheck-disk.cmd','rb').read().decode('utf-8')
+out = src.replace(r'set "QT_DST=%ProgramData%\QTrade"', r'set "QT_DST=C:\Temp\qt-stage-probe"')
+io.open('/tmp/precheck-probe.cmd','wb').write(out.encode('utf-8'))
+EOF
+```
+
+⚠️ **别用环境变量做这件事**:它会在「WSL → powershell → Start-Process → SFX → cmd」这条链上悄悄丢掉。
+丢了之后脚本会回落到默认目标,**把哑载荷真的搬进 `%ProgramData%\QTrade`**,而那里的 ACL 不给 `Users` 删除权限 —— 非管理员清不掉。这个坑我踩过,清理要管理员权限。

@@ -70,7 +70,7 @@ $SevenZip = Find-QtTool -Explicit $SevenZipPath -Name '7z.exe' -Param '-SevenZip
 )
 # 🔴 SFX 存根(7zSD.sfx / 7zS2.sfx)不在 7-Zip 主安装包里,要单独取 7-Zip Extra 或 LZMA SDK
 $SfxStub = Find-QtTool -Explicit $SfxStubPath -Name '7zSD.sfx' -Param '-SfxStubPath' `
-    -HowTo '🔴 SFX 存根**不在 7-Zip 主安装包里**:去 https://www.7-zip.org/download.html 下 “7-Zip Extra”(7z<版本>-extra.7z),解出里面的 7zSD.sfx,放进 installer\build\' -Candidates @(
+    -HowTo '🔴 SFX 存根**不在 7-Zip 主安装包里**:从**官方 LZMA SDK**(lzma<ver>.7z)或 7-Zip Extra 里解出 7zSD.sfx 放进 installer\build\。⚠️ 要官方件,**不要**第三方改版 7zsfxmm(理由见 build/README §8)' -Candidates @(
     (Join-Path $BuildDir '7zSD.sfx')
     (Join-Path $BuildDir '7zS2.sfx')
     "$env:ProgramFiles\7-Zip\7zSD.sfx"
@@ -103,6 +103,38 @@ if ($bomBad.Count -gt 0) {
     throw ('有 {0} 个脚本不是 UTF-8 with BOM —— Windows PowerShell 5.1 会按系统 ANSI(中文机=GBK)解析,中文注释会引发 ParserError(docs/03 §2.6.7 W1)' -f $bomBad.Count)
 }
 Write-Ok ('{0} 个脚本全部 UTF-8 with BOM' -f $scriptFiles.Count)
+
+# ── 门 1b:.cmd 必须 **CRLF** 且**不带 BOM** ─────────────────────────────────
+# 🔴 LF-only 的 .cmd 会让 cmd.exe 的多行结构(for/if/call/标签)解析错乱,
+#    症状是「The system cannot find the batch label specified」「) was unexpected at this time」,
+#    而且只有真跑起来才暴露。BOM 则会让第一行命令解析失败。
+Write-Section 'G1b .cmd 换行与编码(CRLF、无 BOM)'
+$cmdFiles = @(Get-ChildItem -Path $EngineDir -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -eq '.cmd' -and $_.FullName -notmatch '\\(\.omc|__pycache__)\\' })
+$cmdBad = @()
+foreach ($f in $cmdFiles) {
+    $b = [IO.File]::ReadAllBytes($f.FullName)
+    if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+        $cmdBad += ('{0}:带 BOM' -f $f.Name); continue
+    }
+    $text = [Text.Encoding]::UTF8.GetString($b)
+    $lf = ([regex]::Matches($text, "`n")).Count
+    $crlf = ([regex]::Matches($text, "`r`n")).Count
+    if ($lf -ne $crlf) { $cmdBad += ('{0}:有 {1} 个 LF-only 换行' -f $f.Name, ($lf - $crlf)) }
+    # 可执行行必须纯 ASCII(SFX 在未知代码页下拉起它)
+    foreach ($line in ($text -split "`r?`n")) {
+        $s = $line.TrimStart()
+        if ($s -eq '' -or $s.ToLowerInvariant().StartsWith('rem')) { continue }
+        foreach ($ch in $line.ToCharArray()) {
+            if ([int]$ch -gt 127) { $cmdBad += ('{0}:可执行行含非 ASCII -> {1}' -f $f.Name, $line.Trim()); break }
+        }
+    }
+}
+if ($cmdBad.Count -gt 0) {
+    foreach ($b in ($cmdBad | Select-Object -Unique)) { Write-Bad $b }
+    throw '.cmd 文件必须是 CRLF、无 BOM、可执行行纯 ASCII'
+}
+Write-Ok ('{0} 个 .cmd 全部 CRLF / 无 BOM / 可执行行纯 ASCII' -f $cmdFiles.Count)
 
 # ── 门 2:PowerShell 语法解析 ───────────────────────────────────────────────
 Write-Section 'G2 PowerShell 语法解析'
@@ -172,15 +204,42 @@ if ($wxHits.Count -gt 0) {
 }
 Write-Ok '零处 /S 卸载调用'
 
+# ── 门 5:SFX 配置键必须是**官方 SfxSetup 认识的那 7 个** ────────────────────
+# 🔴 官方存根对不认识的键**静默忽略** —— 写了 InstallPath 不报错也不生效,
+#    结果是载荷被解到 %TEMP% 然后跑完即删。这类错只有装到现场才会暴露,所以在这里卡死。
+Write-Section 'G5 SFX 配置键(官方 SfxSetup 只认 7 个键)'
+$SfxOfficialKeys = @('Title', 'BeginPrompt', 'Progress', 'Directory', 'RunProgram', 'ExecuteFile', 'ExecuteParameters')
+$sfxCfg = Join-Path $BuildDir 'sfx-config.txt'
+$badKeys = @()
+$seenKeys = @()
+foreach ($line in [IO.File]::ReadAllLines($sfxCfg)) {
+    $s = $line.Trim()
+    if ($s -eq '' -or $s.StartsWith(';')) { continue }
+    $m = [regex]::Match($s, '^([A-Za-z_]+)\s*=')
+    if (-not $m.Success) { continue }
+    $k = $m.Groups[1].Value
+    $seenKeys += $k
+    if ($SfxOfficialKeys -notcontains $k) { $badKeys += $k }
+}
+if ($badKeys.Count -gt 0) {
+    foreach ($k in $badKeys) {
+        Write-Bad ('sfx-config.txt 里的 "{0}" 不是官方 SfxSetup 的键(那是 7zsfxmm 的),官方存根会**静默忽略**它' -f $k)
+    }
+    Write-Host ('           官方只认:{0}' -f ($SfxOfficialKeys -join ' / ')) -ForegroundColor DarkGray
+    throw 'SFX 配置里有官方存根不认识的键 —— 它不会报错,只会不生效,然后把载荷解到 %TEMP% 并跑完即删'
+}
+if ($seenKeys -notcontains 'RunProgram') { throw 'sfx-config.txt 缺 RunProgram —— 外壳不知道该拉起谁' }
+Write-Ok ('配置键全部合法({0})' -f ($seenKeys -join ', '))
+
 if ($CheckOnly) {
-    Write-Section '仅检查模式(-CheckOnly):四道门已跑完,不出包'
+    Write-Section '仅检查模式(-CheckOnly):五道门已跑完,不出包'
     exit 0
 }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 if ($SelfCheck) {
-    # -SelfCheck:四道门 + 收载荷 + 生成 manifest。不碰 ISCC / 7z / SFX 存根,
+    # -SelfCheck:五道门 + 收载荷 + 生成 manifest。不碰 ISCC / 7z / SFX 存根,
     # 所以在**没装工具链的开发机上也能跑**,用来确认「载荷来源对不对、manifest 长什么样」。
     Write-Section '步 S 自检模式:收集载荷并生成 manifest(不编译、不归档、不拼 EXE)'
     $collect = & (Join-Path $BuildDir 'collect-payload.ps1') -Stage $StageDir -SourceRoot $SourceRoot `

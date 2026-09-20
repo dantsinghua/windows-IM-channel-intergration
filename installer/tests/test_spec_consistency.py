@@ -715,3 +715,84 @@ def test_iss_handles_interactive_uninstall_branch(iss: str) -> None:
     assert "WeChatUninstallConfirmed := True" in iss
     # 🔴 卸载器不带任何静默参数的提醒必须在文案里
     assert "不带任何静默参数" in iss
+
+
+# ── 第四批:SFX 存根的真实能力(实测坐实,见 build/README §8)────────────────
+OFFICIAL_SFX_KEYS = {"Title", "BeginPrompt", "Progress", "Directory",
+                     "RunProgram", "ExecuteFile", "ExecuteParameters"}
+
+
+def _sfx_config_keys() -> set[str]:
+    cfg = read(INSTALLER_ROOT / "build" / "sfx-config.txt")
+    out = set()
+    for line in cfg.splitlines():
+        s = line.strip()
+        if not s or s.startswith(";"):
+            continue
+        m = re.match(r"^([A-Za-z_]+)\s*=", s)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def test_sfx_config_uses_only_official_keys() -> None:
+    """🔴 官方 SfxSetup(LZMA SDK)**只认 7 个键**,对别的键**静默忽略**。
+
+    `InstallPath` / `GUIMode` / `OverwriteMode` / `ExtractTitle` … 是第三方 7zsfxmm 的键:
+    写了不报错、也不生效,结果是载荷被解到 `%TEMP%` 然后跑完即删 —— 装到现场才暴露。
+    证据:SfxSetup.cpp 只对这 7 个名字调 GetTextConfigValue/FindTextConfigItem;
+    对 7zSD.sfx 做 strings 也只有这 7 个;哑 EXE 实测 InstallPath 完全无效。
+    """
+    keys = _sfx_config_keys()
+    assert keys, "sfx-config.txt 一个键都没解析到"
+    extra = sorted(keys - OFFICIAL_SFX_KEYS)
+    assert not extra, f"sfx-config.txt 用了官方存根不认识的键(那是 7zsfxmm 的):{extra}"
+    assert "RunProgram" in keys, "缺 RunProgram,外壳不知道该拉起谁"
+
+
+def test_precheck_stages_payload_to_programdata() -> None:
+    r"""官方存根只解到 %TEMP% 且跑完即删,所以 §2.1 要的「解压到 %ProgramData%\QTrade 并留存」
+    必须由 precheck-disk.cmd 搬运完成。"""
+    cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
+    assert 'set "QT_DST=%ProgramData%\\QTrade"' in cmd
+    assert "robocopy" in cmd and "/MOVE" in cmd, "要能搬(同卷 move / 已存在则 robocopy /MOVE 合并)"
+    assert "last-exit-code.txt" in cmd, "存根会丢掉退出码,必须落盘供自动化读"
+
+
+def test_precheck_does_not_move_its_own_directory() -> None:
+    r"""🔴 自举陷阱:脚本住在 <src>\install\engine\。
+    把 `install` MOVE 走之后,cmd.exe 就读不到脚本文件了,后面每个 CALL 都死在
+    「The system cannot find the batch label specified」—— 而且是**半搬运**状态。
+    所以 `install` 必须用**复制**,其余顶层项才 MOVE。"""
+    cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
+    assert 'if /I not "%%~nxD"=="install"' in cmd, "install 目录必须被排除在 MOVE 之外"
+    assert re.search(r'robocopy "%QT_SRC%\\install" "%QT_DST%\\install" /E(?! /MOVE)', cmd), \
+        "install 要用 /E 复制,不能带 /MOVE"
+
+
+def test_precheck_has_no_install_target_backdoor() -> None:
+    """生产脚本里**不留**「改安装目标」的开关:既是攻击面,也迟早被误用。
+    打包期自验改用「生成副本、替换目标行」的办法(build/README §8)。"""
+    # 只看**可执行行** —— rem 注释里解释「为什么不要这么做」是应该的,不算后门
+    code = "\n".join(
+        line for line in read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd").splitlines()
+        if line.strip() and not line.lstrip().lower().startswith("rem")
+    )
+    assert "QT_INSTALL_ROOT" not in code, "别再用环境变量覆盖安装目标(它会在进程链上丢掉)"
+    assert "--qt-stage-to" not in code, "别在 batch 里解析参数(`=` 是 for 的默认分隔符,解析会坏)"
+    assert ":parse_arg" not in code
+
+
+def test_cmd_files_are_crlf_ascii_no_bom() -> None:
+    """🔴 LF-only 的 .cmd 会让 cmd.exe 的 for/if/call/标签解析错乱,
+    症状是「cannot find the batch label」「) was unexpected at this time」,只有真跑才暴露。"""
+    for p in INSTALLER_ROOT.rglob("*.cmd"):
+        if ".omc" in p.parts or "out" in p.parts:
+            continue
+        b = p.read_bytes()
+        assert b[:3] != b"\xef\xbb\xbf", f"{p.name} 带 BOM"
+        assert b.count(b"\n") == b.count(b"\r\n"), f"{p.name} 有 LF-only 换行"
+        for i, line in enumerate(b.decode("utf-8").splitlines(), 1):
+            if not line.strip() or line.lstrip().lower().startswith("rem"):
+                continue
+            assert line.isascii(), f"{p.name}:{i} 可执行行含非 ASCII:{line.strip()}"
