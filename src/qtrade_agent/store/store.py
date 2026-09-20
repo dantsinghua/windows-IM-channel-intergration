@@ -30,6 +30,40 @@ from ..text import norm
 
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_agent.sql")
 
+#: 02 §3.3:``migrations/NNNN_name.sql`` 顺序脚本;``0001_baseline`` 即 ``schema_agent.sql`` 全文,不单独放文件。
+MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
+BASELINE_VERSION = 1
+BASELINE_NAME = "0001_baseline_docs02_v0.4.6"
+
+
+class StoreCorrupt(Exception):
+    """``agent.db`` 打不开 / 不是 SQLite / ``PRAGMA quick_check`` 不过(02 §2.6:拒绝启动,指向最近备份)。"""
+
+
+class SchemaTooNew(Exception):
+    """库 ``schema_version`` 高于本版代码支持上限(02 §3.8:拒绝启动指向备份;降级不支持)。"""
+
+
+def migration_scripts() -> list[tuple[int, str, str]]:
+    """``migrations/NNNN_name.sql`` 升序 ``[(version, name, path)]``(02 §3.3);基线及以下的编号不算迁移。"""
+    out: list[tuple[int, str, str]] = []
+    if not os.path.isdir(MIGRATIONS_DIR):
+        return out
+    for fn in os.listdir(MIGRATIONS_DIR):
+        if not fn.endswith(".sql") or not fn[:4].isdigit():
+            continue
+        n = int(fn[:4])
+        if n <= BASELINE_VERSION:
+            continue                                    # 0001 = 基线,由 schema_agent.sql 建
+        out.append((n, fn[:-4], os.path.join(MIGRATIONS_DIR, fn)))
+    return sorted(out)
+
+
+def code_schema_version() -> int:
+    """本版代码能把库迁到的最高版本(= 02 §3.8 的 ``SUPPORTED_SCHEMA.max``)。"""
+    scripts = migration_scripts()
+    return scripts[-1][0] if scripts else BASELINE_VERSION
+
 PRAGMAS = (
     # 02 §2.8.4:库开 auto_vacuum=INCREMENTAL(**建库时设定,之后改不了**)⇒ 必须排在建表之前;
     # 对已存在的库是静默 no-op(SQLite 语义),不改也不报错。放在 journal_mode 之前:WAL 下它对已有库同样无效。
@@ -94,8 +128,14 @@ class Store:
 
     # ------------------------------------------------------------------ 打开 / 迁移
     def open(self) -> "Store":
+        # 02 §2.6:已有库先 `PRAGMA quick_check` —— 损坏/不是 SQLite ⇒ 拒绝启动并指向最近备份,**不动该文件**。
+        # 新建库(文件不存在或零字节)与 :memory: 跳过:没有内容可校验。
+        preexisting = self.path != ":memory:" and os.path.exists(self.path) and os.path.getsize(self.path) > 0
         con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         con.row_factory = sqlite3.Row
+        if preexisting:
+            self._quick_check(con)
+            self._check_supported(con)      # 02 §3.8:库比代码新 ⇒ 在动 PRAGMA/写任何一页之前就拒绝,库文件一字不改
         for p in PRAGMAS:
             try:
                 con.execute(p)
@@ -120,19 +160,68 @@ class Store:
         assert self._con is not None, "store not opened"
         return self._con
 
-    def _migrate(self) -> None:
-        """基线 DDL 一次性建齐(项目未发行,无历史迁移;02 §2.1 步 4:迁移失败拒绝启动)。"""
-        has = self.con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
-        if has:
+    def _quick_check(self, con: sqlite3.Connection) -> None:
+        """02 §2.6:损坏 ⇒ 拒绝启动、日志指向最近备份。``quick_check(1)`` 见到第一处错误即停(不做全量 integrity_check)。"""
+        try:
+            row = con.execute("PRAGMA quick_check(1)").fetchone()
+        except sqlite3.DatabaseError as e:
+            con.close()
+            raise StoreCorrupt(f"{self.path} 打不开或不是 SQLite 数据库文件({e});已停止,该文件一字未改。"
+                               f"请按 02 §3.3 用 /var/lib/qtrade/backup 下最近一份备份替换后重试") from e
+        got = str(row[0]).lower() if row else "(空)"
+        if got != "ok":
+            con.close()
+            raise StoreCorrupt(f"{self.path} 完整性校验未通过(PRAGMA quick_check = {got});已停止,该文件一字未改。"
+                               f"请按 02 §3.3 用 /var/lib/qtrade/backup 下最近一份备份替换后重试")
+
+    def _too_new(self, cur: int, code_v: int) -> "SchemaTooNew":
+        return SchemaTooNew(f"{self.path} 的 schema_version={cur} 高于本版 Agent 支持的上限 {code_v}:"
+                            f"这个库是更高版本的 Agent 建的,拒绝启动(02 §3.8,降级不支持)。"
+                            f"请换回对应版本的 Agent,或按 02 §3.3 用备份回滚;该文件一字未改")
+
+    def _check_supported(self, con: sqlite3.Connection) -> None:
+        """只读判一次库版本上限(02 §3.8);没有 ``schema_version`` 表的库交给 ``_migrate`` 建基线。"""
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone():
             return
-        with open(SCHEMA_PATH, encoding="utf-8") as f:
-            ddl = f.read()
+        cur = con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+        code_v = code_schema_version()
+        if cur > code_v:
+            con.close()
+            raise self._too_new(cur, code_v)
+
+    def _apply_script(self, version: int, name: str, sql: str) -> None:
+        """一个脚本 = 一个事务 + 一行 ``schema_version``(02 §3.3;含脚本 sha256)。"""
         with self._tx_lock:
             # executescript 会先隐式 COMMIT 再逐条执行,不能包在 _tx() 里;DDL 失败即抛(拒绝启动)
-            self.con.executescript("BEGIN;\n" + ddl + "\nCOMMIT;")
-            checksum = hashlib.sha256(ddl.encode("utf-8")).hexdigest()   # 脚本 sha256,防被改过的脚本重跑(02 §3.1)
+            self.con.executescript("BEGIN;\n" + sql + "\nCOMMIT;")
+            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()   # 脚本 sha256,防被改过的脚本重跑(02 §3.1)
             self.con.execute("INSERT INTO schema_version(version, name, applied_ms, checksum) VALUES (?, ?, ?, ?)",
-                             (1, "0001_baseline_docs02_v0.4.6", self._clock(), checksum))
+                             (version, name, self._clock(), checksum))
+
+    def _migrate(self) -> None:
+        """基线 DDL + ``migrations/NNNN_name.sql`` 顺序迁移(02 §3.3;§2.1 步 4:迁移失败拒绝启动)。
+
+        幂等:库已是最新 ⇒ 一条语句都不写。库版本高于本版代码上限 ⇒ 拒绝启动(02 §3.8,降级不支持),库文件不动。
+        """
+        code_v = code_schema_version()
+        has = self.con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+        if has:
+            cur = self.con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+        else:
+            with open(SCHEMA_PATH, encoding="utf-8") as f:
+                self._apply_script(BASELINE_VERSION, BASELINE_NAME, f.read())
+            cur = BASELINE_VERSION
+        if cur > code_v:                                # 兜底(``open()`` 已对已有库提前判过一次)
+            raise self._too_new(cur, code_v)
+        for version, name, path in migration_scripts():
+            if version <= cur:
+                continue
+            with open(path, encoding="utf-8") as f:
+                self._apply_script(version, name, f.read())
+
+    def schema_version(self) -> int:
+        """库当前 schema 版本(``schema_version`` 最后一行);空表回 0。"""
+        return self.con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -957,6 +1046,57 @@ class Store:
                           "VALUES (?,0,'INTERNAL','{}',0,'Agent 重启,指令未完成',1,0,?) ON CONFLICT(trace_id) DO NOTHING", (r["trace_id"], now_ms))
             c.execute("UPDATE idempotency SET status='ABANDONED', updated_ms=? WHERE status='SENDING'", (now_ms,))
             return len(rows)
+
+    # ------------------------------------------------------------------ #90~#93 api_clients 管理(02 §3.4.6)
+    # 🔴 本段是 API 层 #90~#93 的最小支撑,**只新增方法、不改上面任何既有函数**(含 `api_client_by_token`)。
+    def api_clients_list(self, *, include_revoked: bool = False) -> list[dict[str, Any]]:
+        """#90 列表(**不含 secret**:`secret_hash` 一并不出表,由 API 层再过一道也无妨)。"""
+        sql = "SELECT * FROM api_clients" + ("" if include_revoked else " WHERE revoked_ms IS NULL") + " ORDER BY created_ms, app_id"
+        return [dict(r) for r in self.con.execute(sql).fetchall()]
+
+    def api_client_get(self, app_id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM api_clients WHERE app_id=?", (app_id,)).fetchone()
+        return dict(r) if r else None
+
+    def api_client_create(self, *, app_id: str, name: str, auth_kind: str, level: str, token: str,
+                          ip_allow: Optional[list[str]] = None, allow_ops: Optional[list[str]] = None,
+                          allow_accounts: Optional[list[str]] = None, rate_per_min: int = 120,
+                          api_version_min: int = 1, secret_ref: Optional[str] = None,
+                          now_ms: Optional[int] = None) -> dict[str, Any]:
+        """#91 新建:``token`` 只在此一次传输,库里只落 ``sha256``。``app_id`` 已存在 ⇒ 抛 ``sqlite3.IntegrityError``。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("INSERT INTO api_clients(app_id, name, auth_kind, secret_hash, secret_ref, level, ip_allow_json, allow_ops_json, "
+                      "allow_accounts_json, rate_per_min, api_version_min, enabled, created_ms, updated_ms) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                      (app_id, name, auth_kind, hashlib.sha256(token.encode("utf-8")).hexdigest(), secret_ref, level,
+                       json.dumps(ip_allow or [], ensure_ascii=False), json.dumps(allow_ops or ["*"], ensure_ascii=False),
+                       json.dumps(allow_accounts or ["*"], ensure_ascii=False), int(rate_per_min), int(api_version_min), now, now))
+        return self.api_client_get(app_id) or {}
+
+    def api_client_rotate(self, app_id: str, token: str, *, now_ms: Optional[int] = None) -> Optional[str]:
+        """#92 轮换:换 ``secret_hash``,回**旧 hash**(宽限期由 API 层落 ``settings`` 登记,库里不留旧值)。"""
+        now = now_ms or self._clock()
+        row = self.api_client_get(app_id)
+        if row is None:
+            return None
+        with self._tx() as c:
+            c.execute("UPDATE api_clients SET secret_hash=?, updated_ms=?, revoked_ms=NULL, enabled=1 WHERE app_id=?",
+                      (hashlib.sha256(token.encode("utf-8")).hexdigest(), now, app_id))
+        return str(row["secret_hash"])
+
+    def api_client_revoke(self, app_id: str, *, now_ms: Optional[int] = None) -> bool:
+        """#93 吊销:``enabled=0`` + ``revoked_ms``(行保留,审计要能回指)。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            cur = c.execute("UPDATE api_clients SET enabled=0, revoked_ms=?, updated_ms=? WHERE app_id=? AND revoked_ms IS NULL",
+                            (now, now, app_id))
+        return cur.rowcount > 0
+
+    def api_client_by_hash(self, secret_hash: str) -> Optional[dict[str, Any]]:
+        """按 ``sha256(token)`` 取行(#92 宽限期复核用;**不判 enabled/revoked**,判定留给调用方)。"""
+        r = self.con.execute("SELECT * FROM api_clients WHERE auth_kind='bearer' AND secret_hash=?", (secret_hash,)).fetchone()
+        return dict(r) if r else None
 
 
 class AsyncStore:

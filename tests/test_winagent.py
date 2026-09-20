@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from qtrade_agent.alerts import H13_CLOCK_DRIFT
+from qtrade_agent.alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, H13_CLOCK_DRIFT
 from qtrade_agent.config import WinAgentConfig
 from qtrade_agent.timesync import TimeSync
 from qtrade_agent.vault_client import VaultUnavailable, WinAgentVault
@@ -298,3 +298,46 @@ async def test_fake_vault_read_checks_source(tmp_path):
     with pytest.raises(VaultUnavailable) as e:
         await v.read("account/qd01")
     assert e.value.reason == "http_403"
+
+
+# ---------------------------------------------------------------- D-04:H02/H03 必须同时进 alerts(02 §3.7 登记)
+async def test_winagent_probe_fires_and_resolves_h02_alert(tmp_path):
+    """`#72` 同一次响应里 `checks.H02=firing` 而 `alerts=[]` 是自相矛盾 —— 02 §3.7 把
+    `H02_WINAGENT_API_DOWN`(crit / subject=host / 事件族 alert)登记为告警码,探活判离线时必须 firing。
+    G-02 判据:同 `(code, subject)` 只推一次 firing、一次 resolved。"""
+    rig = make_rig(tmp_path)
+    alerts = rig.agent.alerts
+    await rig.agent.winagent_probe()
+    assert not alerts.is_firing(H02_WINAGENT_API_DOWN, "host")
+    rig.winagent.offline = True
+    for _ in range(3):                                                  # R-09 去抖:3 次才判离线
+        await rig.agent.winagent_probe()
+    assert rig.agent.health.winagent_online is False
+    a = alerts.active[(H02_WINAGENT_API_DOWN, "host")]
+    assert a.severity == "crit" and a.count == 1                        # 连探 3 次只推一次 firing
+    ev = rig.store.con.execute("SELECT payload_json FROM events_outbox WHERE event='alert'").fetchall()
+    assert len(ev) == 1 and json.loads(ev[0][0])["state"] == "firing"
+    rig.winagent.offline = False
+    await rig.agent.winagent_probe()
+    assert not alerts.is_firing(H02_WINAGENT_API_DOWN, "host") and rig.agent.health.winagent_online is True
+    ev = rig.store.con.execute("SELECT payload_json FROM events_outbox WHERE event='alert'").fetchall()
+    assert [json.loads(e[0])["state"] for e in ev] == ["firing", "resolved"]
+    rig.store.close()
+
+
+async def test_dockerd_probe_fires_and_resolves_h03_alert(tmp_path):
+    """同上,`H03_DOCKERD_DOWN`(crit / subject=wsl / 事件族 alert;02 §3.7)。"""
+    rig = make_rig(tmp_path)
+    await rig.agent.dockerd_probe()
+    assert not rig.agent.alerts.is_firing(H03_DOCKERD_DOWN, "wsl")
+    rig.containers.dockerd_ok = False
+    await rig.agent.dockerd_probe()
+    await rig.agent.dockerd_probe()
+    assert rig.agent.health.dockerd_ok is False
+    assert rig.agent.alerts.active[(H03_DOCKERD_DOWN, "wsl")].severity == "crit"
+    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 1
+    rig.containers.dockerd_ok = True
+    await rig.agent.dockerd_probe()
+    assert not rig.agent.alerts.is_firing(H03_DOCKERD_DOWN, "wsl")
+    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 2
+    rig.store.close()
