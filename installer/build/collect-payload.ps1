@@ -177,6 +177,10 @@ foreach ($item in $PayloadMap) {
     } else {
         $hint = ''
         if ($item.ContainsKey('Hint')) { $hint = [string]$item.Hint }
+        # 🔴 安琳 2026-09-21 拍板:**13 项一个都不能少,没有「可选项」** ——
+        #    `winagent/python` 也必带(目标机可能没有 Python;即便 onedir 的 `_internal`
+        #    已自带运行时,也要随包带一份独立的嵌入式运行时作兜底/排障用)。
+        #    曾按「onedir 路线可缺」把它做成 Optional,已按拍板还原。
         $missing += [pscustomobject]@{ Dest = $item.Dest; Tried = $r.Tried; Critical = $item.Critical; Purpose = $item.Purpose; Hint = $hint }
         Write-Host ('  [缺件] {0,-40} <- {1}' -f $item.Dest, ($r.Tried -join ' | ')) -ForegroundColor Yellow
     }

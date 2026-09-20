@@ -323,7 +323,9 @@ EOF
 | 2 | 自编存根的 `requireAdministrator` 在**非管理员账户**下弹 UAC、拒绝后退出码合理 | 开发机当前账户在 Administrators 组里,走的是「同意提升」那条路 | 建一个标准用户账户跑一次 |
 | 3 | 官方存根回退路径端到端(搬运 + `last-exit-code.txt` + UAC 启发式真的触发) | 回退路径只在自编存根被 EDR/AppLocker 拦时才走,本机没有那个环境;且它**没有清单**,提权是否触发取决于目标机的 `EnableInstallerDetection` 策略 | 在装了 EDR 的测试机上,或手工 `-Stub official` 出包后跑;顺带确认**干净系统**(未装任何 VC++ 运行库)上也能起来 —— 它只依赖系统自带的 `MSVCRT.dll`,预期能起 |
 | 4 | 代码签名后 UAC 行为(§2.2.3) | 本机没有签名证书 | CI 签完名后,在干净 VM 上确认不再弹「未知发布者」 |
-| 5 | 磁盘峰值(§2.1「解压 + 载荷」两份共存) | 轻量验证包只有 1.7 MB,量级差太远 | 真载荷出包后在小盘 VM 上量峰值 |
+| 5 | 磁盘峰值(§2.1「解压 + 载荷」两份共存) | ~~轻量验证包只有 1.7 MB,量级差太远~~ **真载荷包已出(2.2 GB)**,量级到位了 | 在小盘 VM 上装一次,量「解压 + 载荷」两份共存时的峰值,对照 §2.1 与预检门槛(硬 16 GB / 建议 20 GB) |
+| 6 | **设备身份档案库的机型指纹能不能骗过企点** | `installer/rootfs/profiles/device_profiles.json` 的 32 条模板,机型参数(`build_id` / `fingerprint` / `incremental`)是**按公开市售机型资料编写的,不是从真机 dump 出来的**;企点对机型指纹的校验强度**从没验过**,而开发机上既没有 redroid 容器也没有企点账号 | 用库里任取一条档案起一个 redroid 容器,`adb shell getprop` 比对 `ro.product.*` / `ro.build.fingerprint` / `ro.serialno` 与表值一致,再**跑一次企点真实登录**;若登录被风控拦或要求额外验证,说明指纹强度不够,档案库要改用真机 dump 的参数 |
+| 7 | **WinAgent 的两条测试在真 Windows 上必然失败**(2026-09-21 实测) | `winagent/tests/test_audit_log_installer.py` 的 `test_expand_falls_back_under_root_when_env_var_unexpandable` 与 `test_dev_assembly_keeps_everything_under_root` 断言 `expand('%ProgramData%\\…', root)` 必须 `startswith(root)`,而那是**非 Windows 的回退行为**(测试 docstring 自己写着「`%ProgramData%` 在非 Windows 上展不开」)。真机上它能展开成 `C:\ProgramData\QTrade\winagent\vault` —— 这才是期望行为。Linux 上 307 条全绿看不到这一类 | 那两条测试按平台分叉:非 Windows 维持现断言;Windows 断言 `out == os.path.join(os.environ['ProgramData'],'QTrade','winagent','vault')`,两边都保留真正的不变量 `not os.path.exists('%ProgramData%')`(cwd 不留垃圾,实测 Windows 上也满足)。顺带 `winagent/build/build.ps1` 第 2 步要装 `[windows,dev]` 而不只是 `[windows]`,否则第 3 步必炸 `No module named pytest` |
 
 > 1 的**规则**部分已在本机验过:`sfx-stub/verify-space-rule.ps1` 把
 > `ExtractEngine.cpp` 里那段判定**原样抽出来**(不是抄一份)、用同一个 cl.exe
