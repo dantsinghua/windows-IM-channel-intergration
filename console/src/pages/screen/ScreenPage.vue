@@ -9,7 +9,7 @@ import { screen as T, SCREEN_PERF_ITEMS, SCREEN_TOOLS } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
 import { useUiStore } from '@/stores/ui'
 import { accountsApi } from '@/api/client'
-import { ScreenStream, type DecodePath, type StreamProfile } from '@/codec/stream'
+import { ScreenStream, type DecodePath, type StreamClosed, type StreamProfile } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
 
@@ -22,6 +22,8 @@ const focusId = ref<string>(String(route.params.id ?? ''))
 const canvas = ref<HTMLCanvasElement | null>(null)
 const stats = ref({ fps: 0, latencyMs: 0, decoder: 'hardware' as DecodePath, codec: '', connected: false })
 const degradeMsg = ref('')
+/** #34 关闭码分诊结果(4401/4400/4409/4410/4503 分别提示,不一律「连接失败」) */
+const streamClosed = ref<StreamClosed | null>(null)
 const shotUrl = ref('')
 const shotOpen = ref(false)
 const wechatSrc = ref('')
@@ -73,6 +75,7 @@ async function startFocus(): Promise<void> {
     return
   }
   if (!['running', 'degraded', 'login_required', 'starting'].includes(a.state)) return
+  streamClosed.value = null
   stream = new ScreenStream(a.id, PROFILE_OF[ui.perfProfile] ?? 'focus', {
     onHeader: () => undefined,
     onStats: (s) => { stats.value = { ...stats.value, ...s } },
@@ -80,6 +83,14 @@ async function startFocus(): Promise<void> {
     onFatal: (why) => {
       degradeMsg.value = why
       if (stream?.path === 'static') startStaticPreview()
+    },
+    onClosed: (info) => {
+      streamClosed.value = info
+      // 🔴 4503 = 画面流后端本期没有执行体:显示静态提示,**不重连、也不去轮截图**
+      // (企点截图执行层同样未接,轮询只会一直 409),见 backend-api-2 §3。
+      if (info.reason === 'stream_backend_missing') { stopAll(); return }
+      // 4401 由 App.vue 的事件流横幅统一引导「重取令牌」;4409/4400 重试无意义,都停手。
+      if (!info.retryable) stopAll()
     },
   })
   await stream.start()
@@ -93,9 +104,10 @@ function startStaticPreview(): void {
 async function pollStatic(): Promise<void> {
   if (!focus.value) return
   try {
-    const blob = await accountsApi.screenshot(focus.value.id)
+    const shot = await accountsApi.screenshot(focus.value.id)
+    if (!shot.blob) return
     if (staticSrc.value) URL.revokeObjectURL(staticSrc.value)
-    staticSrc.value = URL.createObjectURL(blob)
+    staticSrc.value = URL.createObjectURL(shot.blob)
   } catch { /* 下一轮再试 */ }
 }
 
@@ -104,10 +116,11 @@ async function pollWechat(): Promise<void> {
   try {
     const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
     if (v && v.visible === false) { wechatNotReady.value = true; return }
-    const blob = await accountsApi.screenshot(focus.value.id)
+    const shot = await accountsApi.screenshot(focus.value.id)
+    if (!shot.blob) { wechatNotReady.value = true; return }
     wechatNotReady.value = false
     if (wechatSrc.value) URL.revokeObjectURL(wechatSrc.value)
-    wechatSrc.value = URL.createObjectURL(blob)
+    wechatSrc.value = URL.createObjectURL(shot.blob)
   } catch {
     wechatNotReady.value = true
   }
@@ -145,11 +158,16 @@ function tool(t: string): void {
   else if (t === 'keyboard') canvas.value?.focus()
 }
 
+/** #33:二进制 + `X-QT-Media-Id`/`X-QT-Sha256` 头 —— 存档时把这两个值一起显示,便于对账 */
+const shotMeta = ref<{ mediaId: string | null; sha256: string | null }>({ mediaId: null, sha256: null })
+
 async function takeShot(): Promise<void> {
   if (!focus.value) return
-  const blob = await accountsApi.screenshot(focus.value.id)
+  const shot = await accountsApi.screenshot(focus.value.id)
+  if (!shot.blob) return
   if (shotUrl.value) URL.revokeObjectURL(shotUrl.value)
-  shotUrl.value = URL.createObjectURL(blob)
+  shotUrl.value = URL.createObjectURL(shot.blob)
+  shotMeta.value = { mediaId: shot.mediaId, sha256: shot.sha256 }
   shotOpen.value = true
 }
 
@@ -264,6 +282,26 @@ onUnmounted(() => {
 
         <!-- 企点:WebCodecs canvas + 事件回注;静态预览为第三档降级 -->
         <template v-else>
+          <!--
+            🔴 #34 关闭码分诊(backend-api-2 §6):4503 / 4409 / 4401 / 4400 各说各的,
+            不一律「连接失败」;不可重试的一律停手,不无限重连。
+            ⚠️ 01 §4 还没有这块提示的元素 id(关闭码表 01 §5.1 也缺 4409/4410/4503),已列给文档方。
+          -->
+          <div v-if="streamClosed && !streamClosed.retryable" class="banner crit">
+            <strong>{{ streamClosed.text }}</strong>
+            <span class="qt-small qt-muted">(关闭码 {{ streamClosed.code }} · {{ streamClosed.reason }})</span>
+            <p v-if="streamClosed.reason === 'stream_backend_missing'" class="qt-small qt-muted">
+              画面流执行体本期未装配,已停止重连。截图与事件回注同样不可用,请改用消息页操作。
+            </p>
+            <p v-else-if="streamClosed.reason === 'unauthorized'" class="qt-small qt-muted">
+              请用顶部横幅的「重新取令牌」恢复,再回到本页。
+            </p>
+          </div>
+          <div v-else-if="streamClosed && streamClosed.reason === 'focus_taken'" class="banner">
+            {{ streamClosed.text }}
+            <a-button size="small" @click="startFocus">再试一次</a-button>
+          </div>
+
           <img v-if="stats.decoder === 'static' && staticSrc" class="wxpreview" :src="staticSrc" alt="静态预览" />
           <canvas
             v-else
@@ -310,6 +348,10 @@ onUnmounted(() => {
 
     <a-modal v-model:open="shotOpen" title="截图" :footer="null" :data-testid="T.shotPreview">
       <img v-if="shotUrl" :src="shotUrl" class="shot" alt="截图" />
+      <!-- 二进制响应的 media_id / sha256 只在响应头里(非 JSON 响应不带 trace_id 字段) -->
+      <p v-if="shotMeta.sha256" class="qt-small qt-muted qt-mono">
+        media_id {{ shotMeta.mediaId ?? '—' }} · sha256 {{ shotMeta.sha256.slice(0, 16) }}…
+      </p>
       <a-button type="primary" :data-testid="T.shotSave" @click="saveShot">保存</a-button>
     </a-modal>
   </div>
@@ -325,6 +367,7 @@ onUnmounted(() => {
 .thumb.qq { color: var(--qt-text-disabled); }
 .focus { flex: 1 1 auto; padding: var(--qt-space-3); overflow: auto; }
 .banner { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); margin: var(--qt-space-2) 0; }
+.banner.crit { background: #FFF1F0; color: var(--qt-sev-crit); }
 .canvas { width: 100%; max-width: 720px; background: #000; display: block; outline: none; }
 .wxpreview { max-width: 720px; border: 1px solid var(--qt-border); display: block; }
 .tools { margin-top: var(--qt-space-2); flex-wrap: wrap; }

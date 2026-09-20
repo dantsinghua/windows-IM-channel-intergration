@@ -3,7 +3,10 @@
  * 路径与入参逐字按 02 写,页面只调这里、不自己拼 URL。
  */
 
-import { request, requestCommand, requestList, requestBlob, requestEnvelope, newIdempotencyKey } from './http'
+import {
+  request, requestCommand, requestList, requestBinary, requestEnvelope,
+  pickOnceSecret, newIdempotencyKey,
+} from './http'
 import { normalizeMailStatus, selftestRows } from './types'
 import type {
   Account, AdoptProbeResult, ApiClientRow, AuditRow, CapabilityDef, CommandOutcome,
@@ -51,8 +54,23 @@ export const accountsApi = {
       query: { confirm: confirmLabel },
     }),
 
-  /** #8 真删:须手输账号 id 原文 */
+  /**
+   * #8 账号彻底删除(danger,admin 级)。
+   * 🔴 `confirm` 要**逐字等于账号 id**(手输,不是勾选);须先 #7 软删,否则 `409 not_soft_deleted`。
+   * 回 `202 {job_id}` —— 进度与结果一律走 `#107 GET /jobs/{job_id}`;
+   * 一旦 `params.irreversible_since_ms` 出现就**进了不可逆阶段**,取消按钮要灰掉
+   * (点了也是 `409 NOT_CANCELLABLE`,backend-api-2 §6)。
+   */
   purge: (id: string) => request<{ job_id: string }>(`/accounts/${id}/purge`, { method: 'POST', body: { confirm: id } }),
+
+  /**
+   * #16 登出。🔴 **按通道分界**(backend-api-2 §3,页面要分别提示,不许一律「登出失败」):
+   * - 微信 = 经 WinAgent 真登出 → `202 {account_id, via}`;
+   * - QQ   = `409 NOT_APPLICABLE` `reason=channel_no_logout`(登录态在 `qq_data` 卷里,通道无此概念);
+   * - 企点 = `503 NOT_READY` `reason=logout_backend_missing`(有这个概念,但本期没有执行体)。
+   */
+  logout: (id: string) =>
+    request<{ account_id: string; via?: string }>(`/accounts/${id}/logout`, { method: 'POST' }),
 
   /** #12 密码登录 / 触发登录流 */
   login: (id: string, body: { secret?: string; remember?: boolean; mode?: string; account?: string }) =>
@@ -120,10 +138,20 @@ export const accountsApi = {
   reconnectAdb: (id: string) => request<{ ok: boolean; adb_state: string }>(`/accounts/${id}/runtime/reconnect-adb`, { method: 'POST' }),
   restartStream: (id: string) => request<{ ok: boolean }>(`/accounts/${id}/runtime/restart-stream`, { method: 'POST' }),
 
-  /** #33 截图 */
-  screenshot: (id: string) => requestBlob(`/accounts/${id}/screenshot`),
+  /**
+   * #33 截图。🔴 **二进制,不是 JSON**:`Content-Type: image/png|image/jpeg`,
+   * `media_id`/`sha256` 在响应头 `X-QT-Media-Id` / `X-QT-Sha256` 里(非 JSON 响应不带 `trace_id` 字段,
+   * 指令 trace 在 `X-QT-Trace-Id`,backend-api-2 §6)。要存档/复盘就读这两个头,再走 #55 `GET /media/{sha256}`。
+   * QQ 通道 `409 NOT_APPLICABLE`;企点截图执行层本期未接 ⇒ `409 UNSUPPORTED`(**不回占位图**)。
+   */
+  screenshot: (id: string, q?: { region?: string; format?: 'png' | 'jpeg' }) =>
+    requestBinary(`/accounts/${id}/screenshot`, { query: q as Record<string, unknown> }),
 
-  /** #35 无 WS 时的 REST 注入兜底(C-08) */
+  /**
+   * #35 无 WS 时的 REST 注入兜底(C-08)。
+   * 有 WS 时走控制帧、没有才用它(两条路都会写 `stream_input` 审计);
+   * 画面流执行体未装配时 `503 NOT_READY` `reason=stream_backend_missing`。
+   */
   streamInput: (id: string, body: Record<string, unknown>) =>
     request<{ ok: boolean }>(`/accounts/${id}/stream/input`, { method: 'POST', body }),
 }
@@ -185,6 +213,20 @@ export const commandsApi = {
     '/broadcast/commands', { method: 'POST', body, idempotencyKey: body.idempotency_key },
   ),
 
+  /**
+   * #37 广播汇总回查。🔴 `results`/`counts` **只含当前令牌有权的账号**(受限令牌看到的 `total`
+   * 会比发起时小,这是有意的,backend-api-2 §6)—— 界面别把它当「有账号丢了」。
+   */
+  broadcastGet: (broadcastId: string) =>
+    request<{
+      broadcast_id: string
+      op: string
+      actor?: string
+      submitted_at?: string
+      counts: { total: number; ok: number; failed: number }
+      results: Record<string, CommandResult>
+    }>(`/broadcast/${broadcastId}`),
+
   /** #24 机型档案库(字段名统一 `profile_key`,带 `release/weight`) */
   deviceProfiles: () => requestList<DeviceProfileTemplate>('/device-profiles/templates'),
 }
@@ -208,10 +250,51 @@ export const messagesApi = {
   sessions: (q?: { account_id?: string; keyword?: string }) =>
     requestList<SessionRow>('/sessions', { query: q as Record<string, unknown> }),
 
+  /** #27b 单会话详情(02 只给了 PATCH 半,后端补的只读兄弟端点,待文档方登记) */
+  session: (accountId: string, sessionId: string) =>
+    request<SessionRow>(`/accounts/${accountId}/sessions/${sessionId}`),
+
+  /**
+   * #27 单会话设置。🔴 键集**只有这四个**,多一个键后端就 `400 bad_field`;
+   * `retention_days > 30` 同样 400(E-18,与 #22 同判据)。
+   */
+  patchSession: (accountId: string, sessionId: string, body: {
+    muted?: boolean
+    capture_text?: boolean | null
+    retention_days?: number | null
+    media_policy?: string | null
+  }) => request<SessionRow>(`/accounts/${accountId}/sessions/${sessionId}`, { method: 'PATCH', body }),
+
   list: (q: MessageQuery) => requestList<Message>('/messages', { query: q as Record<string, unknown> }),
 
   /** #55 取媒体一律按 sha256,`ref` 只用于显示 */
-  media: (sha256: string) => requestBlob(`/media/${sha256}`),
+  media: (sha256: string) => requestBinary(`/media/${sha256}`),
+
+  /**
+   * #50 按消息 + 媒体**下标**取(路径参数是 `{idx}` = 媒体在 `media_json` 里的下标,不是 media_id;
+   * 手上只有 media_id 就走 #55)。二进制 + `X-QT-Media-Id`/`X-QT-Sha256` 头。
+   * 🔴 `pending:true`(HTTP 202)= 懒下载还没完 ⇒ 轮询本端点或等 `message` 事件的 `media[].state`,
+   * **不是错误**;`413` = 超限未下载,`410` = 已过保留期。
+   */
+  mediaOfMessage: (messageId: string, idx: number) =>
+    requestBinary(`/messages/${messageId}/media/${idx}`),
+
+  /**
+   * #53 语音转文字。🔴 回的 `trace_id` 是**作业 trace,不是指令 trace**
+   * (`voice_to_text` 本期不走总线,backend-api-2 §7-8)——
+   * 拿它去 `#31 GET /accounts/{id}/commands/{trace_id}` 查**是查不到的**,
+   * 结果要等 `message` 事件回填的 `asr_text`/`asr_state`。
+   * 执行体未装配时 `503 NOT_READY` `reason=asr_backend_missing`。
+   */
+  asr: (messageId: string) =>
+    request<{ trace_id?: string }>(`/messages/${messageId}/asr`, { method: 'POST' }),
+
+  /**
+   * #54 消息清除(danger,admin 级)。🔴 **须 `confirm:true`**,缺则 400 且一行都不删;
+   * `mode:'text_only'` 只清正文、`'all'` 删行并减媒体 refcount。回 `202 {job_id}`,进度走 #107。
+   */
+  purge: (body: { account_id?: string; before?: string; mode: 'all' | 'text_only' }) =>
+    request<{ job_id: string }>('/messages/purge', { method: 'POST', body: { ...body, confirm: true } }),
 
   /**
    * #51 异步导出 → `202 {job_id}`。
@@ -220,6 +303,29 @@ export const messagesApi = {
    */
   export: (body: { filter: MessageQuery; fmt: 'jsonl' | 'csv' | 'eml'; with_media: 'none' | 'zip' }) =>
     request<{ job_id: string }>('/messages/export', { method: 'POST', body }),
+}
+
+/* ───────────────── 导出产物(#52) ───────────────── */
+
+export const exportsApi = {
+  /**
+   * #52 导出作业状态。`download_url` 是**相对路径**(`/api/v1/exports/<job_id>/file`),
+   * `status !== 'succeeded'` 时它是 `null`;`expires_at` 后端当前恒 `null`(交接 §7-6,待补写点)。
+   * 只许取本人作业:非 admin 取别人的 `403 job_not_owned`。
+   */
+  status: (jobId: string) =>
+    request<{
+      job_id: string
+      kind: string
+      status: string
+      rows: number | null
+      bytes: number | null
+      download_url: string | null
+      expires_at: string | null
+    }>(`/exports/${jobId}`),
+
+  /** #52 取产物本体(二进制;后端对 `file_path` 做了 realpath 越界防护,越界 `403 path_escape`) */
+  file: (jobId: string) => requestBinary(`/exports/${jobId}/file`),
 }
 
 /* ───────────────── 异步作业(§11.21 [JOB]) ───────────────── */
@@ -362,6 +468,26 @@ export const systemApi = {
     request<{ ok: boolean }>('/system/wsl-restart', { method: 'POST', body: { mode: 'shutdown', confirm: true } }),
   publicEndpoint: (refresh = false) =>
     request<PublicEndpoint>('/system/public-endpoint', { query: refresh ? { refresh: true } : undefined }),
+
+  /**
+   * #82 排空(升级前用)。🔴 **之后整个控制台的写操作都会 `503` `reason=draining`** —— 这是预期,
+   * 提示语要写「正在为升级排空」而不是「后端故障」;**后端没有逆操作端点**(交接 §7-3),
+   * 恢复受理只能重启 Agent。界面必须在按下前把这句话说清楚。
+   */
+  drain: (timeoutS = 30) =>
+    request<{
+      drained: boolean
+      inflight: number
+      inflight_before: number
+      waited_s: number
+      stopped_accounts: string[]
+    }>('/system/drain', { method: 'POST', body: { timeout_s: timeoutS } }),
+
+  /** #83 优雅停机:须 `confirm:true`,缺则 400。回 `202` 之后控制台会断开 */
+  shutdown: () =>
+    request<{ accepted?: boolean; stopping?: boolean }>('/system/shutdown', {
+      method: 'POST', body: { confirm: true },
+    }),
 }
 
 /* ───────────────── 邮件 ───────────────── */
@@ -390,9 +516,16 @@ export const mailApi = {
    */
   hmacKeys: () => requestList<{ sender: string; short_name: string; created_at?: string }>('/mail/hmac-keys'),
 
-  /** #67 入参只有 sender + short_name,**无 route**(短名全局唯一) */
-  createHmacKey: (sender: string, shortName: string) =>
-    request<{ secret: string }>('/mail/hmac-keys', { method: 'POST', body: { sender, short_name: shortName } }),
+  /**
+   * #67 入参只有 sender + short_name,**无 route**(短名全局唯一)。
+   * `secret` 同 #91 是**一次性明文**,走信封取法(N-1 同型)。
+   */
+  createHmacKey: async (sender: string, shortName: string) => {
+    const env = await requestEnvelope<{ secret?: string }>('/mail/hmac-keys', {
+      method: 'POST', body: { sender, short_name: shortName },
+    })
+    return { secret: pickOnceSecret(env, 'secret'), traceId: env.trace_id ?? '' }
+  },
   /** #68 按短名吊销,不按 sender */
   revokeHmacKey: (shortName: string) => request<{ ok: boolean }>(`/mail/hmac-keys/${shortName}`, { method: 'DELETE' }),
 
@@ -408,14 +541,61 @@ export const mailApi = {
 
 export const settingsApi = {
   get: <T = Record<string, unknown>>(group: string) => request<T>(`/settings/${group}`),
-  put: <T = Record<string, unknown>>(group: string, body: Record<string, unknown>) =>
-    request<T>(`/settings/${group}`, { method: 'PUT', body }),
+
+  /**
+   * #89 整组替换。🔴 走 `requestEnvelope` —— 这个端点在 `data`(组值)**之外**还有四个业务键
+   * `restart_required` / `config_written` / `warnings` / `secret_refs`(真后端实测),
+   * 用 `request()` 的「有 data 就返回 data」会把它们**静默丢掉**(与 N-1 同型)。
+   * 丢了 `restart_required`,界面就说不出「改完要重启 Agent 才生效」这句最关键的话。
+   */
+  put: async <T = Record<string, unknown>>(group: string, body: Record<string, unknown>) => {
+    const env = await requestEnvelope<T>(`/settings/${group}`, { method: 'PUT', body })
+    return {
+      data: (env.data as T | undefined) ?? null,
+      restartRequired: env.restart_required === true,
+      configWritten: env.config_written === true,
+      warnings: Array.isArray(env.warnings) ? (env.warnings as string[]) : [],
+      secretRefs: (env.secret_refs ?? null) as Record<string, string> | null,
+    }
+  },
 
   apiClients: () => requestList<ApiClientRow>('/settings/api-clients'),
-  createApiClient: (body: Record<string, unknown>) =>
-    request<{ app_id: string; token: string }>('/settings/api-clients', { method: 'POST', body }),
-  rotateApiClient: (appId: string) =>
-    request<{ token: string }>(`/settings/api-clients/${appId}/rotate`, { method: 'POST' }),
+
+  /**
+   * #91 新建 API 客户端。
+   * 🔴 **一次性明文令牌**(N-1):走 `requestEnvelope` 拿完整信封,再用 `pickOnceSecret()` 挑键 ——
+   * `request()` 的「有 `data` 就返回 `data`」会把顶层的 `token`/`app_id` 静默丢掉,
+   * 而令牌**只下发这一次**,丢了只能删了重建。`token` 为 `null` 说明后端这一版没下发,
+   * 页面必须明说「本次没拿到明文,请吊销后重建」,不许显示一个空框假装成功。
+   */
+  createApiClient: async (body: Record<string, unknown>) => {
+    const env = await requestEnvelope<ApiClientRow>('/settings/api-clients', { method: 'POST', body })
+    // 顶层平铺形状下 `data` 是空的 —— 行就在信封顶层,摘掉信封键与明文键即是
+    const { ok: _ok, code: _c, error: _e, trace_id: _t, next_cursor: _n, token: _tk, secret: _s, data: _d, ...flatRow }
+      = env as Record<string, unknown>
+    const row = (env.data as ApiClientRow | undefined)
+      ?? (typeof flatRow.app_id === 'string' ? (flatRow as unknown as ApiClientRow) : null)
+    return {
+      row,
+      // app_id 同样两形兼容(收口后只留 data 那一路)
+      appId: row?.app_id ?? (typeof env.app_id === 'string' ? env.app_id : null),
+      token: pickOnceSecret(env, 'token') ?? pickOnceSecret(env, 'secret'),
+      traceId: env.trace_id ?? '',
+    }
+  },
+
+  /** #92 轮换:同样是一次性明文,取法同 #91;`grace_minutes` 是旧凭据宽限期 */
+  rotateApiClient: async (appId: string) => {
+    const env = await requestEnvelope<ApiClientRow>(`/settings/api-clients/${appId}/rotate`, { method: 'POST' })
+    const data = (env.data ?? {}) as Record<string, unknown>
+    const grace = data.grace_minutes ?? env.grace_minutes
+    return {
+      token: pickOnceSecret(env, 'token') ?? pickOnceSecret(env, 'secret'),
+      graceMinutes: typeof grace === 'number' ? grace : null,
+      traceId: env.trace_id ?? '',
+    }
+  },
+
   revokeApiClient: (appId: string) => request<{ ok: boolean }>(`/settings/api-clients/${appId}`, { method: 'DELETE' }),
 
   mailRoutes: () => requestList<MailRouteOverride>('/settings/mail/routes'),
@@ -440,9 +620,10 @@ export const settingsApi = {
    */
   putPublicDomain: async (publicDomain: string) => {
     const cur = await request<Record<string, unknown>>('/settings/api')
-    return request<Record<string, unknown>>('/settings/api', {
+    const env = await requestEnvelope<Record<string, unknown>>('/settings/api', {
       method: 'PUT', body: { ...cur, public_domain: publicDomain },
     })
+    return { data: env.data ?? null, restartRequired: env.restart_required === true }
   },
   webhooks: () => requestList<{ id: string; url: string; enabled: boolean }>('/settings/webhooks'),
   addWebhook: (url: string) => request<{ id: string }>('/settings/webhooks', { method: 'POST', body: { url } }),

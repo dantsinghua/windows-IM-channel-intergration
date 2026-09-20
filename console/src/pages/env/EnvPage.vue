@@ -144,15 +144,68 @@ function confirmKernelReapply(): void {
   })
 }
 
+/** 当前会被中断的账号(重启 WSL / 排空 / 停机的共同影响面) */
+function affectedAccounts(): string[] {
+  return accounts.items
+    .filter((a) => ['running', 'degraded', 'login_required', 'starting', 'logging_in'].includes(a.state))
+    .map((a) => a.id)
+}
+
+/**
+ * 🔴 基线 §11.6 [NOSHUTDOWN]:重启 WSL **必须**二次确认,并**列出影响面**;
+ * 客户端恒带 `confirm:true`(02 #84),不带 confirm 的请求后端会直接拒绝。
+ */
 function confirmWslRestart(): void {
-  const affected = accounts.items.filter((a) => ['running', 'degraded', 'login_required'].includes(a.state)).map((a) => a.id)
+  const affected = affectedAccounts()
   Modal.confirm({
     title: '重启 WSL(经 Agent,需确认)',
     okType: 'danger',
-    content: `将中断这些账号:${affected.join('、') || '无'};你在 WSL 里的其它发行版也会一并停止。`,
+    okText: '我已知悉影响面,重启',
+    content: `将中断这些账号:${affected.join('、') || '无'};`
+      + '你在 WSL 里的其它发行版也会一并停止,未保存的工作会丢失。'
+      + '本机不直接执行 wsl 命令,请求经 Agent 转 WinAgent 执行。',
     onOk: async () => {
       await systemApi.wslRestart()
       message.success('已请求重启 WSL')
+    },
+  })
+}
+
+/**
+ * #82 排空(升级前用)。🔴 **没有逆操作端点**(backend-api-2 §7-3)——
+ * 排空之后所有写操作都会 503,恢复受理只能重启 Agent。这句话必须在按下之前说清楚。
+ */
+function confirmDrain(): void {
+  const affected = affectedAccounts()
+  Modal.confirm({
+    title: '排空 Agent(#82,升级前用)',
+    okType: 'danger',
+    okText: '我知道要重启才能恢复,排空',
+    content: `将停止受理新指令并停止这些账号的容器:${affected.join('、') || '无'};`
+      + '在途指令最多等 30 秒。⚠️ 没有「取消排空」的端点 —— 排空后要恢复受理,只能重启 Agent。',
+    onOk: async () => {
+      const r = await systemApi.drain()
+      message.success(
+        `已排空:在途 ${r.inflight_before} → ${r.inflight},等待 ${r.waited_s}s,`
+        + `停止账号 ${r.stopped_accounts.join('、') || '无'}`,
+      )
+      session.draining = true
+    },
+  })
+}
+
+/** #83 优雅停机:须 `confirm:true`;回 202 之后控制台会断开 */
+function confirmShutdown(): void {
+  const affected = affectedAccounts()
+  Modal.confirm({
+    title: '停止 Agent(#83)',
+    okType: 'danger',
+    okText: '我已知悉控制台会断开,停机',
+    content: `将停止 Agent 与这些账号:${affected.join('、') || '无'};`
+      + '停机后控制台会失去连接,需要在 WinAgent 里重新拉起 WSL 发行版才能继续。',
+    onOk: async () => {
+      await systemApi.shutdown()
+      message.success('已请求停机,控制台即将断开')
     },
   })
 }
@@ -249,8 +302,19 @@ onMounted(async () => {
               :data-testid="T.dockerProxy"
             >为 docker 启用系统代理</a-button>
           </a-popconfirm>
-          <a-button danger :data-testid="T.wslRestart" @click="confirmWslRestart">重启 WSL…</a-button>
+          <a-button
+            danger
+            :disabled="session.draining"
+            :data-testid="T.wslRestart"
+            @click="confirmWslRestart"
+          >重启 WSL…</a-button>
           <span :data-testid="T.wslRestartModal" class="hidden" />
+          <!--
+            #82 / #83:排空与停机。两者都要二次确认并列影响面;
+            ⚠️ 01 §4 还没有这两个按钮的元素 id,已列给文档方。
+          -->
+          <a-button :disabled="session.draining" @click="confirmDrain">排空(升级前)…</a-button>
+          <a-button danger @click="confirmShutdown">停止 Agent…</a-button>
         </div>
       </section>
 

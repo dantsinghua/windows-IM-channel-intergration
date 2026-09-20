@@ -66,11 +66,43 @@ export function isKeyFrame(nal: Uint8Array): boolean {
   return false
 }
 
+/**
+ * 🔴 #34 的关闭码分诊(backend-api-2 §6:「前四个要分别提示,不要一律『连接失败』」)。
+ * 02 §3.4.7 目前只定义了 4401/4400,其余三个是后端为 #34 补的(待文档方在 §3.4.7 补登,
+ * 控制台的关闭码表 01 §5.1 也要跟着加)。
+ */
+export const STREAM_CLOSE_CODES: Record<number, { reason: string; text: string; retryable: boolean }> = {
+  4401: { reason: 'unauthorized', text: '令牌无效或已过期,需要重新取令牌', retryable: false },
+  4400: { reason: 'bad_request', text: '画面流参数或控制帧格式不对', retryable: false },
+  4409: { reason: 'channel_no_stream', text: '该通道不提供画面流(微信请改用截图预览)', retryable: false },
+  4410: { reason: 'focus_taken', text: '该账号已有 focus 连接(同时只允许 1 个)', retryable: true },
+  4503: { reason: 'stream_backend_missing', text: '画面流后端未就绪(本期未装配执行体)', retryable: false },
+}
+
+export interface StreamClosed {
+  code: number
+  reason: string
+  text: string
+  /** 本次连接曾经 open 过没有 —— 区分「握手就被拒」与「看着看着断了」 */
+  everOpened: boolean
+  /** 重试有没有意义(4503/4409/4401/4400 都没有) */
+  retryable: boolean
+}
+
+export function classifyClose(code: number, everOpened: boolean): StreamClosed {
+  const known = STREAM_CLOSE_CODES[code]
+  if (known) return { code, reason: known.reason, text: known.text, everOpened, retryable: known.retryable }
+  if (code === 1000 || code === 1001) return { code, reason: 'normal', text: '画面流已关闭', everOpened, retryable: true }
+  return { code, reason: 'transport', text: `画面流连接中断(关闭码 ${code || '未知'})`, everOpened, retryable: true }
+}
+
 export interface StreamHooks {
   onHeader(h: StreamHeader): void
   onStats(s: Partial<StreamStats>): void
   onFrame(frame: VideoFrame): void
   onFatal(reason: string): void
+  /** 连接关闭:按 `STREAM_CLOSE_CODES` 分诊后交给页面(不重连、不降级的判断在页面) */
+  onClosed?(info: StreamClosed): void
 }
 
 export async function hardwareSupported(codec = 'avc1.42E01E'): Promise<boolean> {
@@ -92,8 +124,12 @@ export class ScreenStream {
   private fpsTimer: ReturnType<typeof setInterval> | null = null
   private decodeErrors = 0
   private header: StreamHeader | null = null
+  /** 收到不可重试的关闭码(4401/4400/4409/4503)后置位:服务端的 `restart` 一律不再理会 */
+  private fatalClosed = false
 
   path: DecodePath = 'hardware'
+  /** 最近一次关闭的分诊结果(页面据此提示,而不是一律「连接失败」) */
+  lastClose: StreamClosed | null = null
 
   constructor(
     private readonly accountId: string,
@@ -102,6 +138,7 @@ export class ScreenStream {
   ) {}
 
   async start(): Promise<void> {
+    this.fatalClosed = false
     const hw = await hardwareSupported()
     if (!hw) this.path = 'software'
     this.hooks.onStats({ decoder: this.path })
@@ -116,8 +153,16 @@ export class ScreenStream {
     const ws = new WebSocket(streamUrl(this.accountId, this.profile), SUBPROTOCOL)
     ws.binaryType = 'arraybuffer'
     this.ws = ws
-    ws.onopen = () => this.hooks.onStats({ connected: true })
-    ws.onclose = () => this.hooks.onStats({ connected: false })
+    let everOpened = false
+    ws.onopen = () => { everOpened = true; this.hooks.onStats({ connected: true }) }
+    ws.onclose = (ev) => {
+      this.hooks.onStats({ connected: false })
+      const info = classifyClose(ev?.code ?? 0, everOpened)
+      this.lastClose = info
+      // 🔴 4503/4409/4401/4400 重试没有意义 —— 停手,由页面显示对应提示,不无限重连
+      if (!info.retryable) this.fatalClosed = true
+      this.hooks.onClosed?.(info)
+    }
     ws.onerror = () => this.hooks.onStats({ connected: false })
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
@@ -132,6 +177,7 @@ export class ScreenStream {
     let obj: Record<string, unknown>
     try { obj = JSON.parse(text) } catch { return }
     if (obj.type === 'restart') {
+      if (this.fatalClosed) return
       this.stop()
       this.openSocket()
       return

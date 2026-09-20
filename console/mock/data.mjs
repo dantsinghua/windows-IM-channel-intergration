@@ -13,7 +13,9 @@ export function makeAccounts() {
       id: 'qd01', channel: 'qidian', host: 'wsl', label: '张三-固收', state: 'running',
       state_code: '', state_reason: '', error_since_ms: null, enabled: true, auto_recover: true, deleted_ms: null,
       runtime: { kind: 'redroid', container: 'qtrade-qd01', adb_port: 16001, stream_port: 16501 },
-      identity: { brand: 'Xiaomi', model: 'MI 11', serialno: 'QT0001' },
+      // 🔴 M-10:00 §7.1 的 `identity` 是按通道自由形状,但 `brand/model/serialno` 三键无出处
+      // (`brand/model` 属于 #24 的机型档案库);mock 不再凭空下发。
+      identity: { qidian_uin: '415011447' },
       login: { mode: 'password', credential_ref: 'vault://account/qd01', remember: true },
       capabilities: ['read_messages', 'list_sessions', 'get_state', 'screenshot', 'send_text', 'send_image', 'send_file'],
       quota_mb: 2560, self_nick: '张三', self_uid: '415011447',
@@ -24,7 +26,7 @@ export function makeAccounts() {
       state_code: 'WAIT_SMS', state_reason: '等待短信验证', error_since_ms: null, enabled: true,
       auto_recover: true, deleted_ms: null,
       runtime: { kind: 'redroid', container: 'qtrade-qd02', adb_port: 16002, stream_port: 16502 },
-      identity: { brand: 'HUAWEI', model: 'P40' },
+      identity: {},
       login: { mode: 'password', credential_ref: null, remember: false },
       capabilities: ['get_state', 'screenshot'],
       quota_mb: 2560, created_at: now(), updated_at: now(), last_seen_at: now(),

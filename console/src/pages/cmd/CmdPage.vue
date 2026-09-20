@@ -11,6 +11,7 @@ import { cmd as T } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
 import { useCommandsStore } from '@/stores/commands'
 import { useMessagesStore } from '@/stores/messages'
+import { useSessionStore } from '@/stores/session'
 import { commandsApi } from '@/api/client'
 import { ApiFailure, newIdempotencyKey } from '@/api/http'
 import CapabilityForm from '@/components/CapabilityForm.vue'
@@ -25,6 +26,7 @@ const router = useRouter()
 const accounts = useAccountsStore()
 const store = useCommandsStore()
 const messages = useMessagesStore()
+const session = useSessionStore()
 
 const mode = ref<'single' | 'broadcast'>('single')
 const accountId = ref<string | undefined>()
@@ -77,6 +79,8 @@ function opTitle(o: string): string {
 }
 
 const runDisabled = computed(() => {
+  // #82 drain 期间 Agent 不受理新指令(503 draining)—— 按钮先灰,别让用户点了吃红错
+  if (session.draining) return true
   if (!op.value) return true
   if (mode.value === 'broadcast') return broadcastIds.value.length === 0
   return opDisabled(op.value)
@@ -281,7 +285,7 @@ onMounted(async () => {
       <a-form-item label="超时 ms">
         <a-input-number v-model:value="timeoutMs" :data-testid="T.timeout" :min="1000" :max="600000" />
       </a-form-item>
-      <a-tooltip :title="op ? opTitle(op) : '请选择能力'">
+      <a-tooltip :title="session.draining ? 'Agent 正在为升级排空,已停止受理新指令' : (op ? opTitle(op) : '请选择能力')">
         <a-button type="primary" :loading="running" :disabled="runDisabled" :data-testid="T.run" @click="run">执行</a-button>
       </a-tooltip>
     </section>

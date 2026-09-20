@@ -458,3 +458,265 @@ describe('mock 必须复现真后端会卡住控制台的三处(E-01 / E-02 / E-
     expect(ack.body.ok).toBe(true)
   })
 })
+
+/* ───────────────── 5. N-6:mock 与**规格**不符的 12 处(e2e-recheck §3.2 B 表 M-1~M-12) ───────────────── */
+
+async function req(
+  method: string, path: string, body?: unknown,
+): Promise<{ status: number; body: Env }> {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { 'X-QT-Api-Min': '1.0', 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  return { status: res.status, body: (await res.json()) as Env }
+}
+
+describe('N-6:mock 对齐规格(M-1 ~ M-12)', () => {
+  it('M-3 🔴 #84 wsl-restart 不带 confirm 必须**拒**(基线 §11.6 [NOSHUTDOWN] / 02 #84)', async () => {
+    const { status, body } = await post('/system/wsl-restart', { mode: 'shutdown' })
+    expect(status, 'mock 放行会让页面开发以为不需要二次确认').toBe(400)
+    expect(body.ok).toBe(false)
+    expect(body.code).toBe('INVALID_ARGS')
+    expect(body.error).toMatchObject({ reason: 'confirm_required' })
+  })
+
+  it('M-3 带 confirm:true 才放行(控制台客户端恒带)', async () => {
+    const { status, body } = await post('/system/wsl-restart', { mode: 'shutdown', confirm: true })
+    expect(status).toBe(200)
+    expect(body.ok).toBe(true)
+  })
+
+  it('M-2 #51:fmt=eml 与 with_media=zip 明着 400,不静默降级(R6-62 (g))', async () => {
+    const eml = await post('/messages/export', { fmt: 'eml', with_media: 'none', filter: {} })
+    expect(eml.status).toBe(400)
+    expect(eml.body.error).toMatchObject({ reason: 'unsupported_fmt' })
+
+    const zip = await post('/messages/export', { fmt: 'jsonl', with_media: 'zip', filter: {} })
+    expect(zip.status).toBe(400)
+    expect(zip.body.error).toMatchObject({ reason: 'unsupported_with_media' })
+
+    const good = await post('/messages/export', { fmt: 'jsonl', with_media: 'none', filter: {} })
+    expect(good.status).toBe(202)
+  })
+
+  it('M-1 #28 的 409 IDEMPOTENT_REPLAY:响应体是**顶层平铺**的完整 CommandResult', async () => {
+    const key = `replay-${Date.now()}`
+    const first = await post('/accounts/qd01/commands', {
+      op: 'send_text', args: { session: 'qd01:415011447', text: '首发' }, idempotency_key: key,
+    })
+    expect(first.status).toBe(200)
+
+    const again = await post('/accounts/qd01/commands', {
+      op: 'send_text', args: { session: 'qd01:415011447', text: '首发' }, idempotency_key: key,
+    })
+    expect(again.status).toBe(409)
+    expect(again.body.code).toBe('IDEMPOTENT_REPLAY')
+    // 顶层平铺 = CommandResult 自己就是信封:`data` 是**业务 data**(message_id 之类),
+    // 不是「再包一层完整 CommandResult」。M-1 要挡的正是后者。
+    const replayData = (again.body.data ?? {}) as Env
+    expect(
+      Object.keys(replayData).filter((k) => ['ok', 'code', 'cost_ms', 'source', 'state_before'].includes(k)),
+      '把完整 CommandResult 包进 data 了 —— 规格与真后端都是顶层平铺',
+    ).toEqual([])
+    assertHas(again.body, ['cost_ms', 'trace_id', 'source', 'state_before', 'state_after'], '#28 重放体')
+    expect(again.body.trace_id, '重放要回首次那条 trace').toBe(first.body.trace_id)
+  })
+
+  it('M-4 #75 mode=sample:出参顶层平铺 {sampled_at,duration_s,rows,skipped},不包 data', async () => {
+    const { status, body } = await post('/system/probe', { mode: 'sample', duration_s: 5 })
+    expect(status).toBe(200)
+    expect(body.data, 'R6-58 (de) 是字面键集 ⇒ 顶层平铺').toBeUndefined()
+    assertHas(body, ['sampled_at', 'duration_s', 'rows', 'skipped'], '#75 sample')
+    expect(body).not.toHaveProperty('run_id')
+  })
+
+  it('M-5 #19 /accounts/{id}/state 存在,且是六键 + trace_id 的**闭集**(R6-62 (b))', async () => {
+    const { status, body } = await get('/accounts/qd01/state')
+    expect(status, 'mock 原先 404').toBe(200)
+    const six = ['state', 'state_code', 'state_reason', 'error_since_ms', 'enabled', 'last_seen_at']
+    assertHas(body, six, '#19')
+    expect(new Set(Object.keys(body))).toEqual(new Set([...six, 'ok', 'trace_id']))
+  })
+
+  it('M-6 #88 的 group 枚举逐字含 runtime / pool / events / log 四组', async () => {
+    for (const g of ['runtime', 'pool', 'events', 'log']) {
+      const { status, body } = await get(`/settings/${g}`)
+      expect(status, `/settings/${g} 应在 #88 的枚举里`).toBe(200)
+      expect(body.group).toBe(g)
+      expect(typeof body.data).toBe('object')
+    }
+  })
+
+  it('M-7 #79 GET /system/selftest/{run_id}:跑过能查到,乱填的 run_id 404', async () => {
+    const run = await post('/system/selftest')
+    expect(run.status).toBe(202)
+    const runId = String(run.body.run_id)
+
+    const got = await get(`/system/selftest/${runId}`)
+    expect(got.status, 'mock 原先只有不带 run_id 的 #79b').toBe(200)
+    expect((got.body.data as Env).run_id).toBe(runId)
+
+    const missing = await get('/system/selftest/st_nope')
+    expect(missing.status, '#79 用不存在的 run_id 是 404,与 #79b「没跑过 ⇒ data:null」是两回事').toBe(404)
+  })
+
+  it('M-8 #87 notice/ack:版本对不上必须拒,否则合规判据失真', async () => {
+    const bad = await post('/system/notice/ack', { notice_version: 'v0-old' })
+    expect(bad.status).toBe(400)
+    expect(bad.body.error).toMatchObject({ reason: 'notice_version_mismatch' })
+
+    const cur = await get('/system/notice')
+    const good = await post('/system/notice/ack', { notice_version: cur.body.notice_version })
+    expect(good.status).toBe(200)
+  })
+
+  it('M-9 #73 /system/version 不造 docs 里不存在的五个键', async () => {
+    const { body } = await get('/system/version')
+    assertHasNot(
+      body,
+      ['kernel_state', 'wsl_state', 'distro', 'migration', 'wa_schema_version'],
+      '#73(第一轮 S-09,裁决① = 以后端现实现为准)',
+    )
+    assertSubset(
+      Object.fromEntries(Object.entries(body).filter(([k]) => !ENVELOPE_KEYS.has(k))),
+      'SystemVersion',
+      '#73',
+    )
+  })
+
+  it('M-10 #3 Account.identity 不造 brand / model / serialno(那是 #24 档案库的键)', async () => {
+    const { body } = await get('/accounts')
+    for (const r of body.data as Env[]) {
+      const identity = (r.identity ?? {}) as Env
+      assertHasNot(identity, ['brand', 'model', 'serialno'], `#3 ${String(r.id)} 的 identity`)
+    }
+  })
+
+  it('M-11 #22 PATCH /accounts/{id}/settings 的出参是 Account,不带 adb_state', async () => {
+    const { status, body } = await req('PATCH', '/accounts/qd01/settings', { auto_recover: true })
+    expect(status).toBe(200)
+    const row = body.data as Env
+    expect(row, '02 #22 的出参是 Account').toBeTruthy()
+    expect(row.id).toBe('qd01')
+    assertSubset(row, 'Account', '#22 出参')
+    assertHasNot(row, ['adb_state'], '#22 出参(adb_state 只属于 #100)')
+  })
+
+  it('M-12 #91 建 API 客户端:201 + 顶层平铺 + 一次性明文 token;列表端点永不回 token', async () => {
+    const { status, body } = await post('/settings/api-clients', { name: 'shape-test', level: 'read' })
+    expect(status, '建资源按 00 §10 / #2 的惯例是 201').toBe(201)
+    expect(body.ok).toBe(true)
+    // R6-55 二选一:ApiClient 不在 00 §7 的对象清单里 ⇒ 顶层平铺
+    expect(body.data, '既包 data 又在顶层放 token 是 B-1 那种两头占').toBeUndefined()
+    assertHas(body, ['app_id', 'token'], '#91')
+    expect(typeof body.token).toBe('string')
+    expect(String(body.token).length).toBeGreaterThan(0)
+
+    const list = await get('/settings/api-clients')
+    for (const r of list.body.data as Env[]) {
+      assertHasNot(r, ['token', 'secret', 'secret_hash'], '#90 列表行')
+      assertSubset(r, 'ApiClientRow', '#90 列表行')
+    }
+  })
+
+  it('#92 轮换同样一次性下发明文 + 旧凭据宽限期', async () => {
+    const { status, body } = await post('/settings/api-clients/ibquote/rotate')
+    expect(status).toBe(200)
+    assertHas(body, ['token', 'grace_minutes'], '#92')
+  })
+})
+
+/* ───────────────── 6. 后端第二批端点在 mock 里的最小实现 ───────────────── */
+
+describe('后端第二批新端点(诚实回 503/409,不伪造)', () => {
+  it('#16 登出按通道分界:微信 202 / QQ 409 channel_no_logout / 企点 503 logout_backend_missing', async () => {
+    const wx = await post('/accounts/wx01/logout')
+    expect(wx.status).toBe(202)
+    expect(wx.body.via).toBe('winagent')
+
+    const qq = await post('/accounts/qq01/logout')
+    expect(qq.status).toBe(409)
+    expect(qq.body.error).toMatchObject({ reason: 'channel_no_logout' })
+
+    const qd = await post('/accounts/qd01/logout')
+    expect(qd.status).toBe(503)
+    expect(qd.body.error).toMatchObject({ reason: 'logout_backend_missing' })
+  })
+
+  it('#8 彻底删除:confirm 要逐字等于 id,且须先软删', async () => {
+    const mismatch = await post('/accounts/qd02/purge', { confirm: 'nope' })
+    expect(mismatch.status).toBe(400)
+    expect(mismatch.body.error).toMatchObject({ reason: 'confirm_mismatch' })
+
+    const notSoftDeleted = await post('/accounts/qd02/purge', { confirm: 'qd02' })
+    expect(notSoftDeleted.status).toBe(409)
+    expect(notSoftDeleted.body.error).toMatchObject({ reason: 'not_soft_deleted' })
+  })
+
+  it('#54 消息清除:无 confirm 一行都不删(400 confirm_required)', async () => {
+    const no = await post('/messages/purge', { account_id: 'qd01', mode: 'all' })
+    expect(no.status).toBe(400)
+    expect(no.body.error).toMatchObject({ reason: 'confirm_required' })
+
+    const yes = await post('/messages/purge', { account_id: 'qd01', mode: 'text_only', confirm: true })
+    expect(yes.status).toBe(202)
+    expect(typeof yes.body.job_id).toBe('string')
+  })
+
+  it('#53 ASR 没有执行体 ⇒ 如实 503 asr_backend_missing(不伪造转写结果)', async () => {
+    const { status, body } = await post('/messages/m1/asr')
+    expect(status).toBe(503)
+    expect(body.error).toMatchObject({ reason: 'asr_backend_missing' })
+  })
+
+  it('#83 停机须 confirm:true', async () => {
+    const no = await post('/system/shutdown', {})
+    expect(no.status).toBe(400)
+    expect(no.body.error).toMatchObject({ reason: 'confirm_required' })
+  })
+
+  // ⚠️ 这条必须**放在最后**:drain 之后 mock 的写操作一律 503(与真后端一样没有逆操作)
+  it('#82 drain 之后:写操作一律 503 draining,只读照常', async () => {
+    const drain = await post('/system/drain', { timeout_s: 1 })
+    expect(drain.status).toBe(200)
+    assertHas(drain.body, ['drained', 'inflight', 'inflight_before', 'waited_s', 'stopped_accounts'], '#82')
+
+    const write = await post('/accounts/qd01/commands', {
+      op: 'send_text', args: { session: 'qd01:415011447', text: '排空后' }, idempotency_key: `d-${Date.now()}`,
+    })
+    expect(write.status).toBe(503)
+    expect(write.body.error).toMatchObject({ reason: 'draining' })
+
+    const read = await get('/accounts')
+    expect(read.status, '只读在排空期间照常可用').toBe(200)
+  })
+})
+
+/* ───────────────── 7. request( 调用点审计:data 之外还有业务键的端点 ───────────────── */
+
+describe('信封里 data 之外的业务键不能被静默丢掉(N-1 同型)', () => {
+  it('#89 PUT /settings/{group}:restart_required / config_written 在 data 之外的顶层', async () => {
+    const cur = await get('/settings/log')
+    const { status, body } = await req('PUT', '/settings/log', cur.body.data as Env)
+    expect(status).toBe(200)
+    expect(body.data, '组值在 data 里').toBeTruthy()
+    assertHas(body, ['group', 'restart_required', 'config_written'], '#89')
+    expect(body.restart_required, 'v1 除 resources 外一律需要重启').toBe(true)
+  })
+
+  it('#21 /capabilities:capabilities_version 在 data 之外的顶层', async () => {
+    const { body } = await get('/capabilities')
+    assertHas(body, ['capabilities_version'], '#21')
+  })
+
+  it('#76 observed:targets 在 data 之外的顶层', async () => {
+    const { body } = await get('/system/probes?kind=observed')
+    assertHas(body, ['targets'], '#76 observed')
+  })
+
+  it('#79b 自检:run_id 在 data 之外的顶层', async () => {
+    const { body } = await get('/system/selftest')
+    assertHas(body, ['run_id'], '#79b')
+  })
+})

@@ -228,8 +228,21 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
 
         <div v-if="ch !== 'wechat' && selected.size" class="qt-row batchbar">
           <span class="qt-small">已选 {{ selected.size }} 个</span>
-          <a-button size="small" :loading="batching" :data-testid="T.batchStart" @click="batch('start')">批量启动</a-button>
-          <a-button size="small" :loading="batching" :data-testid="T.batchStop" @click="batch('stop')">批量停止</a-button>
+          <!-- #82 drain 期间账号动作一律 503 draining,按钮先灰 -->
+          <a-button
+            size="small"
+            :loading="batching"
+            :disabled="session.draining"
+            :data-testid="T.batchStart"
+            @click="batch('start')"
+          >批量启动</a-button>
+          <a-button
+            size="small"
+            :loading="batching"
+            :disabled="session.draining"
+            :data-testid="T.batchStop"
+            @click="batch('stop')"
+          >批量停止</a-button>
         </div>
 
         <table class="tbl">

@@ -18,6 +18,16 @@ export const useJobsStore = defineStore('jobs', () => {
     return !!j && TERMINAL.has(j.state)
   }
 
+  /**
+   * 🔴 已进入**不可逆阶段**(#8 账号彻底删除 / #54 消息清除)。
+   * 判据 = `params.irreversible_since_ms` 一出现就算(backend-api-2 §6 逐字);
+   * 这之后 `#108 POST /jobs/{id}/cancel` 一律 `409 NOT_CANCELLABLE` —— 取消按钮该灰掉,
+   * 而不是让用户点一下再吃一个红错。
+   */
+  function isIrreversible(j: Job | undefined): boolean {
+    return !!j && j.params?.irreversible_since_ms !== undefined && j.params.irreversible_since_ms !== null
+  }
+
   function put(raw: Job): void {
     // S-05 的一次性兼容:后端当前给 `*_ms`,规格是 ISO `*_at`(后端改完删 normalizeJob)
     const j = normalizeJob(raw)
@@ -50,8 +60,12 @@ export const useJobsStore = defineStore('jobs', () => {
   }
 
   async function cancel(jobId: string): Promise<void> {
-    await jobsApi.cancel(jobId)
-    await poll(jobId)
+    try {
+      await jobsApi.cancel(jobId)
+    } finally {
+      // 不论成败都刷一次:409 NOT_CANCELLABLE 时界面要立刻反映「已不可取消」
+      await poll(jobId)
+    }
   }
 
   function bindEvents(): void {
@@ -63,5 +77,5 @@ export const useJobsStore = defineStore('jobs', () => {
     delete byId.value[jobId]
   }
 
-  return { byId, track, cancel, put, clear, isTerminal, bindEvents }
+  return { byId, track, cancel, put, clear, isTerminal, isIrreversible, bindEvents }
 })

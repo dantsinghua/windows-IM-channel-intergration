@@ -76,6 +76,12 @@ export interface HttpHooks {
   onApiVersion?: (v: string) => void
   /** 426:版本协商不通过(02 §3.8)——要给出明确 UI 提示,不能只弹一句「请求失败」 */
   onUpgradeRequired?: (info: { needMin: string; serverVersion: string | null; message: string }) => void
+  /**
+   * #82 drain 之后**所有写操作**都会 `503` `reason=draining`(backend-api-2 §6)。
+   * `true` = 刚撞上排空;`false` = 写操作又成功了(Agent 重启后自动恢复)。
+   * 🔴 后端**没有 undrain 端点**,所以这个状态只能靠「写操作又通了」来解除,不能本地拦请求。
+   */
+  onDraining?: (draining: boolean) => void
 }
 
 let hooks: HttpHooks = {}
@@ -96,6 +102,9 @@ export interface TraceEntry {
 
 const TRACE_MAX = 50
 const traces: TraceEntry[] = []
+
+/** 撞上过 `503 draining` 的写端点路径(见 `perform()` 里的说明) */
+const drainingPaths = new Set<string>()
 
 function recordTrace(e: TraceEntry): void {
   traces.unshift(e)
@@ -240,6 +249,23 @@ async function perform(path: string, opts: RequestOptions): Promise<Attempted> {
       })
     }
 
+    /*
+     * #82 排空:置位/解除全局横幅(提示语要写「正在为升级排空」,不是「后端故障」)。
+     *
+     * 🔴 解除条件只认「**曾经被 draining 拒过的那个 path** 又通了」——
+     * 实测真后端的拦截面只有总线指令类(commands / broadcast / 账号动作),
+     * 设置类写端点在排空期间**照样成功**;若写成「任何写操作成功就解除」,
+     * 用户随手改一条设置就会把横幅抹掉,而 Agent 其实还在排空。
+     */
+    if (method !== 'GET') {
+      if (res.status === 503 && env.error?.reason === 'draining') {
+        drainingPaths.add(path)
+        hooks.onDraining?.(true)
+      } else if (res.ok && drainingPaths.delete(path) && drainingPaths.size === 0) {
+        hooks.onDraining?.(false)
+      }
+    }
+
     recordTrace({
       at: new Date().toISOString(),
       method,
@@ -282,6 +308,30 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
 }
 
 /**
+ * 🔴 一次性明文凭据的取法(N-1;#91 新建 API 客户端 / #92 轮换 / #67 HMAC 密钥)。
+ *
+ * 这类响应**只下发一次**,客户端这一跳丢了就再也拿不到(02 #91「**一次性**返回 `token` 或 `secret`」)。
+ * 所以绝不套用 `request()` —— 它「有 `data` 就返回 `data`」,对
+ * 「既包 `data` 又在顶层放业务键」的混合形状会**静默丢键**(与 E-04 同型,本轮 N-1 的前端次责)。
+ * 一律先拿完整信封,再自己挑键。
+ *
+ * ⚠️ **兼容分支(待后端收口后删)**:R6-55 要求「包 `data`」与「顶层平铺」二选一,
+ * 后端另一位 agent 正把 #91/#92 收口成「令牌与行同在 `data` 里」的单一形状;
+ * 收口前真后端是 `{ok, data:{行}, app_id, token, trace_id}`(两种形状都占)。
+ * 这里两形都认 —— 后端收口后,把「顶层」那一路连同本段注释一起删掉。
+ */
+export function pickOnceSecret(env: Envelope<unknown>, key: string): string | null {
+  const data = isPlainObject(env.data) ? env.data : null
+  const inData = data ? data[key] : undefined
+  if (typeof inData === 'string' && inData) return inData
+  // ↓↓ 兼容分支:令牌在顶层(后端收口后删这三行) ↓↓
+  const top = env[key]
+  if (typeof top === 'string' && top) return top
+  // ↑↑ 兼容分支结束 ↑↑
+  return null
+}
+
+/**
  * 🔴 指令类端点(#28 / #29 / #36)专用通道 —— 02 §3.4 #28 R6-52。
  *
  * 「HTTP 状态说的是这次调用有没有被受理执行,结果码说的是执行成了没有」:
@@ -311,22 +361,77 @@ export async function requestList<T>(
   return { items: (env.data as T[]) ?? [], nextCursor: (env.next_cursor as string | null) ?? null }
 }
 
-/** 二进制端点(截图、媒体、导出流) */
-export async function requestBlob(path: string, opts: RequestOptions = {}): Promise<Blob> {
-  const traceId = ulid()
+/**
+ * 二进制端点的完整结果(#33 截图 / #50 媒体 / #55 媒体 / #52 导出产物)。
+ *
+ * 🔴 非 JSON 响应**不带 `trace_id` 字段**(02 §3.4 通用段例外②:一个字节都不碰),
+ * 复盘要用的三样都在响应头里(backend-api-2 §6):
+ * `X-QT-Media-Id` / `X-QT-Sha256` / `X-QT-Trace-Id`。
+ *
+ * `#50` 懒下载还没完时后端回 **`202 {state:'pending'}`**(JSON,不是图) ——
+ * 这时 `blob` 为 `null`、`pending` 为 `true`,调用方该轮询本端点或等 `message` 事件的 `media[].state`。
+ */
+export interface BinaryResult {
+  blob: Blob | null
+  mediaId: string | null
+  sha256: string | null
+  traceId: string
+  contentType: string
+  /** 202:懒下载未完成(#50) */
+  pending: boolean
+}
+
+/** 二进制端点(截图、媒体、导出流);连同 `X-QT-Media-Id`/`X-QT-Sha256` 一起回 */
+export async function requestBinary(path: string, opts: RequestOptions = {}): Promise<BinaryResult> {
+  const localTrace = ulid()
   const res = await fetch(buildUrl(path, opts.query), {
     method: opts.method ?? 'GET',
-    headers: { 'X-Trace-Id': traceId, 'X-QT-Api-Min': API_MIN_VERSION },
+    headers: { 'X-Trace-Id': localTrace, 'X-QT-Api-Min': API_MIN_VERSION },
     signal: opts.signal,
   })
+  const traceId = res.headers.get('X-QT-Trace-Id') || localTrace
   if (!res.ok) {
-    throw new ApiFailure(statusToCode(res.status), res.status, traceId, {
-      message: `取二进制失败(HTTP ${res.status})`,
-      retryable: res.status >= 500,
-      needs_human: false,
+    // 错误分支后端回的是 JSON 信封(00 §10),把 code/message 原样交给页面
+    const env = await readEnvelope(res)
+    recordTrace({
+      at: new Date().toISOString(), method: opts.method ?? 'GET', path,
+      status: res.status, code: (env.code as string) || statusToCode(res.status),
+      traceId: (env.trace_id as string) || traceId,
+    })
+    throw new ApiFailure(
+      (env.code as string) || statusToCode(res.status),
+      res.status,
+      (env.trace_id as string) || traceId,
+      env.error ?? { message: `取二进制失败(HTTP ${res.status})`, retryable: res.status >= 500, needs_human: false },
+      env,
+    )
+  }
+  const contentType = res.headers.get('Content-Type') ?? ''
+  // #50 的 `202 {state:'pending'}`:懒下载还没完,不是图
+  const pending = res.status === 202 || contentType.includes('application/json')
+  recordTrace({
+    at: new Date().toISOString(), method: opts.method ?? 'GET', path,
+    status: res.status, code: pending ? 'PENDING' : 'OK', traceId,
+  })
+  return {
+    blob: pending ? null : await res.blob(),
+    mediaId: res.headers.get('X-QT-Media-Id'),
+    sha256: res.headers.get('X-QT-Sha256'),
+    traceId,
+    contentType,
+    pending,
+  }
+}
+
+/** 只要图本身的场合(拿不到就是异常);要 `media_id`/`sha256` 请用 `requestBinary` */
+export async function requestBlob(path: string, opts: RequestOptions = {}): Promise<Blob> {
+  const r = await requestBinary(path, opts)
+  if (!r.blob) {
+    throw new ApiFailure('NOT_READY', 202, r.traceId, {
+      message: '媒体仍在下载中,请稍后重试', reason: 'media_pending', retryable: true, needs_human: false,
     })
   }
-  return await res.blob()
+  return r.blob
 }
 
 /** 新幂等键:默认自动 ULID(01 §2.7.5) */

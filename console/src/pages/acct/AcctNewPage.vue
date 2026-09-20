@@ -238,9 +238,11 @@ async function pollWechatPreview(): Promise<void> {
   try {
     const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
     if (v && v.visible === false) { wxPreviewSrc.value = ''; return }
-    const blob = await accountsApi.screenshot(createdId.value)
+    // #33 是二进制 + 响应头(媒体 id / sha256 在头里);这里只做预览,拿 blob 即可
+    const shot = await accountsApi.screenshot(createdId.value)
+    if (!shot.blob) { wxPreviewSrc.value = ''; return }
     if (wxPreviewSrc.value) URL.revokeObjectURL(wxPreviewSrc.value)
-    wxPreviewSrc.value = URL.createObjectURL(blob)
+    wxPreviewSrc.value = URL.createObjectURL(shot.blob)
   } catch {
     wxPreviewSrc.value = ''
   }

@@ -24,6 +24,13 @@ export const useSessionStore = defineStore('session', () => {
    * 一旦出现,任何请求都发不出去 —— 必须给一句能照着做的话,不能只弹「请求失败」。
    */
   const upgradeRequired = ref<{ needMin: string; serverVersion: string | null; message: string } | null>(null)
+  /**
+   * #82 drain:Agent 已停止受理新指令,**所有写操作会 `503` `reason=draining`**。
+   * 🔴 这是**升级流程的预期状态**,不是后端故障 —— 提示语必须写「正在为升级排空」。
+   * 后端没有 undrain 端点(backend-api-2 §7-3),只能靠重启 Agent 恢复;
+   * 所以这里不本地拦请求,只驱动横幅与写按钮的禁用态,写操作一旦又成功就自动解除。
+   */
+  const draining = ref(false)
 
   /** 门禁覆盖层可见:令牌不 ok / Agent 不可达 / 版本协商不通过(保留原路由,恢复后原地继续) */
   const gateVisible = computed(
@@ -115,6 +122,9 @@ export const useSessionStore = defineStore('session', () => {
       onUpgradeRequired: (info) => {
         upgradeRequired.value = info
       },
+      onDraining: (on) => {
+        draining.value = on
+      },
     })
     void refreshAuth()
     void pingAgent()
@@ -130,7 +140,7 @@ export const useSessionStore = defineStore('session', () => {
 
   return {
     authState, agentReachable, agentDownReason, winagentOnline, userAgentOnline, apiVersion, appVersion,
-    upgradeRequired,
+    upgradeRequired, draining,
     gateVisible, gateTitle, gateDetail, GATE_LOGIN_HINT, wechatDisabled, vaultDisabled, wslGroupDisabled,
     refreshAuth, retryToken, pingAgent, startWsl, install, uninstall,
   }

@@ -278,6 +278,13 @@ export interface Message {
   lag_s?: number
   late?: boolean
   origin?: 'rpa' | 'external'
+  /**
+   * #53 语音转文字的回写(backend-api-2 §1)。
+   * `text_source='asr'` 时 `text` 才是转写出来的;否则转写只落在 `asr_text` 里,不覆盖原文。
+   */
+  asr_text?: string | null
+  asr_state?: 'pending' | 'done' | 'failed' | null
+  text_source?: string | null
 }
 
 export interface SessionRow {

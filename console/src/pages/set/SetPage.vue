@@ -27,7 +27,23 @@ const commands = useCommandsStore()
 const setup = useSetupStore()
 const ui = useUiStore()
 
-const onceModal = ref<{ open: boolean; value: string; title: string }>({ open: false, value: '', title: '' })
+/**
+ * 🔴 一次性明文凭据的展示(N-1)。
+ * `value` **只活在内存里**:关闭即清空(`afterClose`),不写 store、不写 localStorage、不进日志。
+ * `missing` = 后端这一版没下发明文 —— 必须明说「拿不到」,不许显示一个空框假装成功。
+ */
+const onceModal = ref<{ open: boolean; value: string; title: string; missing: boolean }>(
+  { open: false, value: '', title: '', missing: false },
+)
+
+function showOnce(title: string, value: string | null): void {
+  onceModal.value = { open: true, value: value ?? '', title, missing: !value }
+}
+
+/** 关闭后从内存清除 —— 明文不留在组件状态里 */
+function clearOnce(): void {
+  onceModal.value = { open: false, value: '', title: '', missing: false }
+}
 const vaultModal = ref<{ open: boolean; id: string; secret: string }>({ open: false, id: '', secret: '' })
 const routePanelOpen = ref(false)
 const mailRouteDraftAccount = ref<string | undefined>()
@@ -53,8 +69,12 @@ function scopeCfg(scope: string) {
 async function saveGroup(group: string, body: Record<string, unknown>): Promise<void> {
   busy.value = true
   try {
-    await settingsApi.put(group, body)
-    message.success('已保存')
+    const r = await settingsApi.put(group, body)
+    // 🔴 `restart_required` 在 `data` 之外的顶层(见 client.ts 的说明)——
+    // 丢了它界面就说不出「要重启才生效」,用户会以为改完立刻就算数
+    if (r.restartRequired) message.warning('已保存,但需要重启 Agent 才生效')
+    else message.success('已保存')
+    for (const w of r.warnings) message.warning(w)
     await store.loadGroup(group)
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
@@ -90,13 +110,14 @@ function confirmLanSave(): void {
 
 async function newApiClient(): Promise<void> {
   const r = await settingsApi.createApiClient({ name: `client-${Date.now()}`, level: 'read' })
-  onceModal.value = { open: true, value: r.token, title: '新建 API 客户端(明文只显示一次)' }
+  showOnce(`新建 API 客户端 ${r.appId ?? ''}(明文只显示一次)`, r.token)
   store.apiClients = (await settingsApi.apiClients()).items
 }
 
 async function rotateApiClient(appId: string): Promise<void> {
   const r = await settingsApi.rotateApiClient(appId)
-  onceModal.value = { open: true, value: r.token, title: `${appId} 已轮换(明文只显示一次)` }
+  const grace = r.graceMinutes !== null ? `,旧凭据还有 ${r.graceMinutes} 分钟宽限期` : ''
+  showOnce(`${appId} 已轮换(明文只显示一次${grace})`, r.token)
 }
 
 async function revokeApiClient(appId: string): Promise<void> {
@@ -128,7 +149,7 @@ async function keygen(scope: string, i: number): Promise<void> {
   // #67:入参只有 sender + short_name,没有 route —— 短名全局唯一
   const r = await mailApi.createHmacKey(s.addr, s.shortname)
   s.keyed = true
-  onceModal.value = { open: true, value: r.secret, title: `HMAC 密钥(${s.shortname},明文只显示一次)` }
+  showOnce(`HMAC 密钥(${s.shortname},明文只显示一次)`, r.secret)
 }
 
 async function revokeKey(scope: string, i: number): Promise<void> {
@@ -193,9 +214,9 @@ async function saveRetention(): Promise<void> {
 
 async function calibrate(): Promise<void> {
   const r = await settingsApi.put('resources', resGroup.value)
-  void r
   await systemApi.version()
-  message.success('已保存资源池设置')
+  // resources 组是 v1 唯一不需要重启的组(#89);真回了 restart_required 就照实说
+  message.success(r.restartRequired ? '已保存资源池设置,需要重启 Agent 才生效' : '已保存资源池设置')
 }
 
 /**
@@ -203,9 +224,9 @@ async function calibrate(): Promise<void> {
  * 保存后重取一次公网端点,让 `configured_domain` 立刻反映出来。
  */
 async function savePubHost(): Promise<void> {
-  await settingsApi.putPublicDomain(pubDomainDraft.value.trim())
+  const r = await settingsApi.putPublicDomain(pubDomainDraft.value.trim())
   await store.loadAll()
-  message.success('已保存配置域名')
+  message.success(r.restartRequired ? '已保存配置域名,需要重启 Agent 才生效' : '已保存配置域名')
 }
 
 async function addWebhook(): Promise<void> {
@@ -802,17 +823,31 @@ onMounted(async () => {
       </a-form>
     </section>
 
-    <!-- 明文只显示一次 -->
-    <a-modal v-model:open="onceModal.open" :title="onceModal.title" :footer="null" :data-testid="T.clientOnceModal">
-      <p class="qt-danger">明文只显示这一次,关闭后无法再取。</p>
-      <a-input class="qt-mono" :value="onceModal.value" readonly />
-      <div class="qt-row mt">
-        <a-button type="primary" :data-testid="T.clientOnceCopy" @click="copyText(onceModal.value)">
-          复制
-        </a-button>
-        <span :data-testid="T.mailKeyOnceModal" class="hidden" />
-        <a-button :data-testid="T.mailKeyOnceCopy" @click="copyText(onceModal.value)">复制密钥</a-button>
-      </div>
+    <!-- 明文只显示一次:关闭即从内存清除(afterClose) -->
+    <a-modal
+      v-model:open="onceModal.open"
+      :title="onceModal.title"
+      :footer="null"
+      :data-testid="T.clientOnceModal"
+      @after-close="clearOnce"
+    >
+      <template v-if="onceModal.missing">
+        <p class="qt-danger">
+          本次<strong>没有拿到明文</strong> —— 后端这一版的响应里没有 token/secret。
+          该凭据已创建但无法使用,请吊销后重建;若反复如此请把 trace 交给后端排查。
+        </p>
+      </template>
+      <template v-else>
+        <p class="qt-danger">明文只显示这一次,<strong>关闭后无法再次查看</strong>(不落盘、不进日志)。</p>
+        <a-input class="qt-mono" :value="onceModal.value" readonly />
+        <div class="qt-row mt">
+          <a-button type="primary" :data-testid="T.clientOnceCopy" @click="copyText(onceModal.value)">
+            复制
+          </a-button>
+          <span :data-testid="T.mailKeyOnceModal" class="hidden" />
+          <a-button :data-testid="T.mailKeyOnceCopy" @click="copyText(onceModal.value)">复制密钥</a-button>
+        </div>
+      </template>
     </a-modal>
 
     <a-modal

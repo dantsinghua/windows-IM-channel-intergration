@@ -61,6 +61,11 @@ const state = {
       },
       quota_mb: { qidian: 2560, qq: 614, wechat: 1536 },
     },
+    // 🔴 M-6:02 #88 的 group 枚举逐字含 runtime / pool / events / log 四组(mock 原先 404)
+    runtime: { adb_connect_timeout_s: 10, ui_action_timeout_ms: 8000, screenshot_format: 'png' },
+    pool: { max_parallel_commands: 4, queue_max: 64, idle_stop_minutes: 0 },
+    events: { outbox_max_rows: 5000, replay_window_rows: 2000, ws_send_timeout_ms: 5000 },
+    log: { level: 'INFO', rotate_mb: 64, keep_files: 7, body_logging: false },
     asr: { endpoint: 'http://10.0.0.8:9000/asr', concurrency: 2, min_confidence: 0.6 },
     ocr: { engine: 'offline', model_dir: '/opt/qtrade/ocr', min_conf: 0.8, lang: 'zh' },
     // 🔴 R6-58 (ac):`mail` 组逐字四键 + scopes 每块 {override, route_id, enabled, inbound, outbound}
@@ -117,8 +122,12 @@ const state = {
   probeTargets: ['msfwifi.3g.qq.com:8080'],
   webhooks: [],
   selftestRunId: null,
+  /** #82 drain 置位后,写操作一律 503 draining(没有 undrain 端点,重启 mock 才恢复) */
+  draining: false,
   /** #87 写的 compliance(读侧 02 #88 没有 compliance 组,控制台本地判,见 stores/setup.ts) */
   compliance: { ack_ms: null, notice_version: 'v1' },
+  /** 当前告知版本(#86 下发、#87 校验的唯一出处;版本一变就得重新勾选) */
+  noticeVersion: 'v1',
   pendingConfirms: [
     {
       id: 'mi_0001', op: 'account_stop', from_addr: 'ops@corp', account_id: 'qd01',
@@ -133,6 +142,24 @@ const state = {
 const sockets = new Set()
 
 function nextSeq() { return ++state.seq }
+
+/** #79/#79b 的一轮自检对象(两个端点同一份,免得两处各写一份走形) */
+function selftestRun(runId) {
+  return {
+    run_id: runId,
+    redroid_boot_ms: 8200,
+    napcat_ok: true,
+    winagent_ok: true,
+    winagent_version: '1.0.2-mock',
+    probes: [
+      { side: 'wsl', target: 'apk_url', status: 'OK', level_reached: 'tls', detail: null },
+      { side: 'wsl', target: 'mail_pop3', status: 'SKIPPED', level_reached: 'none', detail: '目标未配置' },
+    ],
+    started_at: now(),
+    finished_at: now(),
+    skipped: [],
+  }
+}
 
 function emit(event, payload, extra = {}) {
   const frame = JSON.stringify({ event, ts: now(), seq: nextSeq(), payload, ...extra })
@@ -170,7 +197,10 @@ function fail(res, status, code, message, extra = {}) {
   }))
 }
 
-/** `409 IDEMPOTENT_REPLAY`:错误信封 + `data` 回首次的结果(02 #2 R6-54 / #28 B-06) */
+/**
+ * `409 IDEMPOTENT_REPLAY`:错误信封 + `data` 回首次的结果(02 #2 R6-54)。
+ * 用在**响应列是 §7 对象名**的端点(#2 建号 ⇒ `data` 是同一个 Account)。
+ */
 function replay(res, code, message, data) {
   res.writeHead(409, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -180,6 +210,23 @@ function replay(res, code, message, data) {
     ok: false, code, data,
     error: { message, retryable: false, needs_human: false },
     trace_id: `01MOCK${Date.now()}`,
+  }))
+}
+
+/**
+ * 🔴 M-1:`#28` 的 `409 IDEMPOTENT_REPLAY` **响应体仍是完整 `CommandResult`,顶层平铺**
+ * (02 #28 R6-52 逐字 +「R6-55:#28 的 CommandResult 本身就是信封」)——
+ * 包进 `data` 会让前端 `ApiFailure.envelope` 里取不到首次结果。
+ */
+function replayCommand(res, code, message, result) {
+  res.writeHead(409, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-QT-Api-Version': API_VERSION,
+  })
+  res.end(JSON.stringify({
+    ...result,
+    ok: false, code,
+    error: { message, retryable: false, needs_human: false },
   }))
 }
 
@@ -259,6 +306,19 @@ const server = createServer(async (req, res) => {
     })
   }
 
+  /*
+   * 🔴 #82 之后:停止受理**新指令**(02 #82 逐字「停接新指令」)。
+   * 实测真后端的拦截面 = 总线指令类(`/commands`、`/broadcast/commands`、账号动作 start/stop/
+   * restart/enable/disable/logout);**设置类写端点、建号、`/messages/purge` 不被拦**。
+   * mock 照这个范围来 —— 拦宽了会让页面开发以为「drain 后什么都不能写」,那同样是误导。
+   */
+  const COMMAND_LIKE = /^\/(accounts\/[^/]+\/(commands|send|start|stop|restart|enable|disable|logout)|broadcast\/commands|workflows\/[^/]+\/run)$/
+  if (state.draining && m !== 'GET' && COMMAND_LIKE.test(p)) {
+    return fail(res, 503, 'NOT_READY', 'Agent 正在排空(#82 drain),已停止受理新指令', {
+      reason: 'draining', retryable: true, needs_human: false,
+    })
+  }
+
   // ── 账号
   if (p === '/accounts' && m === 'GET') return ok(res, state.accounts, { next_cursor: null })
   if (p === '/accounts' && m === 'POST') {
@@ -276,7 +336,7 @@ const server = createServer(async (req, res) => {
       enabled: true, auto_recover: true, deleted_ms: null, runtime: {}, identity: {},
       login: { mode: body.login?.mode ?? 'password', remember: !!body.login?.remember },
       capabilities: [], quota_mb: state.resources.quota_mb[body.channel], created_at: now(), updated_at: now(),
-      last_seen_at: null, settings: {},
+      last_seen_at: null,
     }
     state.accounts.push(a)
     state.idempotency.set(idemKey, a)
@@ -334,16 +394,69 @@ const server = createServer(async (req, res) => {
     return flat(res, { capabilities: a?.capabilities ?? [], matrix })
   }
   if ((mm = /^\/accounts\/([^/]+)\/purge$/.exec(p)) && m === 'POST') {
-    return flat(res, { job_id: newJob('account_purge', () => ({ purged: true })) }, 202)
+    // #8:`confirm` 要逐字等于账号 id;须先 #7 软删
+    const a = acct(mm[1])
+    if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
+    if (String(body.confirm ?? '') !== mm[1]) {
+      return fail(res, 400, 'INVALID_ARGS', 'confirm 须逐字等于账号 id', {
+        reason: 'confirm_mismatch', details: [{ pointer: '/confirm', message: mm[1] }],
+      })
+    }
+    if (!a.deleted_ms) {
+      return fail(res, 409, 'NOT_APPLICABLE', '请先软删该账号(#7)再彻底删除', { reason: 'not_soft_deleted' })
+    }
+    return flat(res, { job_id: newJob('account_purge', () => ({
+      account_id: mm[1], deleted: { messages: 0, sessions: 0, cursors: 0, media_deref: 0 },
+      dir_removed: true, vault_removed: true, freed_mb: 12.5,
+    })) }, 202)
+  }
+  // #16 登出:🔴 通道分界(QQ 无此概念 409 / 企点本期无执行体 503 / 微信经 WinAgent 202)
+  if ((mm = /^\/accounts\/([^/]+)\/logout$/.exec(p)) && m === 'POST') {
+    const a = acct(mm[1])
+    if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
+    if (a.channel === 'qq') {
+      return fail(res, 409, 'NOT_APPLICABLE', 'QQ 通道没有「登出」概念(登录态在 qq_data 卷里)', {
+        reason: 'channel_no_logout',
+      })
+    }
+    if (a.channel === 'qidian') {
+      return fail(res, 503, 'NOT_READY', 'qidian 通道的登出执行体本期未装配', {
+        reason: 'logout_backend_missing', retryable: false, needs_human: true,
+      })
+    }
+    return flat(res, { account_id: mm[1], via: 'winagent' }, 202)
   }
   if ((mm = /^\/accounts\/([^/]+)\/export-identity$/.exec(p)) && m === 'POST') {
     return flat(res, { job_id: newJob('identity_export', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
   }
   if (/^\/accounts\/[^/]+\/(credential|settings|runtime\/.+|webui\/.+|stream\/input)$/.test(p)) {
     const a = acct(p.split('/')[2])
-    if (a && p.endsWith('/settings') && m === 'PATCH') Object.assign(a.settings ?? {}, body)
+    // 🔴 M-11:02 #22 的出参是 **Account**(不是 `{ok, adb_state}`);
+    // 裁决④ Account 不带 `settings` 子对象 ⇒ 账号级设置并到顶层。
+    if (p.endsWith('/settings') && m === 'PATCH') {
+      if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
+      Object.assign(a, body)
+      a.updated_at = now()
+      return ok(res, a)
+    }
     if (p.endsWith('/webui/open')) return flat(res, { url: 'http://127.0.0.1:16301/', until: new Date(Date.now() + 600_000).toISOString() })
-    return flat(res, { ok: true, adb_state: 'device' })
+    // `adb_state` 只属于 #100 runtime/reconnect-adb,别端点不要顺手带
+    if (p.endsWith('/runtime/reconnect-adb')) return flat(res, { ok: true, adb_state: 'device' })
+    return flat(res, { ok: true })
+  }
+
+  // 🔴 M-5:#19 单账号运行态(mock 原先 404)。02 #19 是**平铺**六键 + 通用 `trace_id`。
+  if ((mm = /^\/accounts\/([^/]+)\/state$/.exec(p)) && m === 'GET') {
+    const a = acct(mm[1])
+    if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
+    return flat(res, {
+      state: a.state,
+      state_code: a.state_code ?? '',
+      state_reason: a.state_reason ?? '',
+      error_since_ms: a.error_since_ms ?? null,
+      enabled: a.enabled,
+      last_seen_at: a.last_seen_at ?? null,
+    })
   }
   if (p === '/accounts/switch' && m === 'POST') {
     const slot = state.resources.pools.windows.wechat_slots
@@ -390,8 +503,8 @@ const server = createServer(async (req, res) => {
     if (isWrite && requireIdempotencyKey(res, body, `/accounts/${mm[1]}/commands`)) return
     const idemKey = `cmd:${mm[1]}:${body.idempotency_key}`
     const before = state.idempotency.get(idemKey)
-    // B-06:重放的响应体仍是**完整 CommandResult**,`trace_id` 是首次那条
-    if (before) return replay(res, 'IDEMPOTENT_REPLAY', '同一幂等键已执行过', before)
+    // B-06 / M-1:重放的响应体仍是**完整 CommandResult 且顶层平铺**,`trace_id` 是首次那条
+    if (before) return replayCommand(res, 'IDEMPOTENT_REPLAY', '同一幂等键已执行过', before)
 
     /*
      * 🔴 R6-52:**HTTP 状态说「有没有被受理执行」,结果码说「执行成了没有」**。
@@ -467,11 +580,43 @@ const server = createServer(async (req, res) => {
     // GET /messages 不带事件专属三字段
     return ok(res, rows.slice(0, Number(q.get('limit') ?? 50)), { next_cursor: null })
   }
+  // #54 消息清除:danger,须 confirm:true
+  if (p === '/messages/purge' && m === 'POST') {
+    if (body.confirm !== true) {
+      return fail(res, 400, 'INVALID_ARGS', 'messages/purge 是不可逆清理,须带 confirm:true', {
+        reason: 'confirm_required', details: [{ pointer: '/confirm', message: '必须为 true' }],
+      })
+    }
+    if (!['all', 'text_only'].includes(String(body.mode))) {
+      return fail(res, 400, 'INVALID_ARGS', "mode 只能是 all|text_only", {
+        reason: 'bad_field', details: [{ pointer: '/mode', message: 'all|text_only' }],
+      })
+    }
+    return flat(res, { job_id: newJob('messages_purge', () => ({ purged: true })) }, 202)
+  }
+  // #53 语音转文字:本期无执行体 ⇒ 如实 503(不伪造转写结果)
+  if ((mm = /^\/messages\/([^/]+)\/asr$/.exec(p)) && m === 'POST') {
+    return fail(res, 503, 'NOT_READY', 'ASR 执行体本期未装配', {
+      reason: 'asr_backend_missing', retryable: false, needs_human: true,
+    })
+  }
   if (p === '/messages/export' && m === 'POST') {
     // #51 入参逐字 `{fmt:'jsonl|csv|eml', with_media:'none|zip', filter}`
     if (!['jsonl', 'csv', 'eml'].includes(String(body.fmt))) {
       return fail(res, 400, 'INVALID_ARGS', 'fmt 只能是 jsonl|csv|eml', {
         reason: 'bad_field', details: [{ pointer: '/fmt', message: 'jsonl|csv|eml' }],
+      })
+    }
+    // 🔴 M-2:02 #51 R6-62 (g) —— `eml` 与 `with_media:'zip'` 本期**明着 400**,
+    // 「不静默降级成别的格式」。mock 放行会让页面开发以为这条路通。
+    if (String(body.fmt) === 'eml') {
+      return fail(res, 400, 'INVALID_ARGS', 'fmt=eml 本期未实现', {
+        reason: 'unsupported_fmt', details: [{ pointer: '/fmt', message: 'eml 本期不支持' }],
+      })
+    }
+    if (String(body.with_media ?? 'none') === 'zip') {
+      return fail(res, 400, 'INVALID_ARGS', 'with_media=zip 本期未实现', {
+        reason: 'unsupported_with_media', details: [{ pointer: '/with_media', message: 'zip 本期不支持' }],
       })
     }
     return flat(res, { job_id: newJob('messages_export', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
@@ -545,10 +690,11 @@ const server = createServer(async (req, res) => {
     return flat(res, {
       agent: { version: '1.0.3-mock', api_version: API_VERSION },
       winagent: { version: '1.0.2-mock', online: true, user_agent: true },
-      kernel: '6.6.123-binder', kernel_state: 'OURS', wsl: '2.4.10', wsl_state: 'WSL2_STORE',
-      docker: '27.3.1', distro: 'qtrade', images: {}, api_version: API_VERSION,
-      capabilities_version: 'mock-1', schema_version: 12, wa_schema_version: 4,
-      migration: { state: 'idle' },
+      // 🔴 M-9:`kernel_state / wsl_state / distro / migration / wa_schema_version` 在 docs 里不存在
+      // (第一轮 S-09,总控裁决① = 以后端现实现为准),一律不下发。
+      kernel: '6.6.123-binder', wsl: '2.4.10',
+      docker: '27.3.1', images: {}, api_version: API_VERSION,
+      capabilities_version: 'mock-1', schema_version: 12,
     })
   }
   if (p === '/system/health') {
@@ -605,7 +751,7 @@ const server = createServer(async (req, res) => {
       ack_ms: state.compliance.ack_ms,
       acked_at: state.compliance.ack_ms ? new Date(state.compliance.ack_ms).toISOString() : null,
       acked_version: state.compliance.ack_ms ? state.compliance.notice_version : null,
-      notice_version: 'v1',
+      notice_version: state.noticeVersion,
       text: [
         '1. 本软件通过自动化方式操作企点/QQ/微信客户端。',
         '2. 模拟设备身份与批量自动化可能违反服务协议,使用方自行评估风险。',
@@ -616,7 +762,15 @@ const server = createServer(async (req, res) => {
   }
   // #87 勾选合规告知(写 settings compliance.*)
   if (p === '/system/notice/ack' && m === 'POST') {
-    state.compliance = { ack_ms: Date.now(), notice_version: String(body.notice_version ?? 'v1') }
+    // 🔴 M-8:02 #87「版本升级后需重新勾选」—— 版本对不上必须拒,否则合规判据失真
+    const want = String(state.noticeVersion ?? 'v1')
+    if (String(body.notice_version ?? '') !== want) {
+      return fail(res, 400, 'INVALID_ARGS', `告知版本不符(当前 ${want}),请重新读取后再勾选`, {
+        reason: 'notice_version_mismatch',
+        details: [{ pointer: '/notice_version', message: want }],
+      })
+    }
+    state.compliance = { ack_ms: Date.now(), notice_version: want }
     return flat(res, { ok: true })
   }
   if (p === '/system/probes') {
@@ -636,8 +790,11 @@ const server = createServer(async (req, res) => {
   }
   if (p === '/system/probe' && m === 'POST') {
     if (body.mode === 'sample') {
-      return ok(res, {
+      // 🔴 M-4:02 #75 R6-58 (de) 逐字 `{sampled_at, duration_s, rows, skipped}` ⇒ **顶层平铺**
+      return flat(res, {
         sampled_at: now(),
+        duration_s: Number(body.duration_s ?? 30),
+        skipped: [],
         rows: [
           { account_id: 'qd01', channel: 'qidian', remote_ip: '14.215.177.39', port: 8080, proto: 'TCP', samples: 12 },
           { account_id: 'qq01', channel: 'qq', remote_host: 'msfwifi.3g.qq.com', remote_ip: '58.250.137.36', port: 8080, proto: 'TCP', samples: 7 },
@@ -654,6 +811,11 @@ const server = createServer(async (req, res) => {
     state.selftestRunId = `st_${Date.now().toString(36)}`
     return flat(res, { run_id: state.selftestRunId }, 202)
   }
+  // 🔴 M-7:#79 `GET /system/selftest/{run_id}`(mock 原先只有不带 run_id 的 #79b ⇒ 404)
+  if ((mm = /^\/system\/selftest\/([^/]+)$/.exec(p)) && m === 'GET') {
+    if (mm[1] !== state.selftestRunId) return fail(res, 404, 'TARGET_NOT_FOUND', `没有这一轮自检:${mm[1]}`)
+    return ok(res, selftestRun(mm[1]), { run_id: mm[1] })
+  }
   // #79b 不带 run_id = 最近一轮;从没跑过回 `{ok:true, data:null, run_id:null}`(不是 404)
   if (p === '/system/selftest') {
     if (!state.selftestRunId && !url.searchParams.get('run_id')) {
@@ -661,20 +823,7 @@ const server = createServer(async (req, res) => {
     }
     const runId = state.selftestRunId ?? url.searchParams.get('run_id')
     // 🔴 #79 的 data 是**一轮的对象**(不是行数组);行由控制台 `selftestRows()` 派生
-    return ok(res, {
-      run_id: runId,
-      redroid_boot_ms: 8200,
-      napcat_ok: true,
-      winagent_ok: true,
-      winagent_version: '1.0.2-mock',
-      probes: [
-        { side: 'wsl', target: 'apk_url', status: 'OK', level_reached: 'tls', detail: null },
-        { side: 'wsl', target: 'mail_pop3', status: 'SKIPPED', level_reached: 'none', detail: '目标未配置' },
-      ],
-      started_at: now(),
-      finished_at: now(),
-      skipped: [],
-    }, { run_id: runId })
+    return ok(res, selftestRun(runId), { run_id: runId })
   }
   if (p === '/system/diagnostics' && m === 'POST') {
     return flat(res, { job_id: newJob('diagnostics', () => ({ download_url: '/api/v1/exports/mock/file' })) }, 202)
@@ -696,7 +845,36 @@ const server = createServer(async (req, res) => {
     if (running.length) return flat(res, { pending: true, reason: 'accounts_running', running })
     return flat(res, { applied: true, proxy: body.enable ? 'http://127.0.0.1:7890' : null })
   }
-  if (p === '/system/wsl-restart') return flat(res, { ok: true })
+  // #82 排空:之后写操作一律 503 draining(没有逆操作端点,只能重启 Agent)
+  if (p === '/system/drain' && m === 'POST') {
+    const running = state.accounts.filter((a) => a.state === 'running').map((a) => a.id)
+    state.draining = true
+    return flat(res, {
+      drained: true, inflight: 0, inflight_before: 0, waited_s: 0,
+      stopped_accounts: running,
+    })
+  }
+  // #83 优雅停机:须 confirm:true
+  if (p === '/system/shutdown' && m === 'POST') {
+    if (body.confirm !== true) {
+      return fail(res, 400, 'INVALID_ARGS', '优雅停机须带 confirm:true(停机后控制台会断开)', {
+        reason: 'confirm_required', details: [{ pointer: '/confirm', message: '必须为 true' }],
+      })
+    }
+    return flat(res, { accepted: true, stopping: true }, 202)
+  }
+  if (p === '/system/wsl-restart') {
+    // 🔴 M-3(最危险的一条):基线 §11.6 [NOSHUTDOWN] + 02 #84 —— **必须** `confirm:true`。
+    // 真后端不带 confirm 时 `400 confirm_required` 且一条请求都不发往 WinAgent;
+    // mock 放行会让页面开发以为不需要二次确认。
+    if (body.confirm !== true) {
+      return fail(res, 400, 'INVALID_ARGS', '重启 WSL 是破坏性操作,须带 confirm:true', {
+        reason: 'confirm_required', needs_human: true,
+        details: [{ pointer: '/confirm', message: '必须为 true' }],
+      })
+    }
+    return flat(res, { ok: true })
+  }
 
   // ── 邮件
   if (p === '/mail/status') {
@@ -863,8 +1041,28 @@ const server = createServer(async (req, res) => {
         },
       ], { next_cursor: null })
     }
-    return flat(res, { app_id: `app_${Date.now().toString(36)}`, token: `qt_${Math.random().toString(36).slice(2)}` })
+    /*
+     * 🔴 M-12 + N-1:建资源按 00 §10 / #2 的惯例是 **201**(mock 原先 200)。
+     * 形状按 R6-55 二选一 —— `ApiClient` 不在 00 §7 的对象清单里 ⇒ **顶层平铺 + `ok`**
+     * (真后端当前两种都占,那是 B-1,后端正在收口)。
+     * 明文 `token` **只在这一次下发**,列表端点永远不回。
+     */
+    const appId = `app_${Date.now().toString(36)}`
+    return flat(res, {
+      app_id: appId,
+      name: String(body.name ?? appId),
+      auth_kind: String(body.auth_kind ?? 'bearer'),
+      level: String(body.level ?? 'read'),
+      ip_allow: body.ip_allow ?? [],
+      allow_ops: body.allow_ops ?? [],
+      allow_accounts: body.allow_accounts ?? ['*'],
+      rate_per_min: 60, api_version_min: 1, enabled: true, secret_ref: null, builtin: false,
+      prefix6: 'qt_abc',
+      created_at: now(), updated_at: now(), last_used_at: null, revoked_at: null,
+      token: `qt_${Math.random().toString(36).slice(2)}`,
+    }, 201)
   }
+  // #92 轮换:同样是一次性明文 + 旧凭据宽限期
   if (/^\/settings\/api-clients\/[^/]+\/rotate$/.test(p)) return flat(res, { token: `qt_${Math.random().toString(36).slice(2)}`, grace_minutes: 10 })
   if (/^\/settings\/api-clients\/[^/]+$/.test(p) && m === 'DELETE') return flat(res, { ok: true })
   if (p === '/settings/mail/routes') {

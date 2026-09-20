@@ -227,8 +227,20 @@ onUnmounted(() => {
                 (连续 {{ events.authLost.failures }} 次握手就断,最后关闭码 {{ events.authLost.code }};
                 已停止重连,避免无声空转)
               </span>
-              <span v-else>(服务端回 4401:令牌无效)</span>
+              <span v-else>
+                (服务端回 4401:令牌无效 —— 已停止重连,重取令牌前再连也是同一个结果)
+              </span>
               <a-button size="small" @click="retryRealtime">重新取令牌并重连</a-button>
+            </div>
+            <!--
+              #82 drain:Agent 正在为升级排空,**指令类**写操作一律 503 draining
+              (实测拦截面 = 指令/群发/账号动作;设置类与只读不受影响)。
+              🔴 这是**预期状态不是故障**,后端没有逆操作端点 —— 恢复受理只能重启 Agent。
+            -->
+            <div v-if="session.draining" class="banner crit">
+              Agent 正在为升级排空(#82 drain):已停止受理<strong>新指令</strong> ——
+              发指令、群发、账号启停/登出都会被拒(结果码 NOT_READY,原因 draining)。
+              只读与设置类页面照常;恢复受理需要重启 Agent(后端没有「取消排空」的端点)。
             </div>
             <!-- E-18/E-19:crit 水位告警常驻红横幅 -->
             <div

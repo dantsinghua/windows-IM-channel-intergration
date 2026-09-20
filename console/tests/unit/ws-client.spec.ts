@@ -1,6 +1,7 @@
 /**
  * 事件流客户端:首帧订阅、seq 去重、since_seq 续传、replay 截断、退避重连、心跳判死、
- * **握手连败即停手**(E-05 的前端侧防御)。
+ * **4401 即停手**(R6-62 (a):服务端先 accept 再 close,客户端看得到 4401)、
+ * **握手连败即停手**(传输层原因只看得到 1006 时的兜底防御)。
  */
 import { describe, expect, it } from 'vitest'
 import { ALL_EVENTS, EventsClient, backoffMs, type WebSocketLike } from '@/api/ws'
@@ -218,7 +219,10 @@ describe('连接状态', () => {
 })
 
 describe('握手连败防御(E-05 前端侧)', () => {
-  /** 令牌无效时服务端在 accept() 之前 close(4401),客户端只看得到 1006 —— 不能就这么无限重连下去 */
+  /**
+   * ⚠️ 这一组防的不是 4401(那条按 R6-62 (a) 已经看得到,见下一个 describe),
+   * 而是**传输层**原因(代理/端口/防火墙)下只看得到 1006 的情形 —— 不能就这么无限重连下去。
+   */
   function handshakeHarness(max = 3) {
     FakeWs.instances = []
     const timers = new Map<number, { fn: () => void; ms: number }>()
@@ -296,5 +300,74 @@ describe('握手连败防御(E-05 前端侧)', () => {
     h.client.connect()
     FakeWs.instances[0].close(4401)
     expect(h.authFailed).toHaveLength(1)
+  })
+})
+
+/* ───────────────── R6-62 (a):4401 先 accept 再 close,客户端看得到 ───────────────── */
+
+describe('4401 的处置(02 §3.4.7 R6-62 (a))', () => {
+  function authHarness() {
+    FakeWs.instances = []
+    const timers = new Map<number, { fn: () => void; ms: number }>()
+    let timerId = 0
+    const authFailed: number[] = []
+    const client = new EventsClient(
+      {
+        onEvent: () => undefined,
+        onStatus: () => undefined,
+        onReplayTruncated: () => undefined,
+        onAuthFailed: () => authFailed.push(1),
+      },
+      {
+        factory: (u) => new FakeWs(u),
+        setTimeoutFn: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id },
+        clearTimeoutFn: (h) => { timers.delete(h as number) },
+        jitter: () => 1,
+      },
+    )
+    const runTimers = (times = 3): void => {
+      for (let i = 0; i < times; i++) {
+        const next = [...timers.keys()].sort((a, b) => a - b)[0]
+        if (next === undefined) return
+        const t = timers.get(next)!
+        timers.delete(next)
+        t.fn()
+      }
+    }
+    return { client, authFailed, runTimers }
+  }
+
+  it('🔴 收到 4401 即 onAuthFailed 且**停止重连** —— 令牌没换,再连也是同一个结果', () => {
+    const h = authHarness()
+    h.client.connect()
+    const ws = FakeWs.instances[0]
+    // R6-62 (a):服务端先 accept 再 close(4401)⇒ 客户端可能已经 open 过
+    ws.open()
+    ws.onclose?.({ code: 4401, reason: '缺少或无效的令牌' })
+
+    expect(h.authFailed).toHaveLength(1)
+    expect(h.client.gaveUp, '4401 之后不该再排重连').toBe(true)
+    h.runTimers(5)
+    expect(FakeWs.instances).toHaveLength(1)
+  })
+
+  it('连都没连上就 4401(未 open)同样停手,不消耗握手连败额度', () => {
+    const h = authHarness()
+    h.client.connect()
+    FakeWs.instances[0].onclose?.({ code: 4401 })
+    expect(h.authFailed).toHaveLength(1)
+    expect(h.client.handshakeFailures, '4401 是鉴权问题,不该算进传输层连败计数').toBe(0)
+    h.runTimers(5)
+    expect(FakeWs.instances).toHaveLength(1)
+  })
+
+  it('用户点「重新取令牌」后 retry() 才重连', () => {
+    const h = authHarness()
+    h.client.connect()
+    FakeWs.instances[0].onclose?.({ code: 4401 })
+    expect(FakeWs.instances).toHaveLength(1)
+    h.client.retry()
+    expect(FakeWs.instances).toHaveLength(2)
+    expect(h.client.gaveUp).toBe(false)
   })
 })

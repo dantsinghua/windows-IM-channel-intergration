@@ -42,6 +42,8 @@ const pwRemember = ref(false)
 const credModal = ref(false)
 const credSecret = ref('')
 const exportJob = ref<string | null>(null)
+/** #8 彻底删除是 `202 {job_id}`:进度走 #107,不可逆阶段后取消按钮自动置灰(JobProgress 里判) */
+const purgeJob = ref<string | null>(null)
 const webuiUntil = ref<number | null>(null)
 const now = ref(Date.now())
 const recent = ref<AuditRow[]>([])
@@ -145,11 +147,60 @@ async function submitCredential(): Promise<void> {
   credModal.value = false
 }
 
+/**
+ * #8 账号彻底删除。🔴 回的是 **`202 {job_id}`**,不是同步删完 ——
+ * 原先拿到就跳走,用户看不到进度、也看不到失败(比如 Vault 不可达时 `vault_removed:false`)。
+ * 现在留在页面上跟 job:进度 + 结果;进不可逆阶段后取消按钮由 `JobProgress` 自动置灰。
+ * 前置:须先 #7 软删,否则后端 `409 not_soft_deleted`。
+ */
 async function doPurge(): Promise<void> {
   if (purgeMismatch.value) return
-  await act(() => accountsApi.purge(id.value), '已发起彻底删除')
-  purgeModal.value = false
+  try {
+    const r = await accountsApi.purge(id.value)
+    purgeJob.value = r.job_id
+    purgeModal.value = false
+    message.success('已发起彻底删除,请等待作业完成')
+  } catch (e) {
+    if (e instanceof ApiFailure) message.error(`${e.message}(trace ${e.traceShort})`)
+    else message.error(String(e))
+  }
+}
+
+function onPurgeDone(job: Job): void {
+  purgeJob.value = null
+  if (job.state !== 'succeeded') {
+    message.error(`彻底删除未完成:${job.error?.message ?? job.state}`)
+    return
+  }
+  const r = (job.result ?? {}) as { vault_removed?: boolean; dir_removed?: boolean; freed_mb?: number }
+  // 🔴 Vault 不可达时后端如实回 `vault_removed:false` —— 界面也要如实说,不许一句「已删除」盖过去
+  if (r.vault_removed === false) {
+    message.warning('数据已删除,但保险库条目未能删除(Vault 不可达),请稍后在保险库里手工清理')
+  } else {
+    message.success(`彻底删除完成,释放 ${r.freed_mb ?? 0} MB`)
+  }
   void router.push('/acct')
+}
+
+/**
+ * #16 登出。🔴 **通道分界**(backend-api-2 §3):QQ 通道压根没有「登出」这个概念、
+ * 企点有概念但本期没有执行体 —— 两者都要如实说清楚,不许一律「登出失败」。
+ */
+async function doLogout(): Promise<void> {
+  try {
+    const r = await accountsApi.logout(id.value)
+    message.success(`已请求登出${r.via ? `(经 ${r.via})` : ''}`)
+    await accounts.load()
+  } catch (e) {
+    if (!(e instanceof ApiFailure)) { message.error(String(e)); return }
+    if (e.reason === 'channel_no_logout') {
+      message.info('QQ 通道没有「登出」这个概念:登录态在 qq_data 卷里,换号请走「导出身份 / 重装」')
+    } else if (e.reason === 'logout_backend_missing') {
+      message.warning('企点通道的登出执行体本期未装配,请在画面里手工退出登录')
+    } else {
+      message.error(`${e.message}(trace ${e.traceShort})`)
+    }
+  }
 }
 
 async function doSoftDelete(): Promise<void> {
@@ -297,7 +348,16 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
             <a-button :disabled="!ops.del" :data-testid="T.delete">停用 / 删除</a-button>
           </a-popconfirm>
           <a-button danger :disabled="!ops.del" :data-testid="T.purge" @click="purgeModal = true">彻底删除数据</a-button>
+          <!--
+            #16 登出:三个通道语义不同(微信真登出 / QQ 无此概念 / 企点本期无执行体),
+            分诊在 doLogout 里。⚠️ 01 §4 还没有这个按钮的元素 id,已列给文档方。
+          -->
+          <a-popconfirm title="登出该账号?登录态会失效,下次要重新登录" @confirm="doLogout">
+            <a-button :disabled="session.draining">登出</a-button>
+          </a-popconfirm>
         </div>
+        <!-- #8 是 202 作业:进度与结果留在页面上,不再「发起即跳走」 -->
+        <JobProgress v-if="purgeJob" :job-id="purgeJob" @done="onPurgeDone" />
       </section>
 
       <!-- 运行时 -->

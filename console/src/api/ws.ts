@@ -8,9 +8,12 @@
  * - **只有**首帧回 `{"replay":"truncated","from_seq":N}` 才需要全量拉 `/accounts` `/resources` `/mail/status`
  * - 心跳:客户端每 20s ping,40s 无任何帧判断线
  * - 关闭码 4401 = 令牌无效;4400 = 首帧订阅非法
- * - 🔴 **握手连败防御**:令牌无效时服务端在 `accept()` 之前 `close(4401)`,Starlette 会把它退化成
- *   「拒绝握手」,客户端只看得到 `1006`(E-05,判给后端改)。前端这一侧不能因此无限重连 ——
- *   连续 `maxHandshakeFailures` 次「从未 open 过就关闭」即停手并转「需要重新取令牌」。
+ * - 🔴 **鉴权失败的时序**(02 §3.4.7 R6-62 (a),后端已按此实现):服务端**先 `accept()` 再
+ *   `close(4401, reason)`**,所以客户端**看得到 4401**(R6-52 原「accept 前关闭」已作废;
+ *   那种写法会退化成拒绝握手、线上只剩 `1006`)。4401 的处置 = 顶部挂横幅 + 用户点按钮重取令牌,
+ *   **不自动重连**(令牌没换,重连只会再吃一次 4401)。
+ * - **握手连败防御**(保留):网络/代理/端口等原因也会「从未 open 过就关闭」,
+ *   连续 `maxHandshakeFailures` 次即停手并转「需要重新取令牌」,免得无声空转刷日志。
  */
 
 import type { EventKind, QtEvent } from './types'
@@ -28,11 +31,14 @@ export interface EventsClientHooks {
   onStatus: (status: WsStatus) => void
   /** 首帧 replay:truncated —— 需要全量重拉后再接事件 */
   onReplayTruncated: (fromSeq: number) => void
-  /** 令牌失效(4401) */
+  /**
+   * 令牌失效(4401,R6-62 (a) 之后能稳定拿到)。
+   * 🔴 收到即**停止重连**并交回上层:令牌不换,再连也是 4401。
+   */
   onAuthFailed?: () => void
   /**
    * 连续 N 次握手就断(从未 open) —— 停止重连,交由上层走「重新取令牌」。
-   * `code` 是最后一次的关闭码(令牌无效时通常是 `1006`,见文件头说明)。
+   * `code` 是最后一次的关闭码(传输层原因时通常是 `1006`)。
    */
   onHandshakeGivenUp?: (info: { failures: number; code: number }) => void
 }
@@ -172,9 +178,16 @@ export class EventsClient {
     ws.onerror = () => { /* onclose 会接着来,这里不重复调度 */ }
     ws.onclose = (ev) => {
       const code = ev?.code ?? 0
-      if (code === 4401) this.hooks.onAuthFailed?.()
       this.clearTimers()
       this.setStatus('closed')
+      // 🔴 4401 = 令牌无效(R6-62 (a) 起稳定可见):停手,等上层重取令牌后 `retry()`。
+      // 再退避重连只是拿同一把坏令牌再试一次,白刷日志也白刷审计。
+      if (code === 4401) {
+        this.gaveUp = true
+        this.stopped = true
+        this.hooks.onAuthFailed?.()
+        return
+      }
       if (!this.everOpened) {
         this.handshakeFailures += 1
         if (this.handshakeFailures >= this.opts.maxHandshakeFailures) {

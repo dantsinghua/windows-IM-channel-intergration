@@ -4,8 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  API_MIN_VERSION, ApiFailure, configureHttp, lastTraceId, newIdempotencyKey, recentTraces,
-  request, requestCommand, requestList, statusToCode,
+  API_MIN_VERSION, ApiFailure, configureHttp, lastTraceId, newIdempotencyKey, pickOnceSecret,
+  recentTraces, request, requestBinary, requestCommand, requestEnvelope, requestList, statusToCode,
 } from '@/api/http'
 import { ulid } from '@/api/ulid'
 import type { CommandResult } from '@/api/types'
@@ -33,7 +33,7 @@ function mockFetch(handler: (n: number, args: FetchArgs) => Response | Promise<R
 beforeEach(() => {
   configureHttp({
     onUnauthorized: undefined, onTokenLost: undefined, onApiVersion: undefined,
-    onUpgradeRequired: undefined,
+    onUpgradeRequired: undefined, onDraining: undefined,
   })
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
@@ -312,5 +312,139 @@ describe('查询串', () => {
     expect(url).not.toContain('dir=')
     expect(url).not.toContain('q=')
     expect(url).toContain('tags=a&tags=b')
+  })
+})
+
+/* ───────────────── N-1:一次性明文凭据(#91/#92/#67) ───────────────── */
+
+describe('N-1 一次性明文凭据:两种形状都要接住', () => {
+  it('🔴 令牌在**顶层**(后端收口前的现状)也拿得到 —— request() 的「有 data 就返回 data」会丢掉它', async () => {
+    const body = {
+      ok: true,
+      data: { app_id: 'app-1', name: 'x', level: 'read', ip_allow: [], created_at: '2026-09-21T00:00:00+08:00' },
+      app_id: 'app-1',
+      token: '01M30ONETIMETOKEN',
+      trace_id: '01M30TRACE',
+    }
+    mockFetch(() => jsonRes(body, { status: 201 }))
+    const env = await requestEnvelope<Record<string, unknown>>('/settings/api-clients', { method: 'POST', body: {} })
+    expect(pickOnceSecret(env, 'token')).toBe('01M30ONETIMETOKEN')
+
+    // 对照组:request() 只会返回 data,明文就此丢失(这正是 N-1 的前端次责)
+    mockFetch(() => jsonRes(body, { status: 201 }))
+    const onlyData = await request<Record<string, unknown>>('/settings/api-clients', { method: 'POST', body: {} })
+    expect(onlyData.token, 'request() 对混合形状静默丢键 —— 所以一次性凭据不能用它').toBeUndefined()
+  })
+
+  it('令牌收口进 `data` 之后同样拿得到(后端收口后这一路是唯一形状)', async () => {
+    mockFetch(() => jsonRes({
+      ok: true,
+      data: { app_id: 'app-2', name: 'y', level: 'read', ip_allow: [], created_at: '', token: '01M30INDATA' },
+      trace_id: '01M30TRACE2',
+    }, { status: 201 }))
+    const env = await requestEnvelope<Record<string, unknown>>('/settings/api-clients', { method: 'POST', body: {} })
+    expect(pickOnceSecret(env, 'token')).toBe('01M30INDATA')
+  })
+
+  it('两处都没有明文时回 null —— 页面据此明说「本次没拿到」,不显示空框', async () => {
+    mockFetch(() => jsonRes({ ok: true, data: { app_id: 'app-3' }, trace_id: 't' }, { status: 201 }))
+    const env = await requestEnvelope<Record<string, unknown>>('/settings/api-clients', { method: 'POST', body: {} })
+    expect(pickOnceSecret(env, 'token')).toBeNull()
+    expect(pickOnceSecret(env, 'secret')).toBeNull()
+  })
+})
+
+/* ───────────────── 二进制端点:响应头里的 media_id / sha256 ───────────────── */
+
+describe('requestBinary(#33 截图 / #50 媒体 / #55)', () => {
+  it('把 X-QT-Media-Id / X-QT-Sha256 / X-QT-Trace-Id 一起交给调用方', async () => {
+    mockFetch(() => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+      status: 200,
+      headers: {
+        'Content-Type': 'image/png',
+        'X-QT-Media-Id': '17',
+        'X-QT-Sha256': 'a'.repeat(64),
+        'X-QT-Trace-Id': '01M30SHOT',
+      },
+    }))
+    const r = await requestBinary('/accounts/qd01/screenshot')
+    expect(r.pending).toBe(false)
+    expect(r.blob).not.toBeNull()
+    expect(r.mediaId).toBe('17')
+    expect(r.sha256).toBe('a'.repeat(64))
+    expect(r.traceId).toBe('01M30SHOT')
+  })
+
+  it('#50 懒下载未完成:202 JSON ⇒ pending,不是错误', async () => {
+    mockFetch(() => jsonRes({ state: 'pending' }, { status: 202 }))
+    const r = await requestBinary('/messages/m1/media/0')
+    expect(r.pending).toBe(true)
+    expect(r.blob).toBeNull()
+  })
+
+  it('错误分支仍走 00 §10 信封:code / reason 交给页面', async () => {
+    mockFetch(() => jsonRes({
+      ok: false, code: 'UNSUPPORTED',
+      error: { message: '截图失败:UNSUPPORTED', reason: 'screenshot_failed', retryable: false, needs_human: false },
+      trace_id: '01M30ERR',
+    }, { status: 409 }))
+    await expect(requestBinary('/accounts/qd01/screenshot')).rejects.toMatchObject({
+      code: 'UNSUPPORTED', status: 409, traceId: '01M30ERR',
+    })
+  })
+})
+
+/* ───────────────── #82 drain:写操作 503 draining ───────────────── */
+
+describe('#82 drain 的全局提示', () => {
+  it('写操作撞上 503 draining ⇒ onDraining(true);写操作又成功 ⇒ onDraining(false)', async () => {
+    const seen: boolean[] = []
+    configureHttp({ onDraining: (on) => seen.push(on) })
+
+    mockFetch(() => jsonRes({
+      ok: false, code: 'NOT_READY',
+      error: { message: 'Agent 正在排空', reason: 'draining', retryable: true, needs_human: false },
+    }, { status: 503 }))
+    await expect(request('/system/cleanup/run', { method: 'POST' })).rejects.toBeInstanceOf(ApiFailure)
+    expect(seen).toEqual([true])
+
+    mockFetch(() => jsonRes({ ok: true, data: { job_id: 'j1' } }))
+    await request('/system/cleanup/run', { method: 'POST' })
+    expect(seen).toEqual([true, false])
+
+    configureHttp({ onDraining: undefined })
+  })
+
+  it('🔴 别的写端点成功**不解除** —— 排空期间设置类端点照样通,解除条件只认被拒过的那个 path', async () => {
+    const seen: boolean[] = []
+    configureHttp({ onDraining: (on) => seen.push(on) })
+
+    mockFetch(() => jsonRes({
+      ok: false, code: 'NOT_READY',
+      error: { message: '排空中', reason: 'draining', retryable: true, needs_human: false },
+    }, { status: 503 }))
+    await expect(request('/accounts/qd01/start', { method: 'POST' })).rejects.toBeInstanceOf(ApiFailure)
+    expect(seen).toEqual([true])
+
+    // 设置类写端点在真后端排空期间仍会 201 —— 不能因此把横幅抹掉
+    mockFetch(() => jsonRes({ ok: true, app_id: 'a1', token: 't' }, { status: 201 }))
+    await request('/settings/api-clients', { method: 'POST', body: {} })
+    expect(seen, '随手改一条设置就解除横幅 = 谎报「已恢复受理」').toEqual([true])
+
+    // 被拒过的那个 path 又通了才解除
+    mockFetch(() => jsonRes({ ok: true, data: { state: 'starting' } }))
+    await request('/accounts/qd01/start', { method: 'POST' })
+    expect(seen).toEqual([true, false])
+
+    configureHttp({ onDraining: undefined })
+  })
+
+  it('只读请求不参与 draining 判定(排空期间只读照常)', async () => {
+    const seen: boolean[] = []
+    configureHttp({ onDraining: (on) => seen.push(on) })
+    mockFetch(() => jsonRes({ ok: true, data: [] }, { status: 200 }))
+    await requestList('/accounts')
+    expect(seen).toEqual([])
+    configureHttp({ onDraining: undefined })
   })
 })
