@@ -1,0 +1,760 @@
+"""``svc`` —— WinAgent **服务**(LocalSystem)的 FastAPI 装配:``/wa/v1`` 全量端点、令牌鉴权、监听绑定规则。
+
+- **HTTP 只在服务里**(02 §2.4):``uvicorn``(``ws="websockets"``),监听 ``{127.0.0.1} ∪ {vEthernet (WSL) 当前 IPv4}``,
+  **不绑 ``0.0.0.0``**(00 §3)。绑定集合由 ``netprobe.desired_listen()`` 算,子网变化时 H16 自愈重绑。
+- **鉴权**(02 §3.6 表头):``A`` = Agent 令牌、``C`` = 控制台令牌、``I`` = 安装器令牌(安装完即吊销)、``—`` = 无鉴权。
+  端点 × 令牌矩阵逐行照 §3.6 的「令牌」列,写在 ``ROUTES`` 里,**改矩阵只改那一张表**。
+- **执行体**:``svc`` 直接执行;``user`` 经 §2.4.1 管道转会话代理,**会话代理不在线一律 ``503 NOT_READY``**。
+  混合端点(``svc+user``)按 R3-15 拆两半、失败带 ``stage``/``partial``。
+- 每个响应带 ``X-WA-Version``(§3.8);**所有调用记 ``wa_audit_log``**(§3.6 表头最后一句)。
+- 🔴 探活 ``ping``/``health`` **由服务直接回答,绝不穿管道**(R3-1);``user_agent`` 取自 ``PipeHub`` 的心跳状态。
+"""
+from __future__ import annotations
+
+import ipaddress
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import JSONResponse
+
+from . import API_VERSION, __version__
+from . import alerts as A
+from .alerts import AlertBuffer
+from .audit import ACTOR_AGENT, ACTOR_CONSOLE, ACTOR_INSTALLER, Audit
+from .config import WinAgentConfig
+from .db import Db
+from .errors import FORBIDDEN, INVALID_ARGS, TARGET_NOT_FOUND, UNAUTHORIZED, WaError, user_agent_offline
+from .ids import trace_id as new_trace_id
+from .installer_ops import InstallerOps
+from .logfmt import get_logger
+from .monitor import Monitor
+from .netprobe import NetProbe, ProbeTargetSpec
+from .pipe import PipeHub
+from .power import Power
+from .vault import Vault
+from .wechat import WeChatHostsBlock, WeChatStore
+
+log = get_logger("svc")
+
+ROLE_AGENT = "agent"
+ROLE_CONSOLE = "console"
+ROLE_INSTALLER = "installer"
+ACTOR_BY_ROLE = {ROLE_AGENT: ACTOR_AGENT, ROLE_CONSOLE: ACTOR_CONSOLE, ROLE_INSTALLER: ACTOR_INSTALLER}
+
+# 02 §2.5「超时」(Agent 侧的期望值;服务侧据此给管道 deadline_ms = 本值 − 1s)
+TIMEOUT_S = {"ping": 2.0, "health": 2.0, "time": 3.0, "vault": 3.0, "metrics": 3.0, "alerts": 3.0, "net": 3.0,
+             "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0, "wechat_send": 15.0,
+             "wechat_login_start": 60.0}
+
+
+@dataclass
+class Tokens:
+    """两把令牌 + 安装器令牌(C-04/C-05)。值从 Vault 读出后常驻内存,**不写日志**。"""
+    agent: Optional[str] = None
+    console: Optional[str] = None
+    installer: Optional[str] = None
+
+    def role_of(self, token: Optional[str]) -> Optional[str]:
+        if not token:
+            return None
+        if self.agent and token == self.agent:
+            return ROLE_AGENT
+        if self.console and token == self.console:
+            return ROLE_CONSOLE
+        if self.installer and token == self.installer:
+            return ROLE_INSTALLER
+        return None
+
+    def revoke_installer(self) -> None:
+        """03:安装完即吊销安装器令牌。"""
+        self.installer = None
+
+
+@dataclass
+class SvcDeps:
+    """服务装配需要的一组模块;测试里逐个注入假后端版本。"""
+    cfg: WinAgentConfig
+    db: Db
+    audit: Audit
+    vault: Vault
+    monitor: Monitor
+    netprobe: NetProbe
+    power: Power
+    hub: PipeHub
+    wechat_store: WeChatStore
+    hosts_block: WeChatHostsBlock
+    installer: InstallerOps
+    alerts: AlertBuffer
+    tokens: Tokens
+    agent_id: str = "winagent"
+    clock: Callable[[], int] = field(default=lambda: int(time.time() * 1000))
+    listen: tuple[str, ...] = ("127.0.0.1",)
+    started_ms: int = 0
+
+
+def _client_host(request: Request) -> Optional[str]:
+    return request.client.host if request.client else None
+
+
+def _is_local_or_wsl(host: Optional[str], wsl_subnet: Optional[str]) -> bool:
+    """#11 ``vault/read`` 「只接受 loopback / WSL 子网来源」(02 §3.6;05 §2.2.4)。"""
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    if wsl_subnet:
+        try:
+            return ip in ipaddress.ip_network(wsl_subnet, strict=False)
+        except ValueError:
+            return False
+    return False
+
+
+def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 端点矩阵天然长,拆开反而看不出对应关系
+    app = FastAPI(title="QTrade WinAgent", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+    d.started_ms = d.started_ms or d.clock()
+
+    # ------------------------------------------------------------------ 横切:X-WA-Version + trace + 审计 + 错误信封
+    @app.middleware("http")
+    async def _wrap(request: Request, call_next):           # type: ignore[no-untyped-def]
+        request.state.trace_id = request.headers.get("X-Trace-Id") or new_trace_id(d.clock())
+        try:
+            resp = await call_next(request)
+        except WaError as e:                                 # 兜底(路由内一般已自行转换)
+            resp = JSONResponse(e.body(request.state.trace_id), status_code=e.http_status)
+        resp.headers["X-WA-Version"] = __version__
+        return resp
+
+    def fail(e: WaError, request: Request) -> JSONResponse:
+        return JSONResponse(e.body(getattr(request.state, "trace_id", None)), status_code=e.http_status)
+
+    def auth(request: Request, allow: tuple[str, ...], *, action: str, target: Optional[str] = None) -> str:
+        """按 §3.6「令牌」列校验;记一行 ``wa_audit_log``。返回 role。"""
+        raw = request.headers.get("Authorization") or ""
+        token = raw[7:].strip() if raw.lower().startswith("bearer ") else None
+        role = d.tokens.role_of(token)
+        trace = getattr(request.state, "trace_id", None)
+        if role is None:
+            d.audit.record(actor="system", action=action, target=target, result=UNAUTHORIZED,
+                           ip=_client_host(request), trace_id=trace)
+            raise WaError(UNAUTHORIZED, "缺少或无效的 Bearer 令牌", reason="bad_token")
+        if role not in allow:
+            d.audit.record(actor=ACTOR_BY_ROLE[role], action=action, target=target, result=FORBIDDEN,
+                           ip=_client_host(request), trace_id=trace)
+            raise WaError(FORBIDDEN, f"该端点只接受 {allow} 令牌", reason="token_role_not_allowed")
+        d.audit.record(actor=ACTOR_BY_ROLE[role], action=action, target=target, ip=_client_host(request), trace_id=trace)
+        return role
+
+    async def via_pipe(method: str, params: dict[str, Any], *, timeout_s: float, request: Request,
+                       target: Optional[str] = None) -> Any:
+        """纯 ``user`` 端点:一一映射下发管道(02 §2.4.1「帧格式」行)。离线 → 503 NOT_READY。"""
+        return await d.hub.call(method, params, timeout_s=timeout_s,
+                                trace_id=getattr(request.state, "trace_id", None), target=target)
+
+    # ================================================================== #1 ping(—,svc)
+    @app.get("/wa/v1/ping")
+    async def ping() -> dict[str, Any]:
+        """无鉴权,故**只回这些**(04 §2.8.2 ``winagent_from_wsl`` 就探它,判据 = 200 且 body 里 ``agent_id`` 匹配)。"""
+        return {"agent_id": d.agent_id, "version": __version__, "time": d.clock(), "listen": list(d.listen)}
+
+    # ================================================================== #2 health(A/C,svc)
+    @app.get("/wa/v1/health")
+    async def health(request: Request):                      # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="health")
+        except WaError as e:
+            return fail(e, request)
+        wechat_mod = "enabled" if d.cfg.wechat.enabled else "disabled"
+        if d.cfg.wechat.enabled and not d.hub.user_agent_online:
+            wechat_mod = "offline"                           # 会话代理不在线 ⇒ 微信模块 offline(#2 枚举第三值)
+        return {"ok": True, "version": __version__, "api_version": API_VERSION,
+                "uptime_s": max(0, (d.clock() - d.started_ms) // 1000),
+                "user_agent": d.hub.user_agent_online,       # 🔴 取自服务维护的心跳状态,不穿管道(R3-1)
+                "user_session": d.hub.user_session_view(),
+                "modules": {"vault": "ok", "monitor": "ok", "netprobe": "ok", "power": "ok",
+                            "wslctl": "ok" if d.hub.user_agent_online else "offline", "wechat": wechat_mod},
+                "checks": dict(d.monitor.state.checks),
+                "host": d.monitor.host_snapshot()}
+
+    # ================================================================== #3 version(A/C,svc)
+    @app.get("/wa/v1/version")
+    async def version(request: Request):                     # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="version")
+        except WaError as e:
+            return fail(e, request)
+        wsl_version = None
+        if d.hub.user_agent_online:
+            try:
+                wsl_version = await via_pipe("wsl.version", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+            except WaError:
+                wsl_version = None                           # 会话代理不在线则该字段 null(#3 逐字)
+        h = d.hub.holder
+        return {"svc_version": __version__, "user_agent_version": h.version if h else None,
+                "api_version": API_VERSION, "wsl_version": wsl_version}
+
+    # ================================================================== #4 time(A,svc)
+    @app.get("/wa/v1/time")
+    async def wa_time(request: Request):                     # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="time")
+        except WaError as e:
+            return fail(e, request)
+        sysb = d.monitor._sys                                 # noqa: SLF001 —— monitor 拥有 SysBackend,这里只读
+        return {"now_ms": d.clock(), "tz_offset_min": sysb.tz_offset_min(),
+                "last_resume_ms": sysb.last_resume_ms(),      # R3-5:Agent 靠轮询它感知主机唤醒
+                "w32time": sysb.w32time()}
+
+    # ================================================================== #5 metrics(A,svc)
+    @app.get("/wa/v1/metrics")
+    async def metrics(request: Request, scope: Optional[str] = None, subject: Optional[str] = None,
+                      since: Optional[int] = None, until: Optional[int] = None, resolution: str = "raw"):  # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="metrics")
+        except WaError as e:
+            return fail(e, request)
+        return {"samples": d.monitor.metrics(scope=scope, subject=subject, since=since, until=until,
+                                             resolution=resolution)}
+
+    # ================================================================== #6 alerts(A,svc)
+    @app.get("/wa/v1/alerts")
+    async def get_alerts(request: Request, since: int = 0, limit: int = 500):    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="alerts")
+        except WaError as e:
+            return fail(e, request)
+        return d.alerts.pull(since=since, limit=limit)
+
+    # ================================================================== #7~#12 vault
+    @app.get("/wa/v1/vault")
+    async def vault_list(request: Request, scope: Optional[str] = None):          # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="vault.list")
+        except WaError as e:
+            return fail(e, request)
+        return {"items": d.vault.list(scope=scope)}
+
+    @app.post("/wa/v1/vault/{name:path}/read")
+    async def vault_read(name: str, request: Request):                            # type: ignore[no-untyped-def]
+        """#11:**仅 Agent 令牌**;控制台 → 403;只接受 loopback / WSL 子网来源;**须带 ``X-Trace-Id``**(C-06)。"""
+        try:
+            auth(request, (ROLE_AGENT,), action="vault.read", target=name)
+            if not request.headers.get("X-Trace-Id"):
+                raise WaError(INVALID_ARGS, "读密钥必须带 X-Trace-Id(读有副作用,要能追溯)", reason="missing_trace_id")
+            if not _is_local_or_wsl(_client_host(request), d.netprobe.state.wsl_subnet):
+                raise WaError(FORBIDDEN, "读密钥只接受 loopback 或 WSL 子网来源", reason="source_not_allowed")
+            value = await d.vault.read(name, trace_id=request.headers["X-Trace-Id"], owner=ACTOR_AGENT)
+        except WaError as e:
+            return fail(e, request)
+        if value is None:
+            return JSONResponse({"ok": False, "code": TARGET_NOT_FOUND}, status_code=404)
+        return {"value": value}
+
+    @app.post("/wa/v1/vault/{name:path}/flag")
+    async def vault_flag(name: str, request: Request):                            # type: ignore[no-untyped-def]
+        try:
+            role = auth(request, (ROLE_AGENT,), action="vault.flag", target=name)
+            body = await _json(request)
+        except WaError as e:
+            return fail(e, request)
+        d.vault.flag(name, suspect=bool(body.get("suspect", True)), owner=ACTOR_BY_ROLE[role],
+                     trace_id=request.state.trace_id)
+        return Response(status_code=204)
+
+    @app.head("/wa/v1/vault/{name:path}")
+    async def vault_head(name: str, request: Request):                            # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="vault.head", target=name)
+        except WaError as e:
+            return Response(status_code=e.http_status)
+        return Response(status_code=200 if d.vault.exists(name) else 404)
+
+    @app.put("/wa/v1/vault/{name:path}")
+    async def vault_put(name: str, request: Request):                             # type: ignore[no-untyped-def]
+        """#9:``{value, scope}``;**请求体不进日志、响应不回显值**。"""
+        try:
+            role = auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="vault.write", target=name)
+            body = await _json(request)
+            if "value" not in body:
+                raise WaError(INVALID_ARGS, "缺少 value", reason="missing_value")
+            await d.vault.put(name, str(body["value"]), scope=str(body.get("scope") or "other"),
+                              owner=ACTOR_BY_ROLE[role], trace_id=request.state.trace_id)
+        except WaError as e:
+            return fail(e, request)
+        return Response(status_code=204)
+
+    @app.delete("/wa/v1/vault/{name:path}")
+    async def vault_delete(name: str, request: Request):                          # type: ignore[no-untyped-def]
+        try:
+            role = auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="vault.delete", target=name)
+        except WaError as e:
+            return fail(e, request)
+        d.vault.delete(name, owner=ACTOR_BY_ROLE[role], trace_id=request.state.trace_id)
+        return Response(status_code=204)
+
+    # ================================================================== #13~#16 net / probe
+    @app.get("/wa/v1/net")
+    async def net(request: Request):                                              # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="net")
+        except WaError as e:
+            return fail(e, request)
+        return d.netprobe.snapshot()
+
+    @app.post("/wa/v1/probe")
+    async def probe(request: Request):                                            # type: ignore[no-untyped-def]
+        """#14:跑 **Windows 侧**目标 → ``202 {run_id}``;``{mode:'sample'}`` 走 C-1 实测采样(04 §2.8.4)。"""
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="probe")
+            body = await _json(request)
+            if body.get("mode") == "sample":
+                out = await d.netprobe.sample_connections(pid_names=tuple(body.get("pid_names") or ()),
+                                                          duration_s=body.get("duration_s"))
+                return JSONResponse(out, status_code=200)
+            specs = [ProbeTargetSpec(**t) for t in (body.get("targets") or [])]
+            run_id = await d.netprobe.probe_run(specs, trigger=str(body.get("trigger") or "manual"))
+        except (WaError, TypeError) as e:
+            if isinstance(e, TypeError):
+                return fail(WaError(INVALID_ARGS, f"targets 字段不合法:{e}", reason="bad_targets"), request)
+            return fail(e, request)
+        return JSONResponse({"run_id": run_id}, status_code=202)
+
+    @app.get("/wa/v1/probes")
+    async def probes_get(request: Request, run_id: Optional[str] = None, latest: int = 0):   # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="probes.read")
+        except WaError as e:
+            return fail(e, request)
+        return {"results": d.netprobe.read_results(run_id=run_id, latest=bool(latest))}
+
+    @app.put("/wa/v1/probes")
+    async def probes_put(request: Request):                                       # type: ignore[no-untyped-def]
+        """#16:Agent 回写 WSL/容器侧探测结果(C-31:``probe_results`` 只在 winagent.db 一份)。"""
+        try:
+            auth(request, (ROLE_AGENT,), action="probes.write")
+            body = await _json(request)
+            n = d.netprobe.write_results(str(body["run_id"]), list(body.get("results") or []),
+                                         trigger=str(body.get("trigger") or "manual"))
+        except KeyError as e:
+            return fail(WaError(INVALID_ARGS, f"缺少字段 {e}", reason="missing_field"), request)
+        except WaError as e:
+            return fail(e, request)
+        return {"written": n}
+
+    # ================================================================== #17 / #45 firewall(唯一拥有者)
+    @app.post("/wa/v1/firewall/ensure")
+    async def firewall_ensure(request: Request):                                  # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="firewall.ensure")
+            body = await _json(request)
+        except WaError as e:
+            return fail(e, request)
+        return d.netprobe.firewall_ensure(lan=bool(body.get("lan")), lan_remote=body.get("lan_remote"))
+
+    @app.delete("/wa/v1/firewall")
+    async def firewall_delete(request: Request, lan: int = 0):                    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="firewall.delete")
+        except WaError as e:
+            return fail(e, request)
+        return d.netprobe.firewall_delete(lan=bool(lan))
+
+    # ================================================================== #18 / #19 power
+    @app.get("/wa/v1/power")
+    async def power_get(request: Request):                                        # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="power.status")
+        except WaError as e:
+            return fail(e, request)
+        return d.power.status()
+
+    @app.post("/wa/v1/power/keepawake")
+    async def power_keepawake(request: Request):                                  # type: ignore[no-untyped-def]
+        """#19 **混合端点**:``svc``(``ES_SYSTEM_REQUIRED`` + powercfg)+ ``user``(``ES_DISPLAY_REQUIRED``)。
+
+        ``ES_DISPLAY_REQUIRED`` 在 Session 0 无效,必须由会话代理发;会话代理不在线时 display 半降级(不整单失败)。
+        """
+        try:
+            auth(request, (ROLE_CONSOLE,), action="power.keepawake")
+            body = await _json(request)
+            out = d.power.apply(str(body.get("mode") or d.cfg.wechat.keep_awake_mode))
+        except WaError as e:
+            return fail(e, request)
+        display = {"applied": False, "reason": "user_agent_offline"}
+        if out["mode"] != "off" and d.hub.user_agent_online:
+            try:
+                display = await via_pipe("power.display", {"on": True}, timeout_s=TIMEOUT_S["health"], request=request)
+            except WaError as e:
+                display = {"applied": False, "reason": e.code}
+        out["display"] = display
+        return out
+
+    # ================================================================== #20~#25 wsl(纯 user / 混合)
+    @app.get("/wa/v1/wsl/status")
+    async def wsl_status(request: Request):                                       # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wsl.status")
+            return await via_pipe("wsl.status", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wsl/start")
+    async def wsl_start(request: Request):                                        # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE,), action="wsl.start")
+            return await via_pipe("wsl.start", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wsl/stop")
+    async def wsl_stop(request: Request):                                         # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE,), action="wsl.stop")
+            return await via_pipe("wsl.stop", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wsl/restart")
+    async def wsl_restart(request: Request):                                      # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wsl.restart")
+            body = await _json(request)
+            out = await via_pipe("wsl.restart", {"mode": body.get("mode") or "terminate",
+                                                 "confirm": bool(body.get("confirm"))},
+                                 timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    @app.get("/wa/v1/wsl/config")
+    async def wsl_config_get(request: Request):                                   # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wsl.config.get")
+            return await via_pipe("wsl.config.get", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.put("/wa/v1/wsl/config")
+    async def wsl_config_put(request: Request):                                   # type: ignore[no-untyped-def]
+        """#25 **混合端点**:``svc``(备份目录与 ACL)+ ``user``(写文件)。白名单只四键(C-32)。"""
+        try:
+            auth(request, (ROLE_CONSOLE,), action="wsl.config.put")
+            body = await _json(request)
+            d.installer.ensure_backup_dir()                                        # 服务半
+            desired = {k: v for k, v in body.items() if k in ("memory", "processors", "autoMemoryReclaim", "swap")
+                       and v is not None}
+            out = await via_pipe("wsl.config.put", {"desired": desired}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        if out.get("pending_restart"):
+            d.alerts.firing(A.WSLCONFIG_PENDING_RESTART, subject="wsl", evidence={"changed": out.get("changed")})
+        return out
+
+    # ================================================================== #26 / #27 / #46 / #47 内核与发行版
+    @app.post("/wa/v1/wsl/kernel/verify")
+    async def kernel_verify(request: Request):                                    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="wsl.kernel.verify")
+            return await d.installer.kernel_verify(trace_id=request.state.trace_id)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wsl/kernel/rollback")
+    async def kernel_rollback(request: Request):                                  # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="wsl.kernel.rollback")
+            body = await _json(request)
+            out = await d.installer.kernel_rollback(confirm_shutdown=bool(body.get("confirm_shutdown")),
+                                                    trace_id=request.state.trace_id)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    @app.post("/wa/v1/wsl/kernel/apply")
+    async def kernel_apply(request: Request):                                     # type: ignore[no-untyped-def]
+        """#46:**必须带 ``{confirm_shutdown:true}``**,否则 400(00 §11.6 [NOSHUTDOWN])。"""
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="wsl.kernel.apply")
+            body = await _json(request)
+            out = await d.installer.kernel_apply(confirm_shutdown=bool(body.get("confirm_shutdown")),
+                                                 kernel_src=body.get("kernel_src"),
+                                                 trace_id=request.state.trace_id)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    @app.post("/wa/v1/wsl/distro/repair")
+    async def distro_repair(request: Request):                                    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE, ROLE_INSTALLER), action="wsl.distro.repair")
+            body = await _json(request)
+            out = await via_pipe("wsl.distro.repair", {"confirm": bool(body.get("confirm"))},
+                                 timeout_s=TIMEOUT_S["wsl"] * 4, request=request)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    # ================================================================== #28~#43 wechat
+    def _wechat_enabled_guard() -> None:
+        if not d.cfg.wechat.enabled:
+            raise WaError("NOT_READY", "微信模块未启用(winagent.toml [wechat] enabled=false)", reason="wechat_disabled")
+
+    @app.get("/wa/v1/wechat/status")
+    async def wechat_status(request: Request):                                    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.status")
+            if not d.cfg.wechat.enabled:
+                return {"enabled": False, "wechat": None, "chatlog": None, "ritual_done": None,
+                        "screen_locked": None, "login_session": None, "hosts_block": d.hosts_block.state()}
+            out = await via_pipe("wechat.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        out["hosts_block"] = d.hosts_block.state()                                 # #33b:状态并入 #28
+        return out
+
+    @app.get("/wa/v1/wechat/version-match")
+    async def wechat_version_match(request: Request):                             # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="wechat.version_match")
+        except WaError as e:
+            return fail(e, request)
+        return d.wechat_store.version_match(bundled_version=_bundled_version(d), wxkey_dlls=d.cfg.wechat.wxkey_dlls)
+
+    @app.get("/wa/v1/wechat/profiles")
+    async def wechat_profiles(request: Request):                                  # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.profiles")
+        except WaError as e:
+            return fail(e, request)
+        return {"profiles": d.wechat_store.profiles()}
+
+    @app.post("/wa/v1/wechat/login/start")
+    async def wechat_login_start(request: Request):                               # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.login_start")
+            _wechat_enabled_guard()
+            body = await _json(request)
+            out = await via_pipe("wechat.login.start", {"account_id": body.get("account_id"),
+                                                        "login_session_id": body.get("login_session_id")},
+                                 timeout_s=TIMEOUT_S["wechat_login_start"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    @app.post("/wa/v1/wechat/login/cancel")
+    async def wechat_login_cancel(request: Request):                              # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.login_cancel")
+            body = await _json(request)
+            return await via_pipe("wechat.login.cancel", {"login_session_id": body.get("login_session_id")},
+                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.get("/wa/v1/wechat/login/status")
+    async def wechat_login_status(request: Request):                              # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.login_status")
+            return await via_pipe("wechat.login.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wechat/update-block")
+    async def wechat_update_block(request: Request):                              # type: ignore[no-untyped-def]
+        """#33b:**执行体 = svc**(整机 hosts 要 LocalSystem)。"""
+        try:
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.update_block")
+            body = await _json(request)
+            out = d.hosts_block.apply(bool(body.get("enable")))
+        except WaError as e:
+            return fail(e, request)
+        if out["result"] == "blocked_by_policy":
+            d.alerts.firing(A.H21_WECHAT_HOSTS_BLOCK_FAILED, subject="host",
+                            evidence={"reason": out.get("reason"), "domains": out.get("domains")})
+        else:
+            d.alerts.resolve(A.H21_WECHAT_HOSTS_BLOCK_FAILED, subject="host")
+        return out
+
+    @app.post("/wa/v1/wechat/bind")
+    async def wechat_bind(request: Request):                                      # type: ignore[no-untyped-def]
+        """#33c(R3-2):``identified`` 相位后 Agent 调它把 ``wxid`` 绑到 ``wxNN``;同 ``wxid`` 重绑幂等。"""
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.bind")
+            body = await _json(request)
+            out = d.wechat_store.bind(wxid=str(body["wxid"]), account_id=str(body["account_id"]))
+            if d.hub.user_agent_online:                                            # 让后续 login/status 带上 wxid
+                try:
+                    await via_pipe("wechat.bind", out, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+                except WaError:
+                    pass
+        except KeyError as e:
+            return fail(WaError(INVALID_ARGS, f"缺少字段 {e}", reason="missing_field"), request)
+        except WaError as e:
+            return fail(e, request)
+        return out
+
+    @app.post("/wa/v1/wechat/logout")
+    async def wechat_logout(request: Request):                                    # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.logout")
+            return await via_pipe("wechat.logout", {}, timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wechat/key/retry")
+    async def wechat_key_retry(request: Request):                                 # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.key_retry")
+            return await via_pipe("wechat.key.retry", {}, timeout_s=TIMEOUT_S["wechat_login_start"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.get("/wa/v1/wechat/ui-visible")
+    async def wechat_ui_visible(request: Request):                                # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.ui_visible")
+            return await via_pipe("wechat.ui-visible", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.post("/wa/v1/wechat/reinstall")
+    async def wechat_reinstall(request: Request):                                 # type: ignore[no-untyped-def]
+        """#37 **混合端点**:``user``(UI 引导)+ ``svc``(备份/安装);**每步用户确认**(00 §11.8 [WXVER])→ ``202``,进度经 #33。"""
+        try:
+            auth(request, (ROLE_CONSOLE,), action="wechat.reinstall")
+            body = await _json(request)
+            d.wechat_store.put_install(backup_dir=body.get("backup_dir"))          # 服务半:记备份目录
+            out = await via_pipe("wechat.reinstall", {"installer": body.get("installer")},
+                                 timeout_s=TIMEOUT_S["wsl"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        return JSONResponse(out, status_code=202)
+
+    @app.post("/wa/v1/wechat/send")
+    async def wechat_send(request: Request):                                      # type: ignore[no-untyped-def]
+        """#38 **仅 A**;**不重试**(重试由上层幂等决定 —— 微信发送重试会重复发)。"""
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.send")
+            body = await _json(request)
+            return await via_pipe("wechat.send", {
+                "session_name": body.get("session_name"), "text": body.get("text"),
+                "image_path": body.get("image_path"), "idempotency_key": body.get("idempotency_key"),
+                "confirm_timeout_ms": body.get("confirm_timeout_ms") or d.cfg.wechat.confirm_timeout_ms},
+                timeout_s=TIMEOUT_S["wechat_send"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.get("/wa/v1/wechat/read")
+    async def wechat_read(request: Request, talker: Optional[str] = None, since_seq: Optional[int] = None,
+                          limit: Optional[int] = None):                           # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.read")
+            return await via_pipe("wechat.read", {"talker": talker, "since_seq": since_seq, "limit": limit},
+                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.get("/wa/v1/wechat/media/{key}")
+    async def wechat_media(key: str, request: Request):                           # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.media", target=key)
+            out = await via_pipe("wechat.media", {"key": key}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        import base64
+        return Response(content=base64.b64decode(out["b64"]), media_type=out.get("content_type", "image/jpeg"))
+
+    @app.get("/wa/v1/wechat/sessions")
+    async def wechat_sessions(request: Request, keyword: Optional[str] = None, limit: int = 100):   # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.sessions")
+            return await via_pipe("wechat.sessions", {"keyword": keyword, "limit": limit},
+                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+
+    @app.get("/wa/v1/wechat/screenshot")
+    async def wechat_screenshot(request: Request):                                # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_AGENT,), action="wechat.screenshot")
+            out = await via_pipe("wechat.screenshot", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+        except WaError as e:
+            return fail(e, request)
+        import base64
+        return Response(content=base64.b64decode(out["b64"]), media_type="image/png")
+
+    @app.get("/wa/v1/settings/wechat")
+    async def settings_wechat_get(request: Request):                              # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE,), action="settings.wechat.get")
+        except WaError as e:
+            return fail(e, request)
+        w = d.cfg.wechat
+        return {"enabled": w.enabled, "keep_awake_mode": w.keep_awake_mode,
+                "narrator_min_seconds": w.narrator_min_seconds, "poll_interval_s": w.poll_interval_s}
+
+    @app.put("/wa/v1/settings/wechat")
+    async def settings_wechat_put(request: Request):                              # type: ignore[no-untyped-def]
+        """#43:``winagent.toml [wechat]`` 的**受控子集**;``enabled`` 改动后通知会话代理起/停模块。"""
+        allow = ("enabled", "keep_awake_mode", "narrator_min_seconds", "poll_interval_s")
+        try:
+            auth(request, (ROLE_CONSOLE,), action="settings.wechat.put")
+            body = await _json(request)
+            bad = [k for k in body if k not in allow]
+            if bad:
+                raise WaError(INVALID_ARGS, f"{bad} 不在 #43 的受控子集 {allow} 内", reason="key_not_allowed")
+            was = d.cfg.wechat.enabled
+            d.cfg = d.cfg.with_wechat(**body)
+            d.db.put_setting("wechat.enabled_snapshot", d.cfg.wechat.enabled, updated_by="console")
+            if was != d.cfg.wechat.enabled:
+                if not d.cfg.wechat.enabled:
+                    d.power.restore()                                              # 关模块即还原电源计划(04 §2.5.1)
+                    d.hosts_block.apply(False)                                     # 并成对删 hosts 屏蔽行(#33b)
+                if d.hub.user_agent_online:
+                    try:
+                        await via_pipe("wechat.module", {"enabled": d.cfg.wechat.enabled},
+                                       timeout_s=TIMEOUT_S["wsl"], request=request)
+                    except WaError:
+                        pass
+        except WaError as e:
+            return fail(e, request)
+        w = d.cfg.wechat
+        return {"enabled": w.enabled, "keep_awake_mode": w.keep_awake_mode,
+                "narrator_min_seconds": w.narrator_min_seconds, "poll_interval_s": w.poll_interval_s}
+
+    # ================================================================== #44 audit
+    @app.get("/wa/v1/audit")
+    async def audit_page(request: Request, since: Optional[int] = None, until: Optional[int] = None,
+                         limit: int = 100, cursor: Optional[int] = None):         # type: ignore[no-untyped-def]
+        try:
+            auth(request, (ROLE_CONSOLE,), action="audit.read")
+        except WaError as e:
+            return fail(e, request)
+        return d.audit.page(since=since, until=until, limit=limit, cursor=cursor)
+
+    return app
+
+
+async def _json(request: Request) -> dict[str, Any]:
+    try:
+        raw = await request.body()
+        if not raw:
+            return {}
+        import json
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError as e:
+        raise WaError(INVALID_ARGS, "请求体不是合法 JSON", reason="bad_json") from e
+    if not isinstance(body, dict):
+        raise WaError(INVALID_ARGS, "请求体必须是 JSON 对象", reason="bad_json")
+    return body
+
+
+def _bundled_version(d: SvcDeps) -> str:
+    """随包微信版本(B-1:4.1.12.26,来源与 sha256 由 03 维护);这里从 ``settings`` 取,缺省用 03 记档值。"""
+    return str(d.db.get_setting("wechat.bundled_version") or "4.1.12.26")

@@ -1,0 +1,7 @@
+# 根 .gitignore 里的 `build/` 会把本目录的 `winagent/build/` 一并忽略,
+# 但那里放的是**打包脚本与 spec(源文件,必须入库)**,不是构建产物。
+# 深层 .gitignore 的规则覆盖上层,故在这里显式取消忽略,再单独忽略真正的产物目录。
+!build/
+build/build/
+dist/
+.venv-build/

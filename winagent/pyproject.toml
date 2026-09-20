@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtrade-winagent"
+version = "0.1.0"
+description = "QTrade 多实例 IM 控制台 —— WinAgent(Windows 侧:LocalSystem 服务 qtrade-winagent-svc + 用户会话代理 qtrade-winagent-user)。规格 = docs/00 基线 + docs/02 §2.4/§2.4.1/§2.5/§2.9/§3.2/§3.6/§3.7/§7.2 + docs/03/04/05。"
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115", "uvicorn>=0.30"]
+
+# Windows 专有依赖只在 Windows 真机装(pywin32 = 服务壳/命名管道/DPAPI/WTS;psutil = 采样;wmi = 子网事件)。
+# 开发/CI 在 Linux 上只装 dev,全部 Win* 后端延迟导入、测试一律走 Fake*。
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+windows = ["pywin32>=306", "psutil>=5.9", "WMI>=1.5.1"]
+
+[project.scripts]
+qtrade-winagent-svc = "qtrade_winagent.main_svc:main"
+qtrade-winagent-user = "qtrade_winagent.main_user:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"qtrade_winagent" = ["*.sql"]
+
+[tool.pytest.ini_options]
+# ``../src`` = Agent 侧包(契约测试用它的真实客户端打本服务;**只读引用,不改 Agent 侧任何文件**)
+pythonpath = ["src", "../src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
