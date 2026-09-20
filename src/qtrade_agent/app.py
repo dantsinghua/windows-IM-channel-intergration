@@ -47,6 +47,7 @@ from .runtime import AdbBackend, AdbCliBackend, ContainerBackend, DockerCliBacke
 from .runtime.runtime import Fs
 from .scheduler import Scheduler
 from .store import Store
+from .netprobe import SocketLevelProbe
 from .sysenv import DockerProxyApplier, WslEnvReader
 from .timesync import Aligner, TimeSync
 from .vault_client import Vault, WinAgentVault, vault_name
@@ -142,8 +143,9 @@ class AgentApp:
         self._proc_reader = proc_reader
         self.config_path = config_path      # #89 写回 agent.toml 的落点;None ⇒ 只落 settings 并回 restart_required
         # ---- #74 / #75 / #85 的三个可注入执行体(协议见 api/routes_ext:LevelProbe / snapshot() / apply|disable)
-        #: 🔴 **缺省不出网**:`net_probe` 不注入 ⇒ #75 的 WSL 侧逐目标记 SKIPPED(agent_probe_disabled)。
-        #: 开关本该来自 `agent.toml`,但 02 §7.1 / 07 的 `[probe]` 段**没有登记启用键**,本批不造键 ⇒ 只收注入参数(见交接)。
+        #: 🔴 **缺省不出网**:`net_probe` 不注入、且 `[probe] agent_probe_enabled` 为 false(缺省)⇒ 不装四级探测器,
+        #: #75 的 WSL 侧逐目标记 SKIPPED(agent_probe_disabled)。真正的自动装配在 `open()`(要先知道是不是真机后端)。
+        self._net_probe_arg = net_probe
         self.net_probe = net_probe
         self._docker_proxy_arg = docker_proxy
         self._wsl_env_reader_arg = wsl_env_reader
@@ -199,6 +201,10 @@ class AgentApp:
         self.wsl_env_reader = self._wsl_env_reader_arg or (WslEnvReader() if real_host else None)
         # 🔴 docker_proxy 只写 drop-in、**不重启 dockerd**(sysenv.DockerProxyApplier 的 last_result.restart_required)
         self.docker_proxy = self._docker_proxy_arg or (DockerProxyApplier() if real_host else None)
+        # 🔴 #75 WSL 侧四级探测:**缺省不出网** —— 只有 `[probe] agent_probe_enabled=true`(04 §7 owner,
+        # 裁决 00 §15g R6-62 Ⅶ①)且真后端时才自动装;显式注入的探测器优先于配置。
+        self.net_probe = self._net_probe_arg or (
+            SocketLevelProbe() if (real_host and self.cfg.probe.agent_probe_enabled) else None)
         adb_backend = self._adb or AdbCliBackend()          # runtime 与企点 UI 执行层共用同一条 adb 后端
         self.runtime = Runtime(containers=self._containers or DockerCliBackend(), adb=adb_backend, cfg=self.cfg, health=self.health,
                                alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs, **rt_kw)

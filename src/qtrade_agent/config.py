@@ -200,6 +200,17 @@ class DeviceProfilesConfig:
 
 
 @dataclass(frozen=True)
+class ProbeConfig:
+    """04 §7 [probe](owner=04 §7;07 §[probe] 同登,裁决 00 §15g R6-62 Ⅶ①)。
+
+    ``agent_probe_enabled`` = WSL 侧四级探测(dns→tcp→tls→http)的总开关,**缺省 false = 缺省不出网**;
+    为 false 时 #75 ``mode:"full"`` 的 WSL 侧逐目标记 ``SKIPPED`` + ``detail = agent_probe_disabled``
+    (04 §3.4;Windows 侧不受本键影响)。
+    """
+    agent_probe_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AccountsConfig:
     """05 §7 [accounts](owner=05)。"""
     login_timeout_s: int = 90                   # 自动填密后等待主界面/验证页
@@ -242,6 +253,7 @@ class AgentConfig:
     jobs: JobsConfig = field(default_factory=JobsConfig)                         # [jobs]
     monitor: MonitorConfig = field(default_factory=MonitorConfig)                # [monitor](owner=04 §7)
     device_profiles: DeviceProfilesConfig = field(default_factory=DeviceProfilesConfig)   # [device_profiles](owner=05 §7)
+    probe: ProbeConfig = field(default_factory=ProbeConfig)                      # [probe](owner=04 §7)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -281,6 +293,7 @@ class AgentConfig:
             jobs=pick(d.get("jobs"), JobsConfig),
             monitor=pick(d.get("monitor"), MonitorConfig),
             device_profiles=pick(d.get("device_profiles"), DeviceProfilesConfig),
+            probe=pick(d.get("probe"), ProbeConfig),
         )
 
     def quota_mb(self, channel: str) -> int:

@@ -506,6 +506,73 @@ def test_显式注入优先(tmp_path):
         app.store.close()
 
 
+# ── #75 WSL 侧四级探测的总开关 `[probe] agent_probe_enabled`(04 §7 owner;裁决 00 §15g R6-62 Ⅶ①)
+def _mk_app(tmp_path, cfg, **kw):
+    from qtrade_agent.app import AgentApp
+    from qtrade_agent.runtime import FakeAdb, FakeContainers
+    from qtrade_agent.runtime.runtime import FakeFs
+    from qtrade_agent.vault_client import FakeVault
+    from qtrade_agent.winagent_client import FakeWinAgent
+
+    wa = FakeWinAgent()
+    kw.setdefault("containers", FakeContainers())
+    kw.setdefault("adb", FakeAdb())
+    return AgentApp(cfg, db_path=str(tmp_path / "probe.db"), vault=FakeVault(), winagent_transport=wa,
+                    winagent_base_url="http://x:17610", winagent_token=wa.token, fs=FakeFs(),
+                    wsl_total_mb=11264, boot_poll_s=0, **kw).open()
+
+
+def _cfg_probe(enabled: bool):
+    from qtrade_agent.config import ProbeConfig
+    return dataclasses.replace(AgentConfig(), probe=ProbeConfig(agent_probe_enabled=enabled))
+
+
+def test_probe_启用键缺省false_缺省不出网():
+    """04 §7 `[probe] agent_probe_enabled` 缺省 false ⇒ 不装探测器 ⇒ #75 `mode:"full"` 的 WSL 侧
+    逐目标记 `SKIPPED(agent_probe_disabled)`(那一步的断言在 tests/test_api_ext.py,判据就是 `net_probe is None`)。"""
+    assert AgentConfig().probe.agent_probe_enabled is False
+
+
+def test_probe_配置开着但不是真机后端仍不装(tmp_path):
+    """两个条件是 **且**:假 adb/假容器的开发容器与测试,配置开了也不许出网。"""
+    app = _mk_app(tmp_path, _cfg_probe(True))
+    try:
+        assert app.net_probe is None
+    finally:
+        app.store.close()
+
+
+def test_probe_真机后端下配置开才装_关则不装(tmp_path):
+    """真后端(不注 adb/容器)+ `agent_probe_enabled=true` ⇒ 自动装 `SocketLevelProbe`;为 false 时仍不装。
+
+    只让 `net_probe` 这一条走自动装配:另两个真机执行体(读 /proc、写 /etc)照旧注假件。
+    `SocketLevelProbe()` 的构造不出网,出网只发生在 `probe()`,本用例不调用它。
+    """
+    from qtrade_agent import netprobe as np
+
+    fakes = dict(docker_proxy=sysenv.DockerProxyApplier(io=MemIo()), wsl_env_reader=sysenv.WslEnvReader(base=_FakeBase()))
+    on = _mk_app(tmp_path, _cfg_probe(True), containers=None, adb=None, **fakes)
+    try:
+        assert isinstance(on.net_probe, np.SocketLevelProbe)
+    finally:
+        on.store.close()
+    off = _mk_app(tmp_path, _cfg_probe(False), containers=None, adb=None, **fakes)
+    try:
+        assert off.net_probe is None
+    finally:
+        off.store.close()
+
+
+def test_probe_显式注入优先于配置(tmp_path):
+    """注入的探测器 > 配置:配置关着也用注入的那个(反过来也不会被自动装的顶掉)。"""
+    probe = _probe()
+    app = _mk_app(tmp_path, _cfg_probe(False), net_probe=probe)
+    try:
+        assert app.net_probe is probe
+    finally:
+        app.store.close()
+
+
 def test_企点UI装上了两条回填回调(agent_app):
     """假后端下 sender/login_fn 保持未接,但 `QidianUi` 对象本身已带 on_default_profile 通道。"""
     assert agent_app.qidian_ui._on_default_profile is not None
