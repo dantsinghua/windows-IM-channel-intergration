@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 $modulesDir = Join-Path $PSScriptRoot 'modules'
 foreach ($m in @('QTrade.Log', 'QTrade.Native', 'QTrade.Exit', 'QTrade.State', 'QTrade.Payload',
         'QTrade.Preflight', 'QTrade.Wsl', 'QTrade.Kernel', 'QTrade.Distro', 'QTrade.WinAgent',
-        'QTrade.Console', 'QTrade.WeChat', 'QTrade.Firewall', 'QTrade.Selftest',
+        'QTrade.Console', 'QTrade.WeChat', 'QTrade.Firewall', 'QTrade.Acl', 'QTrade.Selftest',
         'QTrade.Upgrade', 'QTrade.Diag', 'QTrade.Uninstall')) {
     Import-Module (Join-Path $modulesDir ($m + '.psm1')) -DisableNameChecking
 }
@@ -119,12 +119,31 @@ try {
 
         # ── PAYLOAD_STAGED(§2.2.1 / §2.1):外壳已解压,这里只做 sha256 复核 ─
         'PAYLOAD_STAGED' {
+            <#  🔴 裁决 11:收紧安装根 ACL —— 引擎落地后的**第一个**动作。
+                位置在 sha256 复核**之前**、也在「已完成就跳过」之前,理由有三:
+                  1. 安装根是引擎进程的当前目录(自编存根 SetCurrentDir + 子进程继承),
+                     而当前目录在默认 DLL 搜索序列里。%ProgramData% 默认允许 Users 建文件,
+                     等于给「以管理员跑的引擎」开了一条 DLL 植入路径 —— 越早关上越好;
+                  2. 后面每一步都要往安装根里写状态和载荷,先收紧再写,不给中间窗口;
+                  3. 放在跳过判断之前,是为了让**续跑**也走一遍 —— 它幂等(先读回比对,
+                     已经对了就一个字节都不写),成本只有一次 Get-Acl。
+                失败不阻断安装:§3.4 里没有给 ACL 的退出码,凭空造一个会和规格分叉。
+                但失败要**大声**:ERROR 日志 + 记进状态 + 带进本步的 data,不许静默。
+                (要不要给它一个退出码 / 是否应阻断,已提交裁决。)#>
+            $aclRes = Set-QtInstallRootAcl -Path $paths.Root
+            if ($aclRes.Ok) {
+                Write-QtLog -Level 'INFO' -Message ('安装根 ACL {0}:{1}' -f $(if ($aclRes.Changed) { '已收紧' } else { '本就合规' }), $paths.Root)
+            } else {
+                Write-QtLog -Level 'ERROR' -Message ('🔴 安装根 ACL 未能收紧({0}):{1} —— 普通用户可能仍可往安装根写入,存在 DLL 植入面' -f $paths.Root, ($aclRes.Problems -join '; '))
+            }
+            Set-QtAclHardened -State $state -Result $aclRes | Out-Null
+
             $ctx = [pscustomobject]@{ ManifestPath = $paths.Manifest; StageRoot = $paths.Root }
             if (Test-QtStepComplete -Step 'PAYLOAD_STAGED' -Context $ctx) {
                 Set-QtSubstate -State $state -Substate 'skip' | Out-Null
                 Set-QtState -State $state -To 'PAYLOAD_STAGED' -Note 'skip' | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $true -State 'PAYLOAD_STAGED' -Message '载荷已校验(跳过)'
+                Write-QtStepResult -Ok $true -State 'PAYLOAD_STAGED' -Message '载荷已校验(跳过)' -Data ([ordered]@{ acl_hardened = [bool]$aclRes.Ok; acl_problems = @($aclRes.Problems) })
             }
             $manifest = Read-QtManifest -Path $paths.Manifest
             if (-not (Test-QtManifestCoredumpL2 -Manifest $manifest)) {
@@ -145,7 +164,7 @@ try {
             }
             Set-QtState -State $state -To 'PAYLOAD_STAGED' -Note ('verified {0}' -f $v.VerifiedCount) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-            Write-QtStepResult -Ok $true -State 'PAYLOAD_STAGED' -Message ('已校验 {0} 个文件' -f $v.VerifiedCount)
+            Write-QtStepResult -Ok $true -State 'PAYLOAD_STAGED' -Message ('已校验 {0} 个文件' -f $v.VerifiedCount) -Data ([ordered]@{ acl_hardened = [bool]$aclRes.Ok; acl_problems = @($aclRes.Problems) })
         }
 
         # ── WSL_FEATURE(§2.5.1)──────────────────────────────────────────────

@@ -68,6 +68,10 @@ function New-QtInstallState {
         clients         = [pscustomobject]@{}
         probes          = @()
         firewall_rules  = ''
+        # 裁决 11:安装根 ACL 的收紧结果。收紧失败**不阻断安装**(§3.4 没给它退出码),
+        # 所以必须在这里留痕,否则「装完了但安装根还是人人可写」不会在任何地方显形。
+        acl_hardened    = $false
+        acl_problems    = @()
         resume          = [pscustomobject]@{ runonce_armed = $false; engine = ''; source_exe = '' }
         history         = @()
     }
@@ -146,6 +150,42 @@ function Set-QtSubstate {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $State, [Parameter(Mandatory)][AllowEmptyString()][string] $Substate)
     $State.substate = $Substate
+    return $State
+}
+
+function Set-QtAclHardened {
+    <#
+    .SYNOPSIS
+        把安装根 ACL 的收紧结果记进 install_state.json(裁决 11)。
+    .NOTES
+        为什么要落盘:ACL 收紧**失败不阻断安装**(§3.4 没给它退出码),
+        那就必须留下痕迹 —— 否则「装完了,但安装根还是人人可写」这件事
+        不会在任何地方显形,诊断包和验收也看不到。
+        这里存的是**布尔 + 问题清单**,不存 ACL 全文:诊断包会带走 install_state.json,
+        ACE 明细里有账户名,没必要跟着走(红线 2 的精神)。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $State,
+        [Parameter(Mandatory)][AllowNull()] $Result
+    )
+    $ok = $false
+    $problems = @()
+    if ($null -ne $Result) {
+        if (Test-QtHasProperty -Object $Result -Name 'Ok') { $ok = [bool]$Result.Ok }
+        if (Test-QtHasProperty -Object $Result -Name 'Problems') { $problems = @($Result.Problems) }
+    }
+    # 🔴 StrictMode -Version Latest 下,给 PSCustomObject **赋一个不存在的属性会直接抛**
+    #    (实测:"在此对象中找不到属性 b")。新建的 state 有这两个字段,
+    #    但**旧版本落盘的 install_state.json 读回来时没有** —— 续跑/升级正好会走到那条路。
+    #    所以缺了就 Add-Member 补上,不能直接赋值。
+    foreach ($pair in @(@{ N = 'acl_hardened'; V = $ok }, @{ N = 'acl_problems'; V = $problems })) {
+        if (Test-QtHasProperty -Object $State -Name $pair.N) {
+            $State.($pair.N) = $pair.V
+        } else {
+            Add-Member -InputObject $State -NotePropertyName $pair.N -NotePropertyValue $pair.V -Force
+        }
+    }
     return $State
 }
 
@@ -316,7 +356,7 @@ function ConvertTo-QtWinAgentRow {
     }
 }
 
-Export-ModuleMember -Function Get-QtPaths, New-QtInstallState, Read-QtInstallState, Write-QtInstallState,
+Export-ModuleMember -Function Get-QtPaths, New-QtInstallState, Read-QtInstallState, Write-QtInstallState, Set-QtAclHardened,
 Add-QtHistory, Set-QtState, Set-QtSubstate, Set-QtParked, Clear-QtParked, Test-QtParked,
 Split-QtFailedState, Get-QtResumeStep, Register-QtStepCheck, Get-QtRegisteredStepCheck,
 Clear-QtStepChecks, Test-QtStepComplete, Set-QtRunOnce, Clear-QtRunOnce, ConvertTo-QtWinAgentRow

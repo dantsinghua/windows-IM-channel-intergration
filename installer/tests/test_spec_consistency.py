@@ -1083,3 +1083,102 @@ def test_r6_58_cn_sfx_extract_no_longer_maps_to_123(doc03: str) -> None:
     # 存根侧:解压前空间不足退的是 26
     patch = _read_bytes_text(SFX_PATCH)
     assert "kQTradeExitDiskLow = 26" in patch
+
+
+# ── 安装根 ACL 收紧(裁决 11)──────────────────────────────────────────────
+ACL_PSM1 = INSTALLER_ROOT / "engine" / "modules" / "QTrade.Acl.psm1"
+
+
+def test_acl_uses_wellknown_sids_not_account_names() -> None:
+    """🔴 `Administrators` / `Users` 在中文 Windows 上是**本地化显示名**。
+    按名字建 ACE 会失败,按名字比对读回结果会错判 —— 而「读回 ACL 比对」正是幂等判据。
+    一律用众所周知 SID。"""
+    acl = read(ACL_PSM1)
+    for sid in ("S-1-5-32-544", "S-1-5-18", "S-1-5-32-545"):
+        assert sid in acl, f"缺众所周知 SID {sid}"
+    code = strip_comments(acl)
+    for bad in ("'BUILTIN\\\\Administrators'", "'BUILTIN\\\\Users'", "'NT AUTHORITY\\\\SYSTEM'"):
+        assert bad not in code, f"代码里按账户名建 ACE:{bad}"
+
+
+def test_acl_forbidden_mask_has_no_composite_rights() -> None:
+    """🔴 位掩码坑:`FullControl` = 0x1F01FF、`Modify` = 0x301BF,**把读位也包含在内**。
+    把它们 OR 进「Users 禁止位」掩码,连一条纯只读 ACE 都会 -band 出非零 ——
+    于是收紧得完全正确的 ACL 反而被判违规(实测踩过)。
+    真正危险的位都已单独列出,不放复合掩码不会放松判据。"""
+    acl = read(ACL_PSM1)
+    block = _slice(acl, "$script:QtAclForbiddenForUsers", "function Get-QtInstallRootAclSpec")
+    code = strip_comments(block)
+    for composite in ("FullControl", "Modify"):
+        assert f"::{composite}" not in code, f"禁止位掩码里混进了复合掩码 {composite}"
+    for atomic in ("Write", "Delete", "ChangePermissions", "TakeOwnership"):
+        assert f"::{atomic}" in code, f"禁止位掩码缺 {atomic}"
+
+
+def test_acl_goes_through_the_native_seam() -> None:
+    """ACL 读写必须走 Native 接缝(Get-QtAcl / Set-QtAcl),否则 Pester 没法 Mock,
+    单测就只能去碰真机的 ACL —— 那是绝对不能做的事。"""
+    native = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.Native.psm1")
+    assert "function Get-QtAcl" in native and "function Set-QtAcl" in native
+    for p in _script_files("runtime"):
+        if p.name in ("QTrade.Native.psm1",):
+            continue
+        code = strip_comments(read(p))
+        for raw in ("Get-Acl ", "Set-Acl "):
+            assert raw not in code, f"{p.name} 直接调了 {raw.strip()},绕过了 Native 接缝"
+
+
+def test_payload_staged_hardens_acl_before_everything_else() -> None:
+    r"""🔴 裁决 11:收紧安装根 ACL 是引擎落地后的第一个动作。
+    位置必须在「已完成就跳过」之前 —— 否则**续跑**那条路不会收紧;
+    它幂等(先读回比对,已经对了就一个字节都不写),放在前面成本只有一次 Get-Acl。"""
+    step = read(INSTALLER_ROOT / "engine" / "run-step.ps1")
+    branch = _slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest")
+    i_acl = branch.index("Set-QtInstallRootAcl")
+    i_skip = branch.index("Test-QtStepComplete")
+    assert i_acl < i_skip, "ACL 收紧跑到了「跳过」判断后面,续跑时就不会执行"
+    assert "'QTrade.Acl'" in step, "run-step.ps1 没有导入 QTrade.Acl 模块"
+
+
+def test_acl_failure_does_not_block_install_but_is_loud() -> None:
+    """§3.4 里没有给 ACL 的退出码,凭空造一个会和规格分叉,所以失败**不阻断**。
+    但不阻断不等于可以安静:必须 ERROR 日志 + 落进 install_state + 带进本步 data,
+    否则「装完了但安装根还是人人可写」不会在任何地方显形。"""
+    step = read(INSTALLER_ROOT / "engine" / "run-step.ps1")
+    branch = _slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest")
+    assert "Write-QtLog -Level 'ERROR'" in branch, "ACL 失败没有 ERROR 日志"
+    assert "Set-QtAclHardened" in branch, "ACL 结果没有落进 install_state"
+    assert "acl_hardened" in step, "本步结果里没有带上 acl_hardened"
+    # 不阻断:这一段里不许出现 ACL 自己的失败出口
+    assert "ExitName 'E_INSTALL_ACL" not in step, "给 ACL 造了规格里没有的退出码"
+
+
+def test_install_state_declares_acl_fields() -> None:
+    """🔴 StrictMode 下给 PSCustomObject 赋一个不存在的属性会**直接抛**,
+    所以字段必须在 New-QtInstallState 里声明;旧版本落盘的 state 读回来没有这两个字段,
+    Set-QtAclHardened 必须 Add-Member 补上而不是直接赋值(续跑正好走这条路)。"""
+    state = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.State.psm1")
+    assert "acl_hardened" in state and "acl_problems" in state
+    fn = _slice(state, "function Set-QtAclHardened", "function Set-QtParked")
+    assert "Add-Member" in fn, "旧 state 缺字段时没有补,会在续跑时抛"
+    assert "Test-QtHasProperty" in fn
+
+
+def test_uninstall_removes_install_root() -> None:
+    """裁决 11 说「卸载时随目录删除」——前提是卸载真的删安装根,
+    而且 Administrators 有 FullControl(提权的卸载器删得掉)。"""
+    unins = read(INSTALLER_ROOT / "engine" / "modules" / "QTrade.Uninstall.psm1")
+    assert "$paths.Root" in unins, "卸载没有删安装根"
+    spec = read(ACL_PSM1)
+    assert "S-1-5-32-544" in spec and "FullControl" in spec
+
+
+def test_g5_requires_relative_runprogram() -> None:
+    r"""🔴 裁决 12:`RunProgram` 必须是相对路径。存根拼的是 `dirPrefix + appLaunched`
+    (dirPrefix 缺省 `.\`),写绝对路径会拼成 `.\C:\...` 而起不来。
+    这是**官方存根原版就有的行为**,两条出包路径都受它约束。"""
+    b = read(INSTALLER_ROOT / "build" / "build.ps1")
+    assert "是绝对路径" in b, "G5 没有卡 RunProgram 的绝对路径"
+    assert "'^[A-Za-z]:'" in b, "没有按盘符判绝对路径"
+    readme = read(INSTALLER_ROOT / "sfx-stub" / "README.md")
+    assert "相对路径" in readme, "README 没写裁决 12"

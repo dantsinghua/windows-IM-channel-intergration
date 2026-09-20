@@ -121,10 +121,15 @@ function Set-QtKernelAcl {
     .SYNOPSIS
         docs/03 §2.6.1:`Administrators` 完全控制、`Users` 只读 ——
         内核文件被普通用户替换等于任意内核代码执行。
+    .NOTES
+        走 Native 接缝(Get-QtAcl/Set-QtAcl)而不是直接 Get-Acl/Set-Acl ——
+        直接调的话 Pester 没法 Mock,单测就只能去碰真机的 ACL。
+        ⚠️ 这里**没有**写完读回复核;安装根那条(Set-QtInstallRootAcl)有。
+           要不要给内核文件也补上,已提交裁决。
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $Path)
-    $acl = Get-Acl -LiteralPath $Path
+    $acl = Get-QtAcl -Path $Path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
     $admins = New-Object Security.Principal.SecurityIdentifier ([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
@@ -133,7 +138,7 @@ function Set-QtKernelAcl {
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($admins, 'FullControl', 'Allow')))
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system, 'FullControl', 'Allow')))
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($users, 'Read', 'Allow')))
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    Set-QtAcl -Path $Path -AclObject $acl
 }
 
 function Remove-QtKCheck {

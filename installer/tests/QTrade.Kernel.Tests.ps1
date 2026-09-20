@@ -352,3 +352,57 @@ Describe 'WSLCONFIG_WRITTEN 幂等判据(§2.3:文件含我们的 kernel= 行、
         Test-QtWslConfigWritten -Context ([pscustomobject]@{ WslConfigPath = $script:Wc; KernelLineWritten = '' }) | Should -BeFalse
     }
 }
+
+Describe 'Set-QtKernelAcl(§2.6.1 内核文件 ACL)' {
+    # 这段此前**一条测试都没有** —— 因为它直接调 Get-Acl/Set-Acl,
+    # 要测就只能去碰真机的 ACL。改走 Native 接缝之后才测得了。
+    # 它守的是一条硬风险:内核文件被普通用户替换 = 任意内核代码执行。
+    BeforeEach {
+        $script:KernelAclSet = $null
+        Mock -ModuleName QTrade.Kernel Get-QtAcl {
+            $a = New-Object System.Security.AccessControl.DirectorySecurity
+            $a.SetAccessRuleProtection($false, $false)
+            $a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')),
+                [Security.AccessControl.FileSystemRights]::Modify,
+                [Security.AccessControl.AccessControlType]::Allow)))
+            return $a
+        }
+        Mock -ModuleName QTrade.Kernel Set-QtAcl { $script:KernelAclSet = $AclObject }
+    }
+
+    It '走 Native 接缝(能被 Mock,不碰真机 ACL)' {
+        Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        Should -Invoke -ModuleName QTrade.Kernel Set-QtAcl -Times 1 -Exactly
+    }
+
+    It '🔴 去继承,且不把继承来的 ACE 复制成显式的' {
+        Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        $script:KernelAclSet.AreAccessRulesProtected | Should -BeTrue
+    }
+
+    It '🔴 Users 只剩只读 —— 可写就等于任意内核代码执行' {
+        Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        $forbidden = [int]([Security.AccessControl.FileSystemRights]::Write -bor
+                           [Security.AccessControl.FileSystemRights]::Delete -bor
+                           [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                           [Security.AccessControl.FileSystemRights]::TakeOwnership)
+        $users = @($script:KernelAclSet.Access | Where-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-545' })
+        $users.Count | Should -BeGreaterThan 0
+        foreach ($ace in $users) {
+            ([int]$ace.FileSystemRights -band $forbidden) | Should -Be 0
+        }
+    }
+
+    It 'Administrators 与 SYSTEM 都是 FullControl(否则回滚删不掉内核文件)' {
+        Set-QtKernelAcl -Path 'C:\ProgramData\QTrade\kernel\bzImage'
+        foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {
+            $ace = @($script:KernelAclSet.Access | Where-Object {
+                $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $sid })
+            $ace.Count | Should -BeGreaterThan 0
+            ([int]$ace[0].FileSystemRights -band [int][Security.AccessControl.FileSystemRights]::FullControl) |
+                Should -Be ([int][Security.AccessControl.FileSystemRights]::FullControl)
+        }
+    }
+}

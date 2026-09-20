@@ -285,10 +285,21 @@ if ($StubKind -eq 'qtrade' -and $seenKeys -notcontains 'InstallPath') {
 if ($StubKind -eq 'official' -and $seenKeys -contains 'InstallPath') {
     throw 'sfx-config.txt 里出现了 InstallPath —— 官方存根不认它,会静默忽略'
 }
+# 🔴 裁决 12:RunProgram 必须是**相对路径**。
+#    存根启动子进程时拼的是 `dirPrefix + appLaunched`(dirPrefix 缺省 ".\"),
+#    而它此前已经 SetCurrentDir 到解压目标。所以写绝对路径(或用 %%T 展开成绝对路径)
+#    会被拼成 `.\C:\ProgramData\QTrade\...` —— 一个不存在的路径,外壳直接起不来。
+#    ⚠️ 这是**官方存根原版就有的行为**,不是自编补丁引入的,两条路都受它约束。
+$runNorm = $runProgram.Replace('\\', '\')
+if ($runNorm -match '^[A-Za-z]:' -or $runNorm.StartsWith('\') -or $runNorm -like '*%%T*') {
+    throw ('{0} 的 RunProgram = "{1}" 是绝对路径(或用了 %%T)。存根会把它拼成 ".\<绝对路径>",起不来。必须写相对路径。' -f `
+            $SfxConfigName, $runProgram)
+}
+
 # 🔴 配置里的 RunProgram 必须正是我们待会儿塞进载荷的那个链首脚本,
 #    否则出来的包会去拉一个根本不存在的文件。
 $expectedRun = 'install\engine\' + $ChainHeadName
-if ($runProgram.Replace('\\', '\') -ne $expectedRun) {
+if ($runNorm -ne $expectedRun) {
     throw ('{0} 的 RunProgram = "{1}",但存根 {2} 配套的链首是 "{3}"' -f `
             $SfxConfigName, $runProgram, $StubKind, $expectedRun)
 }

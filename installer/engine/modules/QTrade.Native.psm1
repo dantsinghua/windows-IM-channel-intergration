@@ -345,6 +345,26 @@ function Get-QtCim {
     return Get-CimInstance -ClassName $ClassName -ErrorAction SilentlyContinue
 }
 
+# ── ACL 接缝 ──────────────────────────────────────────────────────────────
+#  🔴 用 Get-Acl/Set-Acl 而**不是** icacls:
+#     icacls 的输出是**本地化**的(中文 Windows 上组名和权限串都会变),
+#     按文本比对读回结果在非英文系统上必然错判;而「读回 ACL 比对」正是幂等判据。
+#     Get-Acl 给的是结构化对象,能按 **SID** 比,与系统语言无关。
+function Get-QtAcl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+    return Get-Acl -LiteralPath $Path
+}
+
+function Set-QtAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][object] $AclObject
+    )
+    Set-Acl -LiteralPath $Path -AclObject $AclObject
+}
+
 function Test-QtAdmin {
     [CmdletBinding()][OutputType([bool])]
     param()
