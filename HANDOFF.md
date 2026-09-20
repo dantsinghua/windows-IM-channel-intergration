@@ -9,4 +9,9 @@
   - 或把 `.claude/skills/qtrade-redroid-resume/` 复制到 `~/.claude/skills/`(Windows:`%USERPROFILE%\.claude\skills\`)装成全局。
 - **参考记忆快照**:`.claude/skills/qtrade-redroid-resume/reference/`(一致性教训、企点读库实测、中文头等规范)。
 
-改文档后:在 `docs/` 里跑 `python3 check-truth-tables.py`(须全绿)→ `python3 -m pytest -q`(代码 ↔ 文档对账也在里面)→ `git commit` → `git push`。
+**接手第一步(任何机器)**:
+1. `git clone` / `git pull` 后在仓库根跑 `python3 -m pytest -q`(应 579 条全绿)、在 `docs/` 跑 `python3 check-truth-tables.py`(应 exit 0)——两者任一红就先别开工。
+2. 读 `.claude/skills/qtrade-redroid-resume/SKILL.md` §5「🔴 代码现状总表」与「接手下一步」,再读该批要动的规格段落。
+3. 问安琳两件事:分支 `claude/lucid-dijkstra-uu5max` 合不合 `main`;要不要把 R6-51~R6-57 这一版回给 cursor 做第九轮评审。
+
+改文档后:在 `docs/` 里跑 `python3 check-truth-tables.py`(须全绿)→ `python3 -m pytest -q`(代码 ↔ 文档对账也在里面)→ `git commit` → `git push`。新裁决追加到 `docs/00` §15g 末尾、编号续 R6-N;新增脚本规则须在改前备份上反向验证能红。

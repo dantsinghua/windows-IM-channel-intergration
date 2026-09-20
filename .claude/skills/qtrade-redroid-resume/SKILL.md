@@ -1,13 +1,13 @@
 ---
 name: qtrade-redroid-resume
-description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 + 统一 RPA」项目(企点/QQ/微信三通道、WSL2+redroid+自编 binder 内核、单 EXE 离线安装)。新 session 接手本项目、或需要那套设计文档知识库时读本 skill。含设计文档索引、六轮评审决策脉络、企点读库(主库)/微信取钥/内核切换的实操指针、禁区与已踩坑。
+description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 + 统一 RPA」项目(企点/QQ/微信三通道、WSL2+redroid+自编 binder 内核、单 EXE 离线安装)。新 session 接手本项目、或需要那套设计文档知识库时读本 skill。含设计文档索引、六轮评审决策脉络、企点读库(主库)/微信取钥/内核切换的实操指针、禁区与已踩坑;以及 Agent 侧代码四批现状(579 条测试、R6-51~R6-57 独立验收)、假后端跑法、独立验收流程与接手下一步。
 ---
 
 # QTrade redroid 多实例 IM 控制台 —— 工作交接 / 断点续接
 
 > 🔴 **头等规范(安琳 2026-09-19 定,优先级高于本文其它一切)**:**所有思考与所有交流一律使用中文**——工具输出/代码/报错是英文也不切换;标识符、命令、路径、错误原文原样保留,说明用中文。此规范同时钉在仓库 `CLAUDE.md`(project scope)、`~/.claude/CLAUDE.md`(user scope)与项目 memory 目录(随仓库快照 = `reference/zh-only-rule.md`);换机器接手时先把三处带过去。
 
-> 2026-09-19 创建、当日多次更新(最新:**R6-47~R6-50 收第八轮 cursor 评审 8.4/10(`norm()` 定义 / (r) 拍板 A / P-MSG 三字段 / `qidian.rebootstrap` 登记),脚本 PAIRED 27 + ⑪ NORM;此前 R6-38~R6-46 收第七轮 + 企点消息类型路由**,详见 §5 顶部「🔴 最新状态」)。这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读桌面知识库。
+> 2026-09-19 创建,**2026-09-20 最近更新**(最新:**Agent 侧代码四批已交付并各经独立验收——基线 §15g R6-51~R6-57,579 条测试全绿,GitHub 分支 `claude/lucid-dijkstra-uu5max`、尚未合 `main`**;此前 R6-47~R6-50 收第八轮 cursor 评审 8.4/10、R6-38~R6-46 收第七轮 + 企点消息类型路由,详见 §5「🔴 代码现状总表」与各批段落)。这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读桌面知识库。
 > ⚠️ 本 skill 是**入口与指针**,不复述文档内容 —— 每个主题都指向"看哪个文件的哪一节",省 token。
 
 ## 🧳 跨机器迁移(换一台机器接手本项目时先读这一段)
@@ -37,16 +37,16 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 | 序 | 文件 | 读它解决什么 |
 |---|---|---|
-| **先读** | `00-共享基线与口径.md` (v1.3 + §15g 增补) | 术语/拓扑/端口/目录/配置/ID/数据模型/状态机/枚举/表名/页面ID/**红线§11**/**§14 拍板**/**§15~§15g 六轮回改+第七轮复评裁决表(R-*~R6-37)** |
-| 1 | `02-后端与本地数据库设计.md` (v0.4.5) | Agent/WinAgent 模块、SQLite 两库全部 DDL、`/api/v1`+`/wa/v1` 端点、并发规约、IPC 契约 |
-| 2 | `01-控制台前端设计.md` (v0.4.5) | Electron 三进程、页面/元素 ID 唯一出处、testid、事件→UI |
+| **先读** | `00-共享基线与口径.md` (v1.3 + §15g 增补) | 术语/拓扑/端口/目录/配置/ID/数据模型/状态机/枚举/表名/页面ID/**红线§11**/**§14 拍板**/**§15~§15g 裁决表(R-*~R6-57;R6-47~R6-50 = 第八轮评审收口,R6-52/54/56 = 代码二~四批的编码口径,R6-51/53/55/57 = 四批独立验收收口)** |
+| 1 | `02-后端与本地数据库设计.md` (v0.4.8) | Agent/WinAgent 模块、SQLite 两库全部 DDL、`/api/v1`+`/wa/v1` 端点、并发规约、IPC 契约;**代码直接对着写的段**:§2.2.2 bus 七段流水/登录门/安全闸、§2.2.4 runtime、§2.2.5 pool + 内存水位、§2.2.7 events、§2.5 WinAgent 契约、§2.6 恢复 + `error_since_ms` 两个动作、§2.8 入库/去重/合并、§3.1 DDL(逐字抽成 `schema_agent.sql`)、§3.4 端点(#1~#23 已带 R6-54/56/57 口径)、§3.7 告警码、§7.1 配置 |
+| 2 | `01-控制台前端设计.md` (v0.4.6) | Electron 三进程、页面/元素 ID 唯一出处、testid、事件→UI(前端尚未开工) |
 | 3 | `03-安装引导与自动化配置.md` (v0.4.5) | 单 EXE 离线打包、环境矩阵、内核切换与回滚、微信版本匹配/重装、退出码 |
-| 4 | `04-系统监控与本地网络.md` (v0.4.5) | 健康项、连通性探测、WSL⇄Windows 网络、`.wslconfig` 十一键、防火墙 |
-| 5 | `05-账号配置与多账号管理.md` (v0.4.6) | 三通道首登、DPAPI Vault、多账号切换、微信单在线、**企点读取=旁路读库(§非frida)**;§2.1.1 ⑪a **企点 `self_uid` = 登录 uin(纯数字)**(R6-39) |
-| 6 | `06-邮件摆渡与消息存取.md` (v0.4.6) | 邮件收发/模板/去重、消息本地存取、**企点旁路读库 §2.9.5(主库;🔴 R6-38~R6-42 重写:`poll_maindb` 伪代码=表发现+bootstrap+历史闸+水位自检+掉线续读、`check_group_gaps` 群缺口、发送确认阻塞语义)**、30天保留 |
+| 4 | `04-系统监控与本地网络.md` (v0.4.6) | 健康项(H02/H03/H04/H05/H06/H13 已编码,`[health]`/`[monitor]` 键是 owner)、连通性探测、WSL⇄Windows 网络、`.wslconfig` 十一键、防火墙 |
+| 5 | `05-账号配置与多账号管理.md` (v0.4.8) | 三通道首登(§2.1.1 冷启动全序已编码到 ⑤b,⑥~⑪ 以 `login_fn` 回调代替)、DPAPI Vault、多账号切换、微信单在线、§2.5.4 掉线(已编码)、§2.5.5 账号级设置(#22 已编码)、§7 `[accounts]` 是 owner;**企点读取=旁路读库(§非frida)**;§2.1.1 ⑪a **企点 `self_uid` = 登录 uin(纯数字)**(R6-39) |
+| 6 | `06-邮件摆渡与消息存取.md` (v0.4.7) | 邮件收发/模板/去重(未编码)、消息本地存取、**企点旁路读库 §2.9.5(主库;`poll_maindb` 伪代码=表发现+bootstrap+历史闸+水位自检+掉线续读、`check_group_gaps` 群缺口、`ensure_root` 三步、发送确认阻塞语义——全部已编码)**、§2.9.2 `norm`/`fingerprint`、§2.12 出向合并、30天保留 |
 | 附 | `07-配置项总表.md` (v0.2) | 约130键跨册对账基准(owner/默认/消费方) |
-| 附 | `check-truth-tables.py` | **真值表对账器,改完必跑**(FORBIDDEN/PAIRED/ENUM/STATUS/KEYNAME/COPYABLE/MIRROR/**⑨DYNAMIC=值集合从owner册现读**/**⑩VALUE=企点确认窗≥15000 且 02↔07 同值**/版本;**73 条规则**(R6-37 `qdidx:`/`c4ext1`;R6-38~R6-41 新增索引库列名、L2 二选一、`.backup`、6 字节密钥、`poll` 无参签名、`ingest` 两元组、新码/新键登记等;**每条新规则都在改前备份上反向验证过能红**);`python3 check-truth-tables.py`,退出0=全绿 |
-| 代码 | `src/qtrade_agent/` + `tests/` | Agent 侧首批代码(2026-09-19 开工):`text.py`(`norm`/`clean_text` 逐字 = 06 §2.9.2/§2.9.5)、`store/`(`schema_agent.sql` 逐字抽自 02 §3.1;`ingest` 三元组、同事务顺序、出向合并定序、QQ id 复用、`qidian_bootstrap_rebase` 含审计)、`adapters/qidian/`(`xor.py` 17 字节密钥、`msgdata.py` msgtype 路由 + `-1035` protobuf Elem、`maindb.py` 本地/adb 两后端、`poll.py` = 06 §2.9.5 两段伪代码逐分支)、`bus/`(R6-48 校验、出向先落库、幂等三态、队列外等确认)、`events.py`/`alerts.py`、`capabilities/*.json`;`python3 -m pytest -q` |
+| 附 | `check-truth-tables.py` | **真值表对账器,改完必跑**(FORBIDDEN/PAIRED/ENUM/STATUS/KEYNAME/COPYABLE/MIRROR/**⑨DYNAMIC=值集合从owner册现读**/**⑩VALUE=企点确认窗≥15000 且 02↔07 同值**/版本;规则数以实跑为准(2026-09-20:FORBIDDEN 38 / PAIRED 30 / COPYABLE 3 / MIRROR 6 / DYNAMIC 3 + KEYNAME/ENUM/⑩ VALUE/⑪ NORM/⑫ LITERAL;PAIRED 17→30 的每条都在改前备份或「抹掉登记行」副本上反向验证过能红;⚠️ 含否定词的规则会被行级 NEGATION 整行吞掉——⑫ LITERAL 因此单列);`python3 check-truth-tables.py`,退出0=全绿 |
+| 代码 | `src/qtrade_agent/` + `tests/` | Agent 侧四批代码(2026-09-19~20),模块 ↔ 规格段落见 §5「🔴 代码现状总表」;`tests/test_*.py` = 开发者测试 165 条,`tests/acceptance/test_spec_*.py` = 独立验收 414 条(五份,每份由只读规格、不看开发者测试的子 agent 撰写);`tests/test_docs_consistency.py` 把代码与文档对账;`python3 -m pytest -q` |
 
 ⚠️ **没有「同步副本」了**:唯一的源是 `Desktop\work\docs\`(见 §0),改完跑对账脚本、提交、推送。该目录在 Windows 盘上(`/mnt/c`),**不是 git 之外还有一份备份**——每轮改前仍先 `cp` 一份到 scratchpad 供只读终审 diff,但真正的还原点现在是 git 历史(`git diff` / `git checkout -- <file>`)。
 
@@ -70,8 +70,10 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 | **企点读消息(实时)** | **主库** `{uin}.db`:参考实现 `~/work/xunjia-agent/relay/side_a/echo_loop_maindb.py` 的 `query()`;规格 06 §2.9.5(**R6-36 已改主库**) | 会话分表 `mr_friend_{MD5(对端uin)大写}_New`/`mr_troop_{MD5(群号)大写}_New`;`msgData/senderuin/frienduin` 逐字节 **XOR,密钥 = ASCII 字符串 `b"02:00:00:00:00:00"` 的 17 字节循环(`in[i]^KEY[i%17]`;🔴 不是 6 个原始字节——R6-39 勘误,按 6 字节解出来全是乱码)**;游标=各表 `_id`;延迟 **2~12 s**(见 §5);**前置=先 `ensure_root`**;零attach零崩溃、`.backup` 只读副本 |
 | **企点读消息(历史/全文兜底)** | 索引库 `{uin}-IndexQQMsg.db`:`db_reader.py`(Base64、单表 `IndexContent_content`、单 `docid` 水位) | **滞后 13~36 s、只索文本**,不做实时正线(R6-36);只作历史回填/全文检索 |
 | **微信取钥** | `/mnt/c/Users/anlin/Desktop/盈米/蜂鸟项目/南银理财/weChatlog/` (chatlog + wx_key DLL) | 三段固定序:起hook→点图片(img_key)→退出重登(data_key),两钥同轮才落盘;详见 [[wechat-pc-install-facts-2026-09-18]] |
-| **改设计文档** | 改 `/mnt/c/Users/anlin/Desktop/work/docs/` → 跑 `check-truth-tables.py`(在该目录里跑)→ `git commit` → `git push` | 新裁决追加到基线 §11 末尾、引用写"§11.N [锚名]";别插中间(会导致编号漂移) |
-| **改代码 / 跑单测** | 仓库根 `python3 -m pytest -q`(需 `pytest`、`pytest-asyncio`;`pythonpath=src` 在 pyproject.toml);`tests/test_docs_consistency.py` 把代码与文档对账(配置默认值 = 02 §7.1、schema 文件 = 02 §3.1 sql 块、`norm` 函数体 = 06 §2.9.2) | 代码以文档为准;改表先改 02 再重新抽 `schema_agent.sql`(抽取方式写在文件头);真机执行层(点发送键等)以 `sender` 回调注入,`tests/test_bus.py::FakeSender` 是假的 |
+| **改设计文档** | 改 `<克隆目录>/docs/`(原机 = `/mnt/c/Users/anlin/Desktop/work/docs/`)→ 在 `docs/` 里跑 `python3 check-truth-tables.py`(exit 0)→ 仓库根 `python3 -m pytest -q`(代码↔文档对账也在里面)→ `git commit` → `git push` | **新裁决追加到基线 §15g 末尾、编号续 R6-N**(红线条款才追加到 §11 末尾、引用写"§11.N [锚名]");都别插中间(会导致编号漂移);新增脚本规则须在改前备份上反向验证能红;编码口径裁决(R6-52/54/56 这类)写前**先 grep 同册通用段与 owner 册**(R6-53/R6-57 各抓过一次自己与 owner 打架) |
+| **改代码 / 跑单测** | 仓库根 `python3 -m pytest -q`(需 `pytest`、`pytest-asyncio`,`requirements-dev.txt`;`pythonpath=src` 与 `asyncio_mode=auto` 在 pyproject.toml;远程容器由 `.claude/hooks/session-start.sh` 自动装);`tests/test_docs_consistency.py` 把代码与文档对账(配置默认值 = 02 §7.1 / 04 §7 / 05 §7、schema 文件 = 02 §3.1 sql 块、`norm` 函数体 = 06 §2.9.2、端口表、`used` SQL、`error_since_ms` SQL) | 代码以文档为准;改表先改 02 再重新抽 `schema_agent.sql`(抽取方式写在文件头);**开发容器里一律假后端**:`tests/conftest.py::make_rig(tmp_path, cfg=, clock=, login_fn=, aligner=, wsl_total_mb=)` 装配 `FakeContainers`/`FakeAdb`/`FakeVault`/`FakeWinAgent`/`FakeFs`,`Clock(auto_step_ms)` 可拨时钟;真机执行层(点发送键 / 装企点 / 填登录)以 `sender`、`login_fn` 回调注入,缺省未接 |
+| **每批交付后的独立验收** | 起一个后台子 agent:只给规格段落行号 + 夹具接口(不许读 `tests/test_*.py` 与实现函数体),写 `tests/acceptance/test_spec_<批次>.py`,失败不改 `src`、原样报回;总控逐条分诊「实现缺陷 / 用例误读 / 规格问题(两册不一致 / 未钉 / 自引用)」,措辞收口进 §15g 新裁决、改行为的修复同一提交 | 五轮验收的产出比例:实现缺陷少、用例误读多、规格张力每轮 7~20 条;**验收撰写者的报告里「疑似规格自相矛盾」一栏最值钱**,逐条落裁决 |
+| **起服务(真机)** | `python3 -m qtrade_agent.main --config /etc/qtrade/agent.toml --db /var/lib/qtrade/agent.db`(uvicorn `ws="websockets"`);先 `Store.upsert_api_client(app_id="console", level="admin", token=…)` 建控制台令牌 | 不注入假后端时用 `DockerCliBackend`/`AdbCliBackend`(只包命令行,**没在真机跑过**)、`WinAgentVault` + urllib;`/etc/qtrade/winagent.token` 缺失只会让 WinAgent 探测记离线、不阻塞;`resource_pools(wsl).total_mb` 首建取 `/proc/meminfo MemTotal` |
 
 ## 4. 🔴 禁区(违反会出大事)
 
@@ -81,9 +83,30 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 - ❌ 企点主进程**在翻译层下对 frida 重负载极脆弱**(广谱hook/全量堆扫崩过两次)—— 读消息一律走**旁路读库**(主库 `echo_loop_maindb.py` 的 `query()`;frida 不在读取链),别 attach 进程。
 - ⚠️ 内核崩溃转储:v2 关机根因=`CONFIG_VIRTIO_VSOCKETS=y` 抢 vsock;改内核配置前必查 vsock 三项与现役 v3 一致。
 
-## 5. 当前进度与下一步(2026-09-19 更新至 R6-37 收口 + 边缘风险已补)
+## 5. 当前进度与下一步(2026-09-20 更新至 R6-57:四批 Agent 侧代码交付并验收)
 
-### 🔴 最新状态(2026-09-19 夜,接手先读这一段;下面「已完成/挂着的」是更早的记录)
+### 🔴 代码现状总表(2026-09-20,接手先读这一段;分支 `claude/lucid-dijkstra-uu5max`,尚未合 `main`)
+
+| 模块(`src/qtrade_agent/`) | 规格段落 | 批次 / 裁决 | 一句话 |
+|---|---|---|---|
+| `text.py` `ids.py` `models.py` `config.py` | 06 §2.9.2 / 00 §6 / 00 §7 / 02 §7.1 + 04 §7 + 05 §7 | 一~四批 | `norm`/`clean_text` 逐字;ULID;`agent.toml` 全部段的默认值都与 owner 册对账 |
+| `store/` | 02 §3.1 DDL、§2.2.8、§2.8、§2.6 | 一、三批 | 唯一读写 `agent.db`;`ingest` 三元组;`transition` 同事务 `error_since_ms` 两动作;`settings.seq.*` 分配 id;资源池行 |
+| `adapters/qidian/` | 06 §2.9.5 | 一批 R6-51 | XOR 解码、msgtype 路由、`poll_maindb`/`check_group_gaps`、`send` 点完即返回;`maindb.py` 本地/adb 两后端 |
+| `bus/` + `gate.py` | 02 §2.2.2、§3.10、§6;00 §11.3 | 一、四批 | 登录门 → 参数校验 → 幂等三态 → 安全闸(白名单/出口词表热更/自定义闸)→ 串行队列 → 队列外等确认 |
+| `events.py` `alerts.py` | 02 §2.2.7、§3.7;00 §7.5 | 一~四批 | outbox + 事件专属 `lag_s/late/origin`;告警去重键 `(code, subject)`、级别翻转再发 firing |
+| `scheduler.py` `health.py` `api/` `app.py` `main.py` | 02 §2.2.11、§2.2.12、§2.2.1、§3.4、§3.4.7、§2.1 | 二批 R6-52/53 | 计时与执行分离;进程内健康态;FastAPI + WS 事件流;装配与启动恢复 |
+| `runtime/` | 02 §2.2.4;06 §2.9.5 `ensure_root`;05 §2.5.7 | 三批 R6-54/55 | docker/adb 后端协议 + CLI 实现 + 假实现;端口推导;`_purge_ephemeral`;`ensure_root` 三步逐字;启动全局串行 |
+| `pool.py` `pressure.py` | 02 §2.2.5;00 §7.6;04 H24 | 三、四批 | `can_add`(start 排除自身)/行级 claim/snapshot;内存水位三级、LRU 建议、critical 阻断、只停显式开关的账号 |
+| `accounts.py` | 02 §3.4.1 #2~#23、§2.6;05 §2.1.1/§2.2.7/§2.5.2/§2.5.4/§2.5.5;00 §8.1 | 三、四批 | 生命周期状态机(不跳段)、登录阶段端点、掉线登记与提醒、能力矩阵、账号级设置、批量、启动恢复 |
+| `healthloop.py` `timesync.py` | 04 §2.3 H04/H05/H06/H13、§2.9、§2.10 | 三、四批 | 容器退避重拉、adb 三振 + root 态、boot 稳态、H13 校时、唤醒后复提权 |
+| `vault_client.py` `winagent_client.py` | 02 §2.5、§3.6 #1/#2/#4/#7~#12;00 §11.1 | 三批 | 单向调用、令牌文件、超时/重试表、Vault 读走 POST + `X-Trace-Id`;假实现 |
+| `capabilities/*.json` | 02 §3.10、#21 | 一、四批 | 目录 5 个 op(`send_text`/`read_messages`/`get_state`/`screenshot`/`list_sessions`) |
+
+**测试 579 条全绿 = 开发者 165(`tests/test_*.py`)+ 独立验收 414(`tests/acceptance/` 五份:读库 94 / store+bus 41 / api 77 / runtime+accounts 83 / login+health+gate 119)**;文档对账脚本 exit 0。**仍未做**(下一批候选见「接手下一步」⑤):企点 UI 执行层真机接线、微信通道整体、QQ 适配器、画面注入/画面流、`pool.calibrate`、`mail`、HMAC 公网入站、webhook 投递器、备份/保留期清理。
+
+**四批的通用做法(接手照做)**:①先读规格段落再写,代码注释引用条款;②规格没写死的口径先登记成 §15g「编码口径」裁决(R6-52/54/56 式)再编码,**写前 grep 同册通用段与 owner 册**;③交付后起只读规格的子 agent 独立验收,分诊「实现缺陷 / 用例误读 / 规格问题」,收口成下一条裁决(R6-53/55/57 式);④每条新脚本规则在改前备份上反向验证;⑤按精确路径 `git add`,不夹带子 agent 半成品;⑥开发容器里绝不碰真 docker/adb/WinAgent/WSL。
+
+### 🔴 各批细节(2026-09-19 夜起;下面「已完成/挂着的」是更早的记录)
 
 **第八轮 cursor 评审(8.4/10;R7 五条 CLOSED、R6-38~R6-46 零回归;1 P0 + 3 P1)已由 R6-47~R6-50 收口(2026-09-19,在 GitHub 仓库分支上改、脚本 exit 0)**:
 - **R6-47(P0)`norm()` 三册无可抄定义** → 06 §2.9.2 落函数体(评审原句照收):`not s → ""`;NFKC;`re.sub(r"\s+"," ",s).strip()`;**不剥 `U+0014`**。分工逐字定死:`clean_text` = 读库解码侧、只在 `to_message()` 调一次;`norm()` = 比较侧、两侧各算一次、不改 `[表情]`/`[图片]`;**出向 `SENDING` 行 = 发送原文、入库前不过 `clean_text`**;00 §7.4 / 02 §2.8.1 改指针。脚本 ⑪ NORM 查唯一 `def norm(` + 函数体三件事、且不含 `\u0014`/`.replace(`。
@@ -93,11 +116,11 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 - 脚本新增 PAIRED ×10(norm 定义 ×2、`text_has_control_chars` ×2、三字段 testid ×2、`qidian.rebootstrap` ×2、两码 01 承接 ×2)+ ⑪ NORM;**每条都在改前备份与「抹掉登记行」副本上反向验证能红**(harness 留在 session scratchpad,不入库)。评审「开工门」:M1、内核 D、WinAgent、Electron 路由与 testid、微信向导、邮件取信、企点 poll 骨架可开;`norm()`/`send_*` 确认匹配已补 ⇒ **无阻塞项,进入编码**(见下「代码现状」)。
 
 **🔴 代码现状(2026-09-19 夜,首批;GitHub 分支 `claude/lucid-dijkstra-uu5max`,尚未合入 `main`)**:
-- 范围 = 02 §8 里 **M2** 行中能在无 redroid 环境下编码与单测的部分:`store` + `agent.db` 基线 DDL(逐字抽自 02 §3.1,SQLite 3.45 实跑;`schema_version` 记 sha256)、`bus` 单账号队列(出向先落库经 `store.ingest`、幂等三态、R6-48 入口校验、登录门、队列外等确认 + 加速轮投递)、`adapters.qidian` 读库正线(`poll_maindb`/`check_group_gaps` 按 06 §2.9.5 伪代码逐分支,含历史闸/水位自检/换号审计/H13 守卫/加速轮不动计数)、`events`(outbox + 事件专属 `lag_s`/`late`/`origin`)、`alerts`(去重键 `(code,subject)`)。**没做**:`api`(FastAPI 端点)、`runtime`(docker/redroid)、`pool`、`workflow`、`mail`、`vault_client`、`scheduler`、`health`、UI 执行层(搜索/打开会话/ADBKeyboard/点发送)——后者以 `QidianAdapter(sender=…)` 回调注入,真机接入时把 `qidian_cold_start.sh` 的动作包成同签名回调。
+- 范围 = 02 §8 里 **M2** 行中能在无 redroid 环境下编码与单测的部分:`store` + `agent.db` 基线 DDL(逐字抽自 02 §3.1,SQLite 3.45 实跑;`schema_version` 记 sha256)、`bus` 单账号队列(出向先落库经 `store.ingest`、幂等三态、R6-48 入口校验、登录门、队列外等确认 + 加速轮投递)、`adapters.qidian` 读库正线(`poll_maindb`/`check_group_gaps` 按 06 §2.9.5 伪代码逐分支,含历史闸/水位自检/换号审计/H13 守卫/加速轮不动计数)、`events`(outbox + 事件专属 `lag_s`/`late`/`origin`)、`alerts`(去重键 `(code,subject)`)。**首批时点没做**(其中 `api`/`runtime`/`pool`/`vault_client`/`scheduler`/`health` 已在二~四批补齐;`workflow`/`mail` 仍未做):UI 执行层(搜索/打开会话/ADBKeyboard/点发送)以 `QidianAdapter(sender=…)` 回调注入,真机接入时把 `qidian_cold_start.sh` 的动作包成同签名回调。
 - 单测 49 条全绿(`tests/`):`norm`/`clean_text` 全部边界(纯表情不为空、串尾孤零、后继 `\t`)、XOR 17 字节自反、路由表五行、`-1035` 顺序、`ingest` 重扫 `(False,False)`、撤回 `changed`、出向合并定序/窗口/空文本守卫、QQ `#n`、空批推游标、单事务回滚、首登历史闸、新会话不丢第一条、重扫不重放、被踢重登 `late`/`external`、加速轮不动计数、首登 12 轮宽限、H13 换号只审计一次、个别表 STUCK 独立码、整库解不出一条告警、群缺口、bus 端到端「send_text → 假 RPA 落库 → poll 合并 → DELIVERED」、控制字符 400 且不进 commands、UNCONFIRMED 留 SENDING、登录门、send 让出队列。
 - **代码 ↔ 文档对账**(`tests/test_docs_consistency.py`):配置默认值 = 02 §7.1、`schema_agent.sql` = 02 §3.1 sql 块、`norm` 函数体逐行 = 06 §2.9.2、能力目录会话参数只叫 `session`。改文档后跑单测也会红。
 - **接手下一步(按优先级;②③已在第二、三批完成)**:①真机接 `sender` 回调 + `AdbMainDb`(需 `ensure_root`,06 §2.9.5——现已有 `runtime.ensure_root(row)` 可直接用,把 `AdbCliBackend` 装上即可)跑一次 06 §8b M2「含表情/控制字符的发送」五例——(r) 拍板 A 的那格「企点会不会把 Unicode emoji 转成 `U+0014`」只能真机验;真机同时首跑 `DockerCliBackend`/`AdbCliBackend`(第三批只包了命令行没在真机跑过)与 05 §2.1.1 ④⑤⑤b(起容器 → boot → 提权);起服务 = `python3 -m qtrade_agent.main --db /var/lib/qtrade/agent.db`(先 `store.upsert_api_client` 建控制台令牌;`/etc/qtrade/winagent.token` 缺失时 WinAgent 相关探测只会记离线、不阻塞);②~~scheduler + api 骨架~~、③~~runtime / pool / 账号生命周期 / WinAgent 客户端 / H13~~、④~~登录阶段端点 #12/#13/#14/#15/#16b、H04~H06 健康循环、E-19 内存水位、GATE 安全闸、#20/#22/#23、掉线登记~~ 已在第二~四批完成;⑤**下一批候选**:企点 UI 执行层接入 `accounts.login_fn`(05 §2.1.1 ⑥~⑪:装两件/首拉起/自动填登录/判定,现为可注入回调、缺省停在 `login_required(WAIT_PASSWORD)`;真机项)、微信通道整体(槽位 switch #17/#18 + reaper + `slot_error_takeover_s` 接管 + WinAgent 微信端点 #28~#42 + 适配器;#16b 微信分支已留钩子)、QQ 适配器(OneBot WS + H08 心跳)、#34/#35 画面注入 + H07 画面流、`pool.calibrate`(M2.9)、`mail`(06 邮件摆渡,含 E-2 邮件入口 op 集合与 danger 二次确认)、HMAC 公网入站(02 §3.5)、webhook 投递器(02 §2.2.7)、备份/保留期清理作业(02 §3.3/E-18);⑥把 `main` 合入(或 PR)由安琳定。
-- ⚠️ 已知取舍:`Store` 是同步 sqlite3 核心 + `AsyncStore` 分片锁包装(文档要求 aiosqlite;容器无网络装包,且 aiosqlite 本质也是线程 + sqlite3);bus 的 GATE 安全闸(§6 双闸门)本期为空放行,留 TODO;`Bus.submit` 对 `SENDING` 幂等行的等待用进程内 future,跨进程重启走 `ABANDONED → confirm_probe`。
+- ⚠️ 已知取舍:`Store` 是同步 sqlite3 核心 + `AsyncStore` 分片锁包装(文档要求 aiosqlite;容器无网络装包,且 aiosqlite 本质也是线程 + sqlite3);bus 的 GATE 安全闸第四批已接(`gate.py`,R6-56);`Bus.submit` 对 `SENDING` 幂等行的等待用进程内 future,跨进程重启走 `ABANDONED → confirm_probe`;#15 prompt / `h06_fail_streak` / `rooting_until_ms` / 退避重拉计数都是进程内内存态,Agent 重启即丢(规格如此)。
 
 **🔴 第二批代码(2026-09-19 夜)= 基线 §15g R6-52,独立验收 = R6-53**:`scheduler.py`(计时循环与执行分离:到点/trigger 只启动一轮、正在跑则 `skipped+1`)、`health.py`(H13 firing / `mark_rooting` 宽限窗 / 免鉴权摘要,均进程内内存态)、`api/`(FastAPI:Bearer 鉴权按 `api_clients` 表、级别 R/W/A、`allow_accounts` 收窄;00 §10 错误信封;`X-QT-Api-Version`/`X-QT-Agent-Version`/`X-QT-Capabilities-Version` 头与 `X-QT-Api-Min` → 426;端点 `system/version|health`、`capabilities`、`accounts`(00 §7.1 视图、端口按序号推导)、`accounts/{id}/commands|send`(#28/#29/#30/#31:HTTP 层错误按 00 §10 映射、业务结果一律 200 + CommandResult、REPLAY 409 带完整信封、`async`/同步超时 202)、`sessions`、`messages`(#48:FTS/LIKE 混合、G-16 JSON cursor、ISO 时间;#49)、`audit`、WS `/events`(订阅/`since_seq` 重放/`truncated`/过滤/`allow_accounts` 二次收窄/ping/重发订阅帧);每次调用记 `audit_log`,health 免鉴权摘要除外)、`app.py`(装配:开库→崩溃恢复→模块→scheduler 注册 `qidian_poll_all`/`qidian_gaps_all`/outbox 保留期)、`main.py`(uvicorn `ws="websockets"`)。**没做**:`runtime`(docker/redroid)、`pool`、账号生命周期端点(`POST /accounts`/start/stop/login…)、`mail`、`vault_client`、WinAgent 探测、HMAC 公网入站、webhook 投递器。第三位独立验收者(`tests/acceptance/test_spec_api.py` 77 条)首跑 3 失败——全是规格明写实现漏了(`disk_free_mb`、`X-QT-Capabilities-Version` 头、WS 帧 `ts` 未 ISO);另揪出 **R6-52 自己与 02 §3.4 通用约定打架**(#48 写 `items` 而通用是 `data`;cursor 写 `"ts_ms:id"` 而 G-16 是 JSON)——按通用约定改回,教训:**新写专条前先 grep 同册通用段**。终态 277 条全绿(开发者 65 + 验收 212)。
 
@@ -125,7 +148,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 **开工时必须带着的开放项(不阻塞编码;全文见基线 §15g R6-42 行 (a)~(i))**:`uniseq` 跨库重建稳定性(正反两向真机验)/「恰在被踢期间由别的端发出」无样本 / `on_late` 无承载 / 群缺口自动补拉未验证 / `mark_rooting` 重启即丢 / 历史闸 120 s 余量 / **对账脚本不读伪代码控制流(伪代码只能靠逐分支人读)** / `origin=external` 策略留 S4 / 脚本待补两条规则。
 
-**下个 session 第一件事**:①问安琳要不要把这一版回给 cursor 做第八轮评审(R6-38~R6-46 改动面大,06 §2.9.5 基本重写);②S1 读循环仍须安琳亲自 gate(开工时解码直接用参考解码器的口径);③企点专项第一批(延迟/消息类型/被踢/体检)**已收完**,开放项见基线 §15g R6-42 (a)~(i) + R6-43~R6-46 (j)~(s),其中要真机验的:`uniseq` 跨库重建稳定性、被踢期间别的端发出的样本、**我方发出含表情的文本能否读回确认**((r):出向行存原文、读回是 `[表情]`,`norm(text)` 不等)、群缺口自动补拉;`norm()` 三册无定义((s))。**子 agent 的结论该进规格的由总控落,别让它改 `docs/design/`。**
+**下个 session 第一件事(2026-09-20 版;上面「第八轮评审 / S1 gate」两条前置都已过)**:①`git pull` 后跑 `python3 -m pytest -q`(579)与 `cd docs && python3 check-truth-tables.py`(exit 0)确认基线;②问安琳:分支 `claude/lucid-dijkstra-uu5max` 合不合 `main`、要不要把 R6-51~R6-57 这一版回给 cursor 做第九轮评审(代码四批 + 文档 02/04/05 改动面大);③按「接手下一步」①(真机接线)或 ⑤(下一批候选)开工,开工前先读该批规格段落。真机项(只能在原机做):`uniseq` 跨库重建稳定性、被踢期间别的端发出的样本、**我方发出含表情的文本能否读回确认**((r) 拍板 A 那格)、群缺口自动补拉、`DockerCliBackend`/`AdbCliBackend` 首跑。**子 agent 的结论该进规格的由总控落,别让它改 `docs/`。**
 
 **🔴 方法论(本轮新增,已写入 [[design-doc-consistency-lessons]])**:①**每一轮的新问题都出自上一轮新写的东西**——收敛期「只动点名处、不扩面」,宁可撤回一条未验证前提的补偿规则、留成开放项,也不要再加设计;②**伪代码要当真代码逐分支跑**(变量在每个分支有没有值、每个 `return` 出口处计数/告警状态是否一致),脚本看不见这一层;③换数据源时旧源**整张表的全部列名**都要进 FORBIDDEN;④同册写下一个实测量就要 grep 所有依赖它的阈值,并做成脚本的**值检查**;⑤新规则必须在改前备份上**反向验证能红**(本轮抓到 3 条自己写的空规则:否定词自吞、正则竖线多转义一层);⑥评审给的替换句也要核后果(`value_int=0` 会回灌全部历史)、终审给的建议也要核(「把 fail 挪到 stuck 之后」会一因两告警);⑦**新语义要沿事件流往下游走一遍**(R6-43 让非文本行也产出 `Message`,没接到出站信息邮件〔无类型过滤、只认 text|image〕、图片恒 MISSING、还引用了不存在的 `Message.origin_json`——解法是**收窄**回「只产出文本」,不是往下游接);⑧**数据清洗规则要问「清完会不会变空」**(删表情 → 17 条空正文 → 空邮件或被静默过滤;改成 `[表情]` 占位);⑨子 agent 的结论采信前到源头抽查(`-1049`/`-1035` 两条我都独立核过),它的推测要让它用全库数据证实或证伪(「@ 属性控制字节」后来被它自己的全库统计否定)。
 
@@ -147,15 +170,17 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 **方法论教训(第六轮,已写入 [[design-doc-consistency-lessons]])**:①返工自己会造新接缝(各路自洽、合起来打架)——跨册的名字/判据原句必须在裁决里**逐字定死**再分派;②总控自己的裁决也会错(⑤/⑥ 锚点、§2.7.5/§2.7.4、提权序列里的 kill-server、「九项已闭合」)——子 agent 与终审的异议要认真看;③「脚本全绿」≠ 通过,存在性检查会给假阳性的安全感,必须有只读的独立终审;④收敛期(只剩「owner 写对、消费方没跟」的单点)由总控**直接改**比再分派更稳(第五次零新引入);⑤值集合类检查要「从 owner 册现读」,写死清单管不了 owner 新增。
 
-**挂着的**:
-1. **企点接进 RPA 五步节奏**(⚠️ 安琳 2026-09-19:**读循环先不开工,等再一轮 cursor 评审良性后才开**):S1 读循环(**读主库**,游标 = 各表 `_id`;启动先 `ensure_root`)→ S2 统一入库 → S3 发送闭环(异步读回确认、会话校验)→ S4 喂谈判核心(先 mock)→ S5 守护/降级。红线:真实发送只发测试号。
-2. ✅ **设计文档企点读取节已改主库**(2026-09-19,基线 §15g **R6-36**):06 §2.9.5 + §2.9.1 + 02 §2.8.1/§2.8.3 + 00 §6 全部换成主库 `{uin}.db`(会话分表、XOR 密钥 `02:00:00:00:00:00`、游标 `cursors.kind='qidian_rowid:<native_id>'`、`ext_msg_id='qd:{uniseq}'`、延迟 2~12 s、异步读回)。索引库降为兜底(`db_reader.py`);主库参考实现 = `echo_loop_maindb.py` 的 `query()`。✅ **那轮 cursor 评审已回**(R6-36 半改已由 R6-37 收口、邻表全跟上、独立终审判 ACCEPT/可开工)——安琳设的「读循环等一轮 cursor 评审良性后才开 S1」这个前置**现已满足**。🔴 **下个 session 第一件事 = 跟安琳确认是否开 S1 读循环**(条件已满足,但安琳要亲自 gate、别自作主张开工;S1 = 读主库、游标各表 `_id`、启动先 `ensure_root`、只回测试号)。
+**挂着的**(2026-09-20 加注:1/2 的代码部分已在四批里落地,真机 gate 仍归安琳):
+1. **企点接进 RPA 五步节奏**(⚠️ 安琳 2026-09-19:**读循环先不开工,等再一轮 cursor 评审良性后才开**——该前置已满足;✅ S1 读循环 = `adapters/qidian/poll.py`、S2 统一入库 = `store.ingest`、S3 发送闭环 = `bus` + 队列外等确认、S5 守护 = `healthloop`/`pressure`/`alerts`,均已编码并独立验收;**真机接线 = 「接手下一步」①**):S1 读循环(**读主库**,游标 = 各表 `_id`;启动先 `ensure_root`)→ S2 统一入库 → S3 发送闭环(异步读回确认、会话校验)→ S4 喂谈判核心(先 mock)→ S5 守护/降级。红线:真实发送只发测试号。
+2. ✅ **设计文档企点读取节已改主库**(2026-09-19,基线 §15g **R6-36**):06 §2.9.5 + §2.9.1 + 02 §2.8.1/§2.8.3 + 00 §6 全部换成主库 `{uin}.db`(会话分表、XOR 密钥 `02:00:00:00:00:00`、游标 `cursors.kind='qidian_rowid:<native_id>'`、`ext_msg_id='qd:{uniseq}'`、延迟 2~12 s、异步读回)。索引库降为兜底(`db_reader.py`);主库参考实现 = `echo_loop_maindb.py` 的 `query()`。✅ **那轮 cursor 评审已回**(R6-36 半改已由 R6-37 收口、邻表全跟上、独立终审判 ACCEPT/可开工)——安琳设的「读循环等一轮 cursor 评审良性后才开 S1」这个前置**现已满足**。(2026-09-20:S1 读循环代码已在首批落地并经独立验收,**真机接线**仍须安琳亲自 gate、别自作主张;S1 = 读主库、游标各表 `_id`、启动先 `ensure_root`、只回测试号。)
 3. 待安琳定:要不要做「logcat 触发」(≈2 s 知道有新消息,只读日志、低风险);要不要探索让内容也秒级(提前落库/读界面,都要碰企点,有风险)。
 4. 里程碑收尾清单(不阻塞):`mark_rooting` 进程重启即丢的处理;脚本补「全套行号锚扫描」「跨册同义量命名唯一性」;**脚本 FORBIDDEN 的 NEGATION 由「整行含否定词即跳」收紧到「命中点近邻窗口」**(现整行判会漏「活写坏 token + 同行无关否定词」,qdidx/c4ext1 两规则都受此限,终审已点名——但按「误报比漏报更伤」没把握前别动共享 NEGATION 逻辑)。
    ✅ **边缘风险已补(2026-09-19,安琳定"先补边缘风险再说")**:①`fp:` 前缀分叉——02 §2.8.1(529)去重键 + 02 DDL(925)注释都对齐 owner 06 §2.9.2 = `ext_msg_id=fingerprint`(full sha256、无前缀;原 `"fp:"+[:32]` 按 99c C-03 作废);②01 §2.5 白名单③ 补 `GET /wa/v1/wechat/login/status`、`ui-visible`(05 §3.2 R6-5 判控制台只读可直调、01 §3 已列,是 01 内部漏列);③01 §4 P-ACCT-DETAIL 新增 `qt-acct-detail-read-degraded`(warn 横幅、**无按钮**,守住 R6-35 已删的"重试提权";兑现 01:873 悬空声明)+ §2.7.3.4 概览承接;④README 行数/版本刷新到实际。脚本全绿、桌面同步。
 5. 企点当前**已退回消息列表页**(2026-09-19 已做);redroid 容器 `qtrade-redroid` 在跑、已登录态、adb root 在位。
 
 ## 6. 记忆索引(项目相关,`~/.claude/projects/-home-anlin-work-qtrade-ibquote/memory/`)
+
+> ⚠️ 这是**原机**的活记忆目录。远程容器 / 别的机器上只有 `zh-only-rule.md`(头等规范),其余以本 skill `reference/` 三份快照为准(`design-doc-consistency-lessons.md` 末尾已追加「代码阶段」教训、`qidian-read-via-db.md`、`zh-only-rule.md`);新的项目记忆先写进本 skill,回原机再落活记忆。
 
 - [[qtrade-design-docs-2026-09-18]] — 设计文档唯一真值口径、六册分工、开工边界、Cursor 15条P0
 - [[design-doc-consistency-lessons]] — 🔴多agent并行写文档的7类缺陷+我犯的错;对账脚本八类检查的由来
@@ -172,3 +197,4 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 - 防自杀 hook:`pgrep/pkill -f` 明文被拦(exit 144),用单字符方括号规避(如 `[f]rida`);`pkill -f xxx` 会把自己这条命令也算进去而误杀,慎用。
 - ⚠️ **改文档的 python 脚本别写 `open(p,'w').write(open(p).read())` 这种"读回自己"的收尾行**——`'w'` 先截断,读到空、写回空,会把整册清零(2026-09-19 踩过,靠桌面副本恢复)。每轮改完 `cp` 回桌面 = 唯一可靠还原点,务必保留这个习惯。
 - 对账脚本 `check-truth-tables.py` 新增规则首跑**必看命中**:误报比漏报更伤(会让人不再看它);历史裁决表 §15x 会引述旧句,规则要用否定词近邻/范围收窄排除。
+- **远程容器(Claude Code on the web)接手时**:没有 `gh`,GitHub 操作走 MCP;`pip` 只装 `requirements-dev.txt`(SessionStart 钩子自动);**没有 docker/adb/WinAgent/WSL,一切经 `tests/conftest.py::make_rig` 的假后端**;临时文件放 session scratchpad(`/tmp/claude-0/…/scratchpad/`),对账脚本的「改前备份验红」也在那里做(拷 `docs/*.md` + 脚本,把目标册换成 `git show HEAD:<path>` 的版本再跑);Stop hook 会催「未提交请提交推送」——按精确路径 `git add`,别把子 agent 正在写的验收文件一起带上。
