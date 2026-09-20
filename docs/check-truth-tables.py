@@ -256,6 +256,57 @@ FORBIDDEN = [
 # ---------------------------------------------------------------- PAIRED
 # (标题, 声明方文件, 声明方正则, 消费方文件, 消费方正则, 说明)
 PAIRED = [
+    # ---- R6-47~R6-50(第八轮 cursor 评审 8.4/10)----
+    # R6-47:norm() 三册到处引用、无一处可抄函数体(第八轮唯一 P0)。凡引用 norm(text) 的册,06 §2.9.2 必须有那一行 def。
+    # 反向验证:改前备份上 06 无 `def norm(` ⇒ 两条都红(2026-09-19 实测)。
+    ("norm():02 §2.8.1 引用 → 06 §2.9.2 必须有可抄函数体",
+     "02-*.md", r"norm\(text\)",
+     "06-*.md", r"def norm\(s: str \| None\) -> str:",
+     "R6-47:norm() 是 fingerprint 的输入与出向合并判据;无定义 = 三通道各写一套归一化,确认与去重对不上。"),
+    ("norm():06 §2.12/§2.9.2 引用 → 06 §2.9.2 必须有可抄函数体",
+     "06-*.md", r"norm\(text\)",
+     "06-*.md", r"def norm\(s: str \| None\) -> str:",
+     "R6-47:同上;06 是 owner,定义只许在 §2.9.2 出现一次(⑪ NORM 另查函数体)。"),
+    # R6-48:出向文本入口校验的 reason 值 —— 06 §2.12 定名 → 02 §3.10 校验段承接 → 01 §2.10 文案承接。
+    # 反向验证:用「抹掉登记行」的副本(声明方当时也没有该词,只在改前备份上跑会只出 ⚠️,不够)。
+    ("text_has_control_chars:06 §2.12 定名 → 02 §3.10 bus 校验段必须承接",
+     "06-*.md", r"text_has_control_chars",
+     "02-*.md", r"error\.reason='text_has_control_chars'",
+     "R6-48:校验点在 bus(02);06 只引用。02 没有 = 含 U+0014 的出向文本照发,该行恒 UNCONFIRMED。"),
+    ("text_has_control_chars:02 §3.10 → 01 §2.10 INVALID_ARGS 文案必须承接",
+     "02-*.md", r"text_has_control_chars",
+     "01-*.md", r"text_has_control_chars",
+     "R6-48:01 不认这个 reason = 用户只看到「参数错误」、不知道该删什么。"),
+    # R6-49:00 §7.4 事件专属三字段 → 01 P-MSG 必须有承接 testid(此前 01 零渲染,评审 P1)。
+    # 反向验证:改前备份上 01 无这两个 testid ⇒ 两条都红。
+    ("lag_s/late:00 §7.4 事件专属字段 → 01 P-MSG 必须有 qt-msg-row-{id}-late",
+     "00-*.md", r"`lag_s`",
+     "01-*.md", r"qt-msg-row-\{id\}-late",
+     "R6-49:迟到消息在画面上看不见;06 验收已在断言 payload.late,01 不渲染 = 断言无 UI 对应物。"),
+    ("origin=external:00 §7.4 → 01 P-MSG 必须有 qt-msg-row-{id}-origin-external",
+     "00-*.md", r'origin: "rpa"\|"external"',
+     "01-*.md", r"qt-msg-row-\{id\}-origin-external",
+     "R6-49:他端代发的我方消息在画面上看不见。"),
+    # R6-50:审计动作名 owner = 02(R6-25「以 02 为准」)。06 产生 qidian.rebootstrap → 02 必须登记、05 必须同名。
+    # 反向验证:改前备份上 02/05 均无该名 ⇒ 两条都红。
+    ("qidian.rebootstrap:06 §2.9.5 ③ 产生 → 02 §3.1 audit_log 必须登记",
+     "06-*.md", r'audit\("qidian\.rebootstrap"',
+     "02-*.md", r"action='qidian\.rebootstrap'",
+     "R6-50:审计名以 02 为准;06 写了 02 没登记 = P-LOG 无固定动作名、实现者另起同义名。"),
+    ("qidian.rebootstrap:06 产生 → 05 §2.1.1 ⑪a 必须同名引用",
+     "06-*.md", r'audit\("qidian\.rebootstrap"',
+     "05-*.md", r"qidian\.rebootstrap",
+     "R6-50:05 是换号语义的入口,不同名 = 两册对同一动作两个名字。"),
+    # R6-50:02 §3.7 登记的两个「读取未降级」码,01 §2.10 必须写明承接方式(只进铃),否则实现者顺手并进「读取已降级」横幅。
+    # 反向验证:改前备份上 01 全文 0 命中 ⇒ 两条都红。
+    ("QIDIAN_TABLE_DECODE_STUCK:02 §3.7 登记 → 01 §2.10 必须写承接方式",
+     "02-*.md", r"`QIDIAN_TABLE_DECODE_STUCK` \| warn",
+     "01-*.md", r"QIDIAN_TABLE_DECODE_STUCK",
+     "R6-50:01 不提 = 可能并进 qt-acct-detail-read-degraded 横幅,把「一张表读不到」渲染成「整账号读取已降级」。"),
+    ("QIDIAN_MSG_GAP:02 §3.7 登记 → 01 §2.10 必须写承接方式",
+     "02-*.md", r"`QIDIAN_MSG_GAP` \| warn",
+     "01-*.md", r"QIDIAN_MSG_GAP",
+     "R6-50:同上。"),
     # R6-41:新码 / 新 reason 值 —— 06 产生 → 02 §3.7 必须登记。
     ("QIDIAN_TABLE_DECODE_STUCK:06 产生 → 02 §3.7 必须登记",
      "06-*.md", r"QIDIAN_TABLE_DECODE_STUCK",
@@ -797,6 +848,64 @@ def check_qidian_confirm_window():
     return red
 
 
+NORM_DEF = r"def norm\(s: str \| None\) -> str:"
+NORM_BODY_MUST = (
+    ('unicodedata.normalize("NFKC"', "NFKC"),
+    ('re.sub(r"\\s+", " ", s).strip()', "折叠空白 + strip"),
+    ('return ""', "空值回空串"),
+)
+NORM_BODY_MUST_NOT = (
+    ("\\u0014", "norm() 不剥 U+0014(那是 clean_text)"),
+    ("[表情]", "norm() 不改 [表情] 占位"),
+    (".replace(", "norm() 不做任何替换"),
+)
+
+
+def check_norm_definition():
+    """⑪ NORM(R6-47):norm() 的可抄函数体只在 06 §2.9.2 出现一次,且做的事逐字对得上规格。
+
+    第八轮评审的唯一 P0:fingerprint 与 §2.12 出向合并到处写 norm(text),三册无一处函数体。
+    PAIRED 只查「有没有 def」;这里查「def 里写的是不是规格说的那三件事」——半改(有 def 但顺手把
+    U+0014 剥掉、或把 [表情] 还原)比没 def 更险:实现者照抄就会与 clean_text 分工打架。
+    反向验证(2026-09-19):改前备份无 def ⇒ 红;把函数体里的 NFKC 行删掉 ⇒ 红;在函数体里加一行
+    s = s.replace("\\u0014", "") ⇒ 红。
+    """
+    red = []
+    print()
+    print("=" * 78)
+    print("⑪ NORM —— norm() 的唯一可抄定义(06 §2.9.2,R6-47)")
+    print("=" * 78)
+    defs = []
+    for f in sorted(glob.glob(os.path.join(HERE, "0[0-7]-*.md"))):
+        for i, ln in enumerate(lines_of(io.open(f, encoding="utf-8").read()), 1):
+            if re.search(r"^\s*def norm\(", ln):
+                defs.append((os.path.basename(f)[:2], i))
+    if len(defs) != 1 or defs[0][0] != "06":
+        red.append("norm() 定义处数 != 1(应只在 06 §2.9.2)")
+        print(f"  ❌ `def norm(` 出现 {len(defs)} 处 —— {defs or '无'};应恰在 06 §2.9.2 出现一次(其它册只引用)")
+        return red
+    p06 = next(iter(glob.glob(os.path.join(HERE, "06-*.md"))))
+    t06 = io.open(p06, encoding="utf-8").read()
+    m = re.search(NORM_DEF + r"(.*?)```", t06, re.S)
+    if not m:
+        red.append("norm() 签名与规格不符")
+        print("  ❌ 06 有 `def norm(` 但签名不是 `def norm(s: str | None) -> str:`(评审给的原句)")
+        return red
+    body = m.group(1)
+    ok = True
+    for needle, what in NORM_BODY_MUST:
+        if needle not in body:
+            ok = False; red.append(f"norm() 函数体缺 {what}")
+            print(f"  ❌ norm() 函数体缺:{what}(找不到 `{needle}`)")
+    for needle, what in NORM_BODY_MUST_NOT:
+        if needle in body:
+            ok = False; red.append(f"norm() 函数体多做了:{what}")
+            print(f"  ❌ norm() 函数体不该有 `{needle}` —— {what}")
+    if ok:
+        print(f"  ✅ 06:{defs[0][1]}  `def norm(s: str | None) -> str:` 唯一;函数体 = NFKC + 折叠空白 + strip,不碰 U+0014/[表情]")
+    return red
+
+
 def main():
     red = []
     red += check_copyable()
@@ -808,6 +917,7 @@ def main():
     red += check_mirrors()
     red += check_dynamic_sets()
     red += check_qidian_confirm_window()
+    red += check_norm_definition()
     red += check_versions()
     print()
     print("=" * 78)

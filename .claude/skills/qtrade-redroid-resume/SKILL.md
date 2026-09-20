@@ -5,7 +5,9 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 # QTrade redroid 多实例 IM 控制台 —— 工作交接 / 断点续接
 
-> 2026-09-19 创建、当日多次更新(最新:**R6-38~R6-42 收第七轮 cursor 评审(终审 REVISE×4→ACCEPT);R6-43~R6-46 企点消息类型路由 + `[图片]`/`[表情]` 占位(终审 REVISE×3→ACCEPT)**,详见 §5 顶部「🔴 最新状态」)。这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读桌面知识库。
+> 🔴 **头等规范(安琳 2026-09-19 定,优先级高于本文其它一切)**:**所有思考与所有交流一律使用中文**——工具输出/代码/报错是英文也不切换;标识符、命令、路径、错误原文原样保留,说明用中文。此规范同时钉在仓库 `CLAUDE.md`(project scope)、`~/.claude/CLAUDE.md`(user scope)与项目 memory 目录(随仓库快照 = `reference/zh-only-rule.md`);换机器接手时先把三处带过去。
+
+> 2026-09-19 创建、当日多次更新(最新:**R6-47~R6-50 收第八轮 cursor 评审 8.4/10(`norm()` 定义 / (r) 拍板 A / P-MSG 三字段 / `qidian.rebootstrap` 登记),脚本 PAIRED 27 + ⑪ NORM;此前 R6-38~R6-46 收第七轮 + 企点消息类型路由**,详见 §5 顶部「🔴 最新状态」)。这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读桌面知识库。
 > ⚠️ 本 skill 是**入口与指针**,不复述文档内容 —— 每个主题都指向"看哪个文件的哪一节",省 token。
 
 ## 🧳 跨机器迁移(换一台机器接手本项目时先读这一段)
@@ -79,7 +81,14 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 ## 5. 当前进度与下一步(2026-09-19 更新至 R6-37 收口 + 边缘风险已补)
 
-### 🔴 最新状态(2026-09-19 晚,接手先读这一段;下面「已完成/挂着的」是更早的记录)
+### 🔴 最新状态(2026-09-19 夜,接手先读这一段;下面「已完成/挂着的」是更早的记录)
+
+**第八轮 cursor 评审(8.4/10;R7 五条 CLOSED、R6-38~R6-46 零回归;1 P0 + 3 P1)已由 R6-47~R6-50 收口(2026-09-19,在 GitHub 仓库分支上改、脚本 exit 0)**:
+- **R6-47(P0)`norm()` 三册无可抄定义** → 06 §2.9.2 落函数体(评审原句照收):`not s → ""`;NFKC;`re.sub(r"\s+"," ",s).strip()`;**不剥 `U+0014`**。分工逐字定死:`clean_text` = 读库解码侧、只在 `to_message()` 调一次;`norm()` = 比较侧、两侧各算一次、不改 `[表情]`/`[图片]`;**出向 `SENDING` 行 = 发送原文、入库前不过 `clean_text`**;00 §7.4 / 02 §2.8.1 改指针。脚本 ⑪ NORM 查唯一 `def norm(` + 函数体三件事、且不含 `\u0014`/`.replace(`。
+- **R6-48 开放项 (r) 拍板 = A(总控定,安琳可改)**:`send_text.text` 须 `clean_text(text)==text`,违例 `400 INVALID_ARGS`/`error.reason='text_has_control_chars'`/`pointer='/text'`,校验点 02 §3.10 `bus` 参数校验段、三通道同一条、不写 `SENDING` 行不占幂等键。不选 B 的理由:`U+0014` 是客户端内部转义、不可输入;B 会让库里「我方发出的内容」与实际发出的不一致。**真机待验一格**:企点会不会把 Unicode emoji 改写成 `U+0014` 落库(06 §8b M2「含表情/控制字符的发送」④,超时且读回含 `[表情]` 即记实测结论另裁,不预设)。
+- **R6-49(P1)** 01 §2.7.7 `P-MSG` 渲染事件专属三字段:`late` 琥珀「迟到 {lag_s} s」`qt-msg-row-{id}-late`、`origin="external"`「外部来源」`qt-msg-row-{id}-origin-external`;只进本次会话 store,`GET /messages` 不带、重拉后消失 = 预期;§8b M2-1/M2-2。
+- **R6-50(P1)** 02 §3.1 `audit_log` 登记 `action='qidian.rebootstrap'`(`kind/transport='system'`、`actor='system:qidian_adapter'`、`detail_json{old_uin,new_uin,deleted_cursors}`),05 ⑪a 同名引用;01 §2.10 写明 `QIDIAN_TABLE_DECODE_STUCK`/`QIDIAN_MSG_GAP` **只进铃与角标**、不上 `qt-acct-detail-read-degraded` 横幅。
+- 脚本新增 PAIRED ×10(norm 定义 ×2、`text_has_control_chars` ×2、三字段 testid ×2、`qidian.rebootstrap` ×2、两码 01 承接 ×2)+ ⑪ NORM;**每条都在改前备份与「抹掉登记行」副本上反向验证能红**(harness 留在 session scratchpad,不入库)。评审「开工门」:M1、内核 D、WinAgent、Electron 路由与 testid、微信向导、邮件取信、企点 poll 骨架可开;`norm()`/`send_*` 确认匹配已补 ⇒ **无阻塞项,进入编码**(见本节末「代码现状」)。
 
 **第七轮 cursor 评审(7.8/10,5 条 P0)已收口:基线 §15g R6-38 → R6-42,五轮只读独立终审 REVISE×4 → ACCEPT**(会改行为的问题数 8 → 13 → 7 → 2 → 0;末轮 0 阻塞、置信度高)。桌面副本已同步、脚本全绿(规则数以脚本实跑为准:FORBIDDEN 38 / PAIRED 17 / COPYABLE 3 / MIRROR 6 / DYNAMIC 3 + KEYNAME/ENUM/⑩值检查)。
 - **R6-38(评审 5 条 P0,均核实属实)**:06 §2.9.1 `type/ts/self` 改主库 `msgtype/time/issend`(唯一出处 §2.9.5);`[bus] confirm_timeout_qidian_ms` 8000→**15000** + 新键 `[adapters.qidian] confirm_poll_interval_ms=1000`(真机实测我方回复落库可见 9.3~11.4 s,8 s 必然 `UNCONFIRMED`);§2.12 企点确认 = **ingest 合并**(`confirmed_by=ingest_merge`、`ext=qd:{uniseq}`;`history` 仅控件树降级路线;回执「确认方式」取的是 `CommandResult.source`=`qidian_db`,别和 `confirmed_by` 混);表发现算法;L2 **只认方案 D**(manifest 恒 `"D"` + CI 硬门)。总控另查出:方案 A 残留多 3 处、`.backup` 与实测读取器相反(主库 64 MB,正线 = `mode=ro` 只读直查增量)。
