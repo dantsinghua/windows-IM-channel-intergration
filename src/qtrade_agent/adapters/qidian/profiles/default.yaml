@@ -1,0 +1,72 @@
+# 企点 UI 定位表 —— 缺省 profile(02 §2.2.3「定位表与 APK 版本绑定(G-15/P-36)」)
+#
+# 选择规则见 ui.pick_profile:按 account_runtime.app_version 精确命中 <四段版本>.yaml → 同主次版本里
+# 最高的低版本(告警 QIDIAN_PROFILE_FALLBACK,info)→ 落到本文件(账号应置 degraded(UI_UNEXPECTED))。
+#
+# 🔴 来源标注(真机核对清单,逐项见 .omc/handoffs/qidian-ui.md):
+#   [实测] = 取自 ~/work/xunjia-agent/relay/side_a 2026-09-19 在 redroid11_x86_64 + 720x1280@320dpi 的实跑;
+#   [推测] = 按企点/手Q 同源控件命名与常见文案推的,**未经真机 dump 验证,必须在真机上核对后另存为 <apk_version>.yaml**。
+#   本文件里除 package / splash_activity / ime / activities / coord_fallback.taps 外,**全部是 [推测]**。
+schema: 1
+apk_version: default
+
+package: com.tencent.qidian                                    # [实测]
+splash_activity: com.tencent.mobileqq.activity.SplashActivity  # [实测]
+ime: com.android.adbkeyboard/.AdbIME                           # [实测] 中文/换行只能走它(input text 打不了中文)
+
+# 前台 Activity 判据(对 `dumpsys window` 的 mCurrentFocus 做 re.search)
+activities:
+  main: "(?i)SplashActivity"          # [实测] 企点主界面挂在 SplashActivity 上
+  login: "(?i)login"                  # [实测] 冷启动脚本 check-login 即以此判「停在登录页」
+  search: "(?i)SearchActivity"        # [实测] 实为 GroupSearchActivity
+  card: "(?i)Card"                    # [实测] 好友名片页
+  chat: "(?i)ChatActivity|SplashActivity"   # [推测] 聊天页 Activity 名未实测;留 SplashActivity 是因为企点把会话页也挂在它下面
+
+# 控件锚点:id 全等 / text_any 子串 / desc_any 子串,取或;**坐标一律从命中节点的 bounds 算**。
+nodes:
+  agree_button:        {text_any: ["同意", "同意并继续"]}                          # [推测] 首拉起的协议弹窗
+  relogin_button:      {text_any: ["重新登录", "重新登陆"]}                        # [推测] 被踢后的重登入口
+  login_account:       {id: "com.tencent.qidian:id/account", text_any: ["请输入账号"]}   # [推测]
+  login_password:      {id: "com.tencent.qidian:id/password", text_any: ["请输入密码"]}  # [推测]
+  login_submit:        {id: "com.tencent.qidian:id/login", text_any: ["登 录", "登录"]}  # [推测]
+  main_marker:         {id: "com.tencent.qidian:id/recent_chat_list", desc_any: ["消息"]} # [推测] 会话列表可见 = 已登录
+  search_entry:        {id: "com.tencent.qidian:id/et_search_keyword", desc_any: ["搜索"]} # [推测]
+  search_result_first: {id: "com.tencent.qidian:id/title"}                          # [推测] 搜索结果首条
+  card_identity:       {id: "com.tencent.qidian:id/account_uin"}                    # [推测] 名片页上的 uin/账号,发送前对象校验靠它
+  card_send_msg:       {text_any: ["发消息", "发送消息"]}                          # [推测]
+  chat_title:          {id: "com.tencent.qidian:id/title"}                          # [推测] 聊天页标题(= 闸门1/2 的判据)
+  chat_input:          {id: "com.tencent.qidian:id/input"}                          # [推测]
+  chat_send:           {id: "com.tencent.qidian:id/fun_btn", text_any: ["发送"]}    # [推测]
+
+# 文本标记(在控件树的 text+content-desc 全文里找子串)
+markers:
+  sms: ["短信验证", "验证码已发送", "获取验证码"]        # [推测] → WAIT_SMS
+  captcha: ["拖动滑块", "安全验证", "向右滑动"]          # [推测] → WAIT_CAPTCHA
+  device_confirm: ["设备锁", "登录确认", "允许本次登录"]  # [推测] → WAIT_DEVICE_CONFIRM
+  bad_credential: ["账号或密码错误", "密码错误", "账号或密碼錯誤"]   # [推测] → bad_credential
+
+timeouts:
+  login_s: 90          # 05 §2.1.1 ⑪ login_timeout
+  poll_interval_s: 1   # 05 §2.1.1 ⑪「每 1s」
+  ui_settle_s: 0.5
+  launch_s: 3.0
+  search_s: 2.0
+  dump_retries: 3
+
+# 输入后回读输入框、与待发文本逐字比对(参考实现 session.py 的做法);回读不上 ⇒ 不发。
+verify_input: true
+
+# 聊天页标题来源。🔴 企点主界面/聊天页有常驻动画,`uiautomator dump` 可能永远 idle 不了(参考实现记过这个坑),
+# 故补 `dumpsys activity top` 作第二来源(只读文本、不产坐标)。两个都拿不到 = 校验不过 = 不发。
+title_sources: ["uiautomator", "dumpsys_top"]
+
+# 坐标兜底:🔴 缺省关闭 —— 控件找不到就失败,不盲点(00 §11.3 [GATE])。
+# 下面的值是参考实现在 720x1280@320dpi 上的 [实测] 坐标,仅供真机排障时显式打开使用;换屏/换版本即失效。
+coord_fallback:
+  enabled: false
+  taps:
+    search_entry: "360 189"
+    search_result_first: "207 300"
+    card_send_msg: "527 1096"
+    chat_input: "320 1123"
+    chat_send: "647 1086"

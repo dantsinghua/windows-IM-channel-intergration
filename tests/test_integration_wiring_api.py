@@ -297,6 +297,22 @@ def test_health_per_account_reports_firing(rig):
     assert checks["accounts"]["qd01"]["H04"] == "firing"
 
 
+def test_health_checks_and_alerts_are_same_source(rig):
+    """D-04:同一次 `#72` 响应里 `checks.H02='firing'` 而 `alerts=[]` 是自相矛盾 ——
+    02 §3.7 把 `H02_WINAGENT_API_DOWN` / `H03_DOCKERD_DOWN` 登记成告警码(crit,subject=host/wsl,事件族 alert),
+    探活判离线时必须同时进 `alerts.active`;反过来 dockerd 正常时不得凭空多一条 H03。"""
+    from qtrade_agent.alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN
+    rig.wechat._base.offline = True                                    # ping 走委托对象,offline 设在它身上
+    for _ in range(3):                                                 # R-09 去抖:3 次才判离线
+        rig.client.portal.call(rig.agent.winagent_probe)
+    rig.client.portal.call(rig.agent.dockerd_probe)
+    body = rig.client.get("/api/v1/system/health", headers=H(TOKEN_READ)).json()
+    codes = {a["code"]: a for a in body["alerts"]}
+    assert body["checks"]["H02"] == "firing" and codes[H02_WINAGENT_API_DOWN]["subject"] == "host"
+    assert codes[H02_WINAGENT_API_DOWN]["severity"] == "crit"
+    assert body["checks"]["H03"] == "ok" and H03_DOCKERD_DOWN not in codes
+
+
 def test_metrics_exposes_per_process_cpu_pct(rig):
     """缺口 2:02 的三个内存键保留,另补 `ours.procs_detail[{name,rss_mb,cpu_pct}]`;monitor 没采 ⇒ 值 null,不编造。"""
     ours = rig.client.get("/api/v1/system/metrics", headers=H(TOKEN_READ)).json()["ours"]

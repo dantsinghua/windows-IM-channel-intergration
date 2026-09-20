@@ -22,9 +22,10 @@ from .adapters.base import Account
 from .adapters.qidian.adapter import QidianAdapter, SendFn
 from .adapters.qidian.maindb import AdbMainDb, LocalSqliteMainDb, MainDb
 from .adapters.qidian.poll import QidianPoller
+from .adapters.qidian.ui import QidianUi
 from .adapters.qq import H08_INTERVAL_S, OneBotTransport, QQAdapter, QQHealth
 from .adapters.wechat import WeChatWinAgent, WechatAdapter, WechatLoginFlow, WechatPoller
-from .alerts import Alerts
+from .alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, Alerts
 from .bus.bus import Bus
 from .config import H13_INTERVAL_S, AgentConfig
 from .events import TZ_SHANGHAI, Events
@@ -114,7 +115,7 @@ class AgentApp:
         self.alerts: Alerts
         self.health = Health(clock=clock)
         self.scheduler = Scheduler(clock=clock)
-        self._sender = sender or _sender_not_wired
+        self._sender = sender          # None ⇒ open() 按后端真假决定装 QidianUi 还是 _sender_not_wired
         self._maindb_factory = maindb_factory
         self._containers = containers
         self._adb = adb
@@ -180,7 +181,8 @@ class AgentApp:
         self.winagent = WinAgentClient(self.cfg.winagent, transport=self._wa_transport, base_url=self._wa_base_url, token=self._wa_token, clock=self.clock)
         self.vault = self._vault if self._vault is not None else WinAgentVault(self.winagent)
         rt_kw = {} if self._boot_poll_s is None else {"boot_poll_s": self._boot_poll_s}
-        self.runtime = Runtime(containers=self._containers or DockerCliBackend(), adb=self._adb or AdbCliBackend(), cfg=self.cfg, health=self.health,
+        adb_backend = self._adb or AdbCliBackend()          # runtime 与企点 UI 执行层共用同一条 adb 后端
+        self.runtime = Runtime(containers=self._containers or DockerCliBackend(), adb=adb_backend, cfg=self.cfg, health=self.health,
                                alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs, **rt_kw)
         self.poller = QidianPoller(store=self.store, events=self.events, alerts=self.alerts, cfg=self.cfg, h13_firing=self.health.h13_firing,
                                    clock=self.clock, maindb_factory=self._maindb_for_uid)
@@ -194,8 +196,14 @@ class AgentApp:
                                                  wa_raw=self._wa_media_raw))
         self.wechat_poller = WechatPoller(store=self.store, events=self.events, client=self.wechat_client, cfg=self.cfg,
                                           wechat_cfg=self.cfg.wechat_adapter, clock=self.clock)
+        # 企点 UI 执行层(05 §2.1.1 ⑥~⑪ 登录 / 06 §2.9.5 发送):**只有真机后端才自动装**,
+        # 注了假 adb 的开发容器/测试一律保持未接(要测 UI 层就显式传 sender/login_fn)。凭据仍由 accounts 从 Vault 取后传进来。
+        self.qidian_ui = QidianUi(adb=adb_backend, store=self.store, alerts=self.alerts, clock=self.clock)
+        real_backend = self._adb is None
+        sender = self._sender or (self.qidian_ui.send_text if real_backend else _sender_not_wired)
+        login_fn = self._login_fn or (self.qidian_ui.login_fn() if real_backend else None)
         self.adapters = {
-            "qidian": QidianAdapter(self.poller, sender=self._sender, store=self.store),
+            "qidian": QidianAdapter(self.poller, sender=sender, store=self.store),
             "qq": QQAdapter(store=self.store, events=self.events, cfg=self.cfg, qq_cfg=self.cfg.qq, clock=self.clock, **qq_kw),
             "wechat": WechatAdapter(self.wechat_poller, client=self.wechat_client, store=self.store,
                                     media_put=self._wechat_screenshot_media),
@@ -205,7 +213,7 @@ class AgentApp:
         from .api.app import load_capabilities
         caps, _ = load_capabilities()
         self.accounts = AccountService(store=self.store, events=self.events, pool=self.pool, runtime=self.runtime, vault=self.vault, cfg=self.cfg,
-                                       adapters=self.adapters, health=self.health, clock=self.clock, login_fn=self._login_fn,
+                                       adapters=self.adapters, health=self.health, clock=self.clock, login_fn=login_fn,
                                        caps_by_op={c["op"]: c for c in caps})
         self.accounts._alerts = self.alerts
         self.accounts._bus = self.bus
@@ -637,9 +645,13 @@ class AgentApp:
         if pong is None:
             self.health.set_winagent(False)
             if self.health.winagent_online is False:
+                # 02 §3.7 登记 `H02_WINAGENT_API_DOWN`(crit,subject=host,事件族 alert):去抖满 3 次判离线后才发。
+                # `checks.H02` 与 `alerts` 必须同源,否则 #72 同一次响应里会出现 checks.H02=firing 而 alerts=[]。
+                self.alerts.firing(H02_WINAGENT_API_DOWN, subject="host")
                 self.pool.set_windows(known=False)
                 self.pressure.evaluate(None)                                   # 读不到整机内存 = unknown,不阻断
             return
+        self.alerts.resolve(H02_WINAGENT_API_DOWN, subject="host")            # ping 通即恢复(去重键翻转才发事件)
         h = await self.winagent.health()
         if h is None:
             self.health.set_winagent(True, version=self.winagent.last_version)
@@ -656,7 +668,13 @@ class AgentApp:
         await self.pressure.enforce()
 
     async def dockerd_probe(self) -> None:
-        self.health.set_dockerd(await self.runtime.dockerd_ok())
+        ok = await self.runtime.dockerd_ok()
+        self.health.set_dockerd(ok)
+        # 02 §3.7 登记 `H03_DOCKERD_DOWN`(crit,subject=wsl,事件族 alert);同 H02,与 `checks.H03` 同源。
+        if ok:
+            self.alerts.resolve(H03_DOCKERD_DOWN, subject="wsl")
+        else:
+            self.alerts.firing(H03_DOCKERD_DOWN, subject="wsl")
 
     async def h13_probe(self) -> None:
         if self.health.winagent_online:

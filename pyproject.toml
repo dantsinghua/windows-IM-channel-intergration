@@ -24,9 +24,12 @@ dev = ["pytest>=8"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# 🔴 运行期要读的数据文件必须逐条声明,否则装进 wheel 后目录根本不存在(`tests/test_packaging.py` 真打一个
+# wheel 开包断言,专拦这类漏)。`profiles/`、`migrations/` 不是包(没有 `__init__.py`),故挂在父包名下按子路径通配。
 [tool.setuptools.package-data]
-"qtrade_agent.store" = ["*.sql"]
+"qtrade_agent.store" = ["*.sql", "migrations/*.sql"]
 "qtrade_agent.capabilities" = ["*.json"]
+"qtrade_agent.adapters.qidian" = ["profiles/*.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
