@@ -34,6 +34,7 @@ from ..models import Command, CommandOrigin, RESULT_CODES
 from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
 from .routes_ext import register_ext
+from .routes_ext2 import job_is_irreversible, register_ext2
 from .serialize import (account_view, command_view, decode_cursor, encode_cursor, message_view, result_view, session_view,
                         stored_result_view)
 
@@ -1037,6 +1038,11 @@ def create_api(agent) -> FastAPI:
         if row["state"] not in ("queued", "running"):
             raise ApiError(409, "NOT_CANCELLABLE", f"作业已处于终态 {row['state']},不可取消", reason="job_terminal",
                            extra={"job_id": job_id, "state": row["state"]})
+        # 02 #108 逐字:`account_purge`/`wechat_reinstall` 进入**不可逆阶段**后 `409 NOT_CANCELLABLE`
+        # (判据由 routes_ext2 的 `_mark_irreversible` 打在 params 上;`messages_purge` 同理)
+        if job_is_irreversible(row):
+            raise ApiError(409, "NOT_CANCELLABLE", f"{row['kind']} 已进入不可逆阶段,不可取消", reason="irreversible",
+                           extra={"job_id": job_id, "state": row["state"]})
         cancelled_task = await agent.cancel_job(job_id)          # 在跑的 task 真 cancel(`job` 事件由作业体收尾时发)
         if not cancelled_task:
             agent.events.emit("job", payload={"job_id": job_id, "kind": row["kind"], "state": "cancelled"})
@@ -1539,6 +1545,9 @@ def create_api(agent) -> FastAPI:
     #      FULL 匹配,FastAPI 按注册顺序取先到的,晚注册就会被 `{group}` 当成「未知配置组」吃掉。
     register_ext(app, agent=agent, cfg=cfg, prefix=API_PREFIX, principal=_principal,
                  json_or_empty=_json_or_empty, caps_by_op=caps_by_op)
+    # ---- 第二批(#8/#16/#27/#33/#34/#35/#37/#50/#52/#53/#54/#82/#83);同样必须排在 `/settings/{group}` 之前。
+    register_ext2(app, agent=agent, cfg=cfg, prefix=API_PREFIX, principal=_principal,
+                  json_or_empty=_json_or_empty, caps_by_op=caps_by_op)
 
     # ---- #88/#89 的 `{group}` 兜底路由必须**排在全部具体 `/settings/*` 路由之后**(FastAPI 按注册顺序匹配,
     #      否则 `/settings/webhooks` 会先被 `{group}` 吃掉)

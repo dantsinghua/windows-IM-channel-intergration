@@ -32,6 +32,7 @@ from ..events import iso8601
 from ..ids import ulid
 from ..models import Command, CommandOrigin
 from .auth import ApiError, Principal, is_unauth_health_source, require_account, require_level
+from .routes_ext2 import note_broadcast
 from .serialize import message_view, result_view
 
 log = logging.getLogger("qtrade.api.ext")
@@ -713,6 +714,10 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
             else:
                 results[aid] = result_view(res)
         _audit(p, "broadcast.commands", detail={"broadcast_id": broadcast_id, "op": op, "accounts": ids})
+        # #37 `GET /broadcast/{broadcast_id}` 要能查回这一次的汇总 ⇒ 落 `settings['broadcast.<id>']`
+        # (`jobs.kind` 的 CHECK 里没有 broadcast,硬塞会违反约束;同 #78 自检落 settings 的做法)
+        note_broadcast(agent.store, broadcast_id=broadcast_id, op=op, actor=p.actor, results=results,
+                       now_ms=agent.clock())
         return {"ok": True, "broadcast_id": broadcast_id, "results": results}
 
     # ================================================================== #51 消息导出
