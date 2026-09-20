@@ -1060,16 +1060,78 @@ def _emit_three(client, rig) -> list[int]:
     return [s1, s2, s3]
 
 
+def _real_ws_close_code(app, path: str, *, first_frame: str | None = None, timeout_s: float = 15.0):
+    """用**真 WebSocket 客户端**(uvicorn + websockets)连一次,返回服务端关闭帧里的 close code。
+
+    🔴 为什么不能只用 TestClient:内存传输层里「accept 前 close」与「accept 后 close」都会被 Starlette
+    包成同一个 `WebSocketDisconnect(code=…)`,两者分不出来;而 R6-62 (a) 要的恰恰是这个区别 ——
+    只有先 `accept()` 把握手做完,关闭码才真的过得了线;在 accept 之前 close,ASGI 服务端会退化成
+    「拒绝握手」,线上客户端只看得到 `1006`。
+
+    返回:`("closed", code)` = 握手成功、收到带码的关闭帧;`("handshake_rejected", status)` = 握手就被拒(⇒ 线上是 1006)。
+    """
+    import uvicorn
+    import websockets
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error", ws="websockets", lifespan="off")
+    server = uvicorn.Server(config)
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    try:
+        deadline = time.time() + timeout_s
+        while not server.started:
+            assert time.time() < deadline, "uvicorn 没起来"
+            time.sleep(0.05)
+        port = server.servers[0].sockets[0].getsockname()[1]
+
+        async def go():
+            try:
+                async with websockets.connect(f"ws://127.0.0.1:{port}{path}", open_timeout=10) as ws:
+                    if first_frame is not None:
+                        await ws.send(first_frame)
+                    await ws.recv()
+                return ("closed", 1000)
+            except websockets.exceptions.ConnectionClosed as e:
+                rcvd = getattr(e, "rcvd", None)
+                return ("closed", rcvd.code if rcvd is not None else 1006)
+            except websockets.exceptions.InvalidStatus as e:            # 握手阶段就被拒
+                return ("handshake_rejected", e.response.status_code)
+            except websockets.exceptions.InvalidHandshake as e:         # 其它握手失败
+                return ("handshake_rejected", repr(e))
+
+        return asyncio.run(go())
+    finally:
+        server.should_exit = True
+        th.join(timeout=10)
+
+
 def test_W01_no_or_bad_token_closed_4401(rig, client):
-    """02 §3.4.7(R6-52 ③):握手 `?token=`/`Authorization`;无令牌或令牌无效 → accept 前直接关闭,关闭码 4401。"""
-    with pytest.raises(WebSocketDisconnect) as ei:
-        with client.websocket_connect(f"{P}/events"):
-            pass
-    assert ei.value.code == 4401
-    with pytest.raises(WebSocketDisconnect) as ei2:
-        with client.websocket_connect(f"{P}/events?token=bad-token"):
-            pass
-    assert ei2.value.code == 4401
+    """02 §3.4.7 **R6-62 (a)**:握手 `?token=`/`Authorization`;无令牌或令牌无效 →
+    服务端**先 `accept()` 把握手做完,再 `close(code=4401, reason)`**。
+
+    🔴 本条断言按 **R6-62 (a) 裁决**改写。原文(R6-52)写的是「`accept` **前**直接关闭 + 关闭码 `4401`」,
+    该句**自相矛盾、已作废**:WebSocket 的关闭码是**关闭帧**里的字段,握手没完成就没有连接、也就没有帧可发,
+    ASGI 服务端会把它退化成「拒绝握手」,客户端只看得到 `1006` ⇒ 控制台按关闭码分诊(01 §5.1)那条路恒不触发。
+    原用例用 `pytest.raises(WebSocketDisconnect)` 断「握手被拒」,断的正是那个矛盾的旧句。
+
+    分两层验:
+    ① **真 WebSocket 客户端**(uvicorn + `websockets`,非 TestClient)—— 只有它能区分「握手被拒(线上 1006)」
+       和「握手成功后收到 4401 关闭帧」,这正是本裁决的要害;
+    ② TestClient 层顺带守住「能进得了 `with` 块」= 握手确实完成了。
+    """
+    # ① 真客户端:不带令牌 / 令牌无效,都必须是「握手成功 + 关闭码 4401」
+    for path, what in ((f"{P}/events", "不带令牌"), (f"{P}/events?token=bad-token", "令牌无效")):
+        kind, code = _real_ws_close_code(rig.api, path)
+        assert kind == "closed", f"{what}:握手就被拒了({code}) ⇒ 线上客户端只会看到 1006,拿不到 4401"
+        assert code == 4401, f"{what}:关闭码是 {code},规格要求 4401"
+
+    # ② TestClient 层:**进得了 `with` 块**本身就说明握手做完了(accept 前 close 会在这一行抛);
+    #    随后收到的第一帧是带 4401 的 close 帧。
+    for path, what in ((f"{P}/events", "不带令牌"), (f"{P}/events?token=bad-token", "令牌无效")):
+        with client.websocket_connect(path) as ws:
+            frame = ws.receive()
+        assert frame["type"] == "websocket.close", f"{what}:第一帧不是关闭帧:{frame}"
+        assert frame["code"] == 4401, f"{what}:关闭码是 {frame.get('code')},规格要求 4401"
 
 
 def test_W02_bad_first_frame_closed_4400(rig, client):

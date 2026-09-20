@@ -608,13 +608,25 @@ def test_error_since_cleared_by_transition_to_non_error(tmp_path):
         assert t2 is not None and t2 >= t1 + 10_000
 
 
-def test_state_endpoint_has_exactly_six_fields(rig, client):
-    """02 #19:`GET /accounts/{id}/state` → `{state, state_code, state_reason, adapter_state, last_seen_at, error_since_ms}`。"""
+def test_state_endpoint_has_the_six_spec_fields_plus_trace_id(rig, client):
+    """02 #19:`GET /accounts/{id}/state` → `{state, state_code, state_reason, adapter_state, last_seen_at, error_since_ms}`
+    —— **加上 §3.4 通用段的 `trace_id`,不多不少**。
+
+    🔴 本条断言按 **R6-62 (b) 裁决**改写(原名 `test_state_endpoint_has_exactly_six_fields`)。02 §3.4 通用段逐字:
+    「**成功响应一律带 `trace_id`**…⇒ 本节与 §3.4.x 各端点响应列里逐字列出的键集,一律读作
+    『**至少这些键,外加通用 `trace_id`**』,**不是「恰好这 N 个键」** —— 照「恰 N 键」写的断言会因为多出
+    `trace_id` 而红(#19 `{state,…}`…这类平铺端点尤其)」。#19 不在那三条例外里(例外①只管 `#72` 的**免鉴权摘要**)。
+
+    ⚠️ 仍然是**闭集**断言:规格点名的六键必须齐、通用 `trace_id` 必须在、**其它键一个都不许多**
+    —— 放成开集(`STATE_KEYS <= set(d)`)就守不住「端点别顺手多塞字段」这条线了。
+    """
     create(client, "qidian", "甲")
     r = client.get(f"{P}/accounts/qd01/state", headers=H(TOK_R))
     assert r.status_code == 200, r.text
     d = unwrap(r.json())
-    assert set(d) == STATE_KEYS, set(d) ^ STATE_KEYS
+    expected = STATE_KEYS | {"trace_id"}
+    assert set(d) == expected, set(d) ^ expected
+    assert isinstance(d["trace_id"], str) and d["trace_id"], d           # R6-62 (b):同值也写进 audit_log
     assert d["state"] == "created" and d["state_code"] == "" and d["error_since_ms"] is None
 
 
