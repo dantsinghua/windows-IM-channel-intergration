@@ -33,6 +33,10 @@ def test_schema_file_matches_doc_sql_block():
     ("late_after_s", AgentConfig().messages.late_after_s),
     ("confirm_poll_interval_ms", AgentConfig().qidian.confirm_poll_interval_ms),
     ("poll_interval_s", AgentConfig().qidian.poll_interval_s),
+    ("http_sync_max_wait_ms", AgentConfig().api.http_sync_max_wait_ms),
+    ("ws_queue_max", AgentConfig().events.ws_queue_max),
+    ("ws_retention_hours", AgentConfig().events.ws_retention_hours),
+    ("port", AgentConfig().api.port),
 ])
 def test_config_defaults_match_doc_02(key, value):
     t = _doc(DOC02)

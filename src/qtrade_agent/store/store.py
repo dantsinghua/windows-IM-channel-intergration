@@ -403,11 +403,27 @@ class Store:
 
     def insert_outbox_event(self, *, event_id: str, target: str, event: str, trace_id: Optional[str], account_id: Optional[str],
                             channel: Optional[str], payload_json: str, now_ms: Optional[int] = None) -> int:
+        """target='ws' 的行是规范事件记录(供 WS 按 seq 重放),写入即 delivered;webhook 行留 pending 给投递器(02 §2.2.7)。"""
+        now = now_ms or self._clock()
         with self._tx() as c:
-            cur = c.execute(
-                "INSERT INTO events_outbox(event_id, target, event, ts_ms, trace_id, account_id, channel, payload_json) VALUES (?,?,?,?,?,?,?,?)",
-                (event_id, target, event, now_ms or self._clock(), trace_id, account_id, channel, payload_json))
+            if target == "ws":
+                cur = c.execute(
+                    "INSERT INTO events_outbox(event_id, target, event, ts_ms, trace_id, account_id, channel, payload_json, status, delivered_ms) "
+                    "VALUES (?,?,?,?,?,?,?,?,'delivered',?)",
+                    (event_id, target, event, now, trace_id, account_id, channel, payload_json, now))
+            else:
+                cur = c.execute(
+                    "INSERT INTO events_outbox(event_id, target, event, ts_ms, trace_id, account_id, channel, payload_json) VALUES (?,?,?,?,?,?,?,?)",
+                    (event_id, target, event, now, trace_id, account_id, channel, payload_json))
             return int(cur.lastrowid)
+
+    def outbox_seq_bounds(self) -> tuple[Optional[int], Optional[int]]:
+        r = self.con.execute("SELECT MIN(seq), MAX(seq) FROM events_outbox WHERE target='ws'").fetchone()
+        return (r[0], r[1]) if r else (None, None)
+
+    def purge_outbox_ws(self, older_than_ms: int) -> int:
+        with self._tx() as c:
+            return c.execute("DELETE FROM events_outbox WHERE target='ws' AND ts_ms < ?", (older_than_ms,)).rowcount
 
     def replay_outbox(self, since_seq: int, limit: int = 1000) -> list[dict[str, Any]]:
         rows = self.con.execute("SELECT seq, event, ts_ms, trace_id, account_id, channel, payload_json FROM events_outbox "
@@ -478,6 +494,138 @@ class Store:
     def idem_delete(self, account_id: str, key: str) -> None:
         with self._tx() as c:
             c.execute("DELETE FROM idempotency WHERE account_id=? AND idem_key=?", (account_id, key))
+
+    # ------------------------------------------------------------------ api 用的查询(账号 / 会话 / 消息 / 指令 / 调用方)
+    def list_accounts(self, *, channel: Optional[str] = None, state: Optional[str] = None, enabled: Optional[bool] = None,
+                      include_deleted: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT a.*, r.app_version AS runtime_app_version, r.kind AS runtime_kind, r.container_name, r.adb_port, r.stream_port, " \
+              "r.ws_port, r.http_port, r.wechat_version, r.wxkey_dll, r.error_since_ms AS runtime_error_since_ms " \
+              "FROM accounts a LEFT JOIN account_runtime r ON r.account_id = a.id WHERE 1=1"
+        params: list[Any] = []
+        if not include_deleted:
+            sql += " AND a.deleted_ms IS NULL"
+        if channel:
+            sql += " AND a.channel=?"; params.append(channel)
+        if state:
+            sql += " AND a.state=?"; params.append(state)
+        if enabled is not None:
+            sql += " AND a.enabled=?"; params.append(1 if enabled else 0)
+        sql += " ORDER BY a.channel, a.seq"
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()]
+
+    def get_account_full(self, id: str) -> Optional[dict[str, Any]]:
+        rows = [r for r in self.list_accounts(include_deleted=True) if r["id"] == id]
+        return rows[0] if rows else None
+
+    def upsert_runtime(self, account_id: str, *, kind: str, app_version: Optional[str] = None, now_ms: Optional[int] = None, **cols: Any) -> None:
+        """account_runtime 行(runtime 模块是 owner;本期给测试与 app_version 回填用)。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("INSERT INTO account_runtime(account_id, kind, app_version, updated_ms) VALUES (?,?,?,?) "
+                      "ON CONFLICT(account_id) DO UPDATE SET kind=excluded.kind, app_version=COALESCE(excluded.app_version, account_runtime.app_version), updated_ms=excluded.updated_ms",
+                      (account_id, kind, app_version, now))
+            for k, v in cols.items():
+                c.execute(f"UPDATE account_runtime SET {k}=? WHERE account_id=?", (v, account_id))
+
+    def list_sessions(self, *, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
+                      limit: int = 100) -> list[dict[str, Any]]:
+        sql, params = "SELECT * FROM sessions WHERE 1=1", []
+        if account_id:
+            sql += " AND account_id=?"; params.append(account_id)
+        if kind:
+            sql += " AND kind=?"; params.append(kind)
+        if keyword:
+            sql += " AND (name LIKE ? OR native_id LIKE ?)"; params += [f"%{keyword}%", f"%{keyword}%"]
+        sql += " ORDER BY COALESCE(last_msg_ms, 0) DESC, id LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()]
+
+    def query_messages(self, *, account_id: Optional[str] = None, session_id: Optional[str] = None, dir: Optional[str] = None,
+                       type: Optional[str] = None, state: Optional[str] = None, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
+                       sender: Optional[str] = None, q: Optional[str] = None, limit: int = 100,
+                       before: Optional[tuple[int, str]] = None) -> tuple[list[dict[str, Any]], bool]:
+        """#48:``q`` ≥ 3 字走 FTS trigram(多词 AND),否则 LIKE(``slow_match=True``);按 ts_ms DESC, id DESC;``before`` = 上一页末行 (ts_ms, id)。"""
+        sql = "SELECT m.*, s.name AS session_name, s.kind AS session_kind FROM messages m JOIN sessions s ON s.id = m.session_id"
+        params: list[Any] = []
+        where: list[str] = []
+        words = [w for w in (q or "").split() if w]
+        fts_words = [w for w in words if len(w) >= 3]          # trigram:≥3 字符子串才能命中
+        like_words = [w for w in words if len(w) < 3]          # 2 字回退 LIKE(02 §2.8.6);多词一律 AND
+        slow = bool(like_words)
+        if fts_words:
+            sql += " JOIN messages_fts f ON f.rowid = m.rowid"
+            params.append(" AND ".join('"' + w.replace('"', '""') + '"' for w in fts_words))
+            where.append("f.messages_fts MATCH ?")
+        for w in like_words:
+            where.append("m.text LIKE ?"); params.append(f"%{w}%")
+        if account_id:
+            where.append("m.account_id=?"); params.append(account_id)
+        if session_id:
+            where.append("m.session_id=?"); params.append(session_id)
+        if dir:
+            where.append("m.dir=?"); params.append(dir)
+        if type:
+            where.append("m.type=?"); params.append(type)
+        if state:
+            where.append("m.state=?"); params.append(state)
+        if since_ms is not None:
+            where.append("m.ts_ms >= ?"); params.append(since_ms)
+        if until_ms is not None:
+            where.append("m.ts_ms <= ?"); params.append(until_ms)
+        if sender:
+            where.append("(m.sender_id=? OR m.sender_name=?)"); params += [sender, sender]
+        if before is not None:
+            where.append("(m.ts_ms < ? OR (m.ts_ms = ? AND m.id < ?))"); params += [before[0], before[0], before[1]]
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY m.ts_ms DESC, m.id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()], slow
+
+    def get_message_full(self, id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT m.*, s.name AS session_name, s.kind AS session_kind FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.id=?", (id,)).fetchone()
+        return dict(r) if r else None
+
+    def get_command(self, trace_id: str) -> Optional[dict[str, Any]]:
+        r = self.con.execute("SELECT * FROM commands WHERE trace_id=?", (trace_id,)).fetchone()
+        return dict(r) if r else None
+
+    def list_commands(self, account_id: str, *, status: Optional[str] = None, op: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql, params = "SELECT c.*, r.ok, r.code, r.data_json, r.cost_ms, r.source, r.confirmed_by, r.finished_ms AS result_finished_ms FROM commands c " \
+                      "LEFT JOIN command_results r ON r.trace_id = c.trace_id WHERE c.account_id=?", [account_id]
+        if status:
+            sql += " AND c.status=?"; params.append(status)
+        if op:
+            sql += " AND c.op=?"; params.append(op)
+        sql += " ORDER BY c.submitted_ms DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self.con.execute(sql, params).fetchall()]
+
+    def api_client_by_token(self, token: str) -> Optional[dict[str, Any]]:
+        h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        r = self.con.execute("SELECT * FROM api_clients WHERE auth_kind='bearer' AND secret_hash=? AND enabled=1 AND revoked_ms IS NULL", (h,)).fetchone()
+        return dict(r) if r else None
+
+    def upsert_api_client(self, *, app_id: str, name: str, level: str, token: str, allow_accounts: Optional[list[str]] = None,
+                          ip_allow: Optional[list[str]] = None, now_ms: Optional[int] = None) -> None:
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            c.execute("INSERT INTO api_clients(app_id, name, auth_kind, secret_hash, level, ip_allow_json, allow_accounts_json, created_ms, updated_ms) "
+                      "VALUES (?,?,'bearer',?,?,?,?,?,?) ON CONFLICT(app_id) DO UPDATE SET secret_hash=excluded.secret_hash, level=excluded.level, "
+                      "allow_accounts_json=excluded.allow_accounts_json, ip_allow_json=excluded.ip_allow_json, updated_ms=excluded.updated_ms, revoked_ms=NULL, enabled=1",
+                      (app_id, name, hashlib.sha256(token.encode("utf-8")).hexdigest(), level,
+                       json.dumps(ip_allow or []), json.dumps(allow_accounts or ["*"]), now, now))
+
+    def api_client_touch(self, app_id: str, now_ms: int) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE api_clients SET last_used_ms=? WHERE app_id=?", (now_ms, app_id))
+
+    def db_size_mb(self) -> tuple[float, float]:
+        if self.path == ":memory:":
+            return 0.0, 0.0
+        size = os.path.getsize(self.path) / 1048576 if os.path.exists(self.path) else 0.0
+        wal = self.path + "-wal"
+        return round(size, 2), round(os.path.getsize(wal) / 1048576, 2) if os.path.exists(wal) else 0.0
 
     def abandon_inflight(self, now_ms: int) -> int:
         """02 §2.6 崩溃恢复:queued/running 指令一律 failed + INTERNAL;对应 SENDING 幂等行改 ABANDONED。"""

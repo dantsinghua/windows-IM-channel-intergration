@@ -45,11 +45,41 @@ class HealthConfig:
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    bind: str = "0.0.0.0"
+    port: int = 17600                           # 00 §3
+    ws_impl: str = "websockets"                 # uvicorn ws=,不许 auto(02 §2.2)
+    rate_default_per_min: int = 120
+    http_sync_max_wait_ms: int = 25000          # 同步等待上限(P-10),超过转 202
+    unauth_health_sources: tuple[str, ...] = ("127.0.0.1/32", "::1/128", "wsl_gateway")
+    api_version: str = "1.0"                    # 只读,随代码(02 §3.8)
+
+
+@dataclass(frozen=True)
+class EventsConfig:
+    ws_queue_max: int = 10000
+    ws_retention_hours: int = 72                # events_outbox target='ws' 保留(02 §2.2.7 / §7.1)
+
+
+WS_PING_INTERVAL_S = 20                         # 02 §3.4.7 字面:心跳每 20 s(不是配置项)
+
+
+@dataclass(frozen=True)
+class DbConfig:
+    path: str = "/var/lib/qtrade/agent.db"
+    busy_timeout_ms: int = 5000
+    read_pool: int = 4
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     bus: BusConfig = field(default_factory=BusConfig)
     qidian: QidianAdapterConfig = field(default_factory=QidianAdapterConfig)
     messages: MessagesConfig = field(default_factory=MessagesConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)
+    events: EventsConfig = field(default_factory=EventsConfig)
+    db: DbConfig = field(default_factory=DbConfig)
 
     @classmethod
     def from_toml_dict(cls, d: dict[str, Any]) -> "AgentConfig":
@@ -57,13 +87,19 @@ class AgentConfig:
         def pick(section: dict[str, Any] | None, klass):
             section = section or {}
             names = klass.__dataclass_fields__.keys()
-            return klass(**{k: section[k] for k in names if k in section})
+            vals = {k: section[k] for k in names if k in section}
+            if "unauth_health_sources" in vals and isinstance(vals["unauth_health_sources"], list):
+                vals["unauth_health_sources"] = tuple(vals["unauth_health_sources"])
+            return klass(**vals)
         adapters = d.get("adapters") or {}
         return cls(
             bus=pick(d.get("bus"), BusConfig),
             qidian=pick(adapters.get("qidian"), QidianAdapterConfig),
             messages=pick(d.get("messages"), MessagesConfig),
             health=pick(d.get("health"), HealthConfig),
+            api=pick(d.get("api"), ApiConfig),
+            events=pick(d.get("events"), EventsConfig),
+            db=pick(d.get("db"), DbConfig),
         )
 
     def confirm_timeout_ms(self, channel: str) -> int:
