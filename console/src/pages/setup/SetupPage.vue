@@ -6,7 +6,7 @@
  * (回 `{notice_version, text, ack_ms, acked_version}`),勾选 = #87 `POST /system/notice/ack`。
  * (原先写的 `PUT /settings/compliance` 在 02 #88 的 group 枚举里不存在,真后端 404。)
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { setup as T } from '@/testids'
 import { NOTICE_FIXED_PARAGRAPHS, useSetupStore } from '@/stores/setup'
@@ -37,11 +37,31 @@ const nextDisabled = computed(() => {
   return false
 })
 
-function onScroll(): void {
+/**
+ * 「滚到底才可勾」的本意是确保全文被看到(01 §2.7.1 步 1)。
+ * 同一判据覆盖两种情形:内容不溢出(scrollTop=0 且 scrollHeight ≤ clientHeight+容差 ⇒ 全文已可见)
+ * 与溢出后滚到底。只靠 `@scroll` 会在「不溢出」时永远不触发 ⇒ 向导卡死,
+ * 所以挂载后、文案到货后、字体就绪后、容器/内容尺寸变化(ResizeObserver)时都重判。
+ * 文案未到货(占位「正在读取…」)时不判,免得占位短文本提前解锁;一旦解锁不回锁。
+ */
+const NOTICE_SLACK_PX = 8
+function checkNoticeRead(): void {
   const el = noticeBox.value
-  if (!el) return
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 8) store.scrolledToBottom = true
+  if (!el || store.scrolledToBottom || !store.noticeText) return
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - NOTICE_SLACK_PX) store.scrolledToBottom = true
 }
+
+// 告知区随 step 0 的 v-if 挂/卸:元素出现时装观察器,元素消失或页面卸载时断开
+watch(noticeBox, (el, _old, onCleanup) => {
+  if (!el) return
+  checkNoticeRead()
+  if (typeof ResizeObserver === 'undefined') return
+  const ro = new ResizeObserver(() => checkNoticeRead())
+  ro.observe(el)
+  for (const child of Array.from(el.children)) ro.observe(child)
+  onCleanup(() => ro.disconnect())
+}, { flush: 'post' })
+watch(() => store.noticeText, () => { void nextTick(checkNoticeRead) }, { flush: 'post' })
 
 async function toggleAck(checked: boolean): Promise<void> {
   if (!checked) { store.acked = false; return }
@@ -69,6 +89,7 @@ function addAccount(ch: string): void {
 }
 
 onMounted(async () => {
+  void document.fonts?.ready.then(checkNoticeRead).catch(() => undefined)
   await store.loadNotice().catch(() => undefined)
   await session.pingAgent()
   await env.loadAll().catch(() => undefined)
@@ -95,7 +116,7 @@ onMounted(async () => {
       >
         <template #action><a-button size="small" @click="store.loadNotice()">重试</a-button></template>
       </a-alert>
-      <div ref="noticeBox" class="notice" @scroll="onScroll">
+      <div ref="noticeBox" class="notice" @scroll="checkNoticeRead">
         <div :data-testid="T.noticeText" class="notice-text">
           {{ store.noticeText || (store.error ? '——' : '正在读取告知文案…') }}
         </div>
