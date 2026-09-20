@@ -72,10 +72,18 @@ async function saveGroup(group: string, body: Record<string, unknown>): Promise<
     const r = await settingsApi.put(group, body)
     // 🔴 `restart_required` 在 `data` 之外的顶层(见 client.ts 的说明)——
     // 丢了它界面就说不出「要重启才生效」,用户会以为改完立刻就算数
-    if (r.restartRequired) message.warning('已保存,但需要重启 Agent 才生效')
-    else message.success('已保存')
+    //
+    // 🔴 回填用的是**本次提交的值**,不是再 GET 一次(backend-api-3 §3:除 `public_domain`/`resources`
+    // 外 GET 读的是「当前生效值」,重启前读回来还是旧值 ⇒ 回头 GET 会把刚填的内容洗回去,
+    // 让人以为没保存上)。`restart_required:false` 的组才回头读真值。
+    store.applySaved(group, body, r.restartRequired)
+    if (r.restartRequired) {
+      message.warning('已保存,重启 Agent 后生效(表单显示的是本次提交的值)')
+    } else {
+      message.success('已保存')
+      await store.loadGroup(group)
+    }
     for (const w of r.warnings) message.warning(w)
-    await store.loadGroup(group)
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
   } finally {
@@ -150,6 +158,8 @@ async function keygen(scope: string, i: number): Promise<void> {
   const r = await mailApi.createHmacKey(s.addr, s.shortname)
   s.keyed = true
   showOnce(`HMAC 密钥(${s.shortname},明文只显示一次)`, r.secret)
+  // 重拉短名表,把 `secret_ref`/`route_id` 补上(建密钥的响应里只有一次性明文,没有这两样)
+  await store.loadHmacKeys()
 }
 
 async function revokeKey(scope: string, i: number): Promise<void> {
@@ -158,7 +168,11 @@ async function revokeKey(scope: string, i: number): Promise<void> {
   // #68:按短名吊销,不按 sender
   await mailApi.revokeHmacKey(s.shortname)
   s.keyed = false
+  s.secret_ref = null
+  s.route_id = null
   message.success('已吊销')
+  // 吊销 = 删条目 ⇒ 重拉后该行就不在短名表里了(`enabled` 没有「停用但保留」这个态)
+  await store.loadHmacKeys()
 }
 
 function toggleAllowOp(scope: string, op: string, danger: boolean, on: boolean): void {
@@ -319,6 +333,12 @@ onMounted(async () => {
         </a-form-item>
       </a-form>
       <a-button type="primary" :data-testid="T.lanSave" @click="confirmLanSave">保存</a-button>
+      <!--
+        「已保存,重启后生效」标记(#89 R6-58 (ad):v1 可热加载键清单 = 空集)。
+        判据 = 本次 `PUT` 回的顶层 `restart_required`,不是猜的;表单里显示的是**本次提交的值**。
+        🔴 元素 id 未在 01 §4 登记 ⇒ 暂不加 `data-testid`,清单已转文档方。
+      -->
+      <span v-if="store.isPendingRestart('api')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
     </section>
 
     <!-- 邮箱(按通道分块) -->
@@ -436,6 +456,14 @@ onMounted(async () => {
             </a-popconfirm>
             <a-button size="small" :data-testid="T.mailSenderRemove(scope)"
                       @click="scopeCfg(scope).senders.splice(i, 1)">删除</a-button>
+            <!--
+              🔴 短名表的唯一来源是 `GET /mail/hmac-keys`(R6-58 (ac)),它**只回 `secret_ref` 不回密钥值** ——
+              这里显示引用与所属路由,是为了让人看得出「这条已经有密钥、存在保险库的哪一格」,
+              明文只在 #67 建密钥那一次弹过(关闭即清,见 `showOnce`)。全局短名的 `route_id` 是 null。
+            -->
+            <span v-if="s.keyed" class="qt-small qt-muted qt-mono">
+              {{ s.secret_ref ?? '(无 secret_ref)' }} · 路由 {{ s.route_id ?? '全局' }}
+            </span>
           </div>
           <a-button
             size="small"
@@ -506,6 +534,7 @@ onMounted(async () => {
       </a-collapse>
 
       <a-button type="primary" :loading="busy" :data-testid="T.mailSave" @click="saveMail">保存邮箱设置</a-button>
+      <span v-if="store.isPendingRestart('mail')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
     </section>
 
     <!-- ASR -->
@@ -533,6 +562,7 @@ onMounted(async () => {
         </a-form-item>
       </a-form>
       <a-button type="primary" :data-testid="T.asrSave" @click="saveGroup('asr', asr)">保存</a-button>
+      <span v-if="store.isPendingRestart('asr')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
     </section>
 
     <!-- OCR(离线) -->
@@ -556,6 +586,7 @@ onMounted(async () => {
       <div class="qt-row">
         <a-button :data-testid="T.ocrSelftest" @click="systemApi.selftestRun()">自检</a-button>
         <a-button type="primary" :data-testid="T.ocrSave" @click="saveGroup('ocr', ocr)">保存</a-button>
+        <span v-if="store.isPendingRestart('ocr')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
       </div>
     </section>
 
@@ -585,6 +616,7 @@ onMounted(async () => {
         每账号可在账号详情覆盖(同样不超过 30);磁盘吃紧时保留期会被水位自动压缩(30→14→7),压缩状态见 P-RES。
       </p>
       <a-button type="primary" :data-testid="T.retentionSave" @click="saveRetention">保存</a-button>
+      <span v-if="store.isPendingRestart('retention')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
     </section>
 
     <!-- 保险库(WinAgent) -->
@@ -711,6 +743,7 @@ onMounted(async () => {
       <div class="qt-row">
         <a-button :data-testid="T.resCalibrate" @click="calibrate">自校准</a-button>
         <a-button type="primary" :data-testid="T.resSave" @click="saveGroup('resources', resGroup)">保存</a-button>
+        <span v-if="store.isPendingRestart('resources')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
       </div>
     </section>
 

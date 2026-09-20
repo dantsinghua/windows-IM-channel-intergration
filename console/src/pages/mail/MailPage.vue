@@ -291,6 +291,14 @@ onUnmounted(() => {
               <tr v-if="!store.inbox.length"><td colspan="7" class="qt-muted">暂无收件记录</td></tr>
             </tbody>
           </table>
+          <!--
+            C-42「加载更多」:`GET /mail/inbox` 已按游标翻页(后端 `received_ms` 降序);
+            改筛选后点「筛选」= 回第一页并重置游标。
+            🔴 元素 id 未在 01 §4 登记 ⇒ 暂不加 `data-testid`,清单已转文档方。
+          -->
+          <div v-if="store.inboxCursor" class="qt-row more">
+            <a-button size="small" @click="store.reloadInbox(true)">加载更多</a-button>
+          </div>
         </section>
 
         <!-- ④ 发件队列 -->
@@ -322,6 +330,10 @@ onUnmounted(() => {
               <tr v-if="!store.outbox.length"><td colspan="7" class="qt-muted">发件队列为空</td></tr>
             </tbody>
           </table>
+          <!-- C-42「加载更多」:`GET /mail/outbox` 同款(后端 `created_ms` 降序);id 未登记,同上 -->
+          <div v-if="store.outboxCursor" class="qt-row more">
+            <a-button size="small" @click="store.reloadOutbox(true)">加载更多</a-button>
+          </div>
         </section>
 
         <!-- ⑤ 清理与归档 -->
@@ -409,6 +421,7 @@ onUnmounted(() => {
 .items { flex-wrap: wrap; gap: var(--qt-space-3); }
 .filters { flex-wrap: wrap; gap: var(--qt-space-2); }
 .w140 { width: 140px; } .w160 { width: 160px; }
+.more { justify-content: center; padding: var(--qt-space-2) 0; }
 .subj { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 h4 { margin: var(--qt-space-3) 0 var(--qt-space-1); }
 </style>

@@ -16,8 +16,13 @@ export interface EventFlags {
   origin?: 'rpa' | 'external'
 }
 
+/** C-42 通用段字面的默认页大小(`limit=50`) */
+const PAGE_LIMIT = 50
+
 export const useMessagesStore = defineStore('messages', () => {
   const sessions = ref<SessionRow[]>([])
+  /** 会话列表的 C-42 游标(与消息列表的 `nextCursor` 是两条独立的翻页线) */
+  const sessionsCursor = ref<string | null>(null)
   const sessionKeyword = ref('')
   const selectedSessionId = ref<string | null>(null)
   const filter = ref<MessageQuery>({ limit: 50 })
@@ -45,10 +50,20 @@ export const useMessagesStore = defineStore('messages', () => {
     return sessions.value.filter((s) => s.name.includes(kw) || s.id.includes(kw))
   })
 
-  async function loadSessions(): Promise<void> {
-    const { items: rows } = await messagesApi.sessions({ account_id: filter.value.account_id })
+  /**
+   * 拉会话列表。`more=true` = 用游标续下一页并**追加**(C-42;后端已把 `limit/cursor` 铺到 `#26`,
+   * 排序 `last_msg_at` 降序),否则从头拉并重置游标。
+   */
+  async function loadSessions(more = false): Promise<void> {
+    const r = await messagesApi.sessions({
+      account_id: filter.value.account_id,
+      limit: PAGE_LIMIT,
+      cursor: more ? sessionsCursor.value ?? undefined : undefined,
+    })
     // 裁决②:统一按 `last_msg_at`;`last_ts` 的一次性兼容在 normalizeSession 里(后端改完删)
-    sessions.value = rows.map(normalizeSession)
+    const rows = r.items.map(normalizeSession)
+    sessions.value = more ? [...sessions.value, ...rows] : rows
+    sessionsCursor.value = r.nextCursor
   }
 
   async function search(reset = true): Promise<void> {
@@ -120,7 +135,7 @@ export const useMessagesStore = defineStore('messages', () => {
   }
 
   return {
-    sessions, sessionKeyword, selectedSessionId, filter, items, nextCursor, loading, error,
+    sessions, sessionsCursor, sessionKeyword, selectedSessionId, filter, items, nextCursor, loading, error,
     newCount, selectedId, eventFlags, mediaUrls, exportJobId,
     selected, qTooShort, filteredSessions,
     loadSessions, search, applyMessageEvent, bindEvents, flagsOf, lateText, isExternal, matchesFilter,

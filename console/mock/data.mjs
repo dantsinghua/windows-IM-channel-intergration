@@ -7,6 +7,9 @@
 
 export const now = () => new Date().toISOString()
 
+/** 「n 分钟前」的 ISO —— C-42 按时间列降序翻页,行的排序列必须互不相同才看得出对错 */
+export const ago = (minutes) => new Date(Date.now() - minutes * 60000).toISOString()
+
 export function makeAccounts() {
   return [
     {
@@ -173,15 +176,15 @@ export function makeMessages(n = 40) {
   const sessions = [
     {
       id: 'wx01:12345@chatroom', name: '某某群', kind: 'group', account_id: 'wx01', channel: 'wechat',
-      native_id: '12345@chatroom', last_msg_at: now(), msg_count: 128, unread: 2, muted: false,
+      native_id: '12345@chatroom', last_msg_at: ago(1), msg_count: 128, unread: 2, muted: false,
     },
     {
       id: 'qq01:g_123456', name: 'QQ 报价群', kind: 'group', account_id: 'qq01', channel: 'qq',
-      native_id: 'g_123456', last_msg_at: now(), msg_count: 64, unread: 0, muted: false,
+      native_id: 'g_123456', last_msg_at: ago(2), msg_count: 64, unread: 0, muted: false,
     },
     {
       id: 'qd01:415011447', name: '张三-固收', kind: 'private', account_id: 'qd01', channel: 'qidian',
-      native_id: '415011447', last_msg_at: now(), msg_count: 27, unread: 0, muted: false,
+      native_id: '415011447', last_msg_at: ago(3), msg_count: 27, unread: 0, muted: false,
     },
   ]
   const out = []

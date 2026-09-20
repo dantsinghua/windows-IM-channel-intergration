@@ -20,9 +20,18 @@ import type { Channel } from '@/i18n/zh-CN/codes'
 /* ───────────────── 账号 ───────────────── */
 
 export const accountsApi = {
-  /** #1;微信档案列表 = `?channel=wechat&include_stopped=true`(C-01/C-40) */
-  list: (q?: { channel?: Channel; state?: string; enabled?: boolean; include_stopped?: boolean }) =>
-    requestList<Account>('/accounts', { query: q as Record<string, unknown> }),
+  /**
+   * #1;微信档案列表 = `?channel=wechat&include_stopped=true`(C-01/C-40)。
+   *
+   * 🔴 **C-42 分页已铺到本端点**(backend-api-3 §1②):`?since&until&limit&cursor` → `{data, next_cursor}`,
+   * `next_cursor` **仅在本页满 `limit` 时非空**;`cursor` 是 G-16 的 opaque 串,客户端**只能透传不能构造**。
+   * 🔴 **默认排序 = `created_ms` 降序**(同上 §7-8;C-42 的游标要求排序列 = 游标里的 `ts_ms`)——
+   * 因此**客户端不再自己排一遍**,页面只做「按通道分组」这种展示层分桶。
+   */
+  list: (q?: {
+    channel?: Channel; state?: string; enabled?: boolean; include_stopped?: boolean
+    since?: string; until?: string; limit?: number; cursor?: string
+  }) => requestList<Account>('/accounts', { query: q as Record<string, unknown> }),
 
   get: (id: string) => request<Account>(`/accounts/${id}`),
 
@@ -247,8 +256,14 @@ export interface MessageQuery {
 }
 
 export const messagesApi = {
-  sessions: (q?: { account_id?: string; keyword?: string }) =>
-    requestList<SessionRow>('/sessions', { query: q as Record<string, unknown> }),
+  /**
+   * #26 会话列表。🔴 **C-42 分页已铺到本端点**(backend-api-3 §1②):
+   * `?since&until&limit&cursor` → `{data, next_cursor}`,排序 = `last_msg_at` 降序。
+   */
+  sessions: (q?: {
+    account_id?: string; keyword?: string
+    since?: string; until?: string; limit?: number; cursor?: string
+  }) => requestList<SessionRow>('/sessions', { query: q as Record<string, unknown> }),
 
   /** #27b 单会话详情(02 只给了 PATCH 半,后端补的只读兄弟端点,待文档方登记) */
   session: (accountId: string, sessionId: string) =>
@@ -499,14 +514,32 @@ export const systemApi = {
 
 /* ───────────────── 邮件 ───────────────── */
 
+/**
+ * `GET /mail/hmac-keys` 的一行(backend-api-3 §1⑤ 的六键)。
+ * 🔴 这里**没有也不会有**密钥值字段 —— 明文只在 `#67 POST /mail/hmac-keys` 返回那一次。
+ */
+export interface HmacKeyRow {
+  short_name: string
+  sender: string
+  /** 该短名所属路由;**全局短名为 `null`** */
+  route_id: string | null
+  /** 恒 `true`(吊销 = 删条目,没有「停用但保留」这个态) */
+  enabled: boolean
+  /** 保险库引用 `vault://mail/hmac/cmd/<短名>`;用于界面证明「有密钥」,**不是密钥本身** */
+  secret_ref: string | null
+  created_at?: string
+}
+
 export const mailApi = {
   /** #56。两形都接住(后端当前把它做成了列表端点),见 `normalizeMailStatus` 的说明 */
   status: () => requestEnvelope<unknown>('/mail/status').then((env) => normalizeMailStatus(
     env.data !== undefined ? env.data : { enabled: env.enabled, routes: env.routes, route: env.route },
   )),
+  /** #58。🔴 C-42 分页已铺到本端点(backend-api-3 §1②):`?route&status&since&until&q&limit&cursor` → `{data, next_cursor}` */
   inbox: (q?: Record<string, unknown>) => requestList<MailInboxRow>('/mail/inbox', { query: q }),
   inboxDetail: (id: string) => request<MailInboxDetail>(`/mail/inbox/${id}`),
   reparse: (id: string) => request<{ ok: boolean }>(`/mail/inbox/${id}/reparse`, { method: 'POST' }),
+  /** #61。🔴 C-42 分页已铺到本端点(backend-api-3 §1②),并补上了参数列里本就有的 `since&until` */
   outbox: (q?: Record<string, unknown>) => requestList<MailOutboxRow>('/mail/outbox', { query: q }),
   resend: (id: string) => request<{ ok: boolean }>(`/mail/outbox/${id}/resend`, { method: 'POST' }),
   discard: (id: string) => request<{ ok: boolean }>(`/mail/outbox/${id}/discard`, { method: 'POST' }),
@@ -518,10 +551,16 @@ export const mailApi = {
       method: 'POST', body: { which, route_id: routeId },
     }),
   /**
-   * `GET /mail/hmac-keys`:短名表(R6-58 (ac) 指名的唯一来源;`senders[].shortname` 不随
-   * `GET /settings/mail` 下发)。**只回短名与发件人,不回密钥**。
+   * `GET /mail/hmac-keys`(暂记 **#67b**,02 §3.4 端点表还没给它编号,已转文档方):
+   * 短名表 —— R6-58 (ac) 指名的**唯一来源**(`senders[].shortname` 不随 `GET /settings/mail` 下发)。
+   *
+   * 出参六键(backend-api-3 §1⑤):`{short_name, sender, route_id, enabled, secret_ref, created_at}`。
+   * - 🔴 **绝不回密钥值**:只有 `secret_ref`(`vault://mail/hmac/cmd/<短名>`);明文只在 #67 那一次。
+   * - `route_id` = 该短名落在哪条路由的 `inbound_json.hmac` 里(06 §3.1);**全局短名回 `null`**。
+   * - `enabled` 恒 `true`:#68 吊销 = 删条目,列出来的就是启用中的(没有「停用但保留」这个态)。
+   * - 邮件服务没装配也能列(短名存 `settings`) ⇒ P-SET 不会因为邮件没配就看不到短名表。
    */
-  hmacKeys: () => requestList<{ sender: string; short_name: string; created_at?: string }>('/mail/hmac-keys'),
+  hmacKeys: () => requestList<HmacKeyRow>('/mail/hmac-keys'),
 
   /**
    * #67 入参只有 sender + short_name,**无 route**(短名全局唯一)。

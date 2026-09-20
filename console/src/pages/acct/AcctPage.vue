@@ -345,6 +345,16 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
           </tbody>
         </table>
       </section>
+
+      <!--
+        C-42「加载更多」:`GET /accounts` 已按游标翻页(后端 `created_ms` 降序,前端不自排),
+        `next_cursor` 非空即还有下一页;续拉的行**追加**进 `items`,由上面的 `byChannel` 自然分桶。
+        🔴 本控件的元素 id 在 **01 §4 还没登记**(C-45:01 §4 是元素 id 的唯一出处)⇒ 暂不加
+        `data-testid`,清单已转文档方(见 `.omc/handoffs/console-fix-3.md`)。
+      -->
+      <div v-if="accounts.nextCursor" class="qt-row more">
+        <a-button :loading="accounts.loading" @click="accounts.load(true)">加载更多</a-button>
+      </div>
     </PageState>
 
     <!-- 删除 = 软删,无 keep_data(R-11) -->
@@ -368,6 +378,7 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
 .banner { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); border-radius: var(--qt-radius-sm); }
 .group { padding: var(--qt-space-3); }
 .ghead { margin-bottom: var(--qt-space-2); }
+.more { justify-content: center; padding: var(--qt-space-3) 0; }
 .fault { background: #FFF1F0; color: var(--qt-state-error); padding: 6px var(--qt-space-3); display: flex; align-items: center; gap: var(--qt-space-2); }
 .batchbar { margin-bottom: var(--qt-space-2); }
 .tbl { width: 100%; border-collapse: collapse; }

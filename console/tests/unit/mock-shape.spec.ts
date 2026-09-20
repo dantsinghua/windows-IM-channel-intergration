@@ -720,3 +720,143 @@ describe('信封里 data 之外的业务键不能被静默丢掉(N-1 同型)', (
     assertHas(body, ['run_id'], '#79b')
   })
 })
+
+/* ───────────────── 8. C-42 统一分页(N-2 的 mock 侧闸门) ─────────────────
+ *
+ * 后端第三批把 `limit/cursor → next_cursor` 铺到了 `#1 /accounts`、`#26 /sessions`、
+ * `#58 /mail/inbox`、`#61 /mail/outbox`(backend-api-3 §1②)。mock 若还把 `limit` 静默忽略、
+ * `next_cursor` 恒 null,前端就会被养出「翻不翻页都一样」的假设 —— 那正是 N-2 的成因。
+ */
+
+/** C-42 铺开的四个列表端点,以及各自的排序列(降序) */
+const PAGED = [
+  { path: '/accounts', tsKey: 'created_at' },
+  { path: '/sessions', tsKey: 'last_msg_at' },
+  { path: '/mail/inbox', tsKey: 'received_at' },
+  { path: '/mail/outbox', tsKey: 'created_at' },
+] as const
+
+/** 按游标一路翻到底,回所有行的 id(顺序保留);`from` = 起始游标(不给即从第一页起) */
+async function drainPages(path: string, limit: number, from: string | null = null): Promise<string[]> {
+  const ids: string[] = []
+  let cursor: string | null = from
+  for (let guard = 0; guard < 50; guard++) {
+    const q = `${path}?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
+    const { status, body } = await get(q)
+    expect(status, `${q} 应 200`).toBe(200)
+    for (const r of body.data as Record<string, unknown>[]) ids.push(String(r.id))
+    cursor = (body.next_cursor as string | null) ?? null
+    if (!cursor) return ids
+  }
+  throw new Error(`${path} 翻页没有终点(next_cursor 一直非空?)`)
+}
+
+describe('C-42 统一分页(#1 / #26 / #58 / #61)', () => {
+  it('limit 真生效,且 next_cursor 仅在本页满 limit 时非空', async () => {
+    for (const { path } of PAGED) {
+      const { body } = await get(`${path}?limit=2`)
+      const rows = body.data as unknown[]
+      expect(rows.length, `${path} 的 limit=2 被忽略了`).toBeLessThanOrEqual(2)
+      // 这四个端点的 mock 数据都 >2 行 ⇒ 第一页必满、必给游标
+      expect(rows.length, `${path} mock 数据不足 3 行,测不出翻页`).toBe(2)
+      expect(typeof body.next_cursor, `${path} 本页满 limit 却没给 next_cursor`).toBe('string')
+    }
+  })
+
+  it('翻到底:不重不漏,且与不分页的全量一致', async () => {
+    for (const { path } of PAGED) {
+      const all = ((await get(`${path}?limit=500`)).body.data as Record<string, unknown>[]).map((r) => String(r.id))
+      const paged = await drainPages(path, 2)
+      expect(new Set(paged).size, `${path} 翻页有重复行`).toBe(paged.length)
+      expect([...paged].sort(), `${path} 翻页与全量对不上`).toEqual([...all].sort())
+      // 末页不满 limit ⇒ next_cursor 必须是 null(否则客户端会一直空转)
+      expect(paged.length).toBe(all.length)
+    }
+  })
+
+  it('排序列严格降序,且游标是「定位」不是 OFFSET(第二页首行 < 第一页末行)', async () => {
+    for (const { path, tsKey } of PAGED) {
+      const p1 = await get(`${path}?limit=2`)
+      const rows1 = p1.body.data as Record<string, unknown>[]
+      expect(Date.parse(String(rows1[0][tsKey])), `${path} 的 ${tsKey} 不是降序`)
+        .toBeGreaterThanOrEqual(Date.parse(String(rows1[1][tsKey])))
+      const p2 = await get(`${path}?limit=2&cursor=${encodeURIComponent(String(p1.body.next_cursor))}`)
+      const rows2 = p2.body.data as Record<string, unknown>[]
+      expect(Date.parse(String(rows2[0][tsKey])), `${path} 第二页没有接着第一页末行往下走`)
+        .toBeLessThanOrEqual(Date.parse(String(rows1[1][tsKey])))
+    }
+  })
+
+  it('非法 limit 必须报错(422 + INVALID_ARGS + pointer=/limit),不能被静默忽略', async () => {
+    for (const { path } of PAGED) {
+      for (const bad of ['0', '-1', '99999', 'abc']) {
+        const { status, body } = await get(`${path}?limit=${bad}`)
+        // 真后端用 FastAPI Query(100, ge=1, le=500) ⇒ 422;信封仍是 INVALID_ARGS(backend-api-3 §1②)
+        expect(status, `${path}?limit=${bad} 应当报错`).toBe(422)
+        expect(body.code).toBe('INVALID_ARGS')
+        const details = (body.error as Record<string, unknown>).details as { pointer?: string }[]
+        expect(details?.[0]?.pointer).toBe('/limit')
+      }
+    }
+  })
+
+  it('乱码 cursor → 400 bad_cursor(而不是把整表当一页吐回来)', async () => {
+    for (const { path } of PAGED) {
+      const { status, body } = await get(`${path}?cursor=not-a-real-cursor`)
+      expect(status, `${path} 对伪造游标应当 400`).toBe(400)
+      expect(body.code).toBe('INVALID_ARGS')
+      expect(body.error).toMatchObject({ reason: 'bad_cursor' })
+    }
+  })
+
+  it('游标稳定:翻页中途插入新行,老行不重复也不丢(G-16 双键定位)', async () => {
+    const p1 = await get('/accounts?limit=2')
+    const first = (p1.body.data as Record<string, unknown>[]).map((r) => String(r.id))
+    // 中途建一个新号(created_at = 现在 ⇒ 按降序它属于**第一页之前**,不该挤进后面的页)
+    const made = await post('/accounts', {
+      channel: 'qq', label: '分页守卫', login: { mode: 'qrcode' }, idempotency_key: `page-${Date.now()}`,
+    })
+    expect(made.status).toBe(201)
+    const rest = await drainPages('/accounts', 2, String(p1.body.next_cursor))
+    expect(rest.filter((id) => first.includes(id)), '老行在后续页里重复了').toEqual([])
+    expect(new Set(rest).size).toBe(rest.length)
+  })
+
+  it('#1 /accounts 默认按创建时间降序(前端不再自排)', async () => {
+    const rows = (await get('/accounts')).body.data as Record<string, unknown>[]
+    const ts = rows.map((r) => Date.parse(String(r.created_at)))
+    expect(ts, '/accounts 默认顺序不是 created_at 降序').toEqual([...ts].sort((a, b) => b - a))
+  })
+})
+
+/* ───────────────── 9. #67b GET /mail/hmac-keys 的新出参 ───────────────── */
+
+describe('#67b 短名表(R6-58 (ac) 指名的唯一来源)', () => {
+  it('出参恰六键,且一个字节的密钥都不出现', async () => {
+    const { status, body } = await get('/mail/hmac-keys')
+    expect(status).toBe(200)
+    const rows = body.data as Record<string, unknown>[]
+    expect(rows.length).toBeGreaterThan(0)
+    for (const r of rows) {
+      assertHas(r, ['short_name', 'sender', 'route_id', 'enabled', 'secret_ref', 'created_at'], '#67b')
+      // 🔴 明文只在 #67 建密钥那一次;这里出现任何密钥字段都是泄漏
+      assertHasNot(r, ['secret', 'key', 'hmac_key', 'secret_value'], '#67b')
+      expect(r.enabled, 'enabled 恒 true(吊销 = 删条目)').toBe(true)
+    }
+    // 整个响应体里不该出现 #67 发过的明文前缀
+    expect(JSON.stringify(body)).not.toContain('hmac_')
+  })
+
+  it('#67 建密钥后短名表里能看到它,且只有 secret_ref 没有明文', async () => {
+    const short = `gw${Date.now().toString(36)}`.slice(0, 16)
+    const made = await post('/mail/hmac-keys', { sender: 'guard@corp', short_name: short })
+    expect(made.status).toBe(200)
+    expect(typeof (made.body.data as Record<string, unknown>).secret, '#67 那一次必须回明文').toBe('string')
+
+    const rows = (await get('/mail/hmac-keys')).body.data as Record<string, unknown>[]
+    const hit = rows.find((r) => r.short_name === short)
+    expect(hit, '新建的短名没出现在表里').toBeTruthy()
+    expect(hit!.secret_ref).toBe(`vault://mail/hmac/cmd/${short}`)
+    expect(hit!.route_id, '#67 入参没有 route ⇒ 全局短名').toBeNull()
+  })
+})

@@ -6,8 +6,13 @@ import type { Account, AccountStatePayload, Prompt, QtEvent } from '@/api/types'
 import { CHANNELS, type Channel, STATE_OPS, type AccountState } from '@/i18n/zh-CN/codes'
 import { useEventsStore } from './events'
 
+/** C-42 通用段字面的默认页大小(`limit=50`);后端实现缺省是 100,客户端显式传以免两边各说各话 */
+const PAGE_LIMIT = 50
+
 export const useAccountsStore = defineStore('accounts', () => {
   const items = ref<Account[]>([])
+  /** C-42 游标:非空 = 还有下一页(后端仅在本页满 `limit` 时才给);opaque,只透传不构造(G-16) */
+  const nextCursor = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
   const selectedId = ref<string | null>(null)
@@ -48,13 +53,24 @@ export const useAccountsStore = defineStore('accounts', () => {
     return STATE_OPS[(a?.state ?? 'stopped') as AccountState]
   }
 
-  async function load(): Promise<void> {
+  /**
+   * 拉账号列表。`more=true` = 用游标续下一页并**追加**,否则从头拉并重置游标(C-42)。
+   *
+   * 🔴 后端已按 **`created_ms` 降序**下发(backend-api-3 §7-8:C-42 的游标要求排序列 = 游标里的 `ts_ms`),
+   * 所以这里**不再自己排一遍** —— 页面的 `byChannel` 只是展示层分桶,桶内保持后端顺序。
+   */
+  async function load(more = false): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      // 微信档案要带 include_stopped(C-40)
-      const { items: rows } = await accountsApi.list({ include_stopped: true })
-      items.value = rows
+      // 微信档案要带 include_stopped(C-40);C-42:`limit` 真生效,翻页靠 `cursor` 透传
+      const { items: rows, nextCursor: nc } = await accountsApi.list({
+        include_stopped: true,
+        limit: PAGE_LIMIT,
+        cursor: more ? nextCursor.value ?? undefined : undefined,
+      })
+      items.value = more ? [...items.value, ...rows] : rows
+      nextCursor.value = nc
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
     } finally {
@@ -116,7 +132,7 @@ export const useAccountsStore = defineStore('accounts', () => {
   }
 
   return {
-    items, loading, error, selectedId, prompts, loginSessions,
+    items, nextCursor, loading, error, selectedId, prompts, loginSessions,
     byId, selected, byChannel, wechatProfiles, summary,
     ops, load, upsert, applyAccountState, bindEvents, refreshPrompt, errorMinutes, errorSeconds,
   }

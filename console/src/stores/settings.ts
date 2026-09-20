@@ -4,7 +4,7 @@
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { mailApi, settingsApi, systemApi } from '@/api/client'
+import { mailApi, settingsApi, systemApi, type HmacKeyRow } from '@/api/client'
 import type { ApiClientRow, MailRouteOverride, MailTemplate, PublicEndpoint, VaultEntry } from '@/api/types'
 
 /** 短名格式(唯一出处 = 02 #67):`^[A-Za-z0-9._-]{1,32}$`,不含冒号 */
@@ -95,9 +95,18 @@ export interface MailScopeConfig {
   allow_ops: string[]
   /**
    * 发件人白名单。地址来自 `inbound.allowed_senders`;
-   * 🔴 **短名不随本组下发**(R6-58 (ac)) —— `shortname`/`keyed` 由 `GET /mail/hmac-keys` 侧补齐。
+   * 🔴 **短名不随本组下发**(R6-58 (ac)) —— `shortname`/`keyed` 连同 `route_id`/`secret_ref`
+   * 一律由 `GET /mail/hmac-keys`(暂记 #67b)侧补齐,那里**不回密钥值**。
    */
-  senders: { addr: string; shortname: string; keyed: boolean }[]
+  senders: {
+    addr: string
+    shortname: string
+    keyed: boolean
+    /** 保险库引用(证明「有密钥」,不是密钥);未建密钥时 null */
+    secret_ref?: string | null
+    /** 短名所属路由;全局短名为 null */
+    route_id?: string | null
+  }[]
 }
 
 export function emptyMailScope(): MailScopeConfig {
@@ -142,7 +151,9 @@ export function scopeFromWire(w: Partial<MailScopeWire> | undefined): MailScopeC
     recipients: (o.recipients ?? []).join(', '),
     'template-id': o.template_id ?? base['template-id'],
     allow_ops: i.allow_ops ?? [],
-    senders: (i.allowed_senders ?? []).map((addr) => ({ addr, shortname: '', keyed: false })),
+    senders: (i.allowed_senders ?? []).map((addr) => ({
+      addr, shortname: '', keyed: false, secret_ref: null, route_id: null,
+    })),
   }
 }
 
@@ -193,10 +204,15 @@ export const useSettingsStore = defineStore('settings', () => {
   const publicEndpoint = ref<PublicEndpoint | null>(null)
   const webhooks = ref<{ id: string; url: string; enabled: boolean }[]>([])
   const vault = ref<VaultEntry[]>([])
-  /** #67/#68 的短名表(`GET /mail/hmac-keys`) */
-  const hmacKeys = ref<{ sender: string; short_name: string }[]>([])
+  /**
+   * #67/#68/#67b 的短名表(`GET /mail/hmac-keys`) —— R6-58 (ac) 指名的**唯一来源**。
+   * 六键出参见 `client.ts` 的 `HmacKeyRow`;🔴 里面**没有密钥值**,只有 `secret_ref`。
+   */
+  const hmacKeys = ref<HmacKeyRow[]>([])
   /** #90~#93 后端未就绪时的一句话原因(P-SET 令牌页据此显示「不可用 + 重试」而不是空表) */
   const apiClientsUnavailable = ref<string | null>(null)
+  /** 已保存但要重启 Agent 才生效的组(见 `applySaved` 的说明) */
+  const pendingRestart = ref<Record<string, boolean>>({})
   const wechatModule = ref<Record<string, unknown>>({})
   const wslConfig = ref<Record<string, unknown>>({})
   const wslPendingRestart = ref(false)
@@ -240,6 +256,27 @@ export const useSettingsStore = defineStore('settings', () => {
     const g = await settingsApi.get(name)
     groups.value[name] = g
     return g
+  }
+
+  /**
+   * 保存成功后的回填(#88/#89;backend-api-3 §3 实测)。
+   *
+   * 🔴 现状:除 `public_domain` 与 `resources` 外,`GET /settings/{group}` 读的是**当前生效值**,
+   * 而 #89 按 R6-58 (ad)「v1 可热加载键清单 = 空集」一律要重启才生效 ⇒ **保存后再 GET 读回的还是旧值**,
+   * 用户会以为没保存成功。后端说「要不要回待生效值是新设计」,已转文档方裁决。
+   *
+   * 在裁决之前按总控口径处置:**用本次提交的值回填表单,并记下这一组「重启后生效」**;
+   * 🔴 **不自创接口**(不去猜一个 `?pending=1` 之类的参数)。
+   * `restart_required:false`(如 `resources`)才回头 GET 一次读真值。
+   */
+  function applySaved(name: string, body: Record<string, unknown>, restartRequired: boolean): void {
+    groups.value[name] = { ...(groups.value[name] ?? {}), ...body }
+    if (restartRequired) pendingRestart.value[name] = true
+  }
+
+  /** 该组有「已保存、待重启生效」的改动(界面据此在卡片上挂标记) */
+  function isPendingRestart(name: string): boolean {
+    return pendingRestart.value[name] === true
   }
 
   async function loadAll(): Promise<void> {
@@ -290,7 +327,14 @@ export const useSettingsStore = defineStore('settings', () => {
           const hit = byAddr.get(s.addr)
           if (hit) {
             s.shortname = hit.short_name
-            s.keyed = true
+            // `enabled` 恒 true(吊销 = 删条目),所以「列出来了」本身就等于「已建密钥」
+            s.keyed = hit.enabled !== false
+            s.secret_ref = hit.secret_ref ?? null
+            s.route_id = hit.route_id ?? null
+          } else {
+            s.keyed = false
+            s.secret_ref = null
+            s.route_id = null
           }
         }
       }
@@ -339,8 +383,8 @@ export const useSettingsStore = defineStore('settings', () => {
   return {
     groups, apiClients, apiClientsUnavailable, mailScopes, mailEnabled, requireSignature, mailArchive,
     mailTemplateVersion, hmacKeys, mailRoutes, mailTemplates,
-    publicEndpoint, webhooks, vault, wechatModule, wslConfig, wslPendingRestart, loading, error,
-    allShortNames, validateShortName, loadGroup, loadAll, loadHmacKeys,
+    publicEndpoint, webhooks, vault, pendingRestart, wechatModule, wslConfig, wslPendingRestart, loading, error,
+    allShortNames, validateShortName, loadGroup, applySaved, isPendingRestart, loadAll, loadHmacKeys,
     loadVault, updateVault, deleteVault, loadWechatModule, saveWechatModule, loadWslConfig, saveWslConfig,
   }
 })

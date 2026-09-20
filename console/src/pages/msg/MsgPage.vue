@@ -186,6 +186,14 @@ onUnmounted(() => {
           <span class="qt-grow">{{ s.name }}</span>
           <span class="qt-small qt-muted">{{ s.unread ?? 0 }}</span>
         </div>
+        <!--
+          C-42「加载更多」:`GET /sessions` 已按游标翻页(后端 `last_msg_at` 降序)。
+          ⚠️ 左侧的关键字框是**本地筛**(`filteredSessions`),只筛已拉到的页 —— 翻到底再筛才是全量。
+          🔴 元素 id 未在 01 §4 登记 ⇒ 暂不加 `data-testid`,清单已转文档方。
+        -->
+        <div v-if="store.sessionsCursor" class="sitem more">
+          <a-button size="small" block @click="store.loadSessions(true)">加载更多</a-button>
+        </div>
       </div>
     </aside>
 
@@ -405,6 +413,7 @@ onUnmounted(() => {
 .mrow.active { background: var(--qt-bg-elevated); }
 .mrow.revoked { color: var(--qt-text-disabled); text-decoration: line-through; }
 .sess, .sender { min-width: 80px; }
+.sitem.more { justify-content: center; padding: var(--qt-space-2) 0; }
 .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag { font-size: var(--qt-font-xs); border: 1px solid currentColor; border-radius: 8px; padding: 0 5px; }
 .amber { color: var(--qt-sev-warn); }

@@ -32,8 +32,23 @@ function apiMinSatisfied(want) {
   return wMajor === hMajor && wMinor <= hMinor
 }
 
+/** 「n 分钟前」的 ISO —— 让 mock 的行有**互不相同**的排序列,否则看不出降序对不对 */
+function agoIso(minutes) {
+  return new Date(Date.now() - minutes * 60000).toISOString()
+}
+
+/**
+ * 真 Agent 的 `/accounts` 按 `created_ms` 降序(backend-api-3 §7-8)。
+ * `makeAccounts()` 里 `created_at` 全是同一刻,分不出先后 ⇒ 这里按声明序**倒着**拉开时间,
+ * 让「后建的排前面」在 mock 下也成立。
+ */
+function withCreatedAt(rows) {
+  const n = rows.length
+  return rows.map((a, i) => ({ ...a, created_at: agoIso(n - i) }))
+}
+
 const state = {
-  accounts: makeAccounts(),
+  accounts: withCreatedAt(makeAccounts()),
   resources: makeResources(),
   metrics: makeMetrics(),
   ...makeMessages(60),
@@ -102,8 +117,29 @@ const state = {
       },
     },
   },
-  /** #67/#68 的短名表(`GET /mail/hmac-keys`);短名**不随 mail 组下发**(R6-58 (ac)) */
-  hmacKeys: [{ sender: 'ops@corp', short_name: 'ops', created_at: now() }],
+  /**
+   * #67/#68/#67b 的短名表(`GET /mail/hmac-keys`);短名**不随 mail 组下发**(R6-58 (ac))。
+   * 🔴 出参**六键**(backend-api-3 §1⑤):`{short_name, sender, route_id, enabled, secret_ref, created_at}`;
+   * `route_id` 为 null = 全局短名;`enabled` 恒 true(吊销 = 删条目);**绝不回密钥值**。
+   */
+  hmacKeys: [{
+    short_name: 'ops', sender: 'ops@corp', route_id: null, enabled: true,
+    secret_ref: 'vault://mail/hmac/cmd/ops', created_at: now(),
+  }],
+  /** #58 收件时间线(排序列 `received_at`;够翻两页以上,好验 `limit/cursor`) */
+  mailInbox: [
+    { id: 'mi_0001', received_at: agoIso(1), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 停账号', status: 'CONFIRM_REQUIRED', trace_id: '01TRACEMOCK' },
+    { id: 'mi_0002', received_at: agoIso(2), route: '企点', from_addr: 'x@corp', subject: '格式不对', status: 'PARSE_FAILED', reason: 'bad template' },
+    { id: 'mi_0003', received_at: agoIso(3), route: '全局', from_addr: 'evil@x.com', subject: '越权', status: 'OP_DENIED', reason: 'NOT_ALLOWED:vault_write' },
+    { id: 'mi_0004', received_at: agoIso(4), route: 'QQ', from_addr: 'ops@corp', subject: '[QTrade] 查会话', status: 'DONE' },
+    { id: 'mi_0005', received_at: agoIso(5), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 导出', status: 'RECEIPT_SENT' },
+  ],
+  /** #61 发件队列(排序列 `created_at`) */
+  mailOutbox: [
+    { id: 'mo_1', kind: 'digest', to: 'team@corp', subject: '[QTrade] 报价汇总', status: 'QUEUED', attempts: 0, next_attempt_at: now(), created_at: agoIso(1) },
+    { id: 'mo_2', kind: 'receipt', to: 'ops@corp', subject: 'Re: 停账号', status: 'RECEIPT_SENT', attempts: 1, created_at: agoIso(2) },
+    { id: 'mo_3', kind: 'receipt', to: 'ops@corp', subject: 'Re: 查会话', status: 'DEAD', attempts: 5, created_at: agoIso(3) },
+  ],
   /** 建号/工作流的幂等键 → 结果(R6-54:重放回 409 IDEMPOTENT_REPLAY + 同一份 data) */
   idempotency: new Map(),
   /** #76 `?kind=observed` 的候选行(行 id = probe_targets_observed.id) */
@@ -164,6 +200,84 @@ function selftestRun(runId) {
 function emit(event, payload, extra = {}) {
   const frame = JSON.stringify({ event, ts: now(), seq: nextSeq(), payload, ...extra })
   for (const ws of sockets) { try { ws.send(frame) } catch { /* 客户端已走 */ } }
+}
+
+/* ── C-42 统一分页(G-16 游标) ──────────────────────────────────────────────
+ * 🔴 口径同真 Agent(backend-api-3 §1②):
+ *  - 游标 = `base64url(JSON{"ts_ms": <排序列毫秒>, "id": <行主键>})`,服务端按 `(ts_ms, id)` 双键
+ *    **定位**(不用 OFFSET)⇒ 翻页期间插入新行也不重不漏;客户端只透传不构造;
+ *  - `next_cursor` **仅在本页满 `limit` 时非空**;
+ *  - `limit` 真生效,非法值回 **422**(信封仍是 `INVALID_ARGS`,`details[].pointer=/limit`)——
+ *    真后端用 FastAPI `Query(100, ge=1, le=500)`,422 是它的载体,mock 照搬以免前端被养出「400」的假设;
+ *  - 乱码 `cursor` 回 `400 INVALID_ARGS` `reason=bad_cursor`。
+ */
+
+function encodeCursor(tsMs, id) {
+  return Buffer.from(JSON.stringify({ ts_ms: tsMs, id: String(id) }), 'utf8').toString('base64url')
+}
+
+function decodeCursor(raw) {
+  const o = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'))
+  if (typeof o.ts_ms !== 'number' || typeof o.id !== 'string') throw new Error('bad cursor')
+  return o
+}
+
+/** ISO 串 / 毫秒 / null → 毫秒(缺时间的行排到最后) */
+function tsMs(v) {
+  if (v == null) return 0
+  if (typeof v === 'number') return v
+  const t = Date.parse(v)
+  return Number.isFinite(t) ? t : 0
+}
+
+/**
+ * 取一页。命中错误时**已经把响应写完了**并返回 `null`,调用方直接 `return`。
+ * `tsOf(row)` 给出该端点的排序列(毫秒)。
+ */
+function takePage(res, url, rows, tsOf) {
+  const q = url.searchParams
+  let limit = 100
+  const rawLimit = q.get('limit')
+  if (rawLimit !== null && rawLimit !== '') {
+    const n = Number(rawLimit)
+    if (!Number.isInteger(n) || n < 1 || n > 500) {
+      fail(res, 422, 'INVALID_ARGS', 'limit 必须是 1~500 的整数', {
+        reason: 'bad_limit', details: [{ pointer: '/limit', message: '1 ≤ limit ≤ 500' }],
+      })
+      return null
+    }
+    limit = n
+  }
+  // 排序列降序 + 主键降序 —— 与游标的双键定位必须是同一把尺子
+  const sorted = [...rows].sort(
+    (a, b) => tsOf(b) - tsOf(a) || String(b.id).localeCompare(String(a.id)),
+  )
+  let start = 0
+  const rawCursor = q.get('cursor')
+  if (rawCursor) {
+    let c
+    try {
+      c = decodeCursor(rawCursor)
+    } catch {
+      fail(res, 400, 'INVALID_ARGS', 'cursor 无法识别,请从头拉', { reason: 'bad_cursor' })
+      return null
+    }
+    const idx = sorted.findIndex(
+      (r) => tsOf(r) < c.ts_ms || (tsOf(r) === c.ts_ms && String(r.id) < c.id),
+    )
+    start = idx < 0 ? sorted.length : idx
+  }
+  const page = sorted.slice(start, start + limit)
+  const last = page[page.length - 1]
+  return {
+    rows: page,
+    next_cursor: page.length === limit && last ? encodeCursor(tsOf(last), last.id) : null,
+  }
+}
+
+/** `takePage` 的结果直接按 C-42 的 `{ok, data, next_cursor}` 回出去 */
+function okPage(res, page) {
+  return ok(res, page.rows, { next_cursor: page.next_cursor })
 }
 
 function ok(res, data, extra = {}, status = 200) {
@@ -320,7 +434,12 @@ const server = createServer(async (req, res) => {
   }
 
   // ── 账号
-  if (p === '/accounts' && m === 'GET') return ok(res, state.accounts, { next_cursor: null })
+  if (p === '/accounts' && m === 'GET') {
+    // 🔴 默认按 **创建时间降序**(backend-api-3 §7-8:C-42 的游标要求排序列 = 游标里的 `ts_ms`);
+    // 前端不再自排,所以 mock 排错了会直接养出错的界面顺序。
+    const page = takePage(res, url, state.accounts, (a) => tsMs(a.created_at))
+    return page && okPage(res, page)
+  }
   if (p === '/accounts' && m === 'POST') {
     // E-02:幂等键在 **body**,不带就 400(与真 Agent 同判据)
     if (requireIdempotencyKey(res, body, '/accounts')) return
@@ -567,7 +686,11 @@ const server = createServer(async (req, res) => {
   }
 
   // ── 会话 / 消息
-  if (p === '/sessions') return ok(res, state.sessions, { next_cursor: null })
+  if (p === '/sessions') {
+    // #26 排序 = `last_msg_at` 降序(backend-api-3 §1②)
+    const page = takePage(res, url, state.sessions, (x) => tsMs(x.last_msg_at))
+    return page && okPage(res, page)
+  }
   if (p === '/messages') {
     const q = url.searchParams
     let rows = state.messages
@@ -907,11 +1030,9 @@ const server = createServer(async (req, res) => {
     return flat(res, { ok: true })
   }
   if (p === '/mail/inbox') {
-    return ok(res, [
-      { id: 'mi_0001', received_at: now(), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 停账号', status: 'CONFIRM_REQUIRED', trace_id: '01TRACEMOCK' },
-      { id: 'mi_0002', received_at: now(), route: '企点', from_addr: 'x@corp', subject: '格式不对', status: 'PARSE_FAILED', reason: 'bad template' },
-      { id: 'mi_0003', received_at: now(), route: '全局', from_addr: 'evil@x.com', subject: '越权', status: 'OP_DENIED', reason: 'NOT_ALLOWED:vault_write' },
-    ], { next_cursor: null })
+    // #58 排序 = `received_ms` 降序
+    const page = takePage(res, url, state.mailInbox, (x) => tsMs(x.received_at))
+    return page && okPage(res, page)
   }
   if ((mm = /^\/mail\/inbox\/([^/]+)$/.exec(p))) {
     return ok(res, {
@@ -923,10 +1044,9 @@ const server = createServer(async (req, res) => {
   }
   if (/^\/mail\/inbox\/[^/]+\/reparse$/.test(p)) return flat(res, { ok: true })
   if (p === '/mail/outbox') {
-    return ok(res, [
-      { id: 'mo_1', kind: 'digest', to: 'team@corp', subject: '[QTrade] 报价汇总', status: 'QUEUED', attempts: 0, next_attempt_at: now() },
-      { id: 'mo_2', kind: 'receipt', to: 'ops@corp', subject: 'Re: 停账号', status: 'RECEIPT_SENT', attempts: 1 },
-    ], { next_cursor: null })
+    // #61 排序 = `created_ms` 降序
+    const page = takePage(res, url, state.mailOutbox, (x) => tsMs(x.created_at))
+    return page && okPage(res, page)
   }
   if (/^\/mail\/outbox\/[^/]+\/(resend|discard)$/.test(p)) return flat(res, { ok: true })
   if (p === '/mail/cleanup/log') {
@@ -945,7 +1065,11 @@ const server = createServer(async (req, res) => {
     if (state.hmacKeys.some((k) => k.short_name === body.short_name)) {
       return fail(res, 400, 'INVALID_ARGS', '短名已被占用(全局唯一)', { reason: 'short_name_taken' })
     }
-    state.hmacKeys.push({ sender: body.sender, short_name: body.short_name, created_at: now() })
+    // 🔴 落的是 #67b 的**六键**行;`route_id` 为 null = 全局短名(#67 入参本来就没有 route)
+    state.hmacKeys.push({
+      short_name: body.short_name, sender: body.sender, route_id: null, enabled: true,
+      secret_ref: `vault://mail/hmac/cmd/${body.short_name}`, created_at: now(),
+    })
     return ok(res, { secret: `hmac_${Math.random().toString(36).slice(2)}` })
   }
   if ((mm = /^\/mail\/hmac-keys\/([^/]+)$/.exec(p)) && m === 'DELETE') {

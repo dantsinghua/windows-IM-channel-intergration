@@ -6,6 +6,8 @@ import { useAccountsStore } from '@/stores/accounts'
 import { useMessagesStore } from '@/stores/messages'
 import { useResourcesStore } from '@/stores/resources'
 import { useJobsStore } from '@/stores/jobs'
+import { useMailStore } from '@/stores/mail'
+import { useSettingsStore } from '@/stores/settings'
 import type { AccountStatePayload, AlertPayload, Message, QtEvent, ResourcePool } from '@/api/types'
 
 beforeEach(() => {
@@ -259,5 +261,118 @@ describe('jobs store(§11.21 [JOB])', () => {
     expect(s.isTerminal(s.byId.j1)).toBe(true)
     // R6-34:清出量字段是 freed_mb
     expect(s.byId.j1.result?.freed_mb).toBe(512)
+  })
+})
+
+/* ───────────────── C-42 分页:调用方**存不存游标、用不用游标** ─────────────────
+ *
+ * N-2 的根因不在 `requestList()`(它一直都回 `{items, nextCursor}`),而在**调用方把 nextCursor 丢了**。
+ * 下面几条就钉这一跳:store 必须存住游标、`more=true` 时把它回传、并**追加**而不是覆盖。
+ */
+
+/** 造一个按调用次序回不同页的 fetch;并记下每次请求的 URL 供断言 */
+function pagedFetch(pages: { data: unknown[]; next_cursor: string | null }[]) {
+  const urls: string[] = []
+  let i = 0
+  const fn = vi.fn(async (input: RequestInfo | URL) => {
+    urls.push(String(input))
+    const p = pages[Math.min(i, pages.length - 1)]
+    i += 1
+    return new Response(JSON.stringify({ ok: true, ...p }))
+  })
+  vi.stubGlobal('fetch', fn)
+  return urls
+}
+
+describe('C-42 分页:store 存游标并续页(N-2)', () => {
+  it('accounts:第一页存住 next_cursor,load(true) 带上它并追加', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 'a1', channel: 'qidian' }], next_cursor: 'cur-1' },
+      { data: [{ id: 'a2', channel: 'qidian' }], next_cursor: null },
+    ])
+    const s = useAccountsStore()
+    await s.load()
+    expect(s.nextCursor, '第一页的 next_cursor 被丢掉了(N-2 的原样)').toBe('cur-1')
+    expect(urls[0]).toContain('limit=')
+    expect(urls[0]).not.toContain('cursor=')
+
+    await s.load(true)
+    expect(urls[1], 'load(true) 没有把游标回传').toContain('cursor=cur-1')
+    expect(s.items.map((a) => a.id), '续页应当追加,不是覆盖').toEqual(['a1', 'a2'])
+    expect(s.nextCursor, '翻到底应当清空游标').toBeNull()
+  })
+
+  it('accounts:load() 不带 more 时回到第一页(不带游标、覆盖旧行)', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 'a1', channel: 'qidian' }], next_cursor: 'cur-1' },
+      { data: [{ id: 'a9', channel: 'qidian' }], next_cursor: 'cur-9' },
+    ])
+    const s = useAccountsStore()
+    await s.load()
+    await s.load()
+    expect(urls[1]).not.toContain('cursor=')
+    expect(s.items.map((a) => a.id)).toEqual(['a9'])
+  })
+
+  it('messages:会话列表有自己的一条翻页线(与消息列表的游标互不干扰)', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 's1', name: '群一', last_msg_at: 'b' }], next_cursor: 'sc-1' },
+      { data: [{ id: 's2', name: '群二', last_msg_at: 'a' }], next_cursor: null },
+    ])
+    const s = useMessagesStore()
+    await s.loadSessions()
+    expect(s.sessionsCursor).toBe('sc-1')
+    expect(s.nextCursor, '消息列表的游标不该被会话列表动到').toBeNull()
+
+    await s.loadSessions(true)
+    expect(urls[1]).toContain('cursor=sc-1')
+    expect(s.sessions.map((x) => x.id)).toEqual(['s1', 's2'])
+  })
+
+  it('mail:收件与发件各存各的游标,续页追加', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 'mi1' }], next_cursor: 'ic-1' },
+      { data: [{ id: 'mi2' }], next_cursor: null },
+    ])
+    const s = useMailStore()
+    await s.reloadInbox()
+    expect(s.inboxCursor).toBe('ic-1')
+    await s.reloadInbox(true)
+    expect(urls[1]).toContain('cursor=ic-1')
+    expect(s.inbox.map((r) => r.id)).toEqual(['mi1', 'mi2'])
+    expect(s.outboxCursor, '收件翻页不该动到发件的游标').toBeNull()
+  })
+
+  it('mail:发件同款', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 'mo1' }], next_cursor: 'oc-1' },
+      { data: [{ id: 'mo2' }], next_cursor: null },
+    ])
+    const s = useMailStore()
+    await s.reloadOutbox()
+    expect(s.outboxCursor).toBe('oc-1')
+    await s.reloadOutbox(true)
+    expect(urls[1]).toContain('cursor=oc-1')
+    expect(s.outbox.map((r) => r.id)).toEqual(['mo1', 'mo2'])
+  })
+})
+
+/* ───────────────── #88/#89:保存后用「本次提交的值」回填 ───────────────── */
+
+describe('settings store:保存后的回填(backend-api-3 §3)', () => {
+  it('restart_required 时用本次提交的值回填,并记下「重启后生效」', () => {
+    const s = useSettingsStore()
+    s.groups.api = { rate_default_per_min: 120, port: 17600 }
+    s.applySaved('api', { rate_default_per_min: 999 }, true)
+    // 🔴 关键:不是回头 GET(那会读回「当前生效值」= 旧值,让人以为没保存上)
+    expect(s.groups.api.rate_default_per_min).toBe(999)
+    expect(s.groups.api.port, '未提交的键保持原样').toBe(17600)
+    expect(s.isPendingRestart('api')).toBe(true)
+  })
+
+  it('restart_required=false 的组不挂「重启后生效」标记', () => {
+    const s = useSettingsStore()
+    s.applySaved('resources', { pools: {} }, false)
+    expect(s.isPendingRestart('resources')).toBe(false)
   })
 })
