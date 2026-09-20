@@ -171,10 +171,13 @@ def test_routes_get_and_put(rig):
 def test_template_defaults_and_preview(rig):
     r = rig.client.get("/api/v1/settings/mail/templates/defaults", headers=H())
     assert r.status_code == 200 and set(r.json()["data"]) >= {"ibquote-163-v1"}
-    r = rig.client.post("/api/v1/mail/templates/preview", headers=H(TOKEN_READ),
+    r = rig.client.post("/api/v1/mail/templates/default/preview", headers=H(TOKEN_READ),
                         json={"ctx": {"session_name": "固收群", "summary": "报价", "ts_cn": "09-20 10:00", "seq": 1,
                                       "text": "3M 1.52", "sender_name": "张三", "channel": "wechat",
                                       "account_id": "wx01", "seq_total": 1, "day_seq": 1, "msg_ts": "10:00",
                                       "revoked": "否"}})
     assert r.status_code == 200 and r.json()["subject"]
-    assert rig.client.post("/api/v1/mail/templates/preview", headers=H(TOKEN_READ), json={}).status_code == 400
+    # #104 路径带 {id}:空 body ⇒ 400(既没 ctx 也没 sample_message_id);老的无 id 路径已不存在 ⇒ 404 信封
+    assert rig.client.post("/api/v1/mail/templates/default/preview", headers=H(TOKEN_READ), json={}).status_code == 400
+    gone = rig.client.post("/api/v1/mail/templates/preview", headers=H(TOKEN_READ), json={})
+    assert gone.status_code == 404 and gone.json()["code"] == "NOT_FOUND"

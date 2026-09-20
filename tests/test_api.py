@@ -79,7 +79,9 @@ def test_auth_401_403_and_error_envelope(rig):
     r = c.get("/api/v1/accounts")
     assert r.status_code == 401
     body = r.json()
-    assert body == {"ok": False, "code": "UNAUTHORIZED", "error": {"message": body["error"]["message"], "reason": "missing_token", "retryable": False, "needs_human": False}, "trace_id": None}
+    # 总控裁决:trace_id 恒非空(错误信封与成功响应同名字段,现场拿它去 audit_log 里对行)
+    assert body == {"ok": False, "code": "UNAUTHORIZED", "error": {"message": body["error"]["message"], "reason": "missing_token", "retryable": False, "needs_human": False}, "trace_id": body["trace_id"]}
+    assert isinstance(body["trace_id"], str) and body["trace_id"]
     assert c.get("/api/v1/accounts", headers=H("bad")).status_code == 401
     r = c.post("/api/v1/accounts/qd01/send", headers=H(TOKEN_READ), json={"session": f"qd01:{PEER}", "text": "x", "idempotency_key": "k"})
     assert r.status_code == 403 and r.json()["code"] == "FORBIDDEN" and r.json()["error"]["reason"] == "level_insufficient"

@@ -140,3 +140,13 @@ def rig3(tmp_path) -> Rig:
     r = make_rig(tmp_path)
     yield r
     r.store.close()
+
+
+def jbody(resp):
+    """响应体去掉请求级 ``trace_id``。
+
+    成功响应统一带 ``trace_id``(总控裁决:与错误信封同名字段,让界面上的那串能直接在 ``audit_log`` 里查到),
+    所以「逐字比对键集」的断言要先把它摘掉 —— 断言的是**业务键集**,不是有没有 trace。
+    """
+    body = resp.json()
+    return {k: v for k, v in body.items() if k != "trace_id"} if isinstance(body, dict) else body

@@ -20,7 +20,9 @@ from email.utils import formatdate
 from typing import Any, Optional
 
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import __version__ as AGENT_VERSION
 from ..config import WS_PING_INTERVAL_S
@@ -31,6 +33,7 @@ from ..maintenance import DiskFullError
 from ..models import Command, CommandOrigin, RESULT_CODES
 from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
+from .routes_ext import register_ext
 from .serialize import (account_view, command_view, decode_cursor, encode_cursor, message_view, result_view, session_view,
                         stored_result_view)
 
@@ -77,6 +80,23 @@ def _parse_time(v: Optional[str]) -> Optional[int]:
     return int(datetime.fromisoformat(v).timestamp() * 1000)
 
 
+async def _ws_reject(ws: WebSocket, code: int, reason: str) -> None:
+    """§3.4.7:握手被拒时也要让客户端**看得到关闭码**(4401/4403…)。
+
+    🔴 在 ``accept()`` **之前** ``close()``,Starlette/uvicorn 会退化成「拒绝握手」(HTTP 403),
+    浏览器与 ws 客户端只看得到 **1006**(异常关闭)—— 控制台 `ws.ts` 的 `onAuthFailed` 因此永远不触发,
+    只会按退避无限重连(联调交接 E-05)。所以这里先 ``accept()`` 建连,再带码关闭。
+    """
+    try:
+        await ws.accept()
+    except Exception:                    # 对端已经走了:没有可送达的关闭码,直接收手
+        return
+    try:
+        await ws.close(code=code, reason=reason)
+    except Exception:
+        pass
+
+
 def create_api(agent) -> FastAPI:
     """``agent`` = app.AgentApp(持 store/bus/events/health/scheduler/cfg/clock/adapters)。"""
     cfg = agent.cfg
@@ -89,6 +109,10 @@ def create_api(agent) -> FastAPI:
     @app.middleware("http")
     async def versions_and_audit(request: Request, call_next):
         started = agent.clock()
+        # 🔴 每个请求一个 trace_id:调用方给了 `X-Trace-Id` 就采纳它,否则本地生成。
+        # 它同时进**审计行**与**响应体**(成功响应也带,见 `_inject_trace_id`),这样现场拿着界面上那串
+        # 就能直接在 audit_log 里找到对应行(联调交接 S-16:此前成功响应不回 trace_id,两边对不上)。
+        request.state.trace_id = (request.headers.get("X-Trace-Id") or "").strip() or ulid(started)
         api_min = request.headers.get("X-QT-Api-Min")
         if api_min:
             try:
@@ -97,7 +121,8 @@ def create_api(agent) -> FastAPI:
             except ValueError:
                 want_major = want_minor = have_major = have_minor = 0
             if want_major != have_major or want_minor > have_minor:
-                resp = JSONResponse(status_code=426, content=_error_body("UPGRADE_REQUIRED", f"需要 API {api_min},当前 {cfg.api.api_version}", reason="api_version"))
+                resp = JSONResponse(status_code=426, content=_error_body("UPGRADE_REQUIRED", f"需要 API {api_min},当前 {cfg.api.api_version}",
+                                                                         reason="api_version", trace_id=request.state.trace_id))
                 return _with_version_headers(resp)
         # §3.4 通用行:「鉴权 `Authorization: Bearer <token>`;**公网入站加 HMAC(§3.5)**」——
         # HMAC 是与 Bearer **并列的鉴权方式,适用于 `/api/v1` 全部端点**,不只是写指令那两个。
@@ -112,14 +137,16 @@ def create_api(agent) -> FastAPI:
                 request.state.hmac = res
             except ApiError as e:
                 resp = JSONResponse(status_code=e.http_status, content=_error_body(e.code, e.message, reason=e.reason,
-                                                                                   retryable=e.retryable, needs_human=e.needs_human, extra=e.extra))
+                                                                                   retryable=e.retryable, needs_human=e.needs_human,
+                                                                                   trace_id=request.state.trace_id, extra=e.extra))
                 resp.headers["Date"] = formatdate(agent.clock() / 1000, usegmt=True)      # §3.5:让对方校时
                 return _with_version_headers(resp)
         try:
             response = await call_next(request)
         except ApiError as e:
             response = JSONResponse(status_code=e.http_status, content=_error_body(e.code, e.message, reason=e.reason, retryable=e.retryable,
-                                                                                  needs_human=e.needs_human, extra=e.extra))
+                                                                                  needs_human=e.needs_human, trace_id=request.state.trace_id,
+                                                                                  extra=e.extra))
         if has_hmac_headers(dict(request.headers)):
             # §3.5 时钟容差:把服务端时间放进 Date 头让对方校时(成功与 401 skew 都要带,否则对方没法自校)
             response.headers["Date"] = formatdate(agent.clock() / 1000, usegmt=True)
@@ -133,7 +160,37 @@ def create_api(agent) -> FastAPI:
                                                  "ip": request.client.host if request.client else None}, now_ms=agent.clock())
             except Exception as e:     # 审计失败不影响响应
                 log.warning("audit_log 写入失败: %s", e)
-        return _with_version_headers(response)
+        # `#72 /system/health` 的键集被 02 逐字定死(免鉴权来源恰五个布尔键),**不往里塞 trace_id**
+        if request.url.path == f"{API_PREFIX}/system/health":
+            return _with_version_headers(response)
+        return _with_version_headers(await _inject_trace_id(response, request.state.trace_id))
+
+    async def _inject_trace_id(response: Response, trace_id: str) -> Response:
+        """给 JSON 响应体补 ``trace_id``(**成功响应也带**,总控裁决;与错误信封同名字段)。
+
+        已经自带非空 ``trace_id`` 的(``CommandResult``、指令 202)原样不动 —— 那是指令的 trace,比请求级的更准。
+        非 JSON 响应(截图字节、CSV 导出)一个字节都不碰。``call_next`` 回的是 streaming 响应,
+        读完 ``body_iterator`` 后必须重建一个普通 ``Response``(并去掉旧的 ``content-length``,否则长度对不上)。
+        """
+        if not response.headers.get("content-type", "").startswith("application/json"):
+            return response
+        if hasattr(response, "body_iterator"):
+            raw = b"".join([chunk async for chunk in response.body_iterator])       # type: ignore[attr-defined]
+            rebuilt = True
+        else:
+            raw, rebuilt = bytes(response.body), False
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and not data.get("trace_id"):
+            data["trace_id"] = trace_id
+            raw = json.dumps(data, ensure_ascii=False).encode()
+            rebuilt = True
+        if not rebuilt:
+            return response
+        headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+        return Response(content=raw, status_code=response.status_code, headers=headers)
 
     def _with_version_headers(resp: Response) -> Response:
         resp.headers["X-QT-Api-Version"] = cfg.api.api_version
@@ -151,7 +208,38 @@ def create_api(agent) -> FastAPI:
         """§2.8.8 / §3.2 R-02:磁盘满 ⇒ HTTP **507** + 结果码 ``DISK_FULL``,信封带 evidence 三个数。"""
         return _with_version_headers(JSONResponse(status_code=507, content=_error_body(
             "DISK_FULL", e.message, reason="disk_full", retryable=False, needs_human=True,
+            trace_id=getattr(request.state, "trace_id", None),
             extra={"hint_actions": ["open_env", "run_cleanup"], "evidence": e.evidence()})))
+
+    #: 未知路由 / 方法不对时的结果码(00 §10;FastAPI 默认的 `{"detail": "Not Found"}` **不是**本项目的信封,
+    #: 控制台的 `readEnvelope` 见到它只能退化成「请求失败(HTTP 404)」,trace_id 也对不上日志)
+    HTTP_EXC_CODES = {400: "INVALID_ARGS", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND",
+                      405: "METHOD_NOT_ALLOWED", 409: "RESOURCE_EXHAUSTED", 429: "RATE_LIMITED", 503: "NOT_READY"}
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception(request: Request, e: StarletteHTTPException):
+        """把框架自己抛的 HTTPException(未知路由 404、方法不对 405…)包成 00 §10 信封。"""
+        code = HTTP_EXC_CODES.get(e.status_code, "INTERNAL" if e.status_code >= 500 else "INVALID_ARGS")
+        detail = e.detail if isinstance(e.detail, str) else json.dumps(e.detail, ensure_ascii=False)
+        message = {404: f"路由不存在:{request.method} {request.url.path}",
+                   405: f"方法不被允许:{request.method} {request.url.path}"}.get(e.status_code, detail)
+        reason = {404: "unknown_route", 405: "method_not_allowed"}.get(e.status_code, "http_error")
+        resp = JSONResponse(status_code=e.status_code, content=_error_body(
+            code, message, reason=reason, trace_id=getattr(request.state, "trace_id", None)))
+        for k, v in (getattr(e, "headers", None) or {}).items():       # 405 的 Allow 头要留着
+            resp.headers[k] = v
+        return _with_version_headers(resp)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, e: RequestValidationError):
+        """422 校验错误同样包成信封:``INVALID_ARGS`` + 每条 ``details[].pointer``(00 §10 的 pointer 口径)。"""
+        details = []
+        for err in e.errors():
+            loc = [str(x) for x in (err.get("loc") or []) if str(x) not in ("body", "query", "path", "header")]
+            details.append({"pointer": "/" + "/".join(loc), "message": err.get("msg", ""), "kind": err.get("type", "")})
+        return _with_version_headers(JSONResponse(status_code=422, content=_error_body(
+            "INVALID_ARGS", "入参校验未过", reason="validation_error",
+            trace_id=getattr(request.state, "trace_id", None), extra={"details": details})))
 
     # ------------------------------------------------------------------ 鉴权
     def _principal(request: Request, required: str = "read") -> Principal:
@@ -169,10 +257,29 @@ def create_api(agent) -> FastAPI:
         """兼容别名:HMAC 的签验已提前到 middleware,这里只是保留调用点的 ``await`` 形态。"""
         return _principal(request, required)
 
+    def _grace_client(token: str) -> Optional[dict[str, Any]]:
+        """#92 轮换的**旧凭据宽限期**:``api_clients`` 只有一列 ``secret_hash``,旧 hash 与到期时刻
+        统一挂在 ``settings['api_clients.grace']`` 的 ``{app_id: {old_hash, until_ms}}`` 里(单键 map,
+        免得为了查一次宽限去扫 settings 的键前缀)。过期、已吊销、已停用的一律不认。"""
+        grace = agent.store.settings_get("api_clients.grace") or {}
+        if not isinstance(grace, dict) or not grace:
+            return None
+        h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = agent.clock()
+        for app_id, blob in grace.items():
+            if not isinstance(blob, dict) or blob.get("old_hash") != h:
+                continue
+            if int(blob.get("until_ms") or 0) <= now:
+                return None
+            row = agent.store.api_client_get(app_id)
+            if row and row.get("enabled") and not row.get("revoked_ms"):
+                return row
+        return None
+
     def _principal_from_token(token: str, required: str, request) -> Principal:
         if not token:
             raise ApiError(401, "UNAUTHORIZED", "缺少 Bearer 令牌", reason="missing_token")
-        row = agent.store.api_client_by_token(token)
+        row = agent.store.api_client_by_token(token) or _grace_client(token)
         if row is None:
             raise ApiError(401, "UNAUTHORIZED", "令牌无效或已过期", reason="bad_token")
         p = principal_from_row(row, transport="local" if (request.client and request.client.host in ("127.0.0.1", "::1")) else "http")
@@ -805,12 +912,60 @@ def create_api(agent) -> FastAPI:
         # monitor 采样(health_samples 的写入方)本期没人做 ⇒ 值一律 null,**不编造**(04 §2.4.5)。
         procs = {"agent_mb": None, "winagent_mb": None, "console_mb": None}
         procs_detail = [{"name": n, "rss_mb": None, "cpu_pct": None} for n in ("agent", "winagent", "console")]
-        return {"ok": True, "disk_watermark": agent.maintenance.watermark_snapshot(),
+        watermark = dict(agent.maintenance.watermark_snapshot())
+        watermark.setdefault("vhdx_grown_mb", None)       # 02 #77 列了这一键;VHDX 增量没有采集执行体 ⇒ null
+        return {"ok": True, "disk_watermark": watermark,
                 "mem_watermark": {"level": agent.pressure.level, "avail_mb": agent.pressure.avail_mb,
                                   "lru_suggest": agent.pressure.lru_suggest() if agent.pressure.blocked() else []},
                 "budget_vs_actual": budget, "pools": snap["pools"], "realtime": snap["realtime"],
+                "hardware": _hardware_snapshot(),
                 "ours": {"procs": procs, "procs_detail": procs_detail,
-                         "accounts": [{"id": b["id"], "quota_mb": b["quota_mb"], "rss_mb": None, "cpu_pct": None} for b in budget]}}
+                         # 02 #77 的 `ours.accounts[]` 列的是 anon_mb/current_mb/cpu_pct/quota_mb
+                         # (`rss_mb` 是 budget_vs_actual 那一组的键);采样缺失时一律 null,不编造
+                         "accounts": [{"id": b["id"], "quota_mb": b["quota_mb"], "anon_mb": None, "current_mb": None,
+                                       "rss_mb": None, "cpu_pct": None} for b in budget],
+                         "wechat": {"chatlog_mb": None, "wechat_pc_mb": None},      # 微信侧体积没有采集方(04 §2.4.5)
+                         "storage": _storage_snapshot()}}
+
+    def _hardware_snapshot() -> dict[str, Any]:
+        """#77 的 ``hardware`` 组(整机):``{mem, cpu, disks}``。
+
+        数据源 = monitor 采样器的 ``ProcReader``(读 ``/proc/meminfo``);拿不到的项一律 ``null``,
+        ``vmmem_mb`` 是 Windows 侧的量、Agent 这边根本没有来源 ⇒ 恒 ``null``(04 §2.4.5「不编造」)。
+        """
+        reader = getattr(agent.sampler, "_reader", None)
+        mem: dict[str, Any] = {"total_mb": None, "used_mb": None, "avail_mb": agent.pressure.avail_mb, "vmmem_mb": None}
+        load_pct: Optional[float] = None
+        if reader is not None:
+            try:
+                raw = reader.meminfo() or {}         # 键 = /proc/meminfo 原名(MemTotal/MemAvailable),单位已换算成 MB
+                total, avail = raw.get("MemTotal"), raw.get("MemAvailable")
+                mem["total_mb"] = total
+                mem["avail_mb"] = avail if avail is not None else mem["avail_mb"]
+                mem["used_mb"] = round(total - avail, 1) if (total is not None and avail is not None) else None
+            except Exception as e:
+                log.debug("#77 读整机内存失败:%s", e)
+            try:
+                load_pct = reader.cpu_pct()
+            except Exception:
+                load_pct = None
+        disks: list[dict[str, Any]] = []
+        data_dir = agent.data_dir
+        try:
+            du = shutil.disk_usage(data_dir)
+            disks.append({"mount": data_dir, "total_mb": du.total // 1048576, "free_mb": du.free // 1048576})
+        except OSError:
+            pass
+        return {"mem": mem, "cpu": {"logical_cores": os.cpu_count(), "load_pct": load_pct}, "disks": disks}
+
+    def _storage_snapshot() -> dict[str, Any]:
+        """#77 的 ``ours.storage``:只报**量得到**的两项(agent.db、media),其余无采集方 ⇒ ``null``。"""
+        try:
+            sizes = agent.maintenance.sizes()
+        except Exception:
+            sizes = {}
+        return {"db_mb": sizes.get("db_size_mb"), "media_mb": sizes.get("media_size_mb"),
+                "mail_mb": None, "accounts_mb": None, "backup_mb": None, "vhdx_mb": None}
 
     @app.post(f"{API_PREFIX}/system/backup")
     async def system_backup(request: Request):
@@ -853,7 +1008,13 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/jobs/{{job_id}}")
     async def get_job(request: Request, job_id: str):
-        """#107:凡 ``202 {job_id}`` 的端点统一用这套查(§3.4.9 R-21)。"""
+        """#107:凡 ``202 {job_id}`` 的端点统一用这套查(§3.4.9 R-21)。
+
+        🔴 **出参的时间键是 `*_at`(ISO 8601 带时区偏移)**,不是库列的 `*_ms` —— 02 #107 逐字定死
+        ``created_at/updated_at/expires_at``,00 §6/§7 也明写「API 与事件的时间一律 ISO 8601」;
+        毫秒整数只活在 ``jobs`` 表的列上(联调交接 S-05)。``actor/attempt_count/params/account_id``
+        是 02 没列但对排障有用的补充键,原样保留。
+        """
         _principal(request, "read")
         row = agent.store.job_get(job_id)
         if row is None:
@@ -861,6 +1022,9 @@ def create_api(agent) -> FastAPI:
         row["params"] = json.loads(row.pop("params_json") or "{}")
         row["result"] = json.loads(row.pop("result_json") or "null")
         row["error"] = json.loads(row.pop("error_json") or "null")
+        for col, key in (("created_ms", "created_at"), ("updated_ms", "updated_at"), ("expires_ms", "expires_at")):
+            ms = row.pop(col, None)
+            row[key] = iso8601(ms) if ms is not None else None
         return {"ok": True, "data": row}
 
     @app.post(f"{API_PREFIX}/jobs/{{job_id}}/cancel")
@@ -1370,6 +1534,12 @@ def create_api(agent) -> FastAPI:
         mail.reload()
         return {"ok": True, "written": written}
 
+    # ---- 02 §3.4 里此前没有执行体的那批端点(#24/#36/#51/#74/#75/#78/#80/#84/#85/#86/#87/#90~#93)。
+    #      🔴 注册点**必须在 `/settings/{group}` 兜底路由之前**:`/settings/api-clients` 与 `{group}` 都是
+    #      FULL 匹配,FastAPI 按注册顺序取先到的,晚注册就会被 `{group}` 当成「未知配置组」吃掉。
+    register_ext(app, agent=agent, cfg=cfg, prefix=API_PREFIX, principal=_principal,
+                 json_or_empty=_json_or_empty, caps_by_op=caps_by_op)
+
     # ---- #88/#89 的 `{group}` 兜底路由必须**排在全部具体 `/settings/*` 路由之后**(FastAPI 按注册顺序匹配,
     #      否则 `/settings/webhooks` 会先被 `{group}` 吃掉)
     @app.get(f"{API_PREFIX}/settings/{{group}}")
@@ -1746,17 +1916,50 @@ def create_api(agent) -> FastAPI:
         from ..mail.templates import DEFAULT_TEMPLATES
         return {"ok": True, "data": DEFAULT_TEMPLATES}
 
-    @app.post(f"{API_PREFIX}/mail/templates/preview")
-    async def mail_template_preview(request: Request):
-        """#104,级别 R:用当前出站模板渲染一条消息(不入 ``mail_outbox``、不发送)。"""
-        _principal(request, "read")
-        body = await request.json()
+    @app.post(f"{API_PREFIX}/mail/templates/{{tpl_id}}/preview")
+    async def mail_template_preview(request: Request, tpl_id: str):
+        """#104,级别 R:用指定模板渲染一条消息(不入 ``mail_outbox``、不发送)。
+
+        🔴 **路径带 `{id}`**(02 #104 逐字;联调交接第 2 节:此前实现成了无 id 的 `/mail/templates/preview`,
+        控制台照 02 调必 404)。``{id}`` = ``mail_templates.id``,``"default"`` = 随包出站模板。
+        入参二选一:``{sample_message_id}``(照 02,从库里取一条真消息组装上下文)或 ``{ctx}``(直接给 12 核心占位符的取值)。
+        """
+        p = _principal(request, "read")
+        body = await _json_or_empty(request)
+        tpl = cfg.mail.template_out
+        if tpl_id not in ("default", "current"):
+            if not tpl_id.isdigit():
+                raise ApiError(400, "INVALID_ARGS", "模板 id 须为整数或 'default'", reason="bad_template_id",
+                               extra={"details": [{"pointer": "/id"}]})
+            _template_or_404(int(tpl_id))       # 存在性校验:不存在 → 404,不静默回退到随包模板
         ctx = body.get("ctx")
-        if not isinstance(ctx, dict):
-            raise ApiError(400, "INVALID_ARGS", "ctx 必填(12 核心占位符的取值)", reason="bad_ctx", extra={"details": [{"pointer": "/ctx"}]})
+        warnings: list[str] = []
+        fields_used: list[str] = []
+        if ctx is None:
+            mid = body.get("sample_message_id")
+            if not isinstance(mid, str) or not mid:
+                raise ApiError(400, "INVALID_ARGS", "须给 sample_message_id 或 ctx", reason="bad_sample",
+                               extra={"details": [{"pointer": "/sample_message_id"}]})
+            row = agent.store.get_message_full(mid)
+            if row is None or not p.allows_account(row["account_id"]):
+                raise ApiError(404, "TARGET_NOT_FOUND", f"消息不存在:{mid}")
+            view = message_view(row)
+            ctx = {"account_id": view["account_id"], "channel": view["channel"], "session": (view["session"] or {}).get("name") or "",
+                   "session_id": (view["session"] or {}).get("id") or "", "sender": (view["sender"] or {}).get("name") or "",
+                   "ts": view["ts"] or "", "text": view["text"] or "", "message_id": view["id"],
+                   "ext_msg_id": view["ext_msg_id"] or "", "dir": view["dir"], "type": view["type"], "state": view["state"]}
+            fields_used = sorted(ctx)
+        elif not isinstance(ctx, dict):
+            raise ApiError(400, "INVALID_ARGS", "ctx 须为对象(12 核心占位符的取值)", reason="bad_ctx",
+                           extra={"details": [{"pointer": "/ctx"}]})
+        else:
+            fields_used = sorted(ctx)
+        if tpl_id not in ("default", "current"):
+            warnings.append(f"本期渲染恒用随包出站模板({cfg.mail.template_out});表里的模板 id={tpl_id} 只做存在性校验")
         from ..mail.templates import render_message_mail
-        rendered = render_message_mail(cfg.mail.template_out, ctx)
-        return {"ok": True, "subject": rendered.subject, "body_text": rendered.body_text, "body_html": rendered.body_html}
+        rendered = render_message_mail(tpl, ctx)
+        return {"ok": True, "id": tpl_id, "subject": rendered.subject, "body_text": rendered.body_text,
+                "body_html": rendered.body_html, "fields_used": fields_used, "warnings": warnings}
 
     @app.get(f"{API_PREFIX}/settings/mail/routes")
     async def mail_routes_list(request: Request):
@@ -1797,7 +2000,7 @@ def create_api(agent) -> FastAPI:
                                               client_ip=ws.client.host if ws.client else None)
                 p = res.principal
             except ApiError:
-                await ws.close(code=4401)
+                await _ws_reject(ws, 4401, "HMAC 签名校验未过")
                 return
         if p is None:
             token = ""
@@ -1807,17 +2010,17 @@ def create_api(agent) -> FastAPI:
             token = token or q.get("token", "")
             row = agent.store.api_client_by_token(token) if token else None
             if row is None:
-                await ws.close(code=4401)
+                await _ws_reject(ws, 4401, "缺少或无效的令牌")
                 return
             p = principal_from_row(row, transport=transport)
         await ws.accept()
         try:
             first = await asyncio.wait_for(ws.receive_json(), timeout=10)
         except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
-            await ws.close(code=4400)
+            await ws.close(code=4400, reason="10 秒内未收到合法的首帧订阅")
             return
         if not isinstance(first, dict) or not isinstance(first.get("subscribe"), dict):   # R6-53:首帧必须是含 subscribe 对象的 JSON
-            await ws.close(code=4400)
+            await ws.close(code=4400, reason="首帧须为 {subscribe:{…}}")
             return
         sub = first["subscribe"]
         events_f = set(sub.get("events") or [])

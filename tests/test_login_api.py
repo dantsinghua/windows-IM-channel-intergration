@@ -8,7 +8,7 @@ from starlette.testclient import TestClient
 
 from qtrade_agent.alerts import ACCOUNT_OFFLINE
 from qtrade_agent.config import AccountsConfig, AgentConfig
-from tests.conftest import Clock, make_rig
+from tests.conftest import Clock, jbody, make_rig
 
 TA, TW, TR = "admin-token", "write-token", "read-token"
 
@@ -154,10 +154,10 @@ def test_prompt_and_login_cancel(api):
     ls = r.json()["login_session_id"]
     assert c.post(f"/api/v1/accounts/{aid}/login", json={"secret": "pw"}, headers=H(TW)).json()["error"]["reason"] == "busy"
     r = c.post(f"/api/v1/accounts/{aid}/login/cancel", json={"login_session_id": "ls_STALE"}, headers=H(TW))
-    assert r.status_code == 200 and r.json() == {"ok": True, "cancelled": False, "stale": True, "current_login_session_id": ls}      # 不误杀
+    assert r.status_code == 200 and jbody(r) == {"ok": True, "cancelled": False, "stale": True, "current_login_session_id": ls}      # 不误杀
     assert st.get_account_full(aid)["state"] == "logging_in"
     r = c.post(f"/api/v1/accounts/{aid}/login/cancel", json={"login_session_id": ls}, headers=H(TW))
-    assert r.json() == {"ok": True, "cancelled": True, "stale": False}
+    assert jbody(r) == {"ok": True, "cancelled": True, "stale": False}
     a = st.get_account_full(aid)
     assert a["state"] == "login_required" and a["state_code"] == "WAIT_PASSWORD" and not rig.agent.accounts.busy(aid)
     assert c.get(f"/api/v1/accounts/{aid}/prompt?login_session_id={ls}", headers=H(TR)).json()["kind"] is None       # 那一次已结束
@@ -179,7 +179,7 @@ def test_running_account_prompt_is_null_and_stopped_cannot_login(api):
     c, st = rig.client, rig.store
     aid = create_and_start(rig)
     rig.agent.accounts.transition(aid, "running")
-    assert c.get(f"/api/v1/accounts/{aid}/prompt", headers=H(TR)).json() == {"ok": True, "kind": None}
+    assert jbody(c.get(f"/api/v1/accounts/{aid}/prompt", headers=H(TR))) == {"ok": True, "kind": None}
     st.transition(aid, "stopped")
     assert c.post(f"/api/v1/accounts/{aid}/login", json={"secret": "x"}, headers=H(TW)).json()["error"]["reason"] == "bad_state"
 

@@ -7,7 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from qtrade_agent.config import AgentConfig, RuntimeConfig
-from tests.conftest import Clock, make_rig
+from tests.conftest import Clock, jbody, make_rig
 
 TOKEN_ADMIN, TOKEN_WRITE, TOKEN_READ = "admin-token", "write-token", "read-token"
 
@@ -131,7 +131,7 @@ def test_start_sequence_qidian_no_skip(api):
     c, st, adb, containers = rig.client, rig.store, rig.adb, rig.containers
     create(c)
     r = c.post("/api/v1/accounts/qd01/start", headers=H(TOKEN_WRITE))
-    assert r.status_code == 202 and r.json() == {"ok": True, "state": "starting"}
+    assert r.status_code == 202 and jbody(r) == {"ok": True, "state": "starting"}
     rig.idle("qd01")
     assert rig.states("qd01") == ["created", "provisioning", "starting", "login_required"]
     a = st.get_account_full("qd01")
@@ -180,7 +180,7 @@ def test_vault_offline_with_saved_credential_is_error_vault_unavailable(api):
     a = c.get("/api/v1/accounts/qd01", headers=H()).json()["data"]
     assert a["state"] == "error" and a["state_code"] == "VAULT_UNAVAILABLE" and isinstance(a["error_since_ms"], int)
     s = c.get("/api/v1/accounts/qd01/state", headers=H(TOKEN_READ)).json()
-    assert set(s) == {"ok", "state", "state_code", "state_reason", "adapter_state", "last_seen_at", "error_since_ms"} and s["error_since_ms"] == a["error_since_ms"]
+    assert set(s) - {"trace_id"} == {"ok", "state", "state_code", "state_reason", "adapter_state", "last_seen_at", "error_since_ms"} and s["error_since_ms"] == a["error_since_ms"]
     ev = st.list_events(event="account_state", account_id="qd01")[-1]["payload"]
     assert ev["error_since_ms"] == a["error_since_ms"]                             # 三处同值
     # 离开 error(再 start)→ 同事务清 NULL;error 可 start
@@ -299,7 +299,7 @@ def test_delete_is_soft_and_requires_label_confirm(api):
     r = c.delete("/api/v1/accounts/qd01?confirm=错的", headers=H())
     assert r.status_code == 400 and r.json()["error"]["reason"] == "confirm_mismatch"
     r = c.delete("/api/v1/accounts/qd01?confirm=张三-固收", headers=H())
-    assert r.status_code == 200 and r.json() == {"ok": True, "deleted": True, "data_kept": True, "id": "qd01"}
+    assert r.status_code == 200 and jbody(r) == {"ok": True, "deleted": True, "data_kept": True, "id": "qd01"}
     assert c.get("/api/v1/accounts/qd01", headers=H()).status_code == 404
     assert c.get("/api/v1/accounts", headers=H()).json()["data"] == []
     rows = c.get("/api/v1/accounts?include_deleted=true", headers=H()).json()["data"]
@@ -339,7 +339,7 @@ def test_resources_endpoint_and_state_endpoint(api):
     assert set(b["pools"]) == {"wsl", "windows"} and b["pools"]["wsl"]["used_mb"] == 2560 and b["can_add"]["qidian"] == 2 and b["accounts_by_channel"] == {"qidian": 1}
     assert b["pools"]["windows"]["wechat_slots"]["pending_login_session_id"] == "" and b["pools"]["windows"]["wechat_slots"]["pending_expires_at"] is None
     s = c.get("/api/v1/accounts/qd01/state", headers=H(TOKEN_READ)).json()
-    assert s == {"ok": True, "state": "created", "state_code": "", "state_reason": "", "adapter_state": "created", "last_seen_at": None, "error_since_ms": None}
+    assert {k: v for k, v in s.items() if k != "trace_id"} == {"ok": True, "state": "created", "state_code": "", "state_reason": "", "adapter_state": "created", "last_seen_at": None, "error_since_ms": None}
     assert c.get("/api/v1/accounts/zz99/state", headers=H()).status_code == 404
 
 
