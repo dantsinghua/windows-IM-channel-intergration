@@ -2,7 +2,7 @@
 # QTrade 发行版 qtrade 的 rootfs.tar —— 构建编排
 #
 # 规格:docs/03 §2.7(发行版导入与首启)、§2.2.1(manifest / rootfs_contents / G-10 / G-11)、
-#       docs/02 §2.1(Agent 进程部署)、docs/05 §2.5.1(设备身份档案库)
+#       docs/02 §2.1(Agent 进程部署)、docs/05 §2.5.1 + §7(设备身份档案库与其落盘路径)
 #
 # 产物:rootfs.tar —— 给 `wsl --import qtrade … --version 2` 吃的完整文件系统。
 #       同时把 G-10 的内容清单写进 rootfs 内的 /etc/qtrade/contents.json,
@@ -136,8 +136,15 @@ APK_SRC="$SOURCE_ROOT/third_party/apk/ADBKeyboard.apk"
 cp -f "$APK_SRC" "$P/ADBKeyboard.apk"
 APK_VERSION="$(cat "$SOURCE_ROOT/third_party/apk/.version" 2>/dev/null || echo unknown)"
 
+# 机型档案库 —— 🔴 落点 = docs/05 §7 `[device_profiles] library` 的
+# `/opt/qtrade/agent/data/device_profiles.json`(裁决 00 §15g R6-62 Ⅶ②,文档不改)。
+# Dockerfile 的 COPY 与下面 contents.json 的 path 必须与它、以及 Agent 侧的配置默认值
+# `src/qtrade_agent/config.py` `DeviceProfilesConfig.library` 三处逐字同值 ——
+# 落错目录不会报错,Agent 只是回落到内置 10 条小清单并记一条 ERROR(构建期有自检拦它)。
 cp -f "$HERE/profiles/device_profiles.json" "$P/device_profiles.json"
 PROFILES_VERSION="$(jq -r '.version' "$P/device_profiles.json")"
+PROFILES_COUNT="$(jq -r '.templates | length' "$P/device_profiles.json")"
+say "    机型档案库 $PROFILES_VERSION,$PROFILES_COUNT 条 → /opt/qtrade/agent/data/device_profiles.json"
 
 # ── 2. docker build ─────────────────────────────────────────────────────────
 say "[2/6] docker build $IMAGE_TAG"
@@ -224,7 +231,7 @@ jq -n \
         scrcpy_server:   { path: "/opt/qtrade/scrcpy/scrcpy-server", version: $scrcpy_ver, sha256: $scrcpy_sha },
         frida_server:    { path: ("/opt/qtrade/frida/" + $frida_name), version: $frida_ver, sha256: $frida_sha },
         adbkeyboard_apk: { path: "/opt/qtrade/apk/ADBKeyboard.apk", version: $apk_ver, sha256: $apk_sha },
-        device_profiles: { path: "/opt/qtrade/profiles/device_profiles.json", version: $prof_ver, sha256: $prof_sha }
+        device_profiles: { path: "/opt/qtrade/agent/data/device_profiles.json", version: $prof_ver, sha256: $prof_sha }
      }' > "$STAGE/etc/qtrade/contents.json"
 
 # CI 要把同一份填进 manifest.rootfs_contents(§2.2.1「两处必须逐字一致」),

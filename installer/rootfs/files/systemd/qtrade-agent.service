@@ -5,6 +5,16 @@ Documentation=file:///opt/qtrade/agent
 # 账号恢复延后 —— 所以是 After= 而不是 Requires=。
 After=network-online.target docker.service
 Wants=network-online.target
+# 迁移失败时 Agent 主动拒绝启动(02 §2.1 第 4 步：数据安全高于可用性)。
+# 那是 exit≠0 的正常路径，Restart=always 会重试 —— 由 StartLimit 把它挡成「失败」
+# 而不是无限重启刷日志。
+# 🔴 这两个键属 **[Unit]**(systemd ≥230；本发行版 249)。此前误写在 [Service] 里被
+#    systemd 静默忽略 ⇒ StartLimitIntervalSec 落回默认 10 s，而 RestartSec=5 ⇒ 10 s 窗口内
+#    最多 2 次启动、永远达不到 burst 阈值 ⇒ start limit 永不触发：单元无限 auto-restart 刷
+#    journal，`systemctl is-active` 永远停在 activating/auto-restart 而不是 failed，
+#    监控与人工排障都被误导。(独立端到端测试 D-02)
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=exec
@@ -17,11 +27,9 @@ ExecStart=/opt/qtrade/agent/venv/bin/python -m qtrade_agent.main \
     --db /var/lib/qtrade/agent.db
 Restart=always
 RestartSec=5
-# 迁移失败时 Agent 主动拒绝启动(02 §2.1 第 4 步：数据安全高于可用性)。
-# 那是 exit≠0 的正常路径，Restart=always 会重试 —— 由 StartLimit 把它挡成「失败」
-# 而不是无限重启刷日志。
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# ⚠️ StartLimitIntervalSec / StartLimitBurst 不在本段 —— 它们属 [Unit]（systemd ≥230），
+#    写在 [Service] 里会被静默忽略（`Unknown key name … in section 'Service', ignoring.`）。
+#    见 [Unit] 段末尾那两行与其注释。
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=qtrade-agent

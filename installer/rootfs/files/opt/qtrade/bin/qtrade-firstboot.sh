@@ -1,13 +1,15 @@
 #!/bin/bash
-# QTrade 首启 ②:docker load 预载镜像 → 复核 → 写 .imported → 建库 → 起 Agent
+# QTrade 首启 ②:docker load 预载镜像 → 复核 →(d)建库 →(e)起 Agent →(b)写 .imported
 #
 # 规格:docs/03 §2.7.3 ②(a)~(e)、§2.2.1(rootfs_contents / IMAGES_LOADED 判据)
+#       (d)(e) 的顺序由 00 §15g R6-60 (a) 裁决对调;(b) 在最后的理由见 write_imported 头(R5-9)。
 #
 # 判据(§2.7.3 末):`docker images` 含两镜像且 digest = manifest rootfs_contents;
 #                   `systemctl is-active qtrade-agent` = active;
 #                   `curl -sf http://127.0.0.1:17600/api/v1/system/health`。
 #
-# 🔴 幂等:整个脚本可以重跑(修复/续跑路径会重跑)。每一步都是「已完成即跳过」。
+# 🔴 幂等:整个脚本可以重跑(修复/续跑路径会重跑)。(a) 与 (b) 靠标记文件「已完成即跳过」;
+#    🔴 但 (d) `--init-db` **不设跳过闸门** —— 它自身幂等,理由与后果见该函数头(R6-62 Ⅰ(i))。
 set -uo pipefail
 
 IMAGES_DIR=/var/lib/qtrade/images
@@ -78,26 +80,40 @@ load_images() {
     log "预载镜像 $n 个加载完成"
 }
 
-# ── (e)→(d) 建库与起 Agent ──────────────────────────────────────────────────
-# ⚠️ 规格 §2.7.3 ② 把这两步写成「(d) systemctl enable --now qtrade-agent;
-#    (e) 第一次 agent --init-db 建 agent.db」。这里**把顺序对调**,理由:
-#    照字面先 enable --now,Agent 会在 agent.db 还不存在时启动、自己开库跑迁移
-#    (02 §2.1 第 4 步),而紧接着的 --init-db 就会撞上一个已被 Agent 持有
-#    (WAL + 连接)的库;两边同时建表的结果不确定,而 02 §2.1 第 4 步明写
-#    「迁移失败**拒绝启动**」——一次竞争就是一次起不来。
-#    先 --init-db(幂等)再 enable --now,两条路径的终态完全一致、没有竞争窗口。
-#    🔴 这是一处**规格顺序与实现顺序不一致**,要么按本注释收口成 §15g 裁决,
-#       要么把 §2.7.3 ②(d)(e) 的次序调过来。交付时已列入待裁决项,未擅自改文档。
+# ── (d) 建库 →(e) 起 Agent ─────────────────────────────────────────────────
+# 规格:docs/03 §2.7.3 ②(d)(e)。**顺序已由 00 §15g R6-60 (a) 裁决对调**:
+#   (d) `agent --init-db` 建 / 迁移 `agent.db`;(e) `systemctl enable --now qtrade-agent`。
+#   照对调前的字面先 `enable --now`,Agent 会在 agent.db 还不存在时启动、自己开库跑迁移
+#   (02 §2.1 第 4 步),紧接着的 `--init-db` 就撞上一个已被 Agent 持有(WAL + 连接)的库;
+#   而 02 §2.1 第 4 步明写「迁移失败拒绝启动」—— 一次竞争就是一次首装失败。
+#   先建库再拉起,两条路径终态一致、没有竞争窗口。文档侧已按此收口,本函数就是那个实现。
+#
+# 🔴 R6-62 Ⅰ(i) / 03 §2.7.3 ②(d) 硬约束:**本步必须无条件调用 `--init-db`**,
+#   调用方**不得自加「库文件在就不调」的前置闸门**。`--init-db` 自身幂等 —— 已是最新则
+#   一条语句都不写、回 0;落后则按 `schema_version` 把迁移跑完。在外面加闸门 =
+#   把 R6-61/W4 刚作废的「库已存在即跳过」语义换个地方写:**升级 / 修复路径上迁移不跑**,
+#   且失败会退化成「Agent 起不来」、拿不到可诊断的 3/4/5(03 §8b.3 M1-12b ②③ 即因此恒红)。
+#
+# 退出码(owner = 02 §2.1「Agent 命令行参数」;3/4/5 只在本机首启日志里可见,
+# 引擎侧统一表现为 `AGENT_NOT_READY` / 退出码 75,03 §5.1):
+#   0 成功(含「已最新、什么都没改」的幂等路径)   2 argparse 用法错误
+#   3 库损坏 / 不是 SQLite(quick_check 未过,不动该文件)
+#   4 库 schema_version 高于本版代码上限(不动该文件;不支持降级)
+#   5 其它:父目录建不出 / DDL 或迁移失败 / 磁盘满 / 权限不足(可能留半建库,下次续跑)
 init_db_and_start_agent() {
     [ -x "$AGENT_PY" ] || die "Agent venv 不存在:$AGENT_PY"
 
-    if [ -f "$AGENT_DB" ]; then
-        log "agent.db 已存在,跳过 --init-db"
-    else
-        log "建 agent.db(02 §3.1 DDL)"
-        "$AGENT_PY" -m qtrade_agent.main --init-db --db "$AGENT_DB" \
-            || die "agent --init-db 失败"
-    fi
+    log "agent --init-db(无条件调用;幂等:已最新不写、落后则迁移)→ $AGENT_DB"
+    local rc=0
+    "$AGENT_PY" -m qtrade_agent.main --init-db --db "$AGENT_DB" || rc=$?
+    case "$rc" in
+        0) log "agent.db 已就绪(--init-db 退出码 0)" ;;
+        3) die "agent --init-db 退出码 3:$AGENT_DB 损坏或不是 SQLite(quick_check 未过),该文件未被改动。带诊断包报障,别自行删库(02 §2.6:日志指向最近备份)" ;;
+        4) die "agent --init-db 退出码 4:$AGENT_DB 的 schema_version 高于本版 Agent 代码上限,该文件未被改动;不支持降级(02 §3.8)。带诊断包报障" ;;
+        5) die "agent --init-db 退出码 5:建库 / 迁移失败(父目录建不出、DDL 或迁移失败、磁盘满、权限不足之一)。清磁盘 / 修权限后重跑首启:下次会无条件再调一次 --init-db 续跑(03 §5.1)" ;;
+        2) die "agent --init-db 退出码 2:argparse 用法错误 —— 本版 Agent 不认这些参数,首启脚本与 wheel 版本对不上" ;;
+        *) die "agent --init-db 退出码 $rc:未登记的退出码(02 §2.1 只登记 0/2/3/4/5)" ;;
+    esac
 
     log "systemctl enable --now qtrade-agent"
     systemctl enable --now qtrade-agent.service || die "qtrade-agent 起不来"
@@ -130,7 +146,7 @@ main() {
     done
 
     load_images            # (a)
-    init_db_and_start_agent # (e)+(d),顺序理由见函数头
+    init_db_and_start_agent # (d)+(e),顺序理由见函数头(R6-60 (a))
     write_imported         # (b)
 
     log "首启完成"
