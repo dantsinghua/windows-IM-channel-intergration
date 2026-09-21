@@ -66,15 +66,41 @@ def ld(field_no: int, payload: bytes) -> bytes:
     return _varint((field_no << 3) | 2) + _varint(len(payload)) + payload
 
 
+def vi(field_no: int, n: int) -> bytes:
+    """protobuf varint 字段(wire type 0)。"""
+    return _varint(field_no << 3) + _varint(n)
+
+
 def elem_text(s: str) -> bytes:
-    """-1035 的文本 Elem:顶层 field 1 = Elem,文本段取 Elem.1.1(06 §2.9.5 路由表)。"""
+    """-1035 的文本 Elem(**原多层结构**):顶层 field 1 = Elem,文本段取 Elem.1.1(06 §2.9.5 路由表)。"""
     return ld(1, ld(1, ld(1, s.encode("utf-8"))))
 
 
+def elem_text2(s: str) -> bytes:
+    """-1035 的文本 Elem(**真机两层结构**,R6-66 (c)):顶层 field 1 = Elem,Elem.1 **直接**是 UTF-8 正文。"""
+    return ld(1, ld(1, s.encode("utf-8")))
+
+
+_PIC_URL = b"/gchatpic_new/10001/0-0-TESTPIC/0?picplatform=1&/download?appid=1407"   # 合成的特征串(06 §2.9.5 三种内容特征)
+
+
 def elem_image() -> bytes:
-    """-1035 的图片 Elem:非文本段,含 06 §2.9.5 列出的内容特征(picplatform / /download?appid= / /gchatpic_new/)与宽高字段。"""
-    meta = ld(1, b"/gchatpic_new/3007373675/0-0-ABCDEF/0?picplatform=1&/download?appid=1407") + ld(2, _varint(300)) + ld(3, _varint(200))
-    return ld(1, ld(2, meta))
+    """-1035 的图片 Elem、**不带宽高**(R6-66 (b) 无尺寸档 ⇒ [图片]):非文本段,只有 06 §2.9.5 列出的内容特征串。"""
+    return ld(1, ld(8, ld(13, _PIC_URL)))
+
+
+def elem_image_wh(w: int | None, h: int | None, pic_type: int | None = None) -> bytes:
+    """-1035 的图片 Elem、**带宽高**(R6-66 (b)):Elem 的某个非 1 号 LEN 字段包一个含图片特征的子消息(PicRec),
+    PicRec 里 varint field 24 = 宽、25 = 高、26 = 图片类型(2000 = GIF);字段号出自 06 §2.9.5 `-1035` 行 R6-66 (b)
+    (开工时规格未写、收尾时文档方已回写)。w/h 传 None 表示缺该字段。"""
+    pic = ld(13, _PIC_URL)
+    if w is not None:
+        pic += vi(24, w)
+    if h is not None:
+        pic += vi(25, h)
+    if pic_type is not None:
+        pic += vi(26, pic_type)
+    return ld(1, ld(8, pic))
 
 
 def row(msgtype: int, data: bytes, *, id: int = 1, issend: int = 0, time: int = 1_758_240_000, uniseq: int = 7001, sender: str = PEER_A) -> MainDbRow:
@@ -207,41 +233,79 @@ class TestA_Norm:
 # ====================================================================== B. clean_text(06 §2.9.5 clean_text 段,R6-46)
 
 class TestB_CleanText:
-    def test_B1_face_to_placeholder(self):
-        """§2.9.5 ①:遇到 U+0014,连同其后 1 个字符替换为字面量 [表情];常量拼写 = 「[表情]」/「[图片]」。"""
+    def test_B1_face_to_name(self):
+        """R6-66 (a) 推翻 R6-46「表情一律 [表情]」:U+0014 + 后继 1 个字符(其码点 = 表情索引)⇒ [名称]。
+        依据:R6-66 (a) 锚点 65=爱你('A')、56=抱拳('8');兜底常量拼写仍为「[表情]」/「[图片]」(越界 / 无尺寸时用)。"""
         assert FACE_PLACEHOLDER == "[表情]"
         assert IMAGE_PLACEHOLDER == "[图片]"
-        assert clean_text("收到\u0014A") == "收到[表情]"
-        assert clean_text("a\u00148b") == "a[表情]b"
+        assert clean_text("收到\u0014A") == "收到[爱你]"
+        assert clean_text("a\u00148b") == "a[抱拳]b"
+
+    @pytest.mark.parametrize("index,name", [(0, "呲牙"), (8, "玫瑰"), (9, "流泪"), (23, "微笑"), (56, "抱拳"), (64, "OK"),
+                                            (65, "爱你"), (66, "咖啡"), (184, "红包"), (219, "口罩护体")])
+    def test_B1b_anchor_names(self, index, name):
+        """R6-66 (a):名称表 = 企点 APK 自带 220 项(索引 0~219);裁决给出的已知锚点逐个恰好等于。"""
+        assert clean_text("前\u0014" + chr(index) + "后") == f"前[{name}]后"
+
+    def test_B1c_all_220_names_well_formed(self):
+        """R6-66 (a):索引 0~219 每一项都还原成「[名称]」——名称非空、不含 [ ]、不以 / 开头;且不是兜底 [表情]。
+        (表里「没有」的项允许出 [表情],但裁决说名称表恰 220 项,故这里要求 0~219 全部有名。)"""
+        names = []
+        for i in range(220):
+            out = clean_text("\u0014" + chr(i))
+            assert out.startswith("[") and out.endswith("]"), (i, out)
+            name = out[1:-1]
+            assert name and "[" not in name and "]" not in name and not name.startswith("/"), (i, out)
+            assert out != FACE_PLACEHOLDER, (i, out)
+            names.append(name)
+        assert len(names) == 220
+
+    @pytest.mark.parametrize("index", [220, 221, 0xFF, 0x100, 0x4E00])
+    def test_B1d_out_of_range_falls_back(self, index):
+        """R6-66 (a):索引越界 ⇒ 仍出 [表情];后继字符照样被消耗(不重叠),不留孤儿字符。"""
+        assert clean_text("a\u0014" + chr(index) + "b") == "a[表情]b"
 
     def test_B2_face_only_not_empty(self):
-        """§2.9.5:「17 条消息整条只由表情组成 … 写成 [表情] 后 text 就是 [表情]」,一个/两个小黄脸各出一个。"""
-        assert clean_text("\u0014A") == "[表情]"
-        assert clean_text("\u0014A\u0014B") == "[表情][表情]"
+        """R6-66 (a) 推翻 R6-46:整条只有表情的消息 text = 表情名,不是空串、不丢;一个/两个小黄脸各出一个(65=爱你,66=咖啡)。
+        越界的纯表情仍是非空的 [表情]。"""
+        assert clean_text("\u0014A") == "[爱你]"
+        assert clean_text("\u0014A\u0014B") == "[爱你][咖啡]"
         assert clean_text("\u0014A\u0014B") != ""
+        assert clean_text("\u0014" + chr(300)) == "[表情]"
 
     def test_B3_trailing_lone_face(self):
-        """§2.9.5 ①:U+0014 在串尾、没有后继时只丢掉它自己、不写占位。"""
+        """§2.9.5 ①:U+0014 在串尾、没有后继时只丢掉它自己、不写占位(R6-66 未改此条)。"""
         assert clean_text("你好\u0014") == "你好"
         assert clean_text("\u0014") == ""
 
     def test_B4_face_consumes_tab(self):
-        """§2.9.5 ①:后继是什么都一并消耗——包括 \\t/\\n/\\r(实测 6 个后继恰是 \\t,它们是索引不是正文)。"""
-        assert clean_text("a\u0014\tb") == "a[表情]b"
-        assert clean_text("a\u0014\nb") == "a[表情]b"
-        assert clean_text("a\u0014\rb") == "a[表情]b"
+        """R6-66 (a) 推翻 R6-46 的占位写法、保留消耗规则:后继为 \\t(=9)等控制字符也按索引消耗 ⇒ \\t 即 9=流泪。
+        \\n(=10)/\\r(=13)同样被当索引消耗:输出恰为一个「[名称]」、正文里不残留换行。"""
+        assert clean_text("a\u0014\tb") == "a[流泪]b"
+        for c in "\n\r":
+            out = clean_text("a\u0014" + c + "b")
+            assert out == "a" + clean_text("\u0014" + c) + "b"
+            face = out[1:-1]
+            assert face.startswith("[") and face.endswith("]") and len(face) > 2
+            assert "\n" not in out and "\r" not in out
 
     def test_B5_two_consecutive_faces(self):
-        """§2.9.5 ①:连续两个 U+0014 按「不重叠」第二个被当作第一个的索引一并消耗、只出一个 [表情]。"""
-        assert clean_text("a\u0014\u0014b") == "a[表情]b"
+        """R6-66 (a) 推翻 R6-46:U+0014 U+0014 X ⇒ 第二个 U+0014(=20)被当作第一个的索引消耗、只出一个 [名称],X 原样保留。"""
+        out = clean_text("a\u0014\u0014Xb")
+        assert out == "a[害羞]Xb"                                           # 06 §2.9.5 R6-66:索引 20 ⇒ [害羞]
+        assert out.count("[") == 1 and out.count("]") == 1
+        assert "\u0014" not in out
+        assert out == "a" + clean_text("\u0014" + chr(20)) + "Xb"          # 与「索引 20」同一个名称
+        assert clean_text("a\u0014\u0014b") == "a" + clean_text("\u0014" + chr(20)) + "b"
 
     def test_B6_index_ge_0x80_char_level(self):
-        """§2.9.5:索引码位实测 U+0000~U+00B8,≥ U+0080 时 UTF-8 占 2 字节,必须在字符层面处理、不得切断多字节序列。"""
+        """R6-66 (a) 推翻 R6-46 占位写法:索引 ≥ U+0080 按字符而非字节处理,不破坏 UTF-8;184=红包('¸')、219=口罩护体('Û')。"""
         s = "a\u0014¸b"
         decoded = s.encode("utf-8").decode("utf-8", errors="replace")     # 与路由表同一条解码路径
-        assert clean_text(decoded) == "a[表情]b"
-        assert "�" not in clean_text(decoded)
-        assert clean_text("报价\u0014¸") == "报价[表情]"
+        assert clean_text(decoded) == "a[红包]b"
+        assert "\ufffd" not in clean_text(decoded)
+        assert clean_text("报价\u0014¸") == "报价[红包]"
+        assert clean_text("\u0014Û测试") == "[口罩护体]测试"
 
     def test_B7_other_ctrl_dropped_keep_tnr(self):
         """§2.9.5 ②:未被 ① 消耗的其余码位 < U+0020 逐个丢弃(实测 U+0000/U+0003/U+0008),但 \\t \\n \\r 保留。"""
@@ -309,12 +373,17 @@ class TestD_Route:
         assert d.unknown is False
 
     def test_D2_text_family_face(self):
-        """路由表第 2 行 + clean_text:文本族里的表情 → [表情](按原位置),不含 < U+0020 的字符(\\t\\n\\r 除外)。"""
+        """R6-66 (a) 推翻 R6-46:文本族里的表情 → [名称](按原位置),不含 < U+0020 的字符(\\t\\n\\r 除外);
+        纯表情消息产出且 text = 名称(不是空串、不丢);越界纯表情 ⇒ 产出且 text='[表情]'。"""
         d = decode(-1000, "文字\u0014A".encode("utf-8"))
-        assert d.emit and d.text == "文字[表情]"
+        assert d.emit and d.text == "文字[爱你]"
         d2 = decode(-1000, "\u0014A".encode("utf-8"))
-        assert d2.emit and d2.text == "[表情]"                      # 纯表情:入库且 text='[表情]',不是空串
-        assert not any(ord(c) < 0x20 and c not in "\t\n\r" for c in d.text)
+        assert d2.emit and d2.type == "text" and d2.text == "[爱你]"
+        d3 = decode(-1051, "1Y 1.70\u0014\u0017\n2Y 1.80".encode("utf-8"))
+        assert d3.emit and d3.text == "1Y 1.70[微笑]\n2Y 1.80"
+        d4 = decode(-1000, ("\u0014" + chr(250)).encode("utf-8"))
+        assert d4.emit and d4.text == "[表情]"
+        assert not any(ord(c) < 0x20 and c not in "\t\n\r" for c in d.text + d3.text)
 
     def test_D3_mixed_order_image_first(self):
         """路由表第 3 行:-1035 各 Elem 按原顺序拼接,先发图后配文字 ⇒ text = "[图片]文字";不含乱码/URL 字样。"""
@@ -330,8 +399,8 @@ class TestD_Route:
         assert decode_mixed(elem_image() + elem_text("x") + elem_image()) == "[图片]x[图片]"
 
     def test_D3c_mixed_text_segment_goes_through_clean_text(self):
-        """路由表第 3 行:「文本段同样过 clean_text」。"""
-        assert decode(-1035, elem_image() + elem_text("配文\u0014A")).text == "[图片]配文[表情]"
+        """路由表第 3 行:「文本段同样过 clean_text」;R6-66 (a) 推翻 R6-46:文本段里的表情同样还原成名字(65=爱你)。"""
+        assert decode(-1035, elem_image() + elem_text("配文\u0014A")).text == "[图片]配文[爱你]"
 
     def test_D4_mixed_without_text_not_emitted(self):
         """路由表第 3 行:有文本段才产出(全库 91 条里 6 条纯图片、无文本段 ⇒ 不产出);不计 unknown。"""
@@ -427,6 +496,130 @@ class TestD_Route:
         assert f.to_message(row(-2000, b"\x0a\x01p", uniseq=8010), table="t", native_id=PEER_A, kind="private") == (None, False)
         assert f.to_message(row(-1035, elem_image(), uniseq=8011), table="t", native_id=PEER_A, kind="private") == (None, False)
         assert f.to_message(row(-2017, b"\xac\xed\x00\x05", uniseq=8012), table="t", native_id=PEER_A, kind="private") == (None, False)
+
+
+# ====================================================================== D'. R6-66 (b)(c):-1035 图片尺寸占位 + 两层 / 多层两种文本段结构
+
+W, H = 123, 45            # 编造的宽高
+
+
+class TestDR_Mixed_R6_66:
+    # ---------------- (b) 图片段三档
+    def test_DR1_image_with_size(self):
+        """R6-66 (b):图片段带宽高 ⇒ `[图片 宽×高]`(乘号 U+00D7),按 Elem 原顺序拼接。"""
+        d = decode(-1035, elem_image_wh(W, H) + elem_text("测试文本甲"))
+        assert d.emit is True and d.type == "text"
+        assert d.text == "[图片 123×45]测试文本甲"
+
+    def test_DR1b_gif_is_animated(self):
+        """R6-66 (b):PicRec field 26 图片类型 = 2000(GIF)⇒ `[动图 宽×高]`;其它类型值 ⇒ `[图片 宽×高]`。"""
+        assert decode(-1035, elem_image_wh(W, H, 2000) + elem_text("测试文本甲")).text == "[动图 123×45]测试文本甲"
+        assert decode(-1035, elem_text("测试文本甲") + elem_image_wh(W, H, 1000)).text == "测试文本甲[图片 123×45]"
+
+    @pytest.mark.parametrize("w,h", [(0, H), (W, 0), (None, H), (W, None), (0, 0)])
+    def test_DR1c_zero_or_missing_size_falls_back(self, w, h):
+        """R6-66 (b):「宽、高都取到且非 0 时」才写尺寸;缺宽/高或为 0 ⇒ `[图片]`(GIF 也一样退回 [图片],不出 [动图])。"""
+        assert decode(-1035, elem_image_wh(w, h) + elem_text("测试")).text == "[图片]测试"
+        assert decode(-1035, elem_image_wh(w, h, 2000) + elem_text("测试")).text == "[图片]测试"
+
+    def test_DR2_image_without_size(self):
+        """R6-66 (b):图片段无尺寸 ⇒ 仍出 `[图片]`(不带空格、不带 0×0)。"""
+        d = decode(-1035, elem_text("测试文本乙") + elem_image())
+        assert d.emit is True and d.text == "测试文本乙[图片]"
+        assert "×" not in d.text
+
+    def test_DR3_sized_and_unsized_mixed_order(self):
+        """R6-66 (b) + 06 §2.9.5「必须按 Elem 原顺序」:有尺寸与无尺寸两种图片段各归其位、各带各自的尺寸。"""
+        b = elem_image_wh(W, H) + elem_text("一") + elem_image() + elem_text("二") + elem_image_wh(640, 480)
+        assert decode_mixed(b) == "[图片 123×45]一[图片]二[图片 640×480]"
+
+    def test_DR4_text_segment_face_restored_in_mixed(self):
+        """R6-66 (b):混排里文本段照常走正文清洗(含表情还原,23=微笑、越界 ⇒ [表情]、其余控制字符丢弃)。"""
+        d = decode(-1035, elem_image_wh(W, H) + elem_text("配文\u0014\u0017尾\u0008") + elem_text("\u0014" + chr(230)))
+        assert d.text == "[图片 123×45]配文[微笑]尾[表情]"
+
+    def test_DR5_pure_image_not_emitted(self):
+        """R6-66 (b):纯图片消息仍不产出(R6-44 不变),无论有无尺寸;不计 unknown。"""
+        for b in (elem_image_wh(W, H), elem_image(), elem_image_wh(W, H) + elem_image()):
+            d = decode(-1035, b)
+            assert d.emit is False and d.unknown is False
+            assert decode_mixed(b) is None
+
+    def test_DR6_no_url_or_garbage_in_text(self):
+        """06 §2.9.5 路由表第 3 行(R6-66 未改):图片段不得把特征串/URL/乱码带进正文。"""
+        t = decode(-1035, elem_image_wh(W, H) + elem_text("测试文本丙")).text
+        assert "gchatpic" not in t and "picplatform" not in t and "appid" not in t and "\ufffd" not in t
+
+    # ---------------- (c) 两层 / 多层两种结构
+    @pytest.mark.parametrize("mk", [elem_text, elem_text2], ids=["多层Elem.1.1", "两层Elem.1"])
+    def test_DR7_both_structures_text_only(self, mk):
+        """R6-66 (c):文本段两种结构(原多层 Elem.1.1 / 真机两层 Elem.1 直接为 UTF-8)都必须解出同样的正文。"""
+        d = decode(-1035, mk("测试文本甲 1.70"))
+        assert d.emit is True and d.type == "text"
+        assert d.text == "测试文本甲 1.70"
+
+    @pytest.mark.parametrize("mk", [elem_text, elem_text2], ids=["多层Elem.1.1", "两层Elem.1"])
+    def test_DR8_both_structures_with_images(self, mk):
+        """R6-66 (c):两种结构与图片段混排,解出的正文逐字相同(含顺序与尺寸占位)。"""
+        b = elem_image_wh(W, H) + mk("张三 测试") + elem_image()
+        assert decode(-1035, b).text == "[图片 123×45]张三 测试[图片]"
+
+    @pytest.mark.parametrize("mk", [elem_text, elem_text2], ids=["多层Elem.1.1", "两层Elem.1"])
+    def test_DR9_both_structures_face_restored(self, mk):
+        """R6-66 (a)(c):两种结构的文本段都走 clean_text、表情还原(65=爱你、9=流泪)。"""
+        assert decode(-1035, mk("收到\u0014A好\u0014\t")).text == "收到[爱你]好[流泪]"
+
+    def test_DR10_two_layer_equals_multi_layer(self):
+        """R6-66 (c):同一内容按两种结构编码,解出的 text 逐字节相同(修正前两层结构整条被当纯图片丢弃)。"""
+        texts = ["测试文本甲", "1Y 1.70\n2Y 1.80", "@张三 OK", "\u0014A"]
+        for t in texts:
+            a = decode(-1035, elem_image() + elem_text(t))
+            b = decode(-1035, elem_image() + elem_text2(t))
+            assert a.emit is True and b.emit is True, t
+            assert a.text == b.text == "[图片]" + clean_text(t), t
+
+    def test_DR11_mixed_structures_in_one_message(self):
+        """R6-66 (c):「两种都必须能解」——同一条里两种结构的文本段并存时各自解出、按原顺序拼接。"""
+        assert decode_mixed(elem_text2("前") + elem_image_wh(W, H) + elem_text("后")) == "前[图片 123×45]后"
+
+    def test_DR12_two_layer_pure_image_not_emitted(self):
+        """R6-66 (c):两层结构的纯图片消息(没有任何文本段)⇒ 不产出;to_message 返回 (None, False)。"""
+        f = MessageFactory("qd01", SELF_UID)
+        assert f.to_message(row(-1035, elem_image_wh(W, H) + elem_image(), uniseq=8021), table="t", native_id=PEER_A,
+                            kind="private") == (None, False)
+
+    def test_DR13_two_layer_text_only_message_emitted(self):
+        """R6-66 (c):两层结构的纯文本 -1035(修正前被当纯图片丢弃的真缺陷)⇒ 产出 Message、type=text、text 逐字。"""
+        f = MessageFactory("qd01", SELF_UID)
+        m, unknown = f.to_message(row(-1035, elem_text2("测试文本丁"), uniseq=8022), table=table_name(PEER_A),
+                                  native_id=PEER_A, kind="private")
+        assert unknown is False and m is not None
+        assert m.type == "text" and m.text == "测试文本丁" and m.ext_msg_id == "qd:8022"
+
+    def test_DR13b_ambiguous_elem1_prefers_three_layer(self):
+        """R6-66 (c) 判定次序(06 §2.9.5 -1035 行):Elem.1 本身能整段严格解析且其 field 1 是合法 UTF-8 ⇒ 取 Elem.1.1(三层);
+        否则 Elem.1 整段当正文(两层)。构造一段两种读法都成立的字节:按规格取三层 ⇒ "测试"。"""
+        inner = ld(1, "测试".encode("utf-8"))                      # = b"\n\x06" + "测试"
+        assert decode(-1035, ld(1, inner)).text == "测试"
+        # 反例:Elem.1 是普通中文 UTF-8、不能整段严格解析成 protobuf ⇒ 两层,整段当正文
+        assert decode(-1035, elem_text2("测试文本乙")).text == "测试文本乙"
+
+    # ---------------- 端到端:经 poll_maindb 入库
+    def test_DR14_poll_ingests_faces_and_two_layer_mixed(self, store, clock, maindb, poller):
+        """R6-66 (a)(b)(c) 经读库正线:纯表情行入库且 text=名称(不空、不丢);两层结构混排入库 text 带尺寸占位;
+        两层纯图片不入库、无 message 事件,但水位越过它。"""
+        poller.poll_maindb(acct_view())
+        clock.advance(5_000)
+        maindb.insert_text(PEER_A, "\u0014A", time_s=clock.now_s)
+        maindb.insert(PEER_A, group=False, time_s=clock.now_s, msgtype=-1035,
+                      msgdata=elem_image_wh(W, H) + elem_text2("测试文本戊\u0014B"))
+        pic_id = maindb.insert(PEER_A, group=False, time_s=clock.now_s, msgtype=-1035, msgdata=elem_image_wh(W, H))
+        poller.poll_maindb(acct_view())
+        texts = {r["ext_msg_id"]: r["text"] for r in all_messages(store)}
+        assert sorted(texts.values()) == sorted(["[爱你]", "[图片 123×45]测试文本戊[咖啡]"])
+        assert len(texts) == 2
+        assert len(msg_events(store)) == 2
+        assert store.cursor_get("qd01", "qidian_rowid:" + PEER_A).value_int == pic_id
 
 
 # ====================================================================== E. 首登历史闸 / bootstrap / 新会话第一条(06 §2.9.5 ③④,§8b M2 1607/1608 行)
