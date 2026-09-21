@@ -272,10 +272,27 @@ uv pip compile installer/rootfs/requirements.in \
 ### 构建侧改动
 
 - `Dockerfile`:新增 `COPY payload/requirements.lock`;依赖装法由 `pip install <wheel>` 改为
-  **先** `pip install --require-hashes -r requirements.lock`(装齐运行期依赖)、**再** `pip install --no-deps <wheel>`
-  (只装 Agent 本体)。任一包 hash 对不上直接构建失败,不静默换版本。
+  **先** `pip install --require-hashes --only-binary=:all: -r requirements.lock`(装齐运行期依赖)、
+  **再** `pip install --no-deps --only-binary=:all: <wheel>`(只装 Agent 本体)。任一包 hash 对不上直接构建失败,
+  不静默换版本、也不静默改走源码构建(`--only-binary` 的原因见下一小节)。
 - `build-rootfs.sh`:备料时把 `requirements.lock` 拷进构建上下文;`contents.json` 新增
   `requirements_lock { path, packages, sha256 }` 一项 —— 依赖集合从此也进了 G-10 完整性清单(正是 R-1 要的)。
+
+### 为什么两处 install 都要 `--only-binary=:all:`(E3-1,2026-09-21 补)
+
+独立端到端第三轮发现:`uv pip compile --generate-hashes` 为每个包**同时**登记 wheel 与同版本 sdist
+的 hash,而 pip 的 `--require-hashes` 是「命中该包任一登记 hash 即放行」。只写 `--require-hashes` 时,
+一旦 pip 选中的 wheel 的 hash 对不上(锁被改坏,或 PyPI / 代理上的 wheel 被替换),pip **不报错**,
+而是退回同版本 sdist(其 hash 仍在锁里、校验通过),再联网装**不在锁内、不校验 hash** 的构建后端
+(fastapi ⇒ `pdm-backend`,pydantic-core ⇒ maturin + 现场下载 Rust)现场编译。纯 Python 包能编译成功,
+`pip freeze` 仍与锁逐行一致 ⇒ 自检看不出,「改坏任一 hash 就构建失败」的承诺并不成立。
+
+修法:两处 `pip install` 都加 `--only-binary=:all:` ⇒ 只许装 wheel,sdist 退路被堵死,wheel hash 不符即报
+`THESE PACKAGES DO NOT MATCH THE HASHES`、构建失败。锁文件**不改**:锁里的 sdist hash 从此永远用不到,
+留着无害;不改锁可保持上面的再生成命令逐字复现同一份 lock(sha256 不变,`contents.json` 的
+`requirements_lock` 登记不变)。第二处装的是本地 Agent `.whl`,本来就不走 sdist,同样加上是防日后
+有人把路径改成源码目录 / sdist 时静默走构建。
+重建后可在构建日志里核对:不应出现 `Building wheel for` / `Installing build dependencies`。
 
 ### 连带:`pyproject.toml` 删了 `docker>=7`
 

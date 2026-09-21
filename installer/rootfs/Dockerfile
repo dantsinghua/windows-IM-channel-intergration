@@ -120,6 +120,17 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 #    requirements.lock(uv pip compile 生成、带 sha256 hash),而不是「构建当天 PyPI
 #    最新且满足下限」。之后 wheel 用 --no-deps 装(依赖已由锁装齐),两次不同日期的
 #    重建得到逐位一致的依赖集合。任一包 hash 对不上直接构建失败,不静默换版本。
+# 🔴 两处 install 都带 `--only-binary=:all:`(E3-1,独立端到端第三轮):uv 生成的锁为每个包
+#    **同时**登记 wheel 与同版本 sdist 的 hash,pip 的 --require-hashes 语义是「命中该包
+#    任一登记 hash 即放行」。不加这个开关时,被选中 wheel 的 hash 一旦对不上(锁被改坏,或
+#    PyPI/代理上的 wheel 被替换),pip **不报错**,而是退回同版本 sdist(其 hash 仍在锁里、
+#    校验通过),再联网装**不在锁内、不校验 hash** 的构建后端(fastapi ⇒ pdm-backend、
+#    pydantic-core ⇒ maturin + 现场下 Rust)现场编译 —— 纯 Python 包能编译成功、freeze 仍与锁
+#    一致,自检看不出。只许装 wheel 后,sdist 这条退路被堵死 ⇒ wheel hash 不符即
+#    `THESE PACKAGES DO NOT MATCH THE HASHES`、构建失败。锁里的 sdist hash 因此永不会被用到,
+#    留着无害(锁文件本身不改,保持 README §8 的再生成命令可逐字复现)。
+#    第二处装的是本地 Agent .whl,本来就不走 sdist;同样加上,免得日后有人把路径改成
+#    源码目录 / sdist 时静默走构建。
 # 🔴 只 `--upgrade pip`,不装 `wheel`:发行版 venv 只**安装**预编译 .whl(锁里 15 个包与
 #    Agent wheel 都有对应 wheel),装 .whl 不需要 `wheel` 包(它只在 build sdist 时才要)。
 #    带上 `wheel` 会把它和它的依赖 `packaging` 留进 venv —— 两个 Agent 运行期从不 import
@@ -127,9 +138,9 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 RUN ${PY} -m venv /opt/qtrade/agent/venv \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
-        -r /opt/qtrade/agent/requirements.lock \
+        --only-binary=:all: -r /opt/qtrade/agent/requirements.lock \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --no-deps \
-        /opt/qtrade/agent/dist/qtrade_agent-*.whl \
+        --only-binary=:all: /opt/qtrade/agent/dist/qtrade_agent-*.whl \
     && /opt/qtrade/agent/venv/bin/python -c "import qtrade_agent, importlib.resources as r; \
         assert (r.files('qtrade_agent.store') / 'schema_agent.sql').is_file(), 'schema_agent.sql 没进包'; \
         import json; \
