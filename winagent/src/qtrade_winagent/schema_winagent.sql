@@ -151,7 +151,7 @@ CREATE TABLE vault_index (
                                                  --   没有任何消费者需要看到明文:#67 只发指令验签钥(cmd/<短名>)且只一次性回显那一把;
                                                  --   #80 诊断包、#89 PUT /settings、#51 导出、审计与日志一律不含它(§2.9 脱敏表同款,Vault 一切 *_ref 只写不读)。
                                                  --   一旦它能被读回,邮箱失陷方就能自己造确认签名,§11.17 ③ 的双钥双通道整条作废。
-  scope           TEXT NOT NULL CHECK (scope IN ('account','mail','api','webhook','winagent','asr','other')),
+  scope           TEXT NOT NULL CHECK (scope IN ('account','mail','api','webhook','winagent','asr','other')),   -- R6-68 ⑨:#89 设置类密钥(settings/<group>/…)用 'other'
   blob_path       TEXT NOT NULL,                 -- 'blobs\<sha256(name)>.bin'(相对 [vault] dir)
   blob_sha256     TEXT NOT NULL,                 -- 密文文件摘要,只用于校验未被替换
   version         INTEGER NOT NULL DEFAULT 1,    -- PUT 覆盖 +1
