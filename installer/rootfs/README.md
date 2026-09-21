@@ -233,3 +233,10 @@ rootfs 方的两条(`docs/00` §15g **R6-62 Ⅴ①⑦**)。
 `qtrade-docker-config.service` 的 `Before=docker.service`、`qtrade-agent.service` 的 `After=`(非 `Requires=`)docker、
 janitor 只监听不清理、时区两处都设、不动 `/usr/bin/python3` 指向、`qtrade-docker-config.sh` 不 `source` `install.env`、
 预载镜像不进 Dockerfile 而用 `tar --append`、工作目录固定 `/var/tmp`。
+
+## 7. 再次重建(2026-09-21 13:00,基于提交 `0180100`,构建流程未改)
+
+只为换上新 Agent wheel(含 D-05 `--init-db` 字节级幂等、后端第四~六批、两批安全修复、企点解码 R6-66),
+`Dockerfile`、`build-rootfs.sh`、`files/` 一字未改。产物 sha256 与自检结果登记在产物根 `SOURCES.md` §12,
+交接见 `.omc/handoffs/rootfs-rebuild.md`。本次首启 `--init-db` 连跑三次主库 sha256 完全相同 ⇒ §6 之后
+遗留的 D-05(字节级不幂等)在发行版上已闭合。
