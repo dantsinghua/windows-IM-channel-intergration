@@ -216,6 +216,28 @@ def test_c42_limit_default_matches_doc_02():
         assert tuple(int(x) for x in q.groups()) == want, f"{fn} 的 limit {q.groups()} ≠ 02 §3.4 C-42 {want}"
 
 
+def test_qidian_face_table_and_pic_fields_match_doc_06():
+    """06 §2.9.5(R6-66):表情名称表项数、`-1035` 图片段 PicRec 字段号与 GIF 类型值 = 实现。
+
+    文档里写的「共 220 项(索引 0~219)」「varint field 24 / 25 为宽 / 高、field 26 为图片类型」「类型 = `2000`(GIF)」
+    任何一个与 ``qidian_faces.FACE_NAMES`` / ``msgdata.PIC_*`` 不同即红;占位格式 `[图片 宽×高]`/`[动图 宽×高]` 与实现的
+    f-string 同形(半角空格 + ``×``)。
+    """
+    from qtrade_agent.adapters.qidian import msgdata
+    from qtrade_agent.qidian_faces import FACE_NAMES
+    d06 = _doc(DOC06)
+    m = re.search(r"共 (\d+) 项[（(]索引 0~(\d+)[)）]", d06)
+    assert m, "06 §2.9.5 找不到名称表项数「共 N 项(索引 0~M)」"
+    assert (int(m.group(1)), int(m.group(2))) == (len(FACE_NAMES), len(FACE_NAMES) - 1)
+    m = re.search(r"varint field (\d+) / (\d+) 为宽 / 高、field (\d+) 为图片类型", d06)
+    assert m, "06 §2.9.5 -1035 行找不到 PicRec 字段号"
+    assert tuple(int(x) for x in m.groups()) == (msgdata.PIC_W, msgdata.PIC_H, msgdata.PIC_TYPE)
+    m = re.search(r"图片类型 = `(\d+)`[（(]GIF[)）]", d06)
+    assert m and int(m.group(1)) == msgdata.PIC_TYPE_GIF, "06 §2.9.5 GIF 类型值与 msgdata.PIC_TYPE_GIF 不同"
+    assert "`[图片 宽×高]`" in d06 and "`[动图 宽×高]`" in d06
+    assert msgdata.image_placeholder(b"") == "[图片]"
+
+
 def test_restart_backoff_matches_doc_04():
     m = re.search(r"^container_restart_backoff_s\s*=\s*\[([\d,]+)\]", _doc(DOC04), re.M)
     assert tuple(int(x) for x in m.group(1).split(",")) == AgentConfig().health.container_restart_backoff_s
