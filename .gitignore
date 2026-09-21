@@ -11,3 +11,6 @@ build/
 .env
 .omc/
 **/.omc/
+
+# Playwright 失败截图/trace 落点
+console/tests/e2e-pw/.pw-results/
