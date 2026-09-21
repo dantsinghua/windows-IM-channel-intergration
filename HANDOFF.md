@@ -58,24 +58,26 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 3. **读 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文**,重点 §4 禁区、§5「🔴 最新状态」与「下一步」、§5b 编排纪律;
    再按你这批要动的东西读对应规格段落与 `reference/e2e-lessons-2026-09-21.md`。
 
-## 3b. 🔴 2026-09-21 09:45 停工快照(安琳关机前;**与下文 §4/§5 矛盾处以本节为准**)
+## 3b. 🔴 2026-09-21 15:45 交接快照(子 agent 全丢、安琳新起 session 接手;**与下文 §4/§5 矛盾处以本节为准**)
 
 > 更细的版本在原机 `.omc/handoffs/team-lead-status.md`(git 忽略、不随仓库走)。本节是它的可携带摘要。
 
-**今天上午入库的**:文档终审第六轮收口 → **第七轮只读终审 ACCEPT**(七轮里第一次过,8 条 MINOR 待下一轮文档方);控制台第三批(四个列表页游标翻页、hmac-keys 短名表、保存设置回填);rootfs 修复(首启无条件 `--init-db`、`StartLimit*` 挪进 `[Unit]`、Python 3.11.0rc1 → **3.12.13 正式版**、机型档案库落点改 05 §7 路径);`--init-db` 字节级幂等(D-05);联调用例 73→123;**Playwright 真点击 e2e 37 条**(`console/tests/e2e-pw/`,`npm run test:pw`);后端第四批(收发件出参视图、**#89 未知键 ⇒ 400**、序号用尽 409 + 全局兜底 500 信封、hmac-keys 不分页);控制台第五批(安琳亲手点出的缺陷:须知勾选框卡死、第 3 步退回第 1 步、**跑过一次引导后下次直达主页**、「现在添加」点了没反应、SKIPPED 显示成黄色警告;以及 P-SET 六组控件键名逐键对齐 `docs/07`)。⇒ 下文 §4 里「StartLimit / Python rc1 尚未修复」的说法**已过时**。
+**现状一句话**:产品代码已冻结在 **HEAD `c7d48d9`**(已推 GitHub、工作区干净、今天 57 个提交)。出带签名正式包**只差两步**,且两步**都没完成**。盘上 `installer/out/QTrade-Setup-1.0.0.exe`(凌晨 03:06 那版)**作废,别装**。
 
-**总控亲自复跑的数字**:根 `pytest -q` **2164 passed**;控制台单测 **231 passed**(typecheck / eslint 全过;build 在 225 那一版跑过);文档对账 exit 0;`test_docs_consistency` + `installer/tests` 194 passed。
+**今天入库的一大段**:文档终审第七轮 ACCEPT;控制台第三~五批(安琳亲手点出的:须知勾选卡死、向导第 3 步退回、跑过一次引导后直达主页、现在添加、SKIPPED 灰档;P-SET 六组键名对齐 07)+ Playwright 真点击 e2e 45 条;后端第四~六批 + 两批安全修复(#56 顶层平铺、#89 未知键 400、出参视图去 *_ms/body_text、邮件路由密钥进 Vault、嵌套密钥递归脱敏、日志遮 ?token=、序号用尽 409+兜底 500);企点读库 R6-66(表情名还原 + 图文混排 -1035 真机两层结构缺陷,修掉「这类消息整条被丢弃」);D-05 `--init-db` 字节级幂等;文档八九批 R6-63~R6-68;**rootfs 重建两次**(第二次带依赖锁,解 R-1);rootfs 复测查出的 D-1/D-2/O-1/O-2 已修;WinAgent schema 补 R6-68 注释(`c7d48d9`)。⇒ 下文 §4/§5 大量已过时,以本节为准。
 
-**🔴 停工时做到一半(接手第一件)**:控制台第五批的**独立复测没做完**(测试方被中途叫停)——
-1. `console/tests/e2e-pw/helpers.mjs` 的 `installQtStub()` 只造了 `setup.done=true`、没造「已确认告知」,而向导线新增了「告知未确认 ⇒ 要求重勾」(05 §6.1,实现正确)⇒ **路由冒烟全被打回 `/setup`**。总控裁决:由**测试侧**在桩里补一次 ack(`POST /api/v1/system/notice/ack`,版本从 `GET /system/notice` 取),不改 mock 初始值;并新增正向用例守住这条新行为。
-2. 摘 5 条已修缺陷的 `test.fail`(D-B/D-C/D-D/D-E/D-F)——现在跑会因「本该失败却过了」报红,属预期。
-3. 补「跑过一次引导后刷新/新开页面都直达主页」「现在添加返回回第 4 步」「窄守卫例外不可滥用」的 Playwright 用例。
-4. 真后端联调复跑(期望 123 全绿,`tests/e2e/console-real/`,跑法见该目录与 SKILL §3)。
-⇒ **新起独立测试方**做,不让实现方代办。另:工作区里留着**一个**未提交的半成品 `console/tests/e2e-pw/helpers.mjs`(被叫停的测试方改到一半、无人验证),由新的独立测试方接着改或 `git checkout` 还原重做。(页面线的邮件页发件表补 `last_error`/`ref` 两列 + 两份单测**已核实入库**,控制台单测现为 **231 passed**。)
+**总控亲自复跑的数字**:仓库根 `pytest -q` **2325 passed**;控制台单测 234 / Playwright 45 / 真后端联调 126(独占副本跑);winagent `pytest -q` **329 passed**;`installer/tests` 122;文档对账 exit 0。
 
-**之后按序**:重打 wheel + 重建 rootfs(今天代码又变了,`8bc334f` 那次产物已过期;🔴 打 wheel 前 `rm -rf build/` **并**清掉 `src/`、`winagent/src/` 下的杂散 `.omc/` 目录——OMC 钩子会往命令的当前目录落状态文件,漏进包源码树会污染 wheel、让 `tests/test_packaging.py` 红)→ 独立复测 rootfs(含 D-05:`--init-db` 连跑主库 sha256 不变)→ **把生成自签名证书的命令原样列给安琳、等点头**再跑 → 带 `-Sign` 重出正式包并校验 → 补真机验收手册 §1.4 → **一次性**向安琳交代重启(启用 Hyper-V)前后要做的事 → 真装验证。🔴 盘上那版 `installer/out/QTrade-Setup-1.0.0.exe` 含首启 P0、从未运行,**作废,别拿去装**。
+**出包产物(总控已核实 sha256,在产物根 `C:\Users\anlin\qtrade-payload\`)**:新 rootfs.tar 2,171,043,840 B `3147e038…`(带依赖锁 `installer/rootfs/requirements.lock`)、新 wheel 506,656 B `d28efc15…`。**签名证书已生成**:指纹 `E36AFD96A801DD666F953AC8E3B3C992AB8CD60E`(`Cert:\CurrentUser\My`,私钥不可导出,公钥 .cer 在 `…\qtrade-payload\signing\`;是 `-WhatIf` 干跑意外真建出来的,命令 2 不必再跑)。
 
-**新增两条工作纪律**(已入项目记忆):收尾只 `kill <自己记的 PID>`,**禁用 `pkill`/`killall`**(今天一条 `pkill -f mock/server.mjs` 误杀了别人的服务);删目录前先 `git ls-files` 查是否受跟踪。给安琳看页面:`cd ~/work/qtrade-build/console && npm run dev:web` → `http://localhost:5273/`(mock 是内存状态,重启清零;改了 mock 要重启)。
+**🔴 接手第一件——两步并行,都没完成**:
+1. **WinAgent 两个 exe 重打 + 签名**:盘上 `…\qtrade-payload\winagent\dist\*.exe` 还是 **9-21 02:37 的旧代码**,必须用冻结代码重打。挡它的 pytest 门(schema 逐字)现已绿。真 Windows PowerShell:`winagent\build\build.ps1 -Clean` 干跑 → `… -Clean -Sign E36AFD96A801DD666F953AC8E3B3C992AB8CD60E` → `Get-AuthenticodeSignature` 核签名 → 同步产物根、旧件改名。详见 `.omc/handoffs/winagent-build.md`。
+2. **新 rootfs 独立复测**:上一轮复测方(`e2e-rootfs-3`)**没出结论、没写交接**(`.omc/handoffs/e2e-rootfs-3.md` 不存在),要重做。沿 `.omc/handoffs/e2e-rootfs-2.md` 九项 + `rootfs-rebuild-2.md` 末尾四项:R-1 锁是否真闭合(容器 `pip freeze` 与 lock 逐行一致)、D-1/D-2/O-1/O-2 回归、首启幂等 D-05。docker 只碰自建 `qtrade-build/e2e3-` 前缀临时容器,现有 13 个一个不许动。
+⇒ **各新起一个对口 agent**。
+
+**之后按序**:两步都绿 → **出带签名正式包**(命令 3,先把改动清单列给安琳确认:`installer\build\build.ps1 -Version 1.0.0 -SourceRoot C:\Users\anlin\qtrade-payload -Sign -CertThumbprint E36AFD96…`,会覆盖旧 EXE)→ 校验(`7z t`、manifest `lightweight=false`+`missing` 空+13 项、三段拼接、包内 exe sha256)→ 补 `fieldtest/真机验收手册.md` §1.4「先导入证书」→ **一次性**交代重启启用 Hyper-V 前后要做的事(重启中断 WSL 内 13 容器+企点登录态+qb 采集)→ 真机装验证(另一台物理机为主 + 本机 Hyper-V 为辅)。
+
+**新增工作纪律**(已入项目记忆):**发给忙碌 agent 的消息要等它这轮结束才到**——别用消息叫停,要停让安琳按 Esc,说「都停了」前用 ps/mtime 实查;收尾只 `kill <自己 PID>`、禁 `pkill`/`killall`;删目录前 `git ls-files` 查跟踪;复跑验证用**自己独占**的副本/端口/数据目录(共享副本+HMR 会造假红);只按精确路径 `git add`;打 wheel/全量前 `rm -rf build/` + 清源码树杂散 `.omc/`;发行版依赖已上锁。安琳今天直接带的羿珩行情采集 + 企点只读监控两条线**不在安装包关键路径、已收口**,新 session 可不管(细节见 `.omc/handoffs/team-lead-status.md` §6)。
 
 ## 4. 现在卡在哪(2026-09-21 清晨)
 
