@@ -105,3 +105,35 @@ export async function ensureAccountRunning(accountId = 'qd01'): Promise<void> {
     return x.state === 'running'
   }, 40000, 500)
 }
+
+/**
+ * 第三轮新增:经假后端的**测试造数口子**(`serve_fake_agent.py --seed-api` 才挂)造行。
+ * 翻页用例要「跨 ≥3 页 + 翻页中途插新行」,store 页大小写死 50 ⇒ 每条线 >100 行,公开 API 造不出来
+ * (建号到第 4~5 个就 RESOURCE_EXHAUSTED、收发件无写入端点)。造数只调产品自己的写入函数,见该文件 docstring。
+ */
+export async function seed(body: {
+  kind: 'accounts' | 'qidian_peers' | 'inbox' | 'outbox'
+  n: number
+  base_ms?: number
+  step_ms?: number
+  tie?: number
+  tag?: string
+  channel?: string
+  peer_prefix?: string
+}): Promise<(string | number)[]> {
+  const res = await realFetch(`${BASE}/__e2e/seed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer e2e-admin-token' },
+    body: JSON.stringify(body),
+  })
+  if (res.status !== 200) {
+    throw new Error(`造数口子不可用(HTTP ${res.status}):假后端要带 --seed-api 启动`)
+  }
+  return ((await res.json()) as { ids: (string | number)[] }).ids
+}
+
+/** 取证:从 `mark`(= 当时的 `seen.length`)之后客户端**实际发出**的请求 */
+export function seenSince(mark: number, pathFragment?: string) {
+  const out = seen.slice(mark)
+  return pathFragment ? out.filter((s) => new URL(s.url).pathname.includes(pathFragment)) : out
+}

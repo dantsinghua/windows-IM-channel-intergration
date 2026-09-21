@@ -155,15 +155,31 @@ describe('鉴权与错误信封(00 §10)', () => {
     expect(r.body.trace_id).toBeUndefined()
   })
 
-  it('🔴 R6-62 (b):#72 **带令牌**的全量响应仍要带 trace_id(例外只针对免鉴权摘要)', async () => {
-    /* 02 §3.4 通用段 R6-62 (b) 例外①逐字:「**`#72 GET /system/health` 的免鉴权摘要**键集逐字定死、**不注入** `trace_id`」
-       —— 例外的范围是「免鉴权摘要」这一条路径的**那一种响应**,不是这个 URL 的所有响应。
-       带令牌拿到的是 02 #72 的全量体(`{ok, agent{…}, dockerd, winagent{…}, accounts{…}, disk_free_mb, checks, alerts}`),
-       它和别的成功响应一样要能拿去查 `GET /audit`。 */
+  it('🔴 R6-62 Ⅵ W1:#72 **带令牌**的全量响应同样不注入 trace_id(例外按 path 整端点)', async () => {
+    /* 第三轮按现行口径**翻面**(docs-fix-7 W5 点名本条:上一轮断言的是 W1 **改前**的原句,「现在是红的但不是实现缺陷」)。
+       02 §3.4 通用段例外①现行逐字:「**`#72 GET /system/health` 这个路径**(免鉴权摘要与带令牌全量**两种形态都不注入**
+       `trace_id`;免鉴权摘要的键集另由本表 #72 行逐字定死)…排除是**按 path 整端点**做的、与带不带令牌无关」
+       (00 §15g R6-62 Ⅵ W1;总控 2026-09-21 裁决维持)。
+       判据不放松:这里仍先确认拿到的**确实是带令牌的全量体**(`checks` 在),再断言没有 `trace_id`。 */
     const r = await raw('/api/v1/system/health')
     expect(r.status).toBe(200)
     expect(r.body.checks, '这应当是带令牌的全量体').toBeTruthy()
-    expect(typeof r.body.trace_id, '带令牌的全量 health 没有 trace_id(例外范围被放宽到整个路径)').toBe('string')
+    expect(r.body.agent?.version, '全量体的 agent 是对象').toBeTruthy()
+    expect('trace_id' in r.body, '#72 这个路径两种形态都不注入 trace_id(02 §3.4 例外①)').toBe(false)
+  })
+
+  it('🔴 R6-62 Ⅷ Q7:#72 这个路径两种形态都**不记审计**(02 §2.2.1 唯一例外)', async () => {
+    /* 02 §2.2.1 现行逐字:「把每次调用记 `audit_log`(`kind='api'`、`action='<METHOD> <path>'`…)**唯一例外 = `/system/health`
+       这个路径**(免鉴权摘要与带令牌全量**两种形态都不记**)」(R6-62 Ⅷ Q7)。
+       对照组:同一窗口里打一次 `/system/version`,它必须留下审计行 —— 证明「查不到」不是审计整体没写。 */
+    await raw('/api/v1/system/health', { token: null })
+    await raw('/api/v1/system/health')
+    const ctl = await raw('/api/v1/system/version')
+    expect(ctl.status).toBe(200)
+    const rows = await auditApi.list({ kind: 'api', limit: 200 })
+    const actions = rows.items.map((x) => String((x as unknown as Record<string, unknown>).action))
+    expect(actions.some((a) => a.endsWith('/system/version')), '对照组 /system/version 没进审计(审计整体失效?)').toBe(true)
+    expect(actions.filter((a) => a.includes('/system/health')), '/system/health 被记了审计').toEqual([])
   })
 
   it('C-42 分页:列表端点统一回 next_cursor(02 §3.4 通用段)', async () => {
@@ -177,7 +193,9 @@ describe('鉴权与错误信封(00 §10)', () => {
     const miss: string[] = []
     for (const path of ['/api/v1/accounts', '/api/v1/sessions', '/api/v1/mail/inbox', '/api/v1/mail/outbox']) {
       const r = await raw(`${path}?limit=1`)
-      if (r.status !== 200) continue
+      /* 第三轮收紧:上一轮这里是 `if (r.status !== 200) continue` —— 端点 503/404 时会被静默跳过、用例照绿。
+         四个端点现在都已装配,非 200 直接记为不符合。 */
+      if (r.status !== 200) { miss.push(`${path}(HTTP ${r.status})`); continue }
       if (!('next_cursor' in r.body)) miss.push(`${path}(无 next_cursor)`)
       if (Array.isArray(r.body.data) && r.body.data.length > 1) miss.push(`${path}(limit=1 却回了 ${r.body.data.length} 行)`)
     }

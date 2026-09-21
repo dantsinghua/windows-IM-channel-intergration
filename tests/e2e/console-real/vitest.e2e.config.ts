@@ -1,7 +1,10 @@
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vitest/config'
+import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
+  // 第三轮:set-page-real.spec.ts 真挂载 SetPage.vue(单文件用 `@vitest-environment jsdom`),需要编译 .vue
+  plugins: [vue()],
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
   test: {
     globals: true,

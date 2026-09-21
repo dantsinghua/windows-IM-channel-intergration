@@ -11,6 +11,7 @@ import { patch, WS_BASE, waitFor, raw } from './harness'
 import { accountsApi, commandsApi, messagesApi, settingsApi, systemApi, jobsApi } from '@/api/client'
 import { requestEnvelope, ApiFailure } from '@/api/http'
 import { EventsClient, ALL_EVENTS, backoffMs } from '@/api/ws'
+import { classifyClose } from '@/codec/stream'
 import type { QtEvent } from '@/api/types'
 
 const ACC = 'qd01'
@@ -265,10 +266,57 @@ describe('E-05 WS 握手鉴权:先 accept 再 close(4401)(02 §3.4.7 R6-62 (a))'
     expect(authFailed).toBeGreaterThanOrEqual(1)
   }, 40000)
 
+  it('4401 之后**不自动重连**;上层重取令牌后 retry() 才再连(01 §5.1 ①)', async () => {
+    /* 01 §5.1 逐字:「`code=4401` ⇒ 置**令牌失效**标记,顶部挂横幅并给出【重新取令牌并重连】,由**用户点按钮**触发…
+       HTTP 侧 401 是自动重取并重放一次,**WS 侧当前不自动重取**」。⇒ 收到 4401 后客户端必须停手
+       (`gaveUp`),否则拿同一把坏令牌无限重连,只刷日志与审计。 */
+    let authFailed = 0
+    const client = new EventsClient(
+      { onEvent: () => {}, onStatus: () => {}, onReplayTruncated: () => {}, onAuthFailed: () => { authFailed += 1 } },
+      { url: `${WS_BASE}/api/v1/events?token=totally-bogus`, jitter: () => 0.01 },
+    )
+    client.connect()
+    await waitFor(async () => authFailed > 0, 15000, 100)
+    // 停手:等 4 s(退避首挡 1 s)也不该再触发第二次 4401
+    await new Promise((r) => setTimeout(r, 4000))
+    expect(authFailed, '4401 之后仍在自动重连(每次都再吃一个 4401)').toBe(1)
+    expect((client as unknown as { gaveUp: boolean }).gaveUp).toBe(true)
+    expect(client.status).toBe('closed')
+    // 用户点「重新取令牌并重连」= retry():这才允许再连一次
+    client.retry()
+    await waitFor(async () => authFailed >= 2, 15000, 100)
+    expect(authFailed).toBe(2)
+    client.close()
+  }, 60000)
+
   it('合法令牌 + 首帧不是 {subscribe:{…}} ⇒ 关闭码 4400', async () => {
     /* 02 §3.4.7 R6-53:「合法首帧 = 含 `subscribe` 对象的 JSON(缺 `subscribe` 键同 `4400`)」;R6-62 (a):同样先 accept 再 close。 */
     expect(await closeCodeOf(WS_URL, JSON.stringify({ hello: 'world' }))).toBe(4400)
   }, 40000)
+})
+
+/* ══════════════ #34 画面流关闭码分诊(客户端侧判据,01 §5.1 第四条) ══════════════ */
+
+describe('#34 画面流三个关闭码:4409/4503 停手,只有 4410 值得再试(01 §5.1 R6-62 Ⅷ)', () => {
+  /* 01 §5.1 逐字:「**`4409`**(该通道不提供画面流)⇒ 提示改用截图预览(#33)并**停手不重连**;
+     **`4410`**(该账号已有 `focus*` 连接)⇒ 提示被占用并**保留重试入口**(三个码里**只有它值得再试**);
+     **`4503`**(画面流执行体本期未装配)⇒ 显示静态提示,**不重连、也不退化成轮询截图**」。
+     这三个码归**客户端**分诊(`codec/stream.ts` 的 `classifyClose`),与后端无关,故不打后端。 */
+  it('4409 / 4503 retryable=false,4410 retryable=true;三档各有自己的人话', () => {
+    const a = classifyClose(4409, false)
+    const b = classifyClose(4410, false)
+    const c = classifyClose(4503, false)
+    expect(a.retryable, '4409 不该保留重试入口').toBe(false)
+    expect(c.retryable, '4503 不该保留重试入口(更不能退化成轮询截图)').toBe(false)
+    expect(b.retryable, '4410 是三个里唯一值得再试的').toBe(true)
+    for (const x of [a, b, c]) expect(x.text.length, '每个码都要给一条人话').toBeGreaterThan(0)
+    expect(new Set([a.text, b.text, c.text]).size, '三档文案不能是同一句').toBe(3)
+  })
+
+  it('事件流的 4401/4400 在画面流码表里同样不可重试(不会被当成「断线了再连」)', () => {
+    expect(classifyClose(4401, false).retryable).toBe(false)
+    expect(classifyClose(4400, false).retryable).toBe(false)
+  })
 })
 
 /* ══════════════ 业务线②:管理线(API 客户端令牌 / 自检 / wsl-restart) ══════════════ */
@@ -278,6 +326,8 @@ describe('业务线②管理线:api-client 令牌全生命周期(02 #90~#93)', (
 
   let appId = ''
   let issued = ''
+  /** 步3b 轮换出来的新令牌(步4 吊销后它们也必须失效) */
+  let rotated: string[] = []
 
   it('步1a #91 新建调用方 ⇒ 201,后端一次性下发明文令牌(02 #91)', async () => {
     /* 02 #91 逐字:「`{name, auth_kind, level, ip_allow, allow_ops, allow_accounts, rate_per_min, api_version_min?}`
@@ -286,9 +336,13 @@ describe('业务线②管理线:api-client 令牌全生命周期(02 #90~#93)', (
       method: 'POST',
       body: { name: 'e2e-复测只读机器人', auth_kind: 'bearer', level: 'read', allow_accounts: ['*'] },
     }) as unknown as Record<string, any>
-    appId = env.app_id ?? env.data?.app_id
+    /* 第三轮收紧(总控口径 ②):R6-55「字面键集 ⇒ 顶层平铺 + ok」的**单一形状** ——
+       上一轮这里写的是 `env.app_id ?? env.data?.app_id`(两形都收),现在只认顶层、且不许再有 `data`。 */
+    expect(env.data, '#91 成功响应不该再包 data(R6-55 单一形状:顶层平铺)').toBeUndefined()
+    appId = env.app_id
     issued = env.token
     expect(appId).toBeTruthy()
+    expect(env.level).toBe('read')                     // 行字段同在顶层
     expect(typeof issued, '后端没有下发一次性明文令牌').toBe('string')
     expect(issued.length).toBeGreaterThan(16)
   })
@@ -296,15 +350,27 @@ describe('业务线②管理线:api-client 令牌全生命周期(02 #90~#93)', (
   it('步1b 经控制台客户端 settingsApi.createApiClient() 也要拿得到那把一次性令牌', async () => {
     /* P-SET 令牌页就是这么调的,而 `token` **只在这一次下发**(02 #91):客户端这一跳丢了它,
        用户就永远拿不到刚建的令牌,只能删了重建。
-       🔴 形状依据 02 §3.4 R6-55:「响应列写成基线 §7 对象名…的端点回 `{ok:true, data:{…}}`;
-       响应列**直接给出字面键集**的端点顶层平铺 + `ok`」—— #91 的响应列是「一次性返回 token 或 secret」,
-       `ApiClient` 不在 00 §7 的对象清单里 ⇒ 该顶层平铺。后端现在**两种都占**(既包 `data` 又在顶层放 `token`),
-       客户端 `request()` 的「有 data 就返回 data」于是把 `token` 丢了(与 E-04 同型)。 */
+       第三轮**按客户端新返回形状翻面**(console-fix-2 §9 第 1 行):`createApiClient()` 现在回
+       `{row, appId, token, traceId}`(不再把信封原样透给页面)。判据一条没松:
+       ① 明文令牌拿得到且能用;② `appId` 与 #90 列表行对得上;③ 列表行不含明文(02 #90「不含 secret」)。 */
     const r = await settingsApi.createApiClient({
       name: 'e2e-复测只读机器人-经客户端', auth_kind: 'bearer', level: 'read', allow_accounts: ['*'],
-    }) as unknown as Record<string, any>
-    expect(r.app_id, '客户端拿不到 app_id').toBeTruthy()
+    })
+    expect(r.appId, '客户端拿不到 app_id').toBeTruthy()
     expect(typeof r.token, '客户端把一次性明文令牌丢了(P-SET 令牌页显示不出来)').toBe('string')
+    expect(r.token!.length).toBeGreaterThan(16)
+    expect(r.row?.app_id, '行对象与 appId 不一致').toBe(r.appId)
+    expect(typeof r.traceId).toBe('string')
+    // 令牌真能用(不是随便一个字符串)
+    expect((await raw('/api/v1/accounts', { token: r.token })).status).toBe(200)
+    // 与 #90 列表行对得上,且列表里读不回明文
+    const list = await settingsApi.apiClients()
+    const row = (list.items as unknown as Record<string, any>[]).find((x) => x.app_id === r.appId)
+    expect(row, '经客户端新建的调用方不在 #90 列表里').toBeTruthy()
+    expect(row!.token).toBeUndefined()
+    expect(row!.secret).toBeUndefined()
+    expect(JSON.stringify(list.items).includes(r.token!), '#90 列表回显了明文令牌').toBe(false)
+    await settingsApi.revokeApiClient(r.appId!)
   })
 
   it('步2 列表里读不回明文(02 #90「不含 secret」)', async () => {
@@ -327,6 +393,25 @@ describe('业务线②管理线:api-client 令牌全生命周期(02 #90~#93)', (
     expect(no.body.error.reason).toBe('level_insufficient')
   })
 
+  it('步3b #92 轮换:单一顶层形状 + 客户端拿到新令牌;新令牌立刻可用,旧令牌在宽限期内仍可用(02 #92)', async () => {
+    /* ⚠️ 本条必须排在步3 之后:轮换两次后**首把**令牌就不在宽限期内了(宽限只护「上一把」),
+       排在前面会把步3 的前提破坏掉(那不是缺陷,是 #92 的语义)。 */
+    /* 02 #92 逐字:「轮换,旧凭据宽限 `grace_minutes`(默认 10)」;形状同 #91(R6-55 字面键集 ⇒ 顶层平铺,总控口径 ②)。 */
+    expect(issued, '步1a 没拿到令牌,本条无从验起').toBeTruthy()
+    const env = await requestEnvelope(`/settings/api-clients/${appId}/rotate`, { method: 'POST' }) as unknown as Record<string, any>
+    expect(env.data, '#92 成功响应不该包 data').toBeUndefined()
+    expect(typeof env.token).toBe('string')
+    expect(env.token).not.toBe(issued)
+    expect(env.grace_minutes).toBe(10)
+    expect((await raw('/api/v1/accounts', { token: env.token })).status, '新令牌不可用').toBe(200)
+    expect((await raw('/api/v1/accounts', { token: issued })).status, '宽限期内旧令牌就失效了').toBe(200)
+    // 经客户端再轮换一次:同样要拿得到一次性明文
+    const viaClient = await settingsApi.rotateApiClient(appId)
+    expect(typeof viaClient.token, 'rotateApiClient() 把一次性明文丢了').toBe('string')
+    expect(viaClient.graceMinutes).toBe(10)
+    rotated = [env.token, viaClient.token!]
+  })
+
   it('步4 #93 吊销 ⇒ 该令牌立刻 401(02 #93)', async () => {
     /* 02 #93 逐字:「吊销」。吊销后旧令牌必须立刻失效,否则「泄露了就换一个」这条运维手段不成立。 */
     expect(issued, '步1a 没拿到令牌,本条无从验起').toBeTruthy()
@@ -335,6 +420,8 @@ describe('业务线②管理线:api-client 令牌全生命周期(02 #90~#93)', (
     expect(after.status).toBe(401)
     expect(after.body.ok).toBe(false)
     expect(after.body.code).toBe('UNAUTHORIZED')
+    // 第三轮:轮换出来的新令牌同属这个调用方,吊销后同样立刻失效(否则「吊销」只吊了一半)
+    for (const t of rotated) expect((await raw('/api/v1/accounts', { token: t })).status, '吊销后轮换出的令牌仍可用').toBe(401)
   })
 
   it('步5 内置 console 不可吊销(吊了控制台自己就连不上)', async () => {
