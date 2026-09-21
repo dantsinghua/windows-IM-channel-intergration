@@ -41,7 +41,7 @@ def image_elem() -> bytes:
 def test_text_family_routes_to_text_with_clean_text():
     for mt in (-1000, -1051, -1049):
         d = decode(mt, "1Y\n1.70 @张三\u0014A".encode("utf-8"))
-        assert d.emit and d.type == "text" and d.text == "1Y\n1.70 @张三[表情]" and not d.unknown and d.kind == "text"
+        assert d.emit and d.type == "text" and d.text == "1Y\n1.70 @张三[爱你]" and not d.unknown and d.kind == "text"
 
 
 def test_java_serial_rows_never_emit_and_count_unknown_only_for_new_types():
@@ -64,8 +64,41 @@ def test_mixed_keeps_elem_order_and_needs_text_segment():
     assert decode_mixed(text_elem("如图") + image_elem()) == "如图[图片]"
     assert decode_mixed(image_elem()) is None                                  # 纯图片:不产出
     d = decode(-1035, image_elem() + text_elem("报价\u0014A"))
-    assert d.emit and d.text == "[图片]报价[表情]"
+    assert d.emit and d.text == "[图片]报价[爱你]"
     assert decode(-1035, b"\xff\xff").emit is False                            # 解析失败:不产出、不抛
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def real_text_elem(s: str) -> bytes:
+    return _pb_field(1, _pb_field(1, s.encode("utf-8")))                  # R6-66 真机结构:Elem.1 直接是正文
+
+
+def pic_elem(w: int, h: int, img_type: int) -> bytes:
+    rec = (_pb_field(1, b"{ABC}.jpg") + _pb_field(7, b"picplatform")
+           + _pb_field(8, b"/gchatpic_new/1/2-3-4/198?term=2")
+           + _varint(24 << 3) + _varint(w) + _varint(25 << 3) + _varint(h) + _varint(26 << 3) + _varint(img_type))
+    return _pb_field(1, _pb_field(2, rec))
+
+
+def test_mixed_real_db_layout_text_segment_is_elem_1_directly():
+    # 真实库 -1035:文本段 Elem.1 直接是 UTF-8 正文;修正前整条被当纯图片丢掉
+    assert decode_mixed(pic_elem(320, 40, 1001) + real_text_elem("测试文本甲")) == "[图片 320×40]测试文本甲"
+    assert decode_mixed(real_text_elem("如图") + pic_elem(240, 180, 2000)) == "如图[动图 240×180]"
+    d = decode(-1035, real_text_elem("好的\u0014\x08") + pic_elem(64, 64, 2000))
+    assert d.emit and d.text == "好的[玫瑰][动图 64×64]"
+    assert decode_mixed(pic_elem(64, 64, 2000)) is None                       # 纯图片仍不产出(R6-44 不变)
+
+
+def test_mixed_image_without_size_falls_back_to_plain_placeholder():
+    assert decode_mixed(real_text_elem("看") + image_elem()) == "看[图片]"
 
 
 def test_message_factory_builds_message_and_warns_once(caplog):
