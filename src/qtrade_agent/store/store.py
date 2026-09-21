@@ -326,6 +326,14 @@ class Store:
                       "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
                       (key, json.dumps(value, ensure_ascii=False), now, actor))
 
+    def settings_swap(self, key: str, old_json: str, value: Any, *, actor: str = "system", now_ms: Optional[int] = None) -> bool:
+        """比较并交换:库里 ``value_json`` 仍逐字等于 ``old_json`` 才改(存量密钥迁移用,防与并发 PUT 互覆)。"""
+        now = now_ms or self._clock()
+        with self._tx() as c:
+            cur = c.execute("UPDATE settings SET value_json=?, updated_ms=?, updated_by=? WHERE key=? AND value_json=?",
+                            (json.dumps(value, ensure_ascii=False), now, actor, key, old_json))
+            return cur.rowcount == 1
+
     def _next_seq(self, c: sqlite3.Connection, channel: str, now: int) -> int:
         """settings.seq.<channel> 单调递增(含已删除的不复用;05 §2.1.1 ②);在调用方的 BEGIN IMMEDIATE 里。"""
         r = c.execute("SELECT value_json FROM settings WHERE key=?", (f"seq.{channel}",)).fetchone()

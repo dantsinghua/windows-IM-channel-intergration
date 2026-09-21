@@ -32,6 +32,7 @@ from ..ids import ulid
 from ..mail.route_secrets import BadSecretRef, check_route, upsert_route
 from ..maintenance import DiskFullError
 from ..models import Command, CommandOrigin, RESULT_CODES
+from ..settings_secrets import VAULT_SCOPE as SETTINGS_VAULT_SCOPE, seal as seal_settings
 from ..store import SeqExhausted
 from ..vault_client import VaultUnavailable
 from ..workflow import WorkflowParseError
@@ -1382,18 +1383,21 @@ def create_api(agent) -> FastAPI:
                                  result_code="OK", detail={"group": "resources"}, now_ms=now)
         return {"data": _group_view("resources"), "restart_required": False}
 
-    async def _stash_secrets(group: str, body: dict[str, Any], actor: str) -> dict[str, str]:
-        """密码类字段**只写不读**:body 里给 ``secret`` 即写 Vault 并回 ``secret_ref``,原值从 body 里摘掉。"""
-        refs: dict[str, str] = {}
-        for key in [k for k in list(body) if any(k.endswith(x) for x in SECRET_KEYS)]:
-            value = body.pop(key)
-            if not isinstance(value, str) or not value:
-                continue
-            name = f"settings/{group}/{key}"
-            await agent.vault.put(name, value, scope="settings")
-            agent.store.settings_set(f"config.{group}.{key}_ref", f"vault://{name}", actor=actor)
-            refs[key] = f"vault://{name}"
-        return refs
+    async def _stash_secrets(group: str, body: dict[str, Any]):
+        """密码类字段**只写不读**(backend-sec-2 起**递归**:嵌套在对象/数组里的密钥同样收走)。
+
+        只做「算出去密后的 body + 把密钥全部写进 Vault」,**不碰库**:调用方在它成功之后才落 ``settings``/``agent.toml``。
+        顶层键 Vault 路径 ``settings/<group>/<key>`` 与改前逐字一致;嵌套键原位置换成 ``<key>_ref``(路径见 ``settings_secrets``)。
+        Vault 写不进 ⇒ ``503 NOT_READY reason=vault_unavailable``(与账号凭据 / 邮件路由同一口径),整个请求不落库。
+        """
+        sealed = seal_settings(group, body, agent.store.settings_get(f"config.{group}"))
+        try:
+            for name, value in sealed.puts:
+                await agent.vault.put(name, value, scope=SETTINGS_VAULT_SCOPE)
+        except VaultUnavailable as e:
+            raise ApiError(503, "NOT_READY", f"凭据保险库不可用({e.reason}),配置未保存",
+                           reason="vault_unavailable", retryable=True)
+        return sealed
 
     def _write_agent_toml(group: str, body: dict[str, Any]) -> bool:
         """原子写(临时文件 + rename);``config_path`` 没给(开发容器 / 测试)就只落 ``settings``,回 False。"""
@@ -1739,20 +1743,24 @@ def create_api(agent) -> FastAPI:
         if not isinstance(body, dict):
             raise ApiError(400, "INVALID_ARGS", "请求体须为对象", reason="bad_body")
         _reject_unknown_keys(group, body)          # 🔴 在**任何**落库动作之前(含下面的 public_domain)
-        if group == "api" and "public_domain" in body:
-            # 与 `_group_view` 同一把键 ⇒ 写进读得回;空串/None = 清除(P-SET 把域名删掉的动作)。
-            pub = body.pop("public_domain")
-            pub = str(pub).strip() if isinstance(pub, str) else None
-            agent.store.settings_set(API_PUBLIC_DOMAIN_KEY, pub or None, actor=p.actor)
         warnings: list[str] = []
         if group == "resources":
             return {"ok": True, "group": group, **_put_resources(body, p.actor)}
         if group == "mail":
             return await put_settings_mail(request)
+        pub_given = group == "api" and "public_domain" in body
+        pub = body.pop("public_domain", None) if pub_given else None
         if group == "retention":
             checked = _validate_retention(body)
             body, warnings = checked["value"], checked["warnings"]
-        secret_refs = await _stash_secrets(group, body, p.actor)
+        sealed = await _stash_secrets(group, body)  # 🔴 先校验、先写 Vault;以下才落库(Vault 失败 ⇒ 503,库一行不动)
+        if pub_given:
+            # 与 `_group_view` 同一把键 ⇒ 写进读得回;空串/None = 清除(P-SET 把域名删掉的动作)。
+            pub = str(pub).strip() if isinstance(pub, str) else None
+            agent.store.settings_set(API_PUBLIC_DOMAIN_KEY, pub or None, actor=p.actor)
+        for key, ref in sealed.top_refs.items():
+            agent.store.settings_set(f"config.{group}.{key}_ref", ref, actor=p.actor)
+        body, secret_refs = sealed.body, sealed.top_refs
         agent.store.settings_set(f"config.{group}", body, actor=p.actor)
         written = _write_agent_toml(group, body)
         data = dict(body)

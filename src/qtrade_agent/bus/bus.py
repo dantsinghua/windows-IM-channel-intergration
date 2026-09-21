@@ -19,6 +19,7 @@ from ..events import Events
 from ..ids import ulid
 from ..maintenance import DiskFullError
 from ..models import Command, CommandError, CommandResult, RESULT_CODES, Message, Session, json_safe
+from ..settings_secrets import redact as redact_secrets
 from ..store import Store
 from .validate import validate_args
 
@@ -34,14 +35,16 @@ def canonical_args_hash(args: dict[str, Any]) -> str:
 
 
 def redact_args(args: dict[str, Any]) -> dict[str, Any]:
-    """P-11:args.text 入库前替换为 {text_sha8, text_len};secret 擦成 ***。"""
-    out = dict(args)
+    """P-11:args.text 入库前替换为 {text_sha8, text_len};密钥类键(**任意层级**,判定同 ``settings_secrets.is_secret``)擦成 ***。
+
+    返回新对象、不改入参:它只作用于落 ``commands.args_json`` 的副本;交给执行体的 ``cmd.args`` 与幂等
+    ``canonical_args_hash(cmd.args)`` 用的都是脱敏前的原值(backend-sec-2 核过,语义不变)。
+    """
+    out = redact_secrets(args)
     if isinstance(out.get("text"), str):
         t = out.pop("text")
         out["text_sha8"] = hashlib.sha256(t.encode("utf-8")).hexdigest()[:8]
         out["text_len"] = len(t)
-    if "secret" in out:
-        out["secret"] = "***"
     return out
 
 

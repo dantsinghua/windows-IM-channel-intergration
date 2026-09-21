@@ -47,6 +47,7 @@ from .pressure import MemoryWatermark
 from .runtime import AdbBackend, AdbCliBackend, ContainerBackend, DockerCliBackend, Runtime
 from .runtime.runtime import Fs
 from .scheduler import Scheduler
+from .settings_secrets import migrate_plaintext as migrate_settings_secrets
 from .store import Store
 from .netprobe import SocketLevelProbe
 from .sysenv import DockerProxyApplier, WslEnvReader
@@ -320,6 +321,8 @@ class AgentApp:
         self.scheduler.register("mail_confirm_reaper", MAIL_CONFIRM_TICK_S, self.mail_confirm_tick)                            # 06 §2.3.6
         # S-8(backend-sec-1):存量 `mail_routes` 明文凭据迁入 Vault;要连 Vault ⇒ 放运行期(不在 `--init-db`),Vault 不在就下轮再试
         self.scheduler.register("mail_route_secret_migrate", MAIL_SECRET_MIGRATE_S, self.mail_secret_migrate_tick, run_immediately=True)
+        # backend-sec-2:#89 存量 `settings['config.<group>'|'config.__all__']` 里嵌套的明文密钥迁入 Vault;同上放运行期
+        self.scheduler.register("settings_secret_migrate", MAIL_SECRET_MIGRATE_S, self.settings_secret_migrate_tick, run_immediately=True)
         self.scheduler.register("monitor_sample", self.cfg.monitor.sample_interval_s, self.monitor_tick)                       # 04 §2.4.5
         self.scheduler.register("jobs_reclaimer", self.cfg.jobs.reclaim_interval_s, self.reclaimer.reclaim_once)               # 02 §3.1 R6-16
         self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
@@ -665,6 +668,10 @@ class AgentApp:
         """与 ``[mail] enabled`` 无关:关着邮件也不许库里躺着明文。没有明文的库只读一遍、一条语句不写。"""
         if await migrate_mail_route_secrets(self.mail.ms, self.vault):
             self.mail.reload()                      # 引用改成本路由自己的路径,取信/发信线程按新引用重建
+
+    async def settings_secret_migrate_tick(self) -> None:
+        """没有明文的库只读一遍、一条语句不写;Vault 不在 ⇒ 行原样保留、下轮再试。"""
+        await migrate_settings_secrets(self.store, self.vault)
 
     async def outbox_retention(self) -> None:
         cutoff = self.clock() - self.cfg.events.ws_retention_hours * 3600 * 1000
