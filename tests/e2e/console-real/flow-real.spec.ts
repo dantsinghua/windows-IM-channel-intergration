@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { patch, WS_BASE, waitFor, raw } from './harness'
-import { accountsApi, commandsApi, messagesApi, settingsApi, systemApi, jobsApi } from '@/api/client'
+import { accountsApi, commandsApi, messagesApi, settingsApi, systemApi } from '@/api/client'
 import { requestEnvelope, ApiFailure } from '@/api/http'
 import { EventsClient, ALL_EVENTS, backoffMs } from '@/api/ws'
 import { classifyClose } from '@/codec/stream'
@@ -452,7 +452,15 @@ describe('业务线②管理线:#78 自检 202 → 轮询到终态', () => {
     // 01 §4 的自检表要行;没有执行体的项一律 warn + 原因,不假装 ok
     const rows = (await systemApi.selftestResult(started.run_id)).items
     expect(rows.length).toBeGreaterThan(0)
-    for (const row of rows) expect(['ok', 'warn', 'fail']).toContain(row.level)
+    /* 行 level 的取值 = `SelftestRow.level`(console/src/api/types.ts:763)四档 ok / warn / error / skip。
+       `skip` 是第五批按 C-18(01:119)/ 01:694「SKIPPED → 灰『未探测』」/ 01:1513 M4-7 新增的灰档;
+       原断言里的 'fail' 并不是 level 的取值(那是探测结论表 tone 的名字),从来匹配不到真实行,顺带改正。
+       不是放松:新增的 skip 档另加文案约束(不甩裸枚举,01 §2.9 约定 6)。 */
+    for (const row of rows) expect(['ok', 'warn', 'error', 'skip']).toContain(row.level)
+    for (const row of rows.filter((x) => x.level === 'skip')) {
+      expect(row.message ?? '', 'skip 档说明列甩了英文枚举').not.toMatch(/SKIPPED/)
+      expect(row.message ?? '', 'skip 档要写「未探测」').toContain('未探测')
+    }
     if (d.redroid_boot_ms === null) {
       expect(rows.find((x) => x.item === 'redroid_boot')?.level, '没跑成的项不得标 ok').not.toBe('ok')
     }

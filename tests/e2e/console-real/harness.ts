@@ -20,6 +20,13 @@ export const patch = {
   /** 置 true 时不注 Authorization(模拟「主进程还没拿到令牌」) */
   noAuth: false,
   token: 'e2e-admin-token' as string,
+  /**
+   * 非 null 时在请求**发出前**改写请求体(返回新 body 字符串;返回 undefined = 不改)。
+   * 🔴 只用于**造错误条件**:前端已按白名单过滤、界面发不出野键,要验「真后端回 400 ⇒ 界面把
+   * `details[].pointer` 显示出来」这条链路,只能在出口处注入一个野键让**真后端**真的回 400。
+   * 响应是真的,被测的是前端对真 400 的处置;用完必须置回 null。
+   */
+  mutateBody: null as ((url: string, method: string, body: string | null) => string | undefined) | null,
 }
 
 const realFetch = globalThis.fetch.bind(globalThis)
@@ -37,12 +44,18 @@ globalThis.fetch = (async (input: any, init: any = {}) => {
   const headers: Record<string, string> = { ...(init.headers ?? {}) }
   if (!patch.noAuth) headers['Authorization'] = `Bearer ${patch.token}`   // 主进程 webRequest 做的事
   if (patch.forceApiMin !== null) headers['X-QT-Api-Min'] = patch.forceApiMin
-  const res = await realFetch(url, { ...init, headers, body: init.body })
+  const method = String(init.method ?? 'GET')
+  let body = init.body
+  if (patch.mutateBody) {
+    const m = patch.mutateBody(url, method, typeof body === 'string' ? body : null)
+    if (m !== undefined) body = m
+  }
+  const res = await realFetch(url, { ...init, headers, body })
   seen.push({
     url,
-    method: String(init.method ?? 'GET'),
+    method,
     headers,
-    body: typeof init.body === 'string' ? init.body : null,
+    body: typeof body === 'string' ? body : null,
     status: res.status,
   })
   return res
