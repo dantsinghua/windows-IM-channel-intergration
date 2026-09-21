@@ -240,3 +240,46 @@ janitor 只监听不清理、时区两处都设、不动 `/usr/bin/python3` 指�
 `Dockerfile`、`build-rootfs.sh`、`files/` 一字未改。产物 sha256 与自检结果登记在产物根 `SOURCES.md` §12,
 交接见 `.omc/handoffs/rootfs-rebuild.md`。本次首启 `--init-db` 连跑三次主库 sha256 完全相同 ⇒ §6 之后
 遗留的 D-05(字节级不幂等)在发行版上已闭合。
+
+## 8. 本轮:依赖上锁(2026-09-21 14:10,基于提交 `d134964`)
+
+起因:独立端到端第二轮复测的 **R-1**——发行版依赖只在 `pip install <wheel>` 时按「构建当天 PyPI
+最新且满足下限」解析,`contents.json` 只登记 wheel 的 sha256、不登记依赖集合 ⇒ 同一份 wheel 在
+不同日期能重建出行为不同的发行版(已见 uvicorn `ws="websockets"`、websockets.legacy、starlette
+testclient 三处弃用信号),追溯不到。本轮把运行期依赖**锁死**。
+
+### 三个文件
+
+| 文件 | 作用 |
+|---|---|
+| `requirements.in` | 顶层运行期依赖,与 `pyproject.toml` 的 `[project] dependencies` 同下限(fastapi/uvicorn/websockets/aiosqlite) |
+| `runtime-constraints.txt` | 版本事实来源 = 开发机 `~/.venvs/qtrade`(全量测试全绿)的 `uv pip freeze`;作 `uv pip compile --constraint`,把闭包版本钉到这套已验证的版本 |
+| `requirements.lock` | `uv pip compile` 生成的**带 sha256 hash** 全集(15 个运行期包);Dockerfile 用 `--require-hashes` 安装 |
+
+### 重新生成锁(需出网走代理)
+
+```bash
+export https_proxy=http://172.19.176.1:7890 http_proxy=http://172.19.176.1:7890 no_proxy=localhost,127.0.0.1
+# 事实来源:先在开发机 venv 上刷新 runtime-constraints.txt(可选)
+uv pip freeze --python ~/.venvs/qtrade/bin/python > installer/rootfs/runtime-constraints.txt   # 顶部注释需保留/补回
+# 生成 lock
+uv pip compile installer/rootfs/requirements.in \
+    --constraint installer/rootfs/runtime-constraints.txt \
+    --generate-hashes --python-version 3.12 \
+    --output-file installer/rootfs/requirements.lock
+```
+
+### 构建侧改动
+
+- `Dockerfile`:新增 `COPY payload/requirements.lock`;依赖装法由 `pip install <wheel>` 改为
+  **先** `pip install --require-hashes -r requirements.lock`(装齐运行期依赖)、**再** `pip install --no-deps <wheel>`
+  (只装 Agent 本体)。任一包 hash 对不上直接构建失败,不静默换版本。
+- `build-rootfs.sh`:备料时把 `requirements.lock` 拷进构建上下文;`contents.json` 新增
+  `requirements_lock { path, packages, sha256 }` 一项 —— 依赖集合从此也进了 G-10 完整性清单(正是 R-1 要的)。
+
+### 连带:`pyproject.toml` 删了 `docker>=7`
+
+全仓无 `import docker`(dockerd 走子进程),该依赖声明未用。删除后发行版 venv 少
+`docker/requests/urllib3/charset-normalizer` 四包(锁解析确认它们非运行期传递依赖,故不进锁),
+供应链面收窄。产物 sha256 与八项自检(尤其 ⑧ `pip freeze` 与锁逐行一致)登记在产物根 `SOURCES.md` §13,
+交接见 `.omc/handoffs/rootfs-rebuild-2.md`。

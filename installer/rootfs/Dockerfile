@@ -102,6 +102,11 @@ COPY payload/ADBKeyboard.apk /opt/qtrade/apk/ADBKeyboard.apk
 #    此前落在 /opt/qtrade/profiles/ —— 正是那个对不上的旧落点。
 COPY payload/device_profiles.json /opt/qtrade/agent/data/device_profiles.json
 COPY payload/agent-wheel/     /opt/qtrade/agent/dist/
+# 🔴 依赖锁(R-1):运行期依赖的带 hash 锁文件,由 build-rootfs.sh 从
+#    installer/rootfs/requirements.lock 备进构建上下文(uv pip compile 生成,版本钉死
+#    到开发机 ~/.venvs/qtrade 那套已验证版本)。下面用 --require-hashes 安装 ⇒ 同一份
+#    wheel 在不同日期重建出的依赖集合一致、可复现;并登记进 contents.json。
+COPY payload/requirements.lock /opt/qtrade/agent/requirements.lock
 
 RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboot 2>/dev/null || true; \
     chmod 0755 /opt/qtrade/frida/frida-server-* 2>/dev/null || true; \
@@ -109,11 +114,21 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 
 # ── Agent(02 §2.1 第 3~4 步:systemd 起 dockerd → qtrade-agent)─────────────
 # venv 而不是 `pip install --break-system-packages`:Agent 的依赖(fastapi/uvicorn/
-# websockets/aiosqlite/docker)与发行版自己的 python3-* 包没有必要互相牵制,
+# websockets/aiosqlite)与发行版自己的 python3-* 包没有必要互相牵制,
 # 升级 Agent 时也只动这一个目录。
+# 🔴 依赖用**锁文件 + --require-hashes** 装(R-1):运行期闭包的版本钉死到
+#    requirements.lock(uv pip compile 生成、带 sha256 hash),而不是「构建当天 PyPI
+#    最新且满足下限」。之后 wheel 用 --no-deps 装(依赖已由锁装齐),两次不同日期的
+#    重建得到逐位一致的依赖集合。任一包 hash 对不上直接构建失败,不静默换版本。
+# 🔴 只 `--upgrade pip`,不装 `wheel`:发行版 venv 只**安装**预编译 .whl(锁里 15 个包与
+#    Agent wheel 都有对应 wheel),装 .whl 不需要 `wheel` 包(它只在 build sdist 时才要)。
+#    带上 `wheel` 会把它和它的依赖 `packaging` 留进 venv —— 两个 Agent 运行期从不 import
+#    的包,污染「pip freeze 与锁一致」这条自检并平白扩大供应链面。
 RUN ${PY} -m venv /opt/qtrade/agent/venv \
-    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --upgrade pip wheel \
-    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir \
+    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
+        -r /opt/qtrade/agent/requirements.lock \
+    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --no-deps \
         /opt/qtrade/agent/dist/qtrade_agent-*.whl \
     && /opt/qtrade/agent/venv/bin/python -c "import qtrade_agent, importlib.resources as r; \
         assert (r.files('qtrade_agent.store') / 'schema_agent.sql').is_file(), 'schema_agent.sql 没进包'; \

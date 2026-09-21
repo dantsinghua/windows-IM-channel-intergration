@@ -1,0 +1,22 @@
+# Agent 运行期依赖 —— 顶层声明(锁文件 requirements.lock 的输入)
+#
+# 规格:与仓库根 `pyproject.toml` 的 `[project] dependencies` 逐条对应(同样的下限)。
+#       02 §2.2 技术选型:FastAPI + uvicorn(显式 ws="websockets")+ aiosqlite + websockets。
+#
+# 🔴 为什么有这份 .in 和配套的 .lock(R-1,独立端到端第二轮复测提出):
+#    Dockerfile 若直接 `pip install <wheel>`,依赖按「构建当天 PyPI 最新且满足下限」解析,
+#    两次不同日期的重建会得到不同的依赖集合,而 contents.json 只登记 wheel 的 sha256、
+#    不登记依赖集合 ⇒ 同一份 wheel 可对应行为不同的发行版,追溯不到。
+#    锁做法:这份 .in 给顶层依赖;`requirements.lock` 由 uv pip compile 把闭包解析成
+#    带精确版本 + sha256 hash 的全集,版本钉死到开发机 `~/.venvs/qtrade`(跑着全绿测试)
+#    那套已验证的版本;Dockerfile 用 `--require-hashes -r requirements.lock` 安装。
+#
+# 🔴 已从 pyproject 删除的 `docker>=7`(全仓无 import,dockerd 走子进程)不在此列;
+#    连带 requests/urllib3/charset-normalizer 四包不再进发行版。
+#
+# 重新生成锁(需出网走代理):见 README.md「依赖上锁」一节。
+
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=12
+aiosqlite>=0.20

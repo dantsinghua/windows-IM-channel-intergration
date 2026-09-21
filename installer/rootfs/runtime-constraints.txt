@@ -1,0 +1,36 @@
+# 依赖锁的版本事实来源 —— 开发机 venv `~/.venvs/qtrade` 的 `uv pip freeze`
+#
+# 这份文件是「已验证可用的版本集合」:开发机这套 venv 上全量 Agent 测试(2316/2325)全绿,
+# 其版本组合是经过测试的。生成 requirements.lock 时用它作 `uv pip compile --constraint`,
+# 把运行期闭包的每个包钉到这里的版本(而不是构建当天 PyPI 的最新版),从而
+# 「同一份 wheel 在不同日期重建出的发行版依赖集合一致、可复现」(R-1)。
+#
+# 含测试依赖(pytest/httpx 等):约束文件只约束版本、不强制安装 —— lock 的闭包仍只从
+# requirements.in 的运行期顶层依赖解析,测试依赖不会进 lock。
+#
+# 刷新方式:在开发机 venv 上 `uv pip freeze --python ~/.venvs/qtrade/bin/python` 覆盖本文件,
+# 再重跑 README「依赖上锁」一节的 compile。截取时间:2026-09-21(基于提交 d134964)。
+aiosqlite==0.22.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+fastapi==0.141.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pygments==2.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+starlette==1.6.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.53.0
+websockets==17.1

@@ -88,6 +88,15 @@ shopt -u nullglob
 AGENT_WHEEL="${wheels[0]}"
 cp -f "$AGENT_WHEEL" "$P/agent-wheel/"
 AGENT_WHEEL_NAME="$(basename "$AGENT_WHEEL")"
+
+# 依赖锁(R-1)—— 与 Dockerfile 的 `COPY payload/requirements.lock` 对应。
+# 运行期依赖的带 hash 锁(uv pip compile 生成),Dockerfile 用 --require-hashes 安装,
+# 让「同一份 wheel 不同日期重建出的依赖集合一致、可复现」;下面登记进 contents.json。
+LOCK_SRC="$HERE/requirements.lock"
+[ -r "$LOCK_SRC" ] || die "缺 $LOCK_SRC(先在 installer/rootfs 跑 uv pip compile 生成,见 README「依赖上锁」)"
+cp -f "$LOCK_SRC" "$P/requirements.lock"
+LOCK_PKGS="$(grep -cE '^[a-zA-Z0-9].*==' "$P/requirements.lock")"
+say "    依赖锁 $LOCK_PKGS 个运行期包 → /opt/qtrade/agent/requirements.lock"
 # 版本号从文件名取(qtrade_agent-<ver>-py3-none-any.whl)
 AGENT_VERSION="$(printf '%s' "$AGENT_WHEEL_NAME" | sed -E 's/^qtrade_agent-([^-]+)-.*/\1/')"
 
@@ -213,6 +222,7 @@ fi
 jq -n \
     --arg wheel_path "/opt/qtrade/agent/dist/$AGENT_WHEEL_NAME" \
     --arg wheel_ver "$AGENT_VERSION" --arg wheel_sha "$(sha "$AGENT_WHEEL")" \
+    --arg lock_sha "$(sha "$P/requirements.lock")" --argjson lock_pkgs "$LOCK_PKGS" \
     --argjson redroid "$(img_json "$REDROID_REF" "$REDROID_TAR")" \
     --argjson napcat  "$(img_json "$NAPCAT_REF"  "$NAPCAT_TAR")" \
     --arg adb_ver "$ADB_VERSION" --arg adb_sha "$(sha "$P/platform-tools/adb")" \
@@ -225,6 +235,7 @@ jq -n \
         rootfs_version: $rootfs_ver,
         built_at: $built,
         agent_wheel:     { path: $wheel_path, version: $wheel_ver, sha256: $wheel_sha },
+        requirements_lock: { path: "/opt/qtrade/agent/requirements.lock", packages: $lock_pkgs, sha256: $lock_sha },
         redroid_image:   $redroid,
         napcat_image:    $napcat,
         adb:             { path: "/opt/qtrade/platform-tools/adb", version: $adb_ver, sha256: $adb_sha },
