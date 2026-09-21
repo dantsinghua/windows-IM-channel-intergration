@@ -201,10 +201,22 @@ class WorkflowEngine:
         """#45:``{run, steps:[…]}`` 每步留痕。"""
         return {"run": self._run_row(run_id), "steps": self.steps(run_id)}
 
-    def runs(self, workflow_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        """#44:分页(调用方套 §3.4 通用 cursor)。"""
-        return [dict(r) for r in self._store.con.execute(
-            "SELECT * FROM workflow_runs WHERE workflow_id=? ORDER BY started_ms DESC LIMIT ?", (workflow_id, limit))]
+    def runs(self, workflow_id: str, *, limit: int = 50, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
+             before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#44:C-42 分页,``(started_ms, run_id)`` 降序;``before`` = 上一页末行 ``(ts_ms, run_id)``(游标 G-16)。
+
+        排序带上 ``run_id`` 作第二键:同一毫秒起跑的多个 run 否则翻页时顺序不定、会重会漏。
+        """
+        sql, args = ["SELECT * FROM workflow_runs WHERE workflow_id=?"], [workflow_id]
+        if since_ms is not None:
+            sql.append("AND started_ms >= ?"); args.append(since_ms)
+        if until_ms is not None:
+            sql.append("AND started_ms <= ?"); args.append(until_ms)
+        if before is not None:
+            sql.append("AND (started_ms < ? OR (started_ms = ? AND run_id < ?))")
+            args += [int(before[0]), int(before[0]), str(before[1])]
+        sql.append("ORDER BY started_ms DESC, run_id DESC LIMIT ?"); args.append(limit)
+        return [dict(r) for r in self._store.con.execute(" ".join(sql), tuple(args))]
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self._store.con.execute(

@@ -190,14 +190,14 @@ def test_mail_status_times_are_iso(rig):
     st.update({"last_success_ms": T0, "fallback_since": T0 - 60_000})
     fetcher._save(st)
     _mk_cleanup(rig, 1, started_ms=T0 - 5000)
-    route = _get(rig, "/mail/status")["data"][0]
+    route = _get(rig, "/mail/status")["routes"][0]          # 第六批:按 02 #56 + R6-55 改为顶层平铺 {ok, enabled, routes:[…]}
     assert _iso_ms(route["inbound"]["last_success_at"]) == T0
-    assert _iso_ms(route["inbound"]["fallback_since"]) == T0 - 60_000
+    assert route["inbound"]["fallback"] is None                       # 未回落(active == configured)⇒ null(02 #56)
     assert _iso_ms(route["cleanup"]["last_run_at"]) == T0 - 5000 + 1000                  # finished_ms,秒精度
     assert route["cleanup"]["last_status"] == "OK"
 
 
 def test_mail_status_never_run_is_null(rig):
-    route = _get(rig, "/mail/status")["data"][0]
+    route = _get(rig, "/mail/status")["routes"][0]
     assert route["cleanup"]["last_run_at"] is None
-    assert route["inbound"]["last_success_at"] is None and route["inbound"]["fallback_since"] is None
+    assert route["inbound"]["last_success_at"] is None and route["inbound"]["fallback"] is None

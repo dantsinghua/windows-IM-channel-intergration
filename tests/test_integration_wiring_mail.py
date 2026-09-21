@@ -48,7 +48,7 @@ def _pending(rig) -> tuple[int, dict]:
 def test_mail_status_and_lists(rig):
     _ingest(rig, command_mail(req_id="r-read"))
     r = rig.client.get("/api/v1/mail/status", headers=H(TOKEN_READ))
-    assert r.status_code == 200 and r.json()["data"]
+    assert r.status_code == 200 and r.json()["routes"]      # 第六批:#56 按 02 + R6-55 顶层平铺 {ok, enabled, routes}
     r = rig.client.get("/api/v1/mail/inbox", headers=H(TOKEN_READ))
     assert r.status_code == 200 and len(r.json()["data"]) == 1
     iid = r.json()["data"][0]["id"]

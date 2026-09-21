@@ -153,8 +153,9 @@ def test_three_connect_failures_trigger_fallback(store, clock):
     assert env.fetcher.effective_protocol == "pop3"
     assert fire_count(env, MAIL_PROTOCOL_FALLBACK) == 1
     st = env.fetcher.status()
-    assert st["configured_protocol"] == "imap" and st["effective_protocol"] == "pop3"
-    assert st["fallback_since"] is not None
+    # 第六批:#56 inbound 段按 02 #56 改名(protocol_configured/protocol_active/fallback{since_at,reason});判据不松
+    assert st["protocol_configured"] == "imap" and st["protocol_active"] == "pop3"
+    assert st["fallback"]["since_at"] is not None and st["fallback"]["reason"]
 
 
 def test_auth_failure_never_falls_back(store, clock):

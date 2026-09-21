@@ -191,6 +191,76 @@ def mail_cleanup_log_row_view(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _obj(text: Any, default: Any) -> Any:
+    """``*_json`` 库列 → 对象;坏 JSON / 空 → ``default``(与 #65 ``detail`` 同套路,不让前端再 parse 一次)。"""
+    try:
+        return json.loads(text) if text else default
+    except ValueError:
+        return default
+
+
+# ════════════════════════════════════════════ 第六批(S-4~S-9):其它域同型的出参视图
+# 口径同 #58/#65/#68b:不把库行原样透出;`*_ms` → `*_at`(ISO 8601 +08:00,00 §6);`*_json` → 解成对象、去 `_json`
+# 后缀;整数主键 `id` → 字符串。键集显式列出 ⇒ 库里以后加列不会自动外露。
+
+def workflow_view(row: dict[str, Any], *, with_yaml: bool = True) -> dict[str, Any]:
+    """#38(``with_yaml=False``,02 #38「不含 yaml 全文」)/ #39 / #40 / #41 的工作流定义。``id`` 本就是 ULID 字符串。"""
+    out: dict[str, Any] = {"id": row["id"], "name": row["name"], "version": row["version"]}
+    if with_yaml:
+        out["yaml"] = row.get("yaml")
+    out.update({"checksum": row.get("checksum"), "enabled": bool(row.get("enabled", 1)), "schedule_cron": row.get("schedule_cron"),
+                "created_at": _iso(row.get("created_ms")), "updated_at": _iso(row.get("updated_ms")),
+                "updated_by": row.get("updated_by")})
+    return out
+
+
+def workflow_run_view(row: dict[str, Any]) -> dict[str, Any]:
+    """#44 的行 / #45 的 ``run``(02 §3.1 `workflow_runs`;``args_json`` → ``args`` 对象)。"""
+    return {"run_id": row["run_id"], "workflow_id": row.get("workflow_id"), "workflow_version": row.get("workflow_version"),
+            "trigger": row.get("trigger"), "actor": row.get("actor"), "args": _obj(row.get("args_json"), {}),
+            "status": row.get("status"), "pause_reason": row.get("pause_reason"), "error": row.get("error"),
+            "started_at": _iso(row.get("started_ms")), "finished_at": _iso(row.get("finished_ms"))}
+
+
+def workflow_step_view(row: dict[str, Any]) -> dict[str, Any]:
+    """#45 的 ``steps[]``(02 §3.1 `workflow_steps` 全列,时间换 ISO)。"""
+    return {"step_id": row["step_id"], "run_id": row.get("run_id"), "idx": row.get("idx"), "step_name": row.get("step_name"),
+            "op": row.get("op"), "account_id": row.get("account_id"), "trace_id": row.get("trace_id"),
+            "status": row.get("status"), "attempt": row.get("attempt"), "result_code": row.get("result_code"),
+            "note": row.get("note"), "started_at": _iso(row.get("started_ms")), "finished_at": _iso(row.get("finished_ms"))}
+
+
+def _is_secret_key(k: str) -> bool:
+    kl = k.lower()
+    return kl in ("secret", "password", "token") or kl.endswith(("_secret", "_password", "_token"))
+
+
+def strip_secrets(obj: Any) -> Any:
+    """递归去掉「只写不读」的明文键(``secret``/``password``/``*_secret``…),``*_ref`` 保留。"""
+    if isinstance(obj, dict):
+        return {k: strip_secrets(v) for k, v in obj.items() if not _is_secret_key(str(k))}
+    if isinstance(obj, list):
+        return [strip_secrets(v) for v in obj]
+    return obj
+
+
+def mail_route_row_view(row: dict[str, Any], *, status: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """#105 ``GET /settings/mail/routes`` 的行(此前 ``SELECT *`` 原样,``inbound_json``/``outbound_json`` 是字符串)。
+
+    键 = 02 #105 body 的键集(``channel/account_id/inbound/outbound/outbound_template_id/inbound_template_id/enabled``)
+    + ``id`` + ``created_at/updated_at`` + ``status``(02 #105「含每条 `status` 摘要 = #56 单条」,由调用方给)。
+    🔴 ``inbound``/``outbound`` 过 ``strip_secrets``:02 #105「`inbound.secret/outbound.secret` 只写不读」——
+    改前实测 PUT 带进来的 ``secret`` 明文被原样存进 ``inbound_json``、GET 原样回显。
+    """
+    return {"id": str(row["id"]), "channel": row.get("channel"), "account_id": row.get("account_id"),
+            "inbound": strip_secrets(_obj(row.get("inbound_json"), {})),
+            "outbound": strip_secrets(_obj(row.get("outbound_json"), {})),
+            "outbound_template_id": row.get("outbound_template_id"), "inbound_template_id": row.get("inbound_template_id"),
+            "enabled": bool(row.get("enabled", 1)),
+            "created_at": _iso(row.get("created_ms")), "updated_at": _iso(row.get("updated_ms")),
+            "status": status}
+
+
 def encode_cursor(ts_ms: int, id: str) -> str:
     """02 §3.4 通用 G-16:``cursor = base64url(JSON{"ts_ms":…,"id":…})``(R6-53:R6-52 曾写 "ts_ms:id",按 G-16 改回)。"""
     raw = json.dumps({"ts_ms": int(ts_ms), "id": id}, separators=(",", ":")).encode()

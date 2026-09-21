@@ -36,9 +36,10 @@ from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
 from .routes_ext import register_ext
 from .routes_ext2 import job_is_irreversible, register_ext2
-from .serialize import (account_view, command_view, decode_cursor, encode_cursor, mail_cleanup_log_row_view,
-                        mail_inbox_row_view, mail_outbox_row_view, message_view, result_view, session_view,
-                        stored_result_view)
+from .serialize import (account_view, command_view, decode_cursor, encode_cursor,
+                        mail_cleanup_log_row_view, mail_inbox_row_view, mail_outbox_row_view, mail_route_row_view,
+                        message_view, result_view, session_view, stored_result_view, workflow_run_view,
+                        workflow_step_view, workflow_view)
 
 log = logging.getLogger("qtrade.api")
 
@@ -854,7 +855,7 @@ def create_api(agent) -> FastAPI:
     async def list_workflows(request: Request):
         """#38:列表**不含 yaml 全文**(G-09:工作流只存表)。"""
         _principal(request, "read")
-        return {"ok": True, "data": [{k: v for k, v in w.items() if k != "yaml"} for w in agent.workflows.list()]}
+        return {"ok": True, "data": [workflow_view(w, with_yaml=False) for w in agent.workflows.list()]}
 
     @app.post(f"{API_PREFIX}/workflows", status_code=201)
     async def create_workflow(request: Request):
@@ -870,13 +871,13 @@ def create_api(agent) -> FastAPI:
                                         schedule_cron=body.get("schedule_cron"), actor=p.actor)
         except WorkflowParseError as e:
             raise _wf_parse_error(e)
-        return {"ok": True, "data": wf}
+        return {"ok": True, "data": workflow_view(wf)}
 
     @app.get(f"{API_PREFIX}/workflows/{{workflow_id}}")
     async def get_workflow(request: Request, workflow_id: str):
         """#40:含 yaml。"""
         _principal(request, "read")
-        return {"ok": True, "data": _wf_or_404(workflow_id)}
+        return {"ok": True, "data": workflow_view(_wf_or_404(workflow_id))}
 
     @app.put(f"{API_PREFIX}/workflows/{{workflow_id}}")
     async def put_workflow(request: Request, workflow_id: str):
@@ -892,7 +893,7 @@ def create_api(agent) -> FastAPI:
                                         schedule_cron=body.get("schedule_cron", cur.get("schedule_cron")), actor=p.actor)
         except WorkflowParseError as e:
             raise _wf_parse_error(e)
-        return {"ok": True, "data": wf}
+        return {"ok": True, "data": workflow_view(wf)}
 
     @app.delete(f"{API_PREFIX}/workflows/{{workflow_id}}")
     async def delete_workflow(request: Request, workflow_id: str):
@@ -917,11 +918,17 @@ def create_api(agent) -> FastAPI:
         return JSONResponse(status_code=202, content={"ok": True, "run_id": run_id})
 
     @app.get(f"{API_PREFIX}/workflows/{{workflow_id}}/runs")
-    async def list_workflow_runs(request: Request, workflow_id: str, limit: int = Query(50, ge=1, le=500)):
-        """#44:分页。"""
+    async def list_workflow_runs(request: Request, workflow_id: str, since: Optional[str] = None,
+                                 until: Optional[str] = None, limit: int = Query(50, ge=1, le=500),
+                                 cursor: Optional[str] = None):
+        """#44:分页(02 #44「分页」= C-42 ``since/until/limit/cursor`` → ``{data, next_cursor}``;此前收 ``limit`` 却不回
+        ``next_cursor`` ⇒ 静默截断)。排序 ``(started_ms, run_id)`` 降序;游标**先按库行算、再转视图**。"""
         _principal(request, "read")
         _wf_or_404(workflow_id)
-        return {"ok": True, "data": agent.workflows.runs(workflow_id, limit=limit)}
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = agent.workflows.runs(workflow_id, limit=limit, since_ms=since_ms, until_ms=until_ms, before=before)
+        nxt = _next_cursor(rows, limit, ts_key="started_ms", id_key="run_id")
+        return {"ok": True, "data": [workflow_run_view(r) for r in rows], "next_cursor": nxt}
 
     @app.get(f"{API_PREFIX}/workflows/runs/{{run_id}}")
     async def get_workflow_run(request: Request, run_id: str):
@@ -930,7 +937,7 @@ def create_api(agent) -> FastAPI:
         st = agent.workflows.status(run_id)
         if st.get("run") is None:
             raise ApiError(404, "TARGET_NOT_FOUND", f"工作流运行不存在:{run_id}")
-        return {"ok": True, **st}
+        return {"ok": True, "run": workflow_run_view(st["run"]), "steps": [workflow_step_view(x) for x in st["steps"]]}
 
     @app.post(f"{API_PREFIX}/workflows/runs/{{run_id}}/cancel")
     async def cancel_workflow_run(request: Request, run_id: str):
@@ -1429,7 +1436,9 @@ def create_api(agent) -> FastAPI:
         return {"id": row["id"], "name": row["name"], "url": row["url"], "secret_ref": row["secret_ref"],
                 "events": json.loads(row["events_json"] or '["*"]'), "accounts": json.loads(row["accounts_json"] or '["*"]'),
                 "enabled": bool(row["enabled"]), "timeout_ms": row["timeout_ms"], "max_attempts": row["max_attempts"],
-                "consecutive_fail": row["consecutive_fail"], "dead_ms": row["dead_ms"],
+                "consecutive_fail": row["consecutive_fail"],
+                # ISO(00 §6;R6-62 (f) 的 `*_ms` 例外只有 Account 两键);库列 `dead_ms` 不变,R6-58 (af) PATCH 照旧清它
+                "dead_at": iso8601(row["dead_ms"]) if row["dead_ms"] is not None else None,
                 "created_at": iso8601(row["created_ms"]), "updated_at": iso8601(row["updated_ms"])}
 
     def _webhook_or_404(wid: str) -> dict[str, Any]:
@@ -1780,9 +1789,26 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/mail/status")
     async def mail_status(request: Request, route: Optional[str] = None, route_id: Optional[str] = None):
-        """#56,级别 R:不带 ``route_id`` 回全部路由。"""
+        """#56,级别 R。形状照 02 #56 逐字:不带 ``route_id`` ⇒ ``{enabled, routes:[{route_id, channel, account_id, route,
+        inbound, outbound, cleanup}]}``(全部启用路由);带 ⇒ 单条 ``{enabled, route, inbound, outbound, cleanup}``,
+        没有这条路由 ⇒ ``404``(此前回 ``data:[]``;02 #56 未写,按全册 `TARGET_NOT_FOUND` 惯例)。
+        🔴 信封**顶层平铺 + ``ok``**、不包 ``data``:02 §3.4 通用 R6-55「响应列直接给出字面键集的端点顶层平铺」,
+        #56 的响应列正是字面键集(不是 §7 对象名、也不是 C-42 列表)。``?route=`` 是 06 §2.7 的旧参数名,照收。"""
         _principal(request, "read")
-        return {"ok": True, "data": _mail_or_503().status(route_id or route)}
+        mail = _mail_or_503()
+        rid = route_id or route
+        rows = mail.status(rid)
+        if rid is None:
+            return {"ok": True, "enabled": bool(mail.cfg.enabled), "routes": rows}
+        if not rows:
+            raise ApiError(404, "TARGET_NOT_FOUND", f"路由不存在:{rid}")
+        return {"ok": True, **_mail_status_single(mail, rows[0])}
+
+    def _mail_status_single(mail: Any, row: dict[str, Any]) -> dict[str, Any]:
+        """02 #56 单条形状;``enabled`` = 全局 ``[mail] enabled`` 且该路由 ``enabled``(停用路由带 id 也查得到)。"""
+        r = next((x for x in mail.routes.routes if str(x.id) == row["route_id"]), None)
+        return {"enabled": bool(mail.cfg.enabled and (r is None or r.enabled)),
+                **{k: row[k] for k in ("route", "inbound", "outbound", "cleanup")}}
 
     @app.post(f"{API_PREFIX}/mail/fetch")
     async def mail_fetch(request: Request):
@@ -2227,7 +2253,11 @@ def create_api(agent) -> FastAPI:
     async def mail_routes_list(request: Request):
         """#105(GET 半),级别 A:路由 CRUD;``inbound.secret``/``outbound.secret`` 只写不读。"""
         _principal(request, "admin")
-        return {"ok": True, "data": _mail_or_503().ms.routes_list()}
+        mail = _mail_or_503()
+        status = {row["route_id"]: row for row in mail.status(include_disabled=True)}
+        return {"ok": True, "data": [
+            mail_route_row_view(r, status=(_mail_status_single(mail, status[str(r["id"])]) if str(r["id"]) in status else None))
+            for r in mail.ms.routes_list()]}
 
     @app.put(f"{API_PREFIX}/settings/mail/routes")
     async def mail_routes_upsert(request: Request):
@@ -2242,7 +2272,7 @@ def create_api(agent) -> FastAPI:
         row_id = mail.ms.route_upsert(channel=ch, account_id=aid, inbound_json=body.get("inbound") or {},
                                       outbound_json=body.get("outbound") or {}, enabled=bool(body.get("enabled", True)))
         mail.reload()
-        return {"ok": True, "id": row_id}
+        return {"ok": True, "id": str(row_id)}          # 与 GET 行 `id`、#56 `route_id` 同型(字符串)
 
     # ------------------------------------------------------------------ WS /events(02 §3.4.7)
     @app.websocket(f"{API_PREFIX}/events")

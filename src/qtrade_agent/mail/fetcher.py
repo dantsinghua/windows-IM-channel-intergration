@@ -306,8 +306,10 @@ class MailFetcher:
             if st["effective_protocol"] != "pop3":
                 st["effective_protocol"] = "pop3"
                 st["fallback_since"] = self.clock()
+                st["fallback_reason"] = str(err)       # 02 §2.2.9 E-1 回落状态 `{…, since_ms, reason}`;#56 `fallback.reason` 的源
+                # 事件时间一律 ISO 8601(00 §6「时间(API/**事件**/邮件)」);此前 `since` 是毫秒整数
                 self._alert(MAIL_PROTOCOL_FALLBACK, subject=f"mailbox:{self.mailbox}",
-                            evidence={"last_error": str(err), "since": st["fallback_since"]})
+                            evidence={"last_error": str(err), "since": iso8601(int(st["fallback_since"]))})
         elif not fb.host:
             # `host` 空 ⇒ 不回落只告警 MAIL_INBOUND_STALLED(§2.1.1)
             self._alert(MAIL_INBOUND_STALLED, subject=f"mailbox:{self.mailbox}", evidence={"last_error": str(err)})
@@ -338,23 +340,32 @@ class MailFetcher:
         st["effective_protocol"] = "imap"
         st["imap_consecutive_failures"] = 0
         st["fallback_since"] = None
+        st["fallback_reason"] = None
         self._save(st)
         self._resolve(MAIL_PROTOCOL_FALLBACK, subject=f"mailbox:{self.mailbox}")
 
-    # ------------------------------------------------------------------ §2.7 GET /mail/status 的 inbound 段
+    # ------------------------------------------------------------------ 02 #56 GET /mail/status 的 inbound 段
     def status(self) -> dict[str, Any]:
+        """#56 ``inbound`` 段,键名以 **02 #56 逐字**为准(总控 2026-09-21 裁决:06 §2.7 的
+        ``configured_protocol/effective_protocol/fallback_since`` 是旧名,控制台 ``MailRouteStatus`` 照 02 写)。
+
+        ``quota`` 不在这里:它的源是清理轮的 ``mail_cleanup_log``,由 ``MailService.status`` 补。
+        状态行(``cursors`` 的 ``protocol_state``)里仍存旧名 + 毫秒,只有出参改名、转 ISO(00 §6)。
+        """
         st = self.state()
         folders = []
         for f in self.route.inbound.folders:
             uv, last_uid = self.ms.imap_watermark(self.owner, f)
             folders.append({"name": f, "uidvalidity": uv, "last_uid": last_uid})
-        # 🔴 #56 出参:时间一律 ISO 8601(00 §6「时间(API/事件/**邮件**)」)。此前 `last_success_at` 键名 `*_at`、
-        # 值却是 `last_success_ms` 毫秒整数,`fallback_since` 同为毫秒(第五批与 #68b 同型一并修;状态行内仍存毫秒)。
+        configured, active = st["configured_protocol"], st["effective_protocol"]
         since, last_ok = st.get("fallback_since"), st.get("last_success_ms")
+        fallback = None
+        if active != configured:                                       # E-1:两者不等即回落中;不回落 ⇒ null
+            fallback = {"since_at": iso8601(int(since)) if since else None, "reason": st.get("fallback_reason")}
         return {
-            "configured_protocol": st["configured_protocol"],
-            "effective_protocol": st["effective_protocol"],            # 两者不等即回落中(E-1)
-            "fallback_since": iso8601(int(since)) if since else None,
+            "protocol_configured": configured,
+            "protocol_active": active,
+            "fallback": fallback,
             "folders": folders,
             "last_success_at": iso8601(int(last_ok)) if last_ok else None,
             "last_error": st.get("last_error"),
@@ -373,8 +384,9 @@ class MailFetcher:
         threshold = max(3 * self.route.inbound.poll_interval_s * 1000, 10 * 60 * 1000)
         if idle_ms <= threshold:
             return False
+        # evidence 时间一律 ISO(00 §6「事件」+ 06 §2.7 告警样例 `"last_success_at":"…"`);此前是毫秒整数
         self._alert(MAIL_INBOUND_STALLED, subject=f"mailbox:{self.mailbox}",
                     severity="crit" if idle_ms > 3600 * 1000 else "warn",
-                    evidence={"last_success_at": last, "last_error": st.get("last_error"),
+                    evidence={"last_success_at": iso8601(last), "last_error": st.get("last_error"),
                               "protocol": st["effective_protocol"]})
         return True

@@ -144,28 +144,72 @@ class MailService:
         sent = self.send_once()
         return {"fetched": fetched, "dispatched": len(results), "sent": sent}
 
-    # ------------------------------------------------------------------ §2.7 GET /mail/status
-    def status(self, route_id: Optional[Any] = None) -> list[dict[str, Any]]:
-        """不带 ``route`` 返回**全部路由**的数组;带 ``route=<id>`` 返回一条(E-5)。"""
+    # ------------------------------------------------------------------ 02 #56 GET /mail/status
+    def status(self, route_id: Optional[Any] = None, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        """#56 的逐路由条目(键集 = **02 #56 逐字**,总控 2026-09-21 裁决以 02 为准)。
+
+        不带 ``route_id`` ⇒ **全部启用路由**(02 #56「全部启用路由」;``include_disabled=True`` 连停用的一起,供 #105
+        每行的 ``status`` 摘要);带 ⇒ 该条(停用的也给),没有 ⇒ ``[]``。
+        顶层 ``{enabled, routes}`` / 单条 ``{enabled, route, …}`` 的外壳由 ``api/app.py`` 包。每个键的数据源见
+        ``.omc/handoffs/backend-api-6.md`` §A:找不到可信源的键回 ``null``,不编值。
+        """
         out = []
-        counts = self.ms.outbox_counts()
-        logs = self.ms.cleanup_log_list(limit=1)
+        # mail_cleanup_log 没有 mailbox 列(02 DDL;06 §3.1 有 `mailbox_key`,见 backend-api-5 D-3)⇒ 只有一个物理邮箱时
+        # 才能把「最近一轮清理」归到它名下;多邮箱时归不了属,回 null,不把 A 邮箱的配额摆到 B 邮箱名下。
+        attributable = len(self.fetchers) <= 1
+        last_log = (self.ms.cleanup_log_list(limit=1) or [None])[0] if attributable else None
+        last_round = self.ms.cleanup_log_last_round() if attributable else None
+        consecutive = self.sender._consecutive_failures if self.sender else 0
         for r in self.routes.routes:
+            if route_id is None and not r.enabled and not include_disabled:
+                continue
             if route_id is not None and str(r.id) != str(route_id):
                 continue
             f = self.fetchers.get(r.mailbox_key)
+            inbound = f.status() if f else {
+                "protocol_configured": r.inbound.protocol, "protocol_active": r.inbound.protocol, "fallback": None,
+                "folders": [{"name": n, "uidvalidity": None, "last_uid": 0} for n in r.inbound.folders],
+                "last_success_at": None, "last_error": None, "idle_supported": r.inbound.idle, "consecutive_failures": 0}
+            inbound["quota"] = _quota_view(last_round)
+            counts = self.ms.outbox_counts(r.id)
+            last_sent = self.ms.outbox_last_sent_ms(r.id)
+            rid = str(r.id) if r.id is not None else None
             out.append({
-                "route": {"id": r.id, "name": r.name, "channel": r.channel or "*", "account_id": r.account_id,
-                          "mailbox_key": r.mailbox_key},
-                "inbound": f.status() if f else {"configured_protocol": r.inbound.protocol,
-                                                 "effective_protocol": r.inbound.protocol},
-                "outbound": {**counts, "rate_per_min": self.cfg.outbound.send_rate_per_min,
-                             "template_profile": self.cfg.template_out.compat_profile},
-                # 🔴 ISO(00 §6);此前键名 `last_run_at`、值是 `finished_ms` 毫秒整数(第五批与 #68b 同型一并修)
-                "cleanup": {"last_run_at": iso8601(logs[0]["finished_ms"]) if logs else None,
-                            "last_status": logs[0]["status"] if logs else None},
+                "route_id": rid, "channel": r.channel, "account_id": r.account_id,
+                "route": {"id": rid, "channel": r.channel, "account_id": r.account_id,
+                          "outbound_template_id": r.outbound_template_id, "inbound_template_id": r.inbound_template_id},
+                "inbound": inbound,
+                "outbound": {"queued": counts["queued"], "retrying": counts["retrying"], "dead": counts["dead"],
+                             "last_sent_at": iso8601(last_sent) if last_sent else None,
+                             # 源 = 投递器的连续失败计数(全 Agent 一个投递器、内存态,重启归零;不分路由)
+                             "consecutive_failures": consecutive,
+                             "rate_per_min": self.cfg.outbound.send_rate_per_min},
+                "cleanup": {"last_run_at": iso8601(last_log["finished_ms"]) if last_log else None,
+                            "last_status": last_log["status"] if last_log else None,
+                            "archived_mb": _mb(self.ms.inbox_archived_bytes(mailbox=r.mailbox_key)),
+                            # 无可信源:清理实际挂在每轮取信之后跑(fetcher 的 cleanup_hook),`cleanup_interval_min`
+                            # 没有被任何调度消费 ⇒ 按「上次 + interval」算出来的时刻不是真的下次,宁可 null
+                            "next_run_at": None},
             })
         return out
+
+
+def _mb(n: Optional[int]) -> Optional[float]:
+    return None if n is None else round(int(n) / (1024 * 1024), 1)
+
+
+def _quota_view(row: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """#56 ``inbound.quota``:取最近一轮清理量到的配额(§2.6.4 ``quota()``,清理轮之外没有别处量它)。
+
+    ``used_mb`` 取清理**后**的量(没有则清理前);``source`` 原样 = ``imap_quota|estimate|pop3_stat|unknown``(02 DDL CHECK)。
+    还没跑过清理、或那轮什么都没量到 ⇒ ``null``。
+    """
+    if row is None:
+        return None
+    used = row.get("quota_used_after") if row.get("quota_used_after") is not None else row.get("quota_used_before")
+    if used is None and row.get("quota_limit") is None:
+        return None
+    return {"used_mb": _mb(used), "limit_mb": _mb(row.get("quota_limit")), "source": row.get("quota_source") or "unknown"}
 
 
 def _inbound_json(route: MailRoute) -> dict[str, Any]:

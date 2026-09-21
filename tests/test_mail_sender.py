@@ -207,5 +207,6 @@ def test_status_reports_queue_counts(store, clock):
     env = make_env(store, clock)
     enqueue_msg(env)
     st = env.service.status()[0]
-    assert st["outbound"]["queued"] == 1 and st["outbound"]["template_profile"] == "ibquote-163-v1"
-    assert st["route"]["channel"] == "*" and st["inbound"]["configured_protocol"] == "imap"
+    # 第六批:键集按 02 #56(`template_profile`/`channel:"*"`/`configured_protocol` 是 06 §2.7 旧写法,02 无)
+    assert st["outbound"]["queued"] == 1 and st["outbound"]["rate_per_min"] == 20
+    assert st["route"]["channel"] is None and st["inbound"]["protocol_configured"] == "imap"

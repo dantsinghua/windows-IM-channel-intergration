@@ -336,7 +336,9 @@ def test_webhook_reenable_clears_dead_counters(rig):
     rig.store.con.execute("UPDATE webhooks SET enabled=0, consecutive_fail=10, dead_ms=? WHERE id=?", (rig.clock(), wid))
     r = rig.client.patch(f"/api/v1/settings/webhooks/{wid}", headers=H(), json={"enabled": True})
     assert r.json()["data"]["enabled"] is True and r.json()["data"]["consecutive_fail"] == 0
-    assert r.json()["data"]["dead_ms"] is None
+    # 第六批 S-9:出参 `dead_ms` → `dead_at`(ISO,00 §6);判据不松 —— 出参为 null 且库列 `dead_ms` 真被清
+    assert r.json()["data"]["dead_at"] is None and "dead_ms" not in r.json()["data"]
+    assert rig.store.con.execute("SELECT dead_ms FROM webhooks WHERE id=?", (wid,)).fetchone()[0] is None
 
 
 def test_webhook_bad_input_and_404(rig):

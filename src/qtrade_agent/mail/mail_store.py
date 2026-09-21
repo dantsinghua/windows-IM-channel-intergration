@@ -449,12 +449,29 @@ class MailStore:
             (inbox_id,)).fetchone()
         return r is not None
 
-    def outbox_counts(self) -> dict[str, int]:
-        """§2.7 ``GET /mail/status`` 的 ``outbound`` 段:``queued/retrying/dead``。"""
-        rows = _rows(self.con.execute("SELECT status, COUNT(*) AS n FROM mail_outbox GROUP BY status"))
+    def outbox_counts(self, route_id: Optional[int] = None) -> dict[str, int]:
+        """§2.7 ``GET /mail/status`` 的 ``outbound`` 段:``queued/retrying/dead``;给 ``route_id`` 只数该路由的行(#56 按路由)。"""
+        if route_id is None:
+            cur = self.con.execute("SELECT status, COUNT(*) AS n FROM mail_outbox GROUP BY status")
+        else:
+            cur = self.con.execute("SELECT status, COUNT(*) AS n FROM mail_outbox WHERE route_id=? GROUP BY status",
+                                   (route_id,))
+        rows = _rows(cur)
         by = {r["status"]: int(r["n"]) for r in rows}
         return {"queued": by.get("QUEUED", 0), "retrying": by.get("RETRY", 0), "dead": by.get("DEAD", 0),
                 "sent": by.get("SENT", 0), "discarded": by.get("DISCARDED", 0)}
+
+    def outbox_last_sent_ms(self, route_id: Optional[int]) -> Optional[int]:
+        """#56 ``outbound.last_sent_at`` 的源:该路由最后一封投递成功的 ``sent_ms``。"""
+        r = self.con.execute("SELECT MAX(sent_ms) FROM mail_outbox WHERE route_id IS ? AND sent_ms IS NOT NULL",
+                             (route_id,)).fetchone()
+        return int(r[0]) if r and r[0] is not None else None
+
+    def inbox_archived_bytes(self, *, mailbox: str) -> int:
+        """#56 ``cleanup.archived_mb`` 的源:该邮箱已归档(``archived_path`` 仍在,§2.6.7 过期会置空)行的 ``size_bytes`` 之和。"""
+        r = self.con.execute("SELECT COALESCE(SUM(size_bytes),0) FROM mail_inbox WHERE mailbox=? AND archived_path IS NOT NULL",
+                             (mailbox,)).fetchone()
+        return int(r[0] or 0)
 
     # ================================================================ mail_cleanup_log
     def cleanup_log_insert(self, **cols: Any) -> int:
@@ -472,6 +489,12 @@ class MailStore:
     def cleanup_log_list(self, limit: int = 50) -> list[dict[str, Any]]:
         return _rows(self.con.execute("SELECT * FROM mail_cleanup_log ORDER BY started_ms DESC, id DESC LIMIT ?",
                                       (limit,)))
+
+    def cleanup_log_last_round(self) -> Optional[dict[str, Any]]:
+        """最近一轮**清理**(不含 ``archive_rotation``:归档滚动不量配额,那几列恒空)—— #56 ``inbound.quota`` 的源。"""
+        rows = _rows(self.con.execute("SELECT * FROM mail_cleanup_log WHERE trigger != 'archive_rotation'"
+                                      " ORDER BY started_ms DESC, id DESC LIMIT 1"))
+        return rows[0] if rows else None
 
     def cleanup_log_list_page(self, *, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
                               limit: int = 50, before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
