@@ -307,7 +307,12 @@ onUnmounted(() => {
         <section class="qt-card box" :data-testid="T.block('outbox')">
           <div class="qt-section-title">发件队列</div>
           <table class="tbl">
-            <thead><tr><th>类型</th><th>收件人</th><th>主题</th><th>状态</th><th>重试</th><th>下次</th><th>动作</th></tr></thead>
+            <!--
+              列 = 01 §2.7.8 发件队列逐字 `kind/to/subject/status/attempts/next_attempt_at/last_error/ref`。
+              `last_error`/`ref` 是 `#61` 出参视图(backend-api-4 §1 P-1)刚定稿下发的两键 ——
+              不摆出来,DEAD 行就只剩一个状态、看不出为什么死,回执也对不回是哪封来信。
+            -->
+            <thead><tr><th>类型</th><th>收件人</th><th>主题</th><th>状态</th><th>重试</th><th>下次</th><th>失败原因</th><th>关联</th><th>动作</th></tr></thead>
             <tbody>
               <tr v-for="(o, i) in store.outbox" :key="o.id" :data-testid="T.outboxRow(i)">
                 <td>{{ o.kind }}</td>
@@ -316,6 +321,8 @@ onUnmounted(() => {
                 <td :class="{ 'qt-danger': o.status === 'DEAD' }">{{ o.status }}</td>
                 <td>{{ o.attempts }}</td>
                 <td class="qt-small">{{ o.next_attempt_at ?? '—' }}</td>
+                <td class="qt-small" :class="{ 'qt-danger': !!o.last_error }">{{ o.last_error ?? '—' }}</td>
+                <td class="qt-small qt-mono">{{ o.ref ?? '—' }}</td>
                 <td class="qt-row">
                   <a-button size="small" :data-testid="T.outboxRowResend(i)" @click="resend(o.id)">重发</a-button>
                   <a-popconfirm title="丢弃这封邮件?" @confirm="discard(o.id)">
@@ -329,7 +336,7 @@ onUnmounted(() => {
                   >重发回执</a-button>
                 </td>
               </tr>
-              <tr v-if="!store.outbox.length"><td colspan="7" class="qt-muted">发件队列为空</td></tr>
+              <tr v-if="!store.outbox.length"><td colspan="9" class="qt-muted">发件队列为空</td></tr>
             </tbody>
           </table>
           <!-- C-42「加载更多」:`GET /mail/outbox` 同款(后端 `created_ms` 降序);id 未登记,同上 -->

@@ -7,6 +7,10 @@
  *
  * 判据出处:01 §2.7.9 探测结论表(`SKIPPED` → 灰,文案「未探测(目标未配置或 Agent 不可达)」,C-18)、
  * 01 M4-7「SKIPPED 不计红项,`P-SETUP` 步 3 不因它阻断」。
+ *
+ * ⚠️ 跑起来会刷一片「Failed to resolve component: a-*」—— ant-design-vue 没在测试里 `app.use()`,
+ * 而 SFC 是预编译的,`compilerOptions.isCustomElement` 对它无效。这些 warn 与本文件的判据无关
+ * (断的是原生 `<table>` 里的单元格),**不要**为了消 warn 去把真实组件装进来。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, shallowMount } from '@vue/test-utils'
@@ -31,8 +35,6 @@ const ROWS: SelftestRow[] = [
 async function renderEnv() {
   const w = shallowMount(EnvPage, {
     global: {
-      // ant-design-vue 没有在测试里注册;把 `a-*` 当自定义元素,免得刷满「Failed to resolve component」
-      config: { compilerOptions: { isCustomElement: (tag: string) => tag.startsWith('a-') } },
       stubs: {
         teleport: true,
         // 自检表包在 `PageState` 的默认插槽里;shallowMount 会把它整个 stub 掉 ⇒ 插槽不渲染。

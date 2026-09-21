@@ -64,14 +64,14 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 **今天上午入库的**:文档终审第六轮收口 → **第七轮只读终审 ACCEPT**(七轮里第一次过,8 条 MINOR 待下一轮文档方);控制台第三批(四个列表页游标翻页、hmac-keys 短名表、保存设置回填);rootfs 修复(首启无条件 `--init-db`、`StartLimit*` 挪进 `[Unit]`、Python 3.11.0rc1 → **3.12.13 正式版**、机型档案库落点改 05 §7 路径);`--init-db` 字节级幂等(D-05);联调用例 73→123;**Playwright 真点击 e2e 37 条**(`console/tests/e2e-pw/`,`npm run test:pw`);后端第四批(收发件出参视图、**#89 未知键 ⇒ 400**、序号用尽 409 + 全局兜底 500 信封、hmac-keys 不分页);控制台第五批(安琳亲手点出的缺陷:须知勾选框卡死、第 3 步退回第 1 步、**跑过一次引导后下次直达主页**、「现在添加」点了没反应、SKIPPED 显示成黄色警告;以及 P-SET 六组控件键名逐键对齐 `docs/07`)。⇒ 下文 §4 里「StartLimit / Python rc1 尚未修复」的说法**已过时**。
 
-**总控亲自复跑的数字**:根 `pytest -q` **2164 passed**;控制台单测 **225 passed**(typecheck / eslint / build 全过);文档对账 exit 0;`test_docs_consistency` + `installer/tests` 194 passed。
+**总控亲自复跑的数字**:根 `pytest -q` **2164 passed**;控制台单测 **231 passed**(typecheck / eslint 全过;build 在 225 那一版跑过);文档对账 exit 0;`test_docs_consistency` + `installer/tests` 194 passed。
 
 **🔴 停工时做到一半(接手第一件)**:控制台第五批的**独立复测没做完**(测试方被中途叫停)——
 1. `console/tests/e2e-pw/helpers.mjs` 的 `installQtStub()` 只造了 `setup.done=true`、没造「已确认告知」,而向导线新增了「告知未确认 ⇒ 要求重勾」(05 §6.1,实现正确)⇒ **路由冒烟全被打回 `/setup`**。总控裁决:由**测试侧**在桩里补一次 ack(`POST /api/v1/system/notice/ack`,版本从 `GET /system/notice` 取),不改 mock 初始值;并新增正向用例守住这条新行为。
 2. 摘 5 条已修缺陷的 `test.fail`(D-B/D-C/D-D/D-E/D-F)——现在跑会因「本该失败却过了」报红,属预期。
 3. 补「跑过一次引导后刷新/新开页面都直达主页」「现在添加返回回第 4 步」「窄守卫例外不可滥用」的 Playwright 用例。
 4. 真后端联调复跑(期望 123 全绿,`tests/e2e/console-real/`,跑法见该目录与 SKILL §3)。
-⇒ **新起独立测试方**做,不让实现方代办。另:工作区里可能留有未提交、未验证的半成品(`console/src/pages/mail/MailPage.vue`、`console/tests/unit/{selftest-skip,mail-rows}.spec.ts`),先跑单测 + typecheck 再决定留还是 `git checkout` 还原。
+⇒ **新起独立测试方**做,不让实现方代办。另:工作区里留着**一个**未提交的半成品 `console/tests/e2e-pw/helpers.mjs`(被叫停的测试方改到一半、无人验证),由新的独立测试方接着改或 `git checkout` 还原重做。(页面线的邮件页发件表补 `last_error`/`ref` 两列 + 两份单测**已核实入库**,控制台单测现为 **231 passed**。)
 
 **之后按序**:重打 wheel + 重建 rootfs(今天代码又变了,`8bc334f` 那次产物已过期;🔴 打 wheel 前 `rm -rf build/` **并**清掉 `src/`、`winagent/src/` 下的杂散 `.omc/` 目录——OMC 钩子会往命令的当前目录落状态文件,漏进包源码树会污染 wheel、让 `tests/test_packaging.py` 红)→ 独立复测 rootfs(含 D-05:`--init-db` 连跑主库 sha256 不变)→ **把生成自签名证书的命令原样列给安琳、等点头**再跑 → 带 `-Sign` 重出正式包并校验 → 补真机验收手册 §1.4 → **一次性**向安琳交代重启(启用 Hyper-V)前后要做的事 → 真装验证。🔴 盘上那版 `installer/out/QTrade-Setup-1.0.0.exe` 含首启 P0、从未运行,**作废,别拿去装**。
 
