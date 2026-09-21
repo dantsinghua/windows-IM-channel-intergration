@@ -86,7 +86,8 @@ def test_pending_confirms_endpoint_returns_exactly_eight_keys(rig):
     r = rig.client.get("/api/v1/mail/pending-confirms", headers=H())
     assert r.status_code == 200
     items = r.json()["data"]
-    assert len(items) == 1 and items[0]["id"] == iid
+    # 出参 `id` 为字符串(与 #58/#59 的同一个 `mail_inbox.id` 同型、控制台 `PendingConfirm.id: string`;第五批 backend-api-5)
+    assert len(items) == 1 and items[0]["id"] == str(iid)
     assert set(items[0]) == {"id", "op", "from_addr", "account_id", "args_digest", "created_at",
                              "expires_at", "remaining_ttl_s"}
 

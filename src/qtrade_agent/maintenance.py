@@ -577,7 +577,8 @@ class MaintenanceService:
         """每周日跑 ``PRAGMA incremental_vacuum``;**不做全量 VACUUM**。返回是否真的跑了。
 
         ⚠️ 只有建库时设过 ``auto_vacuum=INCREMENTAL`` 才有效(§2.8.4「建库时设定,之后改不了」);
-        现行 ``store.PRAGMAS`` 未设 —— 见 handoff「接线事项」。
+        D-05 之后由 ``Store.open()`` 在库的 ``auto_vacuum`` 还不是 INCREMENTAL 时先执行 ``store.AUTO_VACUUM_PRAGMA``
+        (已是 INCREMENTAL 的库不再执行,保 ``--init-db`` 幂等),它不在 ``store.PRAGMAS`` 里。
         """
         now = now_ms if now_ms is not None else self._clock()
         if not force and datetime.fromtimestamp(now / 1000, tz=TZ_SHANGHAI).weekday() != 6:   # 6 = 周日

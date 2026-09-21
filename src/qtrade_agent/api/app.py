@@ -36,8 +36,9 @@ from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
 from .routes_ext import register_ext
 from .routes_ext2 import job_is_irreversible, register_ext2
-from .serialize import (account_view, command_view, decode_cursor, encode_cursor, mail_inbox_row_view,
-                        mail_outbox_row_view, message_view, result_view, session_view, stored_result_view)
+from .serialize import (account_view, command_view, decode_cursor, encode_cursor, mail_cleanup_log_row_view,
+                        mail_inbox_row_view, mail_outbox_row_view, message_view, result_view, session_view,
+                        stored_result_view)
 
 log = logging.getLogger("qtrade.api")
 
@@ -2052,10 +2053,19 @@ def create_api(agent) -> FastAPI:
         return JSONResponse(status_code=202, content={"ok": True, "job_id": job_id})
 
     @app.get(f"{API_PREFIX}/mail/cleanup/log")
-    async def mail_cleanup_log(request: Request, limit: int = Query(50, ge=1, le=500)):
-        """#65,级别 R。"""
+    async def mail_cleanup_log(request: Request, since: Optional[str] = None, until: Optional[str] = None,
+                               limit: int = Query(50, ge=1, le=500), cursor: Optional[str] = None):
+        """#65,级别 R。**C-42 统一分页**(02 #65 逐字「分页」):排序 = ``started_ms`` 降序,游标 G-16。
+
+        🔴 出参走 ``mail_cleanup_log_row_view``(此前 ``SELECT *`` 原样透出 `started_ms`/`finished_ms`/`detail_json`),
+        且此前收 `limit` 却不回 `next_cursor` —— 超出 `limit` 的轮次被静默丢掉(与 hmac-keys P-5 同型)。
+        ``next_cursor`` 先按**库行**的 ``started_ms`` 算,再转视图(视图里已没有 ``*_ms``)。
+        """
         _principal(request, "read")
-        return {"ok": True, "data": _mail_or_503().ms.cleanup_log_list(limit=limit)}
+        before, since_ms, until_ms = _page_window(cursor, since, until)
+        rows = _mail_or_503().ms.cleanup_log_list_page(since_ms=since_ms, until_ms=until_ms, limit=limit, before=before)
+        nxt = _next_cursor(rows, limit, ts_key="started_ms")
+        return {"ok": True, "data": [mail_cleanup_log_row_view(r) for r in rows], "next_cursor": nxt}
 
     @app.get(f"{API_PREFIX}/mail/hmac-keys")
     async def mail_hmac_keys_list(request: Request):
@@ -2131,7 +2141,8 @@ def create_api(agent) -> FastAPI:
 
     @app.get(f"{API_PREFIX}/mail/pending-confirms")
     async def mail_pending_confirms(request: Request):
-        """#68b,级别 A:出参**恰八键**(R6-7 定死),直接透传。"""
+        """#68b,级别 A:出参**恰八键**(R6-7 定死)。视图在 ``MailStore.pending_confirms``(时间 ISO、``id`` 字符串),
+        与 ``confirms.list()`` 同一份,这里不再二次加工。"""
         _principal(request, "admin")
         return {"ok": True, "data": _mail_or_503().confirms.list() if _mail_or_503().confirms else []}
 

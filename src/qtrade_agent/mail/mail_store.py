@@ -14,6 +14,7 @@ import json
 import sqlite3
 from typing import Any, Iterable, Optional
 
+from ..events import iso8601
 from .codes import CONFIRM_EXPIRED, CONFIRM_REQUIRED, NEVER_DELETE, TERMINAL
 
 POP3_UIDL_RECENT_MAX = 2000         # §2.9.3:``pop3_uidl_recent`` = 最近 2000 个 UIDL
@@ -203,6 +204,12 @@ class MailStore:
         """🔴 R6-7:``GET /mail/pending-confirms`` 出参恰八键 ``{id, op, from_addr, account_id, args_digest, created_at, expires_at, remaining_ttl_s}``。
 
         **不含 ``confirm_via``/``confirm_nonce``**(v1 无此两列)。``remaining_ttl_s`` 由服务端算好。
+
+        🔴 这就是 #68b 的**出参视图**(`confirms.list()` 与端点共用这一份,验收 M87 钉的也是它):
+        02 #68b 逐字「`created_at` = `received_ms` **序列化**;`expires_at` = `confirm_expires_ms` **序列化**」,
+        序列化口径 = 00 §6「时间(API/事件/**邮件**)一律 ISO 8601 带偏移」⇒ 两键出 ISO 字符串(此前是毫秒整数,
+        键名 `*_at`、值 `*_ms`)。`id` 出**字符串**,与 #58/#59 的同一个 `mail_inbox.id` 同型(第四批 D-3)。
+        `confirm_expires_ms` 与状态同一事务写(R6-7),正常不为空;万一为空回 ``null`` 且 `remaining_ttl_s=0`,不回 1970 年。
         """
         now = now_ms or self._now()
         rows = _rows(self.con.execute(
@@ -210,11 +217,13 @@ class MailStore:
             "  FROM mail_inbox WHERE status=? ORDER BY confirm_expires_ms", (CONFIRM_REQUIRED,)))
         out = []
         for r in rows:
-            exp = r["confirm_expires_ms"] or 0
+            exp = r["confirm_expires_ms"]
             out.append({
-                "id": r["id"], "op": r["op"], "from_addr": r["from_addr"], "account_id": r["account_id"],
-                "args_digest": r["args_digest"], "created_at": r["received_ms"], "expires_at": exp,
-                "remaining_ttl_s": max(0, (exp - now) // 1000),
+                "id": str(r["id"]), "op": r["op"], "from_addr": r["from_addr"], "account_id": r["account_id"],
+                "args_digest": r["args_digest"],
+                "created_at": iso8601(r["received_ms"]) if r["received_ms"] is not None else None,
+                "expires_at": iso8601(exp) if exp is not None else None,
+                "remaining_ttl_s": max(0, (exp - now) // 1000) if exp is not None else 0,
             })
         return out
 
@@ -463,6 +472,24 @@ class MailStore:
     def cleanup_log_list(self, limit: int = 50) -> list[dict[str, Any]]:
         return _rows(self.con.execute("SELECT * FROM mail_cleanup_log ORDER BY started_ms DESC, id DESC LIMIT ?",
                                       (limit,)))
+
+    def cleanup_log_list_page(self, *, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
+                              limit: int = 50, before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+        """#65 的分页视图:``(started_ms, id)`` 降序;``before`` = 上一页末行 ``(ts_ms, id)``(C-42 / G-16)。"""
+        sql = ["SELECT * FROM mail_cleanup_log WHERE 1=1"]
+        args: list[Any] = []
+        if since_ms is not None:
+            sql.append("AND started_ms >= ?")
+            args.append(since_ms)
+        if until_ms is not None:
+            sql.append("AND started_ms <= ?")
+            args.append(until_ms)
+        if before is not None:
+            sql.append("AND (started_ms < ? OR (started_ms = ? AND id < ?))")
+            args += [int(before[0]), int(before[0]), int(before[1])]
+        sql.append("ORDER BY started_ms DESC, id DESC LIMIT ?")
+        args.append(limit)
+        return _rows(self.con.execute(" ".join(sql), tuple(args)))
 
     # ================================================================ cursors(§2.9.3 邮件五行)
     def imap_watermark(self, owner: str, folder: str) -> tuple[Optional[int], int]:

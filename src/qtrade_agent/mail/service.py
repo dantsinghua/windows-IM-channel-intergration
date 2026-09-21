@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+from ..events import iso8601
 from .catalog import Catalog
 from .cleanup import MailCleanup
 from .config import MailConfig
@@ -160,7 +161,8 @@ class MailService:
                                                  "effective_protocol": r.inbound.protocol},
                 "outbound": {**counts, "rate_per_min": self.cfg.outbound.send_rate_per_min,
                              "template_profile": self.cfg.template_out.compat_profile},
-                "cleanup": {"last_run_at": logs[0]["finished_ms"] if logs else None,
+                # 🔴 ISO(00 §6);此前键名 `last_run_at`、值是 `finished_ms` 毫秒整数(第五批与 #68b 同型一并修)
+                "cleanup": {"last_run_at": iso8601(logs[0]["finished_ms"]) if logs else None,
                             "last_status": logs[0]["status"] if logs else None},
             })
         return out

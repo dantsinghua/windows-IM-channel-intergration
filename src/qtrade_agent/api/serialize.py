@@ -165,6 +165,32 @@ def mail_outbox_row_view(row: dict[str, Any], *, route: Optional[str] = None) ->
             "created_at": _iso(row.get("created_ms")), "sent_at": _iso(row.get("sent_ms"))}
 
 
+#: #65 行的出参键(06 §3.1 `mail_cleanup_log` 字段定案 ∩ 02 实际 DDL,按列序);时间列另换 `*_at`,`detail_json` 另转 `detail`。
+#: ⚠️ 06 §3.1 还列了 `route_id`/`mailbox_key`(v0.3,E-5),但 02 DDL 没有这两列 ⇒ 视图不造(转文档方)。
+CLEANUP_LOG_PLAIN_COLS = ("trigger", "protocol", "folder", "candidates", "archived", "deleted", "failed", "bytes_freed",
+                          "quota_used_before", "quota_used_after", "quota_limit", "quota_source",
+                          "archive_rotated_files", "archive_rotated_bytes", "status", "error")
+
+
+def mail_cleanup_log_row_view(row: dict[str, Any]) -> dict[str, Any]:
+    """#65 ``GET /mail/cleanup/log`` 的行视图(此前 ``SELECT *`` 原样透出库行)。
+
+    与 #58/#61 同口径:① `started_ms`/`finished_ms` → ISO 8601 `started_at`/`finished_at`(00 §6「时间(API/事件/**邮件**)」,
+    R6-62 (f):新增时间键一律 ISO + `*_at`);② `id` 出字符串(同 #58 D-3);③ `detail_json` 解成对象、键名 `detail`
+    (与本文件 `args_json→args`、`media_json→media` 同一套路;06 §2.6.8 要求它必带 `skipped_oversize`/`skipped_out_of_scope`,
+    是 R6-26 门生效的唯一可观测证据,给字符串等于让前端再 parse 一次)。键集显式列出,库里以后加列不会自动外露。
+    """
+    try:
+        detail = json.loads(row.get("detail_json") or "{}")
+    except ValueError:
+        detail = {}
+    out: dict[str, Any] = {"id": str(row["id"]), "started_at": _iso(row.get("started_ms")),
+                           "finished_at": _iso(row.get("finished_ms"))}
+    out.update({k: row.get(k) for k in CLEANUP_LOG_PLAIN_COLS})
+    out["detail"] = detail
+    return out
+
+
 def encode_cursor(ts_ms: int, id: str) -> str:
     """02 §3.4 通用 G-16:``cursor = base64url(JSON{"ts_ms":…,"id":…})``(R6-53:R6-52 曾写 "ts_ms:id",按 G-16 改回)。"""
     raw = json.dumps({"ts_ms": int(ts_ms), "id": id}, separators=(",", ":")).encode()

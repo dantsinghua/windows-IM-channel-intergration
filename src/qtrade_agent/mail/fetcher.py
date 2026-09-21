@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ..events import iso8601
 from .backends import MailAuthError, MailConnectError, MailTransientError
 from .codes import (MAIL_ALERT_CODES, MAIL_AUTH_FAILED, MAIL_INBOUND_STALLED, MAIL_MSG_OVERSIZE,
                     MAIL_PAUSED_DISK_FULL, MAIL_PROTOCOL_FALLBACK, OVERSIZE)
@@ -347,12 +348,15 @@ class MailFetcher:
         for f in self.route.inbound.folders:
             uv, last_uid = self.ms.imap_watermark(self.owner, f)
             folders.append({"name": f, "uidvalidity": uv, "last_uid": last_uid})
+        # 🔴 #56 出参:时间一律 ISO 8601(00 §6「时间(API/事件/**邮件**)」)。此前 `last_success_at` 键名 `*_at`、
+        # 值却是 `last_success_ms` 毫秒整数,`fallback_since` 同为毫秒(第五批与 #68b 同型一并修;状态行内仍存毫秒)。
+        since, last_ok = st.get("fallback_since"), st.get("last_success_ms")
         return {
             "configured_protocol": st["configured_protocol"],
             "effective_protocol": st["effective_protocol"],            # 两者不等即回落中(E-1)
-            "fallback_since": st.get("fallback_since"),
+            "fallback_since": iso8601(int(since)) if since else None,
             "folders": folders,
-            "last_success_at": st.get("last_success_ms"),
+            "last_success_at": iso8601(int(last_ok)) if last_ok else None,
             "last_error": st.get("last_error"),
             "idle_supported": self.route.inbound.idle,
             "consecutive_failures": int(st.get("imap_consecutive_failures", 0)),
