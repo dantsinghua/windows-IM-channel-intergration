@@ -106,11 +106,31 @@ test('P-MAIL 立即清理:点一次后按钮进入 60s 防重(01:643)', async ({
   expect(posts.length, '连点发出了多次清理').toBe(1)
 })
 
-test.fail('P-ENV「修复防火墙规则」缺二次确认(01:696「全部二次确认」)', async ({ page }) => {
+/**
+ * 桩记下的 WinAgent 调用里**与防火墙有关**的那些 op(`firewall.ensure` 等)。这个按钮不走 HTTP,
+ * 光盯写请求会漏判。只筛 `firewall*`:P-ENV 打开后本来就会自己轮询 `wechat.status` 之类的**只读** op,
+ * 把它们算进来会让判据变成「页面不许有任何 WinAgent 往返」—— 那是另一回事,会误红。
+ */
+const waFirewallOps = (page) => page.evaluate(
+  () => (window.__pwQtCalls ?? [])
+    .filter((c) => c.name === 'wa.invoke' && String(c.args?.[0] ?? '').startsWith('firewall'))
+    .map((c) => c.args?.[0]),
+)
+
+test('P-ENV「修复防火墙规则」必须先二次确认(01:696「运行期动作按钮…全部二次确认」)', async ({ page }) => {
   await installQtStub(page)
   await page.goto('/#/env')
   await expect(page.getByText('一键自检').first()).toBeVisible()
   const btn = page.getByRole('button', { name: loose('修复防火墙规则') }).first()
-  const { dialogs } = await clickAndWatch(page, btn)
-  expect(dialogs, '点下去直接调 WinAgent 改防火墙,没有任何确认').toBeGreaterThan(0)
+  await expect(btn, '按钮得在,否则这条用例什么也没测').toHaveCount(1)
+
+  const before = await waFirewallOps(page)
+  const { writes, dialogs } = await clickAndWatch(page, btn)
+  expect(dialogs, '点下去必须先弹确认').toBeGreaterThan(0)
+  expect(writes, '没确认就发了写请求').toEqual([])
+  expect(await waFirewallOps(page), '确认之前就把防火墙改了(该按钮直连 window.qt.wa.invoke)').toEqual(before)
+
+  // 取消/Esc 之后同样不许动手
+  await closeDialogs(page)
+  expect(await waFirewallOps(page), '取消了还是把防火墙改了').toEqual(before)
 })

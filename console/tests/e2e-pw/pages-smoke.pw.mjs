@@ -29,8 +29,8 @@ const ROUTES = [
 
 for (const [route, mustSee] of ROUTES) {
   test(`打开 ${route}:不白屏、无未捕获异常`, async ({ page }) => {
-    // P-SET 的 `/settings/compliance` 404 是已知缺陷,由本文件末尾那条专门用例盯着
-    const errors = collectErrors(page, { allow404: ['/settings/compliance'] })
+    // D-E 修好后这里不再留 404 白名单:任何 404 都算错(白名单会掩盖同类回归)
+    const errors = collectErrors(page)
     await installQtStub(page)
     await page.goto(`/#${route}`)
     await expect(page.getByText(mustSee).first(), `${route} 没渲染出「${mustSee}」`).toBeVisible()
@@ -47,7 +47,7 @@ for (const [route, mustSee] of ROUTES) {
 }
 
 test('左侧导航 11 个入口都能点开对应页面', async ({ page }) => {
-  const errors = collectErrors(page, { allow404: ['/settings/compliance'] })
+  const errors = collectErrors(page)
   await installQtStub(page)
   await page.goto('/#/dash')
   for (const seg of ['dash', 'res', 'acct', 'screen', 'cmd', 'flow', 'msg', 'mail', 'env', 'set', 'log']) {
@@ -67,20 +67,40 @@ test('顶栏告警抽屉能开能关', async ({ page }) => {
   await expect(drawer).toBeHidden()
 })
 
-test.fail('P-SET 不该再调已废弃的 /settings/compliance(真后端 404,合规块恒为空)', async ({ page }) => {
-  await installQtStub(page)
+test('P-SET 合规块走 #86 GET /system/notice,不再调已废弃的 /settings/compliance', async ({ page }) => {
+  // `/settings/compliance` 不在 #88 的 group 枚举里、真后端 404 ⇒ 合规块此前恒为「—」。
+  // 现数据源 = #86(`SetPage.vue:377` systemApi.notice())。这里接管 #86 回一组特征值,
+  // 断言界面显示的就是它回的东西 —— 光断「不是 —」不足以证明数据源换对了。
+  await installQtStub(page, { ack: false })
   const notFound = []
-  page.on('response', (r) => { if (r.status() === 404) notFound.push(r.url().split('/api/v1')[1] ?? r.url()) })
+  const paths = []
+  page.on('response', (r) => {
+    const u = r.url()
+    if (!u.includes('/api/v1')) return
+    paths.push(u.split('/api/v1')[1].split('?')[0])
+    if (r.status() === 404) notFound.push(u.split('/api/v1')[1])
+  })
+  await page.route('**/api/v1/system/notice', (route) => route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify({
+      ok: true, notice_version: 'pw-compliance-9', text: '合规告知',
+      ack_ms: 1789900000000, acked_at: '2026-09-20T11:22:33+08:00', acked_version: 'pw-compliance-9',
+      trace_id: 'pw',
+    }),
+  }))
   await page.goto('/#/set')
   await expect(page.getByTestId('qt-set-compliance-version')).toBeVisible()
   await page.waitForTimeout(1500)
-  expect(notFound, 'SetPage.vue:270 仍在 loadGroup("compliance")').toEqual([])
-  // 合规块应显示真实的告知版本/确认时间(数据源 = #86 GET /system/notice)
-  await expect(page.getByTestId('qt-set-compliance-version')).not.toContainText('—')
+  expect(notFound, '不该再有 404').toEqual([])
+  expect(paths.filter((x) => x.includes('/settings/compliance')), 'SetPage 不该再 loadGroup("compliance")').toEqual([])
+  expect(paths.filter((x) => x === '/system/notice').length, '合规块必须真去拉 #86').toBeGreaterThan(0)
+  await expect(page.getByTestId('qt-set-compliance-version')).toContainText('pw-compliance-9')
+  // 确认时间优先 ISO 的 `acked_at`(00 §6)
+  await expect(page.getByTestId('qt-set-compliance-ack')).toContainText('2026-09-20')
 })
 
 test('空数据不崩:四个列表端点都回空数组时,各页渲染空态且不报错', async ({ page }) => {
-  const errors = collectErrors(page, { allow404: ['/settings/compliance'] })
+  const errors = collectErrors(page)
   await installQtStub(page)
   for (const p of ['/accounts', '/sessions', '/messages', '/mail/inbox', '/mail/outbox', '/mail/pending-confirms', '/audit', '/workflows']) {
     await page.route((u) => u.pathname === `/api/v1${p}`, (route) => route.fulfill({
