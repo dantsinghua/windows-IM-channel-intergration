@@ -196,6 +196,26 @@ def test_agent_probe_enabled_default_matches_doc_04():
     assert m.group(1) == ("true" if default else "false")
 
 
+API_APP = os.path.join(ROOT, "src", "qtrade_agent", "api", "app.py")
+
+
+def test_c42_limit_default_matches_doc_02():
+    """02 §3.4 通用 C-42:`limit` 缺省与合法区间 = 实现(裁决 00 §15g R6-64 ⑦:文档跟实现)。
+
+    对的是 #1/#26/#48/#58/#61 五个列表端点的 ``limit: int = Query(缺省, ge=下限, le=上限)``;任何一个与文档不同即红。
+    """
+    m = re.search(r"`limit` \*\*缺省 (\d+)、合法区间 (\d+)~(\d+)\*\*", _doc(DOC02))
+    assert m, "02 §3.4 通用段找不到 C-42 的 limit 缺省值/合法区间"
+    want = tuple(int(x) for x in m.groups())
+    src = _doc(API_APP)
+    for fn in ("list_accounts", "list_sessions", "list_messages", "mail_inbox", "mail_outbox"):
+        sig = re.search(rf"async def {fn}\((.*?)\):", src, re.S)
+        assert sig, f"api/app.py 找不到 {fn}"
+        q = re.search(r"limit: int = Query\((\d+), ge=(\d+), le=(\d+)\)", sig.group(1))
+        assert q, f"{fn} 的 limit 不是 Query(缺省, ge, le) 形态"
+        assert tuple(int(x) for x in q.groups()) == want, f"{fn} 的 limit {q.groups()} ≠ 02 §3.4 C-42 {want}"
+
+
 def test_restart_backoff_matches_doc_04():
     m = re.search(r"^container_restart_backoff_s\s*=\s*\[([\d,]+)\]", _doc(DOC04), re.M)
     assert tuple(int(x) for x in m.group(1).split(",")) == AgentConfig().health.container_restart_backoff_s
