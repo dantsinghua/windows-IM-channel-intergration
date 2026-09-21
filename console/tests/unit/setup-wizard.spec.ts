@@ -14,9 +14,10 @@ import { setupRedirect } from '@/router'
 import { selftestRows, type SelftestRun } from '@/api/types'
 
 // 页面只用 `useRouter`;`@/router` 自己要真的 `createRouter`,所以按需局部 mock
+const routerSpy = vi.hoisted(() => ({ push: vi.fn(), replace: vi.fn() }))
 vi.mock('vue-router', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-router')>()),
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useRouter: () => routerSpy,
 }))
 
 const NOTICE_ACKED = { notice_version: 'v2', text: '须知正文', ack_ms: 1, acked_version: 'v2' }
@@ -28,6 +29,8 @@ function stubFetch(notice: Record<string, unknown>): void {
 }
 
 beforeEach(() => {
+  routerSpy.push.mockReset()
+  routerSpy.replace.mockReset()
   setActivePinia(createPinia())
   localStorage.clear()
   stubFetch(NOTICE_ACKED)
@@ -168,6 +171,86 @@ describe('向导步骤存 store(D-B)', () => {
     await w.find('[data-testid="qt-setup-next"]').trigger('click')
     expect(store.step).toBe(1)
     w.unmount()
+  })
+})
+
+/**
+ * R-1:告知改版那一路「只重勾一次即进主页、不重走五步」(05 §6.1 / §8b.6 U1 / 01:350)。
+ * #86 先回旧版(acked_version 落后),#87 成功后 #86 回新版已勾;`ackFails` 时 #87 回 500。
+ */
+function stubNoticeFlow(opts: { ackFails?: boolean } = {}): void {
+  let acked = false
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+    const u = String(url)
+    if (u.includes('/system/notice/ack')) {
+      if (opts.ackFails) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: '落库失败' } }), { status: 500 })
+      }
+      acked = true
+      return new Response(JSON.stringify({ ok: true, data: { ok: true } }))
+    }
+    if (u.includes('/system/notice') && (init?.method ?? 'GET') === 'GET') {
+      return new Response(JSON.stringify({ ok: true, data: acked ? { ...NOTICE_STALE, acked_version: 'v3' } : NOTICE_STALE }))
+    }
+    return new Response(JSON.stringify({ ok: true, data: {} }))
+  }))
+}
+
+describe('告知改版:只重勾一次即进主页(R-1)', () => {
+  async function mountReack() {
+    const store = useSetupStore()
+    store.done = true
+    await store.refreshAck()
+    expect(store.reackRequired).toBe(true)
+    // 按钮文字要看得见:换一个渲染插槽的按钮桩(`true` 桩不渲染默认插槽)
+    const stubs = { ...ANTD_STUBS, 'a-button': { template: '<button><slot /></button>' } }
+    const w = shallowMount(SetupPage, { global: { stubs } })
+    await flushPromises()
+    return { store, w }
+  }
+
+  it('勾完后按钮仍是「确认并进入控制台」,点了直进 /dash、不进第 2 步', async () => {
+    stubNoticeFlow()
+    const { store, w } = await mountReack()
+    await store.ack()
+    await flushPromises()
+    expect(store.acked).toBe(true)
+    const next = w.find('[data-testid="qt-setup-next"]')
+    expect(next.text()).toBe('确认并进入控制台')
+    await next.trigger('click')
+    expect(routerSpy.replace).toHaveBeenCalledWith('/dash')
+    expect(store.step).toBe(0)
+    // 进主页之后守卫不再把人打回 /setup
+    expect(store.reackRequired).toBe(false)
+    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} },
+      { done: store.done, needsReack: store.reackRequired })).toBeNull()
+    w.unmount()
+  })
+
+  it('#87 失败 ⇒ 不算勾过、按钮禁用、仍按在 /setup', async () => {
+    stubNoticeFlow({ ackFails: true })
+    const { store, w } = await mountReack()
+    await expect(store.ack()).rejects.toBeTruthy()
+    await flushPromises()
+    expect(store.acked).toBe(false)
+    expect(store.reackRequired).toBe(true)
+    expect(w.find('[data-testid="qt-setup-next"]').attributes('disabled')).toBeDefined()
+    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} },
+      { done: store.done, needsReack: store.reackRequired })).toEqual({ path: '/setup' })
+    w.unmount()
+  })
+
+  it('勾完未点按钮就刷新 ⇒ 以 Agent 为准已勾过,直接放行不再重勾', async () => {
+    stubNoticeFlow()
+    const { store, w } = await mountReack()
+    await store.ack()
+    w.unmount()
+    // 刷新 = 新 store 重新核对(fetch 桩保留「已勾」状态,等同 Agent 已落库)
+    setActivePinia(createPinia())
+    const fresh = useSetupStore()
+    fresh.done = true
+    await fresh.refreshAck()
+    expect(fresh.reackRequired).toBe(false)
   })
 })
 

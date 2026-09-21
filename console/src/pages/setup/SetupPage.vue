@@ -109,7 +109,10 @@ async function finish(): Promise<void> {
   void router.replace('/dash')
 }
 
-/** 「下一步」:告知改版那一路只需重勾告知,勾完即进控制台,不重走五步 */
+/**
+ * 「下一步」:告知改版那一路只需重勾告知,勾完即进控制台,不重走五步。
+ * 重勾态**只在这里清**(`store.ack()` 不清,R-1),且先清后跳 ⇒ 守卫 `needsReack` 不再打回。
+ */
 function goNext(): void {
   if (reackOnly.value) {
     store.reackRequired = false

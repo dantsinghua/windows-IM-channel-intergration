@@ -97,7 +97,13 @@ export const useSetupStore = defineStore('setup', () => {
     await systemApi.noticeAck(noticeVersion.value)
     // 以 Agent 为准:写完重读一次,别让界面记住一个服务端没落下的勾
     await loadNotice()
-    if (acked.value) reackRequired.value = false
+    /**
+     * 🔴 这里**不清** `reackRequired`(R-1):勾完就清会让页面的 `reackOnly` 立刻变 false,
+     * 按钮变回「下一步」、点了进第 2 步 = 重走五步。重勾态由 `SetupPage.goNext()` 在
+     * 「直进主页」那一刻清掉(清完再跳,守卫 `needsReack` 才不把人打回)。
+     * #87 失败会在上面抛出,`acked` 不变 ⇒ 按钮禁用、守卫照旧按住 `/setup`;
+     * 勾完没点按钮就刷新 ⇒ `refreshAck()` 以 Agent 的 `acked_version` 重判,已勾即放行。
+     */
   }
 
   /**
