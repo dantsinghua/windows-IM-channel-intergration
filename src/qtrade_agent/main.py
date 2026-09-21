@@ -8,12 +8,39 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 
 from .config import AgentConfig
 
 log = logging.getLogger("qtrade.main")
+
+#: 查询串里的凭据参数(02 §3.4.7 WS 握手允许 `?token=`)。uvicorn 在 WS 握手 / 访问日志里打**带查询串的完整路径**,
+#: 不遮就把 bearer 令牌明文写进应用日志(00 §11.2 [NOLOG];backend-sec-1 同型扫描发现)。
+_QUERY_SECRET = re.compile(r"(?i)([?&](?:token|secret|password|access_token)=)[^&\s\"']*")
+
+
+class MaskQuerySecrets(logging.Filter):
+    """把日志行里 ``?token=…`` 一类查询参数的值换成 ``***``(挂在 uvicorn 的两个 logger 上)。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:                       # 格式化本身出错就原样放行,交给 logging 自己报
+            return True
+        masked = _QUERY_SECRET.sub(r"\1***", msg)
+        if masked != msg:
+            record.msg, record.args = masked, ()
+        return True
+
+
+def install_log_masking() -> None:
+    """uvicorn.Config 构造时会 dictConfig 它自己的 logger ⇒ 必须在那之后挂。"""
+    for name in ("uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, MaskQuerySecrets) for f in lg.filters):
+            lg.addFilter(MaskQuerySecrets())
 
 #: ``--init-db`` 的退出码约定(调用方 = ``qtrade-firstboot.sh``,非 0 即 ``die``)。2 是 argparse 的用法错误,不归这里排。
 EXIT_OK = 0
@@ -109,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
     server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
                                            workers=1, log_level=args.log_level.lower()))
+    install_log_masking()
 
     async def _graceful_shutdown() -> None:
         """#83 `POST /system/shutdown` 的**生产**执行体(02 §2.6 优雅停机)。

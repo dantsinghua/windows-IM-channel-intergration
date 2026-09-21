@@ -39,6 +39,7 @@ from .maintenance import DiskFullError, DiskProbe, MaintenanceService
 from .media import Downloader, MediaStore, UrllibDownloader
 from .monitor import JobsReclaimer, ProcReader, PublicEndpointProbe, Sampler
 from .mail.backends import ImapLibBackend, PopLibBackend, SmtpLibBackend
+from .mail.route_secrets import migrate_plaintext as migrate_mail_route_secrets
 from .mail.service import MailService
 from .pool import Pool
 from .pool_calibrate import PoolCalibrator
@@ -65,6 +66,7 @@ DISK_TICK_S = 15            # §2.8.8 磁盘水位与 health 同 15 s 一轮
 CALIB_TICK_S = 300          # 04 §2.5.3:漂移检查 + 零账号自动重测
 MAIL_SEND_TICK_S = 5        # 06 §2.4:出站队列消费单线程
 MAIL_CONFIRM_TICK_S = 60    # 02 §2.2.11 同 60 s 节拍
+MAIL_SECRET_MIGRATE_S = 300  # S-8 存量明文迁移的重试节拍(无明文时只读不写);规格未定,取 5 min
 DAILY_TICK_S = 60           # daily_at 包装的检查节拍(每分钟看一次到点没有)
 
 
@@ -316,6 +318,8 @@ class AgentApp:
         self.scheduler.register("mail_inbound", self.cfg.mail.inbound.poll_interval_s, self.mail_inbound_tick)                 # 06 §2.1
         self.scheduler.register("mail_outbound", MAIL_SEND_TICK_S, self.mail_outbound_tick)                                    # 06 §2.4
         self.scheduler.register("mail_confirm_reaper", MAIL_CONFIRM_TICK_S, self.mail_confirm_tick)                            # 06 §2.3.6
+        # S-8(backend-sec-1):存量 `mail_routes` 明文凭据迁入 Vault;要连 Vault ⇒ 放运行期(不在 `--init-db`),Vault 不在就下轮再试
+        self.scheduler.register("mail_route_secret_migrate", MAIL_SECRET_MIGRATE_S, self.mail_secret_migrate_tick, run_immediately=True)
         self.scheduler.register("monitor_sample", self.cfg.monitor.sample_interval_s, self.monitor_tick)                       # 04 §2.4.5
         self.scheduler.register("jobs_reclaimer", self.cfg.jobs.reclaim_interval_s, self.reclaimer.reclaim_once)               # 02 §3.1 R6-16
         self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
@@ -656,6 +660,11 @@ class AgentApp:
         if not self.cfg.mail.enabled:
             return
         await asyncio.to_thread(self.mail.reap_confirms)
+
+    async def mail_secret_migrate_tick(self) -> None:
+        """与 ``[mail] enabled`` 无关:关着邮件也不许库里躺着明文。没有明文的库只读一遍、一条语句不写。"""
+        if await migrate_mail_route_secrets(self.mail.ms, self.vault):
+            self.mail.reload()                      # 引用改成本路由自己的路径,取信/发信线程按新引用重建
 
     async def outbox_retention(self) -> None:
         cutoff = self.clock() - self.cfg.events.ws_retention_hours * 3600 * 1000

@@ -29,16 +29,18 @@ from ..config import WS_PING_INTERVAL_S
 from ..events import iso8601
 from ..hmac_inbound import has_hmac_headers
 from ..ids import ulid
+from ..mail.route_secrets import BadSecretRef, check_route, upsert_route
 from ..maintenance import DiskFullError
 from ..models import Command, CommandOrigin, RESULT_CODES
 from ..store import SeqExhausted
+from ..vault_client import VaultUnavailable
 from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
 from .routes_ext import register_ext
 from .routes_ext2 import job_is_irreversible, register_ext2
 from .serialize import (account_view, command_view, decode_cursor, encode_cursor,
                         mail_cleanup_log_row_view, mail_inbox_row_view, mail_outbox_row_view, mail_route_row_view,
-                        message_view, result_view, session_view, stored_result_view, workflow_run_view,
+                        message_view, result_view, session_view, stored_result_view, strip_secrets, workflow_run_view,
                         workflow_step_view, workflow_view)
 
 log = logging.getLogger("qtrade.api")
@@ -1636,17 +1638,33 @@ def create_api(agent) -> FastAPI:
         request.state.account_id = account_id
         return {"ok": True, **(await agent.restart_stream(row))}
 
+    # ------------------------------------------------------------------ 邮件路由写入(S-8:密钥只进 Vault,库里只落 `secret_ref`)
+    def _check_route_or_400(mail, channel: Optional[str], account_id: Optional[str], blob: dict[str, Any], *, pointer: str) -> None:
+        try:
+            check_route(mail.ms, channel=channel, account_id=account_id,
+                        inbound=blob.get("inbound") or {}, outbound=blob.get("outbound") or {})
+        except BadSecretRef as e:
+            raise ApiError(400, "INVALID_ARGS", str(e), reason="bad_secret_ref",
+                           extra={"details": [{"pointer": f"{pointer}/{e.side}/secret_ref"}]})
+
+    async def _upsert_route_or_503(mail, channel: Optional[str], account_id: Optional[str], blob: dict[str, Any]) -> int:
+        """Vault 写不进 ⇒ 整个请求 503(与账号凭据同一口径 `NOT_READY`/`vault_unavailable`),库不落半截。"""
+        try:
+            return await upsert_route(mail.ms, agent.vault, channel=channel, account_id=account_id,
+                                      inbound=blob.get("inbound") or {}, outbound=blob.get("outbound") or {},
+                                      enabled=bool(blob.get("enabled", True)))
+        except VaultUnavailable as e:
+            raise ApiError(503, "NOT_READY", f"凭据保险库不可用({e.reason}),邮件路由未保存",
+                           reason="vault_unavailable", retryable=True)
+
     # ------------------------------------------------------------------ #88 / #89 的 mail 组(01 §2.7.10 的四块同构卡片)
     MAIL_SCOPES = ("default", "qidian", "qq", "wechat")
 
     def _mail_scope_view(channel: Optional[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
         """一块卡片 = 一条 ``mail_routes`` 行(全局行 = ``channel IS NULL``);``*_ref``/密码**只回引用不回值**(#88)。"""
         row = next((r for r in rows if (r["channel"] or None) == channel and r["account_id"] is None), None)
-        inbound = json.loads((row or {}).get("inbound_json") or "{}")
-        outbound = json.loads((row or {}).get("outbound_json") or "{}")
-        for blob in (inbound, outbound):
-            blob.pop("secret", None)
-            blob.pop("password", None)
+        inbound = strip_secrets(json.loads((row or {}).get("inbound_json") or "{}"))
+        outbound = strip_secrets(json.loads((row or {}).get("outbound_json") or "{}"))
         return {"override": row is not None, "route_id": (row or {}).get("id"),
                 "enabled": bool((row or {}).get("enabled", 1)), "inbound": inbound, "outbound": outbound}
 
@@ -1677,13 +1695,12 @@ def create_api(agent) -> FastAPI:
         if not isinstance(scopes, dict) or any(s not in MAIL_SCOPES for s in scopes):
             raise ApiError(400, "INVALID_ARGS", f"scopes 的键须为 {'|'.join(MAIL_SCOPES)}", reason="bad_scopes",
                            extra={"details": [{"pointer": "/scopes"}]})
+        todo = [(name, blob) for name, blob in scopes.items() if isinstance(blob, dict) and blob.get("override", True)]
+        for name, blob in todo:                    # 先全部校验、再逐块写(非法 secret_ref 不能留下前几块已落库的半截)
+            _check_route_or_400(mail, None if name == "default" else name, None, blob, pointer=f"/scopes/{name}")
         written: dict[str, int] = {}
-        for name, blob in scopes.items():
-            if not isinstance(blob, dict) or not blob.get("override", True):
-                continue
-            written[name] = mail.ms.route_upsert(channel=None if name == "default" else name, account_id=None,
-                                                 inbound_json=blob.get("inbound") or {}, outbound_json=blob.get("outbound") or {},
-                                                 enabled=bool(blob.get("enabled", True)))
+        for name, blob in todo:
+            written[name] = await _upsert_route_or_503(mail, None if name == "default" else name, None, blob)
         mail.reload()
         return {"ok": True, "written": written}
 
@@ -2269,8 +2286,8 @@ def create_api(agent) -> FastAPI:
         if ch is not None and ch not in ("qidian", "qq", "wechat"):
             raise ApiError(400, "INVALID_ARGS", "channel 须为 qidian|qq|wechat 或 null(全局行)", reason="bad_channel",
                            extra={"details": [{"pointer": "/channel"}]})
-        row_id = mail.ms.route_upsert(channel=ch, account_id=aid, inbound_json=body.get("inbound") or {},
-                                      outbound_json=body.get("outbound") or {}, enabled=bool(body.get("enabled", True)))
+        _check_route_or_400(mail, ch, aid, body, pointer="")
+        row_id = await _upsert_route_or_503(mail, ch, aid, body)
         mail.reload()
         return {"ok": True, "id": str(row_id)}          # 与 GET 行 `id`、#56 `route_id` 同型(字符串)
 

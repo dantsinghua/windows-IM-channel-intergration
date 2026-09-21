@@ -88,6 +88,27 @@ class MailStore:
                 (channel, account_id, payload[0], payload[1], payload[2], now, now))
             return int(cur.lastrowid)
 
+    def route_find(self, *, channel: Optional[str], account_id: Optional[str]) -> Optional[dict[str, Any]]:
+        """按 upsert 的同一把唯一键取一行(没有回 ``None``)。"""
+        row = self.con.execute("SELECT * FROM mail_routes WHERE COALESCE(channel,'')=? AND COALESCE(account_id,'')=?",
+                               (channel or "", account_id or "")).fetchone()
+        return dict(row) if row is not None else None
+
+    def route_delete(self, route_id: int) -> None:
+        """只给「新建路由时 Vault 写失败」的补偿用:删掉刚占位插入的那一行(S-8,backend-sec-1)。"""
+        with self._store._tx() as c:
+            c.execute("DELETE FROM mail_routes WHERE id=?", (route_id,))
+
+    def route_swap_json(self, route_id: int, *, old_inbound: Any, old_outbound: Any,
+                        inbound_json: dict[str, Any], outbound_json: dict[str, Any]) -> bool:
+        """比较并交换:库里两列仍是 ``old_*`` 原文才改写(存量明文迁移用,防与并发 PUT 互相覆盖);回是否改到。"""
+        with self._store._tx() as c:
+            cur = c.execute(
+                "UPDATE mail_routes SET inbound_json=?, outbound_json=? WHERE id=? AND inbound_json IS ? AND outbound_json IS ?",
+                (json.dumps(inbound_json, ensure_ascii=False), json.dumps(outbound_json, ensure_ascii=False),
+                 route_id, old_inbound, old_outbound))
+            return cur.rowcount == 1
+
     # ================================================================ mail_inbox
     def inbox_insert(self, **cols: Any) -> int:
         """插一行 ``mail_inbox``;返回 ``id``。列名逐字照 06 §3.1 / 02 DDL。"""
