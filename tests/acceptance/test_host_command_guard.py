@@ -72,11 +72,22 @@ BLOCKED = ["test_sync_adb_is_blocked", "test_swallowed_docker_still_red", "test_
            "test_any_other_host_binary_is_blocked"]
 
 
+OUTSIDE = textwrap.dedent('''
+    import subprocess
+
+    def test_outside_acceptance_dir_is_not_guarded():
+        subprocess.run(["adb", "outside-ok"], check=True)     # 护栏目录之外(开发者测试 / e2e 的位置):照常放行
+''')
+
+
 def _run_inner(tmp_path: Path) -> tuple[subprocess.CompletedProcess, Path]:
     inner = tmp_path / "inner"
     inner.mkdir()
     shutil.copy(HERE / "conftest.py", inner / "conftest.py")
     (inner / "test_inner.py").write_text(INNER, encoding="utf-8")
+    other = tmp_path / "other"                              # 与护栏目录平级、不在其下
+    other.mkdir()
+    (other / "test_outside.py").write_text(OUTSIDE, encoding="utf-8")
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     marker = tmp_path / "EXECUTED.txt"
@@ -86,18 +97,38 @@ def _run_inner(tmp_path: Path) -> tuple[subprocess.CompletedProcess, Path]:
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
     env = dict(os.environ, PATH=f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}", PYTHONDONTWRITEBYTECODE="1")
     p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", "-o", "addopts=",
-                        "--rootdir", str(inner), str(inner / "test_inner.py")],
-                       capture_output=True, text=True, env=env, cwd=str(inner), timeout=120)
+                        "--rootdir", str(tmp_path), str(inner / "test_inner.py"), str(other / "test_outside.py")],
+                       capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
     return p, marker
 
 
 def test_guard_fails_every_host_command_and_never_executes_it(tmp_path):
     p, marker = _run_inner(tmp_path)
     out = p.stdout + p.stderr
-    assert not marker.exists(), f"护栏失守:假宿主命令真的被执行了:\n{marker.read_text() if marker.exists() else ''}\n{out}"
+    executed = marker.read_text().splitlines() if marker.exists() else []
+    leaked = [ln for ln in executed if "outside-ok" not in ln]
+    assert not leaked, f"护栏失守:验收目录内的假宿主命令真的被执行了:\n{leaked}\n{out}"
     assert p.returncode != 0, out
     for name in BLOCKED:
-        assert f"FAILED test_inner.py::{name}" in out, f"{name} 应被护栏判红\n{out}"
-        assert f"[验收护栏] test_inner.py::{name}" in out, f"{name} 的失败信息须指名用例\n{out}"
-    assert "PASSED test_inner.py::test_current_interpreter_is_allowed" in out, out
+        assert f"FAILED inner/test_inner.py::{name}" in out, f"{name} 应被护栏判红\n{out}"
+        assert f"[验收护栏] inner/test_inner.py::{name}" in out, f"{name} 的失败信息须指名用例\n{out}"
+    assert "PASSED inner/test_inner.py::test_current_interpreter_is_allowed" in out, out
     assert "'adb', '-s', '127.0.0.1:16001'" in out, "失败信息须列出被拦的 argv"
+
+
+def test_guard_does_not_touch_tests_outside_its_directory(tmp_path):
+    """派工要求 4:护栏只覆盖验收目录,不得影响 `tests/` 下的开发者测试与 `tests/e2e/`(它们有正当的子进程需求)。
+    同一会话里,护栏目录之外的用例起子进程照常执行(假 adb 真的被调到一次)且用例绿。"""
+    p, marker = _run_inner(tmp_path)
+    out = p.stdout + p.stderr
+    assert "PASSED other/test_outside.py::test_outside_acceptance_dir_is_not_guarded" in out, out
+    executed = marker.read_text().splitlines() if marker.exists() else []
+    assert [ln for ln in executed if "outside-ok" in ln], f"护栏目录之外的子进程应照常执行\n{out}"
+
+
+def test_conftest_module_name_resolves_to_root_conftest():
+    """撞名回归(总控补充要求):`tests/` 与本目录都没有 `__init__.py`,两个 conftest 的顶层模块名都是 ``conftest``。
+    本目录 conftest 加载后,``import conftest`` 必须仍是根 `tests/conftest.py`(`tests/test_qq_*.py` 与本目录用例都靠它取 `Clock` 等)。"""
+    import conftest
+    assert os.path.realpath(conftest.__file__) == os.path.realpath(HERE.parent / "conftest.py")
+    assert hasattr(conftest, "Clock") and hasattr(conftest, "FakeMainDb")
