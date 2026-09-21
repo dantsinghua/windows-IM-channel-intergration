@@ -294,6 +294,45 @@ uv pip compile installer/rootfs/requirements.in \
 有人把路径改成源码目录 / sdist 时静默走构建。
 重建后可在构建日志里核对:不应出现 `Building wheel for` / `Installing build dependencies`。
 
+### `wheels.expected`:实装 wheel 逐包对清单(E4-1,2026-09-21 补)
+
+独立端到端第四轮发现:`--only-binary=:all:` 只堵 sdist,堵不住「另一个也在锁里的 wheel」。锁为每个包登记了
+该版本 PyPI 上**全部**文件的 hash;同一包在目标平台(cp312 / manylinux x86_64,glibc 2.35)若有 ≥2 个可用
+wheel,被选中那个的 hash 对不上时 pip 把它静默滤掉、改装另一个,rc=0、`pip freeze` 与锁一致。逐包核过:
+15 个包里**只有 websockets 17.1** 如此(cp312 manylinux 带 C 加速 / py3-none-any 纯 Python),其余 14 包在目标
+平台各只有 1 个可用 wheel(pydantic-core 只有 cp312 manylinux_2_17,无纯 Python wheel)。
+收窄锁(只留目标平台 hash)解决不了:websockets 的两个 wheel **都**是目标平台可用的。
+
+修法按「类」设防,不点名某个包:
+
+| 文件 | 作用 |
+|---|---|
+| `wheels.expected` | 15 行 `规范名 版本 wheel 文件名 sha256` —— 锁完好时 pip 在目标平台选中的那一个文件。随包进 rootfs 的 `/opt/qtrade/agent/wheels.expected`,`contents.json` 登记为 `wheel_manifest { path, packages, sha256 }` |
+| `verify-wheels.py` | `check`:Dockerfile 装完依赖紧接着跑,断言 ①清单包集合 = 锁包集合、每行版本 = 锁、sha256 ∈ 锁;②`pip install --report` 里实装包集合 = 清单、下载文件名与 sha256 = 清单;③site-packages 里 dist-info 集合 = 清单 ∪ {pip}、每包 `WHEEL` 的 Tag 集合 = 清单文件名展开的 tag、版本 = 清单、RECORD 在;④ pip 版本 = `pip-bootstrap.lock`。任一不符 `exit 1` ⇒ 构建失败。`emit`:再生成用 |
+| `gen-wheel-manifest.sh` | 再生成清单:在构建镜像(jammy + python3.12)里按 Dockerfile 同样的 pip 版本与开关对锁跑 `pip install --dry-run --report`,交给 `verify-wheels.py emit`。只 `docker build --output type=local`,不产生镜像 / 容器 |
+
+再生成(需出网走代理;基础镜像默认 `qtrade-build/rootfs:rootfs-1.0.0`,本机没有就先跑一次 build-rootfs.sh,或 `--base` 指定任一 jammy + deadsnakes python3.12 的镜像):
+
+```bash
+export https_proxy=http://172.19.176.1:7890 http_proxy=http://172.19.176.1:7890 no_proxy=localhost,127.0.0.1
+bash installer/rootfs/gen-wheel-manifest.sh > installer/rootfs/wheels.expected
+git diff installer/rootfs/wheels.expected   # 人眼看文件名变化(尤其平台 wheel ↔ py3-none-any)再提交
+```
+
+**何时必须再生成**:`requirements.lock` 变了(重新 compile、升降任一版本)、`pip-bootstrap.lock` 的 pip 版本变了、
+或发行版 Python 的 minor / glibc 基线变了(Dockerfile 的 `ARG PY`、`FROM`)。忘了再生成会怎样:包数对不上时
+`build-rootfs.sh` 备料阶段就 `die`;包数相同但版本 / 文件变了时 Dockerfile 的 `verify-wheels.py check` 报不符、构建失败
+—— 都不会静默出包。
+
+### pip 钉版本(E3-O1,2026-09-21 补)
+
+原先 `pip install --upgrade pip` 不带版本与 hash ⇒ 执行整个 `--require-hashes` 校验的那个 pip 随构建日期漂移。
+现改为按 `pip-bootstrap.lock` 升级:`pip==26.2.1`(= 上一版 rootfs `b9771c36…` 里实际装着的版本),只登记 wheel
+`pip-26.2.1-py3-none-any.whl` 的 sha256,安装时带 `--require-hashes --only-binary=:all:` ⇒ hash 不符即构建失败;
+`verify-wheels.py check` 再断言 venv 里 pip 版本 = 钉值。`pip-bootstrap.lock` 与 `verify-wheels.py` 只在构建期用,
+Dockerfile 在同一 RUN 末尾删掉,不进 rootfs。升级 pip:改 `pip-bootstrap.lock` 的版本与 hash(PyPI
+`https://pypi.org/pypi/pip/<ver>/json` 里 `py3-none-any.whl` 那条 `digests.sha256`),再跑 `gen-wheel-manifest.sh`。
+
 ### 连带:`pyproject.toml` 删了 `docker>=7`
 
 全仓无 `import docker`(dockerd 走子进程),该依赖声明未用。删除后发行版 venv 少

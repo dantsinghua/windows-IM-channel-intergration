@@ -97,6 +97,22 @@ LOCK_SRC="$HERE/requirements.lock"
 cp -f "$LOCK_SRC" "$P/requirements.lock"
 LOCK_PKGS="$(grep -cE '^[a-zA-Z0-9].*==' "$P/requirements.lock")"
 say "    依赖锁 $LOCK_PKGS 个运行期包 → /opt/qtrade/agent/requirements.lock"
+
+# wheel 清单(E4-1)—— 与 Dockerfile 的 `COPY payload/wheels.expected` 对应:锁里每个包在目标平台
+# 「应装上的那一个 wheel 文件」(文件名 + sha256)。Dockerfile 装完依赖后由 verify-wheels.py 逐包断言
+# 实装与之一致(否则构建失败);清单本身随包进 rootfs 并登记进 contents.json(wheel_manifest)。
+# 再生成:gen-wheel-manifest.sh(见 README §8)。另两件只在构建期用、不留进 rootfs:
+# pip-bootstrap.lock(pip 钉版本 + hash,E3-O1)、verify-wheels.py(断言脚本)。
+MANIFEST_SRC="$HERE/wheels.expected"
+for f in "$MANIFEST_SRC" "$HERE/pip-bootstrap.lock" "$HERE/verify-wheels.py"; do
+    [ -r "$f" ] || die "缺 $f(见 README §8)"
+done
+cp -f "$MANIFEST_SRC" "$P/wheels.expected"
+cp -f "$HERE/pip-bootstrap.lock" "$HERE/verify-wheels.py" "$P/"
+MANIFEST_PKGS="$(grep -cvE '^[[:space:]]*(#|$)' "$P/wheels.expected")"
+[ "$MANIFEST_PKGS" = "$LOCK_PKGS" ] \
+    || die "wheels.expected 有 $MANIFEST_PKGS 个包,requirements.lock 有 $LOCK_PKGS 个 —— 锁变了清单没跟着再生成?(gen-wheel-manifest.sh)"
+say "    wheel 清单 $MANIFEST_PKGS 个包 → /opt/qtrade/agent/wheels.expected"
 # 版本号从文件名取(qtrade_agent-<ver>-py3-none-any.whl)
 AGENT_VERSION="$(printf '%s' "$AGENT_WHEEL_NAME" | sed -E 's/^qtrade_agent-([^-]+)-.*/\1/')"
 
@@ -223,6 +239,7 @@ jq -n \
     --arg wheel_path "/opt/qtrade/agent/dist/$AGENT_WHEEL_NAME" \
     --arg wheel_ver "$AGENT_VERSION" --arg wheel_sha "$(sha "$AGENT_WHEEL")" \
     --arg lock_sha "$(sha "$P/requirements.lock")" --argjson lock_pkgs "$LOCK_PKGS" \
+    --arg manifest_sha "$(sha "$P/wheels.expected")" --argjson manifest_pkgs "$MANIFEST_PKGS" \
     --argjson redroid "$(img_json "$REDROID_REF" "$REDROID_TAR")" \
     --argjson napcat  "$(img_json "$NAPCAT_REF"  "$NAPCAT_TAR")" \
     --arg adb_ver "$ADB_VERSION" --arg adb_sha "$(sha "$P/platform-tools/adb")" \
@@ -236,6 +253,7 @@ jq -n \
         built_at: $built,
         agent_wheel:     { path: $wheel_path, version: $wheel_ver, sha256: $wheel_sha },
         requirements_lock: { path: "/opt/qtrade/agent/requirements.lock", packages: $lock_pkgs, sha256: $lock_sha },
+        wheel_manifest:  { path: "/opt/qtrade/agent/wheels.expected", packages: $manifest_pkgs, sha256: $manifest_sha },
         redroid_image:   $redroid,
         napcat_image:    $napcat,
         adb:             { path: "/opt/qtrade/platform-tools/adb", version: $adb_ver, sha256: $adb_sha },

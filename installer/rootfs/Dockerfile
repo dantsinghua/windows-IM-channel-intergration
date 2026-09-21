@@ -107,6 +107,11 @@ COPY payload/agent-wheel/     /opt/qtrade/agent/dist/
 #    到开发机 ~/.venvs/qtrade 那套已验证版本)。下面用 --require-hashes 安装 ⇒ 同一份
 #    wheel 在不同日期重建出的依赖集合一致、可复现;并登记进 contents.json。
 COPY payload/requirements.lock /opt/qtrade/agent/requirements.lock
+# 🔴 wheel 清单(E4-1):锁里每个包「在目标平台应装上的那一个 wheel 文件」(文件名 + sha256),
+#    随包留在 rootfs 并登记进 contents.json(wheel_manifest);下面装完依赖即逐包对照断言。
+COPY payload/wheels.expected /opt/qtrade/agent/wheels.expected
+# 仅构建期用、不留进 rootfs(下面 RUN 末尾 rm):pip 自身的钉版本锁(E3-O1)与断言脚本。
+COPY payload/pip-bootstrap.lock payload/verify-wheels.py /tmp/qtrade-build/
 
 RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboot 2>/dev/null || true; \
     chmod 0755 /opt/qtrade/frida/frida-server-* 2>/dev/null || true; \
@@ -119,7 +124,8 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 # 🔴 依赖用**锁文件 + --require-hashes** 装(R-1):运行期闭包的版本钉死到
 #    requirements.lock(uv pip compile 生成、带 sha256 hash),而不是「构建当天 PyPI
 #    最新且满足下限」。之后 wheel 用 --no-deps 装(依赖已由锁装齐),两次不同日期的
-#    重建得到逐位一致的依赖集合。任一包 hash 对不上直接构建失败,不静默换版本。
+#    重建得到逐位一致的依赖集合。任一包 hash 对不上直接构建失败,不静默换版本
+#    (由 --require-hashes + --only-binary + 下面的 wheel 清单断言三者合起来保证)。
 # 🔴 两处 install 都带 `--only-binary=:all:`(E3-1,独立端到端第三轮):uv 生成的锁为每个包
 #    **同时**登记 wheel 与同版本 sdist 的 hash,pip 的 --require-hashes 语义是「命中该包
 #    任一登记 hash 即放行」。不加这个开关时,被选中 wheel 的 hash 一旦对不上(锁被改坏,或
@@ -131,14 +137,30 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 #    留着无害(锁文件本身不改,保持 README §8 的再生成命令可逐字复现)。
 #    第二处装的是本地 Agent .whl,本来就不走 sdist;同样加上,免得日后有人把路径改成
 #    源码目录 / sdist 时静默走构建。
-# 🔴 只 `--upgrade pip`,不装 `wheel`:发行版 venv 只**安装**预编译 .whl(锁里 15 个包与
-#    Agent wheel 都有对应 wheel),装 .whl 不需要 `wheel` 包(它只在 build sdist 时才要)。
-#    带上 `wheel` 会把它和它的依赖 `packaging` 留进 venv —— 两个 Agent 运行期从不 import
-#    的包,污染「pip freeze 与锁一致」这条自检并平白扩大供应链面。
+# 🔴 实装 wheel 逐包对清单(E4-1,独立端到端第四轮):--only-binary 只堵 sdist,堵不住「另一个
+#    也在锁里的 wheel」。锁为每个包登记了该版本 PyPI 全部文件的 hash;同一包在目标平台若有 ≥2 个
+#    可用 wheel(现为 websockets 17.1:cp312 manylinux 带 C 加速 / py3-none-any 纯 Python),被选中
+#    那个的 hash 对不上时 pip 把它静默滤掉、改装另一个,rc=0、freeze 与锁一致。所以装依赖时带
+#    `--report`,紧接着由 verify-wheels.py 断言:实装包集合 = 清单、每包下载文件名与 sha256 = 清单、
+#    site-packages 里每包 dist-info 的 WHEEL Tag 与版本 = 清单文件名、venv 里没有清单外的包,
+#    任一不符 exit 1 ⇒ 构建失败。按「类」设防,将来任何包出现多个可用 wheel 同样被拦。
+# 🔴 pip 自身钉版本 + 带 hash(E3-O1):不再 `--upgrade pip` 到构建当天最新,而是按
+#    pip-bootstrap.lock(pip==26.2.1,只登记 wheel hash)升级 ⇒ 执行整个 --require-hashes 校验的
+#    那个 pip 不随构建日期漂移;verify-wheels.py 顺带断言 venv 里 pip 版本 = 钉值。
+#    不装 `wheel`:发行版 venv 只**安装**预编译 .whl,不需要它;带上会把它和 `packaging` 留进
+#    venv(Agent 运行期从不 import),污染「pip freeze 与锁一致」这条自检并平白扩大供应链面。
 RUN ${PY} -m venv /opt/qtrade/agent/venv \
-    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
-        --only-binary=:all: -r /opt/qtrade/agent/requirements.lock \
+        --only-binary=:all: -r /tmp/qtrade-build/pip-bootstrap.lock \
+    && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
+        --only-binary=:all: --report /tmp/qtrade-build/pip-report.json \
+        -r /opt/qtrade/agent/requirements.lock \
+    && /opt/qtrade/agent/venv/bin/python /tmp/qtrade-build/verify-wheels.py check \
+        --report /tmp/qtrade-build/pip-report.json \
+        --manifest /opt/qtrade/agent/wheels.expected \
+        --lock /opt/qtrade/agent/requirements.lock \
+        --pip-lock /tmp/qtrade-build/pip-bootstrap.lock \
+    && rm -rf /tmp/qtrade-build \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --no-deps \
         --only-binary=:all: /opt/qtrade/agent/dist/qtrade_agent-*.whl \
     && /opt/qtrade/agent/venv/bin/python -c "import qtrade_agent, importlib.resources as r; \
