@@ -58,26 +58,37 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 3. **读 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文**,重点 §4 禁区、§5「🔴 最新状态」与「下一步」、§5b 编排纪律;
    再按你这批要动的东西读对应规格段落与 `reference/e2e-lessons-2026-09-21.md`。
 
-## 3b. 🔴 2026-09-21 15:45 交接快照(子 agent 全丢、安琳新起 session 接手;**与下文 §4/§5 矛盾处以本节为准**)
+## 3b. 🔴 2026-09-21 23:45 交接快照(带签名正式包已出、独立校验通过;**与下文 §4/§5 矛盾处以本节为准**)
 
 > 更细的版本在原机 `.omc/handoffs/team-lead-status.md`(git 忽略、不随仓库走)。本节是它的可携带摘要。
 
-**现状一句话**:产品代码已冻结在 **HEAD `c7d48d9`**(已推 GitHub、工作区干净、今天 57 个提交)。出带签名正式包**只差两步**,且两步**都没完成**。盘上 `installer/out/QTrade-Setup-1.0.0.exe`(凌晨 03:06 那版)**作废,别装**。
+**现状一句话**:**带签名的正式包已出并经独立校验「通过」**,下一步是真机装验证(要安琳定时机:重启主机启用 Hyper-V + 提供另一台物理机)。HEAD 见 `git log`(本节写入时产品侧最后一个提交 = `801a52d`,其后只有文档提交),工作区干净、已全部 push。
 
-**今天入库的一大段**:文档终审第七轮 ACCEPT;控制台第三~五批(安琳亲手点出的:须知勾选卡死、向导第 3 步退回、跑过一次引导后直达主页、现在添加、SKIPPED 灰档;P-SET 六组键名对齐 07)+ Playwright 真点击 e2e 45 条;后端第四~六批 + 两批安全修复(#56 顶层平铺、#89 未知键 400、出参视图去 *_ms/body_text、邮件路由密钥进 Vault、嵌套密钥递归脱敏、日志遮 ?token=、序号用尽 409+兜底 500);企点读库 R6-66(表情名还原 + 图文混排 -1035 真机两层结构缺陷,修掉「这类消息整条被丢弃」);D-05 `--init-db` 字节级幂等;文档八九批 R6-63~R6-68;**rootfs 重建两次**(第二次带依赖锁,解 R-1);rootfs 复测查出的 D-1/D-2/O-1/O-2 已修;WinAgent schema 补 R6-68 注释(`c7d48d9`)。⇒ 下文 §4/§5 大量已过时,以本节为准。
+**正式包**:`installer/out/QTrade-Setup-1.0.0.exe`(`installer/out/` 被 git 忽略,只在原机)—— **2,259,695,672 B**,sha256 **`d10f46b7b7a1708914ef1951ca3f189efe4760b09e4047c56041e822aacc504c`**;Authenticode 自签名,指纹 `E36AFD96A801DD666F953AC8E3B3C992AB8CD60E`(`CN=QTrade Internal Code Signing, O=QTrade`,2029-09-21 到期,带 DigiCert 时间戳;目标机须先按 `fieldtest/真机验收手册.md` §1.4 导入证书)。包内 `install/manifest.json` sha256 `0c444a2d…fa13f7f7`(`lightweight=false`、`missing` 空、13 项载荷 + 引擎)。⚠️ 同目录留着作废旧包 `*.void-20260921-0306`(凌晨 03:06 未签名那版,装上必起不来),**分发前按 sha256 核对,别拷错**。**这个包至今没在任何机器上运行过。**
 
-**总控亲自复跑的数字**:仓库根 `pytest -q` **2325 passed**;控制台单测 234 / Playwright 45 / 真后端联调 126(独占副本跑);winagent `pytest -q` **329 passed**;`installer/tests` 122;文档对账 exit 0。
+**包里装的是什么(全部溯源闭环,独立校验方自己重算过)**:
+| 载荷 | 来源 / 指纹 |
+|---|---|
+| rootfs.tar | 2,171,043,840 B,sha256 `732d1169…137a9fc3`(第四次重建;依赖锁 + 两处 `--only-binary=:all:` + 构建期逐包 wheel 断言 + pip 钉 26.2.1) |
+| Agent wheel | 506,656 B,`d28efc15…fefbb9de3`(源码 = 冻结点 `c7d48d9`,之后 `src/` 无改动) |
+| WinAgent svc / user | 冻结代码重打(内置 pytest 门 329 passed);出包时在预签副本上覆盖重签 ⇒ 包内 sha256 = `7fbc363a…` / `a6f0ca2a…`,剥签名块后与产物根原件 `ED9C0685…` / `7E16E37B…` 逐字节相同 |
+| 控制台 | 冻结代码重打(`console/` 最后提交 `f06de76`;单测 234 + typecheck + lint 全绿);`app.asar` = `fde6df63…`,主 exe 剥签名后 = `8e9d7a04…` |
+| 安装引擎 | 19 个 ps1/psm1 剥签名后与 HEAD `installer/engine/**` 逐字一致 |
 
-**出包产物(总控已核实 sha256,在产物根 `C:\Users\anlin\qtrade-payload\`)**:新 rootfs.tar 2,171,043,840 B `3147e038…`(带依赖锁 `installer/rootfs/requirements.lock`)、新 wheel 506,656 B `d28efc15…`。**签名证书已生成**:指纹 `E36AFD96A801DD666F953AC8E3B3C992AB8CD60E`(`Cert:\CurrentUser\My`,私钥不可导出,公钥 .cer 在 `…\qtrade-payload\signing\`;是 `-WhatIf` 干跑意外真建出来的,命令 2 不必再跑)。
+**本段(19:50~23:45)做了什么**:①WinAgent 两 exe 重打 + 签名;②发现交接漏项——产物根的控制台载荷是 01:56 旧件、其后 11 个 console 提交没进包 ⇒ 重打;③新 rootfs 独立复测三轮:第三轮揪出 **E3-1**(锁同时登记 wheel+sdist hash,wheel hash 坏了 pip 静默退回 sdist 联网现编)→ 修(`0c621f0`)→ 第四轮揪出 **E4-1**(websockets 有两个可用 wheel,平台版 hash 坏了静默改装纯 Python 版)→ 按「类」修(`801a52d`:`wheels.expected` + `verify-wheels.py` 构建期断言,顺带 E3-O1 钉 pip)→ **第五轮通过**(对断言做了 27 个定点篡改全部拦下);④真机验收手册补 §1.4「先导入证书」(`95603a7`)并回填 §1.1 签名包数值;⑤出带签名正式包 + 独立校验(8 项全过)。
 
-**🔴 接手第一件——两步并行,都没完成**:
-1. **WinAgent 两个 exe 重打 + 签名**:盘上 `…\qtrade-payload\winagent\dist\*.exe` 还是 **9-21 02:37 的旧代码**,必须用冻结代码重打。挡它的 pytest 门(schema 逐字)现已绿。真 Windows PowerShell:`winagent\build\build.ps1 -Clean` 干跑 → `… -Clean -Sign E36AFD96A801DD666F953AC8E3B3C992AB8CD60E` → `Get-AuthenticodeSignature` 核签名 → 同步产物根、旧件改名。详见 `.omc/handoffs/winagent-build.md`。
-2. **新 rootfs 独立复测**:上一轮复测方(`e2e-rootfs-3`)**没出结论、没写交接**(`.omc/handoffs/e2e-rootfs-3.md` 不存在),要重做。沿 `.omc/handoffs/e2e-rootfs-2.md` 九项 + `rootfs-rebuild-2.md` 末尾四项:R-1 锁是否真闭合(容器 `pip freeze` 与 lock 逐行一致)、D-1/D-2/O-1/O-2 回归、首启幂等 D-05。docker 只碰自建 `qtrade-build/e2e3-` 前缀临时容器,现有 13 个一个不许动。
-⇒ **各新起一个对口 agent**。
+**接下来(都要安琳定时机 / 给资源,任何 agent 不得自行执行)**:
+1. **重启主机启用 Hyper-V**(`fieldtest/vm-lab/01-启用HyperV.ps1`,先 `-WhatIfOnly`;重启会中断 WSL 内全部 13 个容器、企点登录态、qb 行情采集;网络异常立即 `01b-撤销HyperV.ps1`)→ 建虚拟机 / 装 Win11 / 打 `clean-baseline` 检查点(`02`/`02b`/`03`)。
+2. **真机装验证**:`fieldtest/真机验收手册.md` A~I 九组 51 条,另一台物理机为主 + 本机虚拟机为辅。**未经安琳同意不运行安装 EXE。**
+3. 验完再谈:分支合 `main`、要不要回给 cursor 做第九轮评审。
 
-**之后按序**:两步都绿 → **出带签名正式包**(命令 3,先把改动清单列给安琳确认:`installer\build\build.ps1 -Version 1.0.0 -SourceRoot C:\Users\anlin\qtrade-payload -Sign -CertThumbprint E36AFD96…`,会覆盖旧 EXE)→ 校验(`7z t`、manifest `lightweight=false`+`missing` 空+13 项、三段拼接、包内 exe sha256)→ 补 `fieldtest/真机验收手册.md` §1.4「先导入证书」→ **一次性**交代重启启用 Hyper-V 前后要做的事(重启中断 WSL 内 13 容器+企点登录态+qb 采集)→ 真机装验证(另一台物理机为主 + 本机 Hyper-V 为辅)。
+**攒着没做的(不阻塞真机验证)**:
+- rootfs 线:E3-O2(janitor 单元无 `StartLimit*`,涉及规格待裁)、E5-O1(断言失败消息 sha 只显示前 12 位)、E5-O2(同名 dist-info 多份时取最后一份)、apt 层与 `FROM ubuntu:22.04` 未钉版本 / digest、Agent 本体 wheel 无 hash 安装(靠 `contents.json` 登记)。
+- 打包线:`winagent/build/build.ps1` 签名步调裸 `signtool`(不在 PATH 时必败,应复用 `Find-QtSignTool`);manifest 对 `winagent/app/*`、`console/*` 是通配条目、无单文件 sha256 ⇒ 安装期无法按 manifest 复核这两个目录(V3-4);包内 `winagent/python/site-packages/bin` 有两个同名未签名的 pip 启动器(V3-2,引擎不用);控制台 `npm audit` 19 条依赖告警;控制台仍用默认 Electron 图标。
+- 文档 01 侧登记、待实现项(企点名称列 UTF-16 异或解密等)、待安琳裁的几条(#95 / #42 / R6-60 f / #88 / 磁盘门槛)、前端连带 —— 原样沿用上一版快照,见 `.omc/handoffs/team-lead-status.md` §5。
+- 产物根 `rootfs\out\` 攒了 5 份旧 rootfs tar(各约 2.1 GB)、`winagent\dist\*.old-20260921`、`console\release\win-unpacked.old-20260921`、构建副本 `~/work/qtrade-build/console-pack-2/` —— 删不删由安琳定。
 
-**新增工作纪律**(已入项目记忆):**发给忙碌 agent 的消息要等它这轮结束才到**——别用消息叫停,要停让安琳按 Esc,说「都停了」前用 ps/mtime 实查;收尾只 `kill <自己 PID>`、禁 `pkill`/`killall`;删目录前 `git ls-files` 查跟踪;复跑验证用**自己独占**的副本/端口/数据目录(共享副本+HMR 会造假红);只按精确路径 `git add`;打 wheel/全量前 `rm -rf build/` + 清源码树杂散 `.omc/`;发行版依赖已上锁。安琳今天直接带的羿珩行情采集 + 企点只读监控两条线**不在安装包关键路径、已收口**,新 session 可不管(细节见 `.omc/handoffs/team-lead-status.md` §6)。
+**新增工作纪律**(已入项目记忆):🔴 **绝不 `cd` 进会被打包收集的目录**(`installer/out/**`、`winagent/dist/**`、`console/release/**`、产物根)——本机 OMC 钩子会在当前目录写 `.omc/state/…`,被通配收集带进安装包(本段出包第一轮因此作废重跑);一律绝对路径,出包后的校验必须含「包内与 stage 零 `.omc`」。实现方的自检脚本不能当结论(第三批自检 `docker exec` 缺 `-i` ⇒ heredoc 检查空跑恒通过,靠独立复测兜住)⇒ 每条检查都要有「确实执行了」的证据。其余沿用:发给忙碌 agent 的消息要等它这轮结束才到;收尾只 `kill <自己 PID>`、禁 `pkill`/`killall`;删目录前 `git ls-files`;复跑用独占副本;只按精确路径 `git add`;打 wheel / 全量前 `rm -rf build/` + 清杂散 `.omc/`。安琳直接带的羿珩行情采集 + 企点只读监控两条线不在安装包关键路径、已收口。
 
 ## 4. 现在卡在哪(2026-09-21 清晨)
 
