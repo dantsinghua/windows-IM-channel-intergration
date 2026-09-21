@@ -15,7 +15,11 @@ import { useSessionStore } from '@/stores/session'
 import { useCommandsStore } from '@/stores/commands'
 import { useSetupStore } from '@/stores/setup'
 import { useUiStore } from '@/stores/ui'
-import { settingsApi, mailApi, systemApi } from '@/api/client'
+import { settingsApi, mailApi, systemApi, resourcesApi } from '@/api/client'
+import { ApiFailure } from '@/api/http'
+import {
+  API_KEYS, ASR_KEYS, ASR_SECRET_KEY, OCR_KEYS, POOL_KEYS, RETENTION_KEYS, pickKeys,
+} from '@/api/settingsKeys'
 import { CHANNEL_TEXT, DANGER_OPS, capabilityText } from '@/i18n/zh-CN/codes'
 
 const router = useRouter()
@@ -50,12 +54,29 @@ const mailRouteDraftAccount = ref<string | undefined>()
 const busy = ref(false)
 /** #102 的 `configured_domain` 编辑草稿(写回落点 = `PUT /settings/api {public_domain}`) */
 const pubDomainDraft = ref('')
+/** ASR 密钥草稿:只写不读(输入框永远从空开始,留空即不改) */
+const asrKeyDraft = ref('')
 
 const retention = computed(() => store.groups.retention ?? {})
 const apiGroup = computed(() => store.groups.api ?? {})
 const asr = computed(() => store.groups.asr ?? {})
 const ocr = computed(() => store.groups.ocr ?? {})
 const resGroup = computed(() => store.groups.resources ?? {})
+/**
+ * 🔴 `resources` 组的线上形状 = **`{pools, quota_mb}`**(#88 逐字,后端 `_group_view('resources')`),
+ * **不是**一堆 `*_mb` 顶层键;三通道预算在 `quota_mb.{qidian|qq|wechat}`,
+ * 「WSL 基础占用」= `pools.wsl.reserved_mb`(07 §2 `[pool] wsl_reserved_mb` 的运行期真值,C-43)。
+ */
+const resQuota = computed(() => (resGroup.value.quota_mb ?? {}) as Record<string, number | undefined>)
+const resPools = computed(() => (resGroup.value.pools ?? {}) as Record<string, Record<string, number | undefined> | undefined>)
+/**
+ * 🔴 内存水位阈值 `mem_warn_mb`/`mem_critical_mb` 在 **`pool` 组**(07 §2 `[pool]`,后端 `PoolConfig`),
+ * 不在 `resources` 组 —— 塞进 `resources` 会被 #89 的未知键判定挡回 400。
+ * (01 §4 :1345 把这两个控件写成 `PUT /settings/resources`,与 07 冲突,已转文档方订正。)
+ */
+const poolGroup = computed(() => store.groups.pool ?? {})
+/** 合规块的数据源 = #86 `GET /system/notice`(`/settings/compliance` 不在 #88 的 group 枚举里,真后端 404) */
+const notice = ref<{ notice_version: string; acked_at: string | null; ack_ms: number | null } | null>(null)
 const version = computed(() => env.version)
 const migration = computed(() => env.version?.migration ?? { state: 'idle' as const })
 
@@ -64,6 +85,20 @@ const opOptions = computed(() => commands.catalog.map((c) => ({ op: c.op, danger
 
 function scopeCfg(scope: string) {
   return store.mailScopes[scope] ?? (store.mailScopes[scope] = emptyMailScope())
+}
+
+/**
+ * 保存失败的文案。🔴 `#89` 对未知键回 `400 INVALID_ARGS` 时,**哪个键不认**只在
+ * `error.details[].pointer` 里(RFC 6901);不摊开就只剩一句「未知配置键」,
+ * 用户与排障都看不出是哪一项 —— 这正是 P-2 那类键名笔误最需要的线索。
+ */
+function saveErrorText(e: unknown): string {
+  if (!(e instanceof ApiFailure)) return e instanceof Error ? e.message : String(e)
+  const keys = (e.detail.details ?? [])
+    .map((d) => String(d.pointer ?? '').replace(/^\//, '').replace(/~1/g, '/').replace(/~0/g, '~'))
+    .filter(Boolean)
+  const where = keys.length ? `(涉及:${keys.join('、')})` : ''
+  return `${e.message}${where}(trace ${e.traceShort})`
 }
 
 async function saveGroup(group: string, body: Record<string, unknown>): Promise<void> {
@@ -85,7 +120,7 @@ async function saveGroup(group: string, body: Record<string, unknown>): Promise<
     }
     for (const w of r.warnings) message.warning(w)
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    message.error(saveErrorText(e))
   } finally {
     busy.value = false
   }
@@ -107,12 +142,25 @@ async function saveMail(): Promise<void> {
   })
 }
 
+/**
+ * 「允许局域网访问 17600」在配置里的落点 = **`[api] bind`**(07 §2:`bind="0.0.0.0"`)——
+ * 07 `[api]` 里**没有** `lan_enabled` 这个键,开关只是 `bind` 的两档视图:
+ * 开 = `0.0.0.0`(监听所有网卡)、关 = `127.0.0.1`(只本机)。下拉框改的是同一个键。
+ */
+const lanEnabled = computed(() => String(apiGroup.value.bind ?? '127.0.0.1') !== '127.0.0.1')
+
+function setLanEnabled(on: boolean): void {
+  const g = store.groups.api ?? (store.groups.api = {})
+  g.bind = on ? '0.0.0.0' : '127.0.0.1'
+}
+
 function confirmLanSave(): void {
   Modal.confirm({
     title: '开放局域网访问 17600',
     okType: 'danger',
     content: '将按端口精确放行 Windows 防火墙(不放 Any)。确认保存?',
-    onOk: () => saveGroup('api', apiGroup.value),
+    // 🔴 整组替换 + 未知键拒收 ⇒ 只下发 07 §2 `[api]` 登记的键
+    onOk: () => saveGroup('api', pickKeys(apiGroup.value, API_KEYS)),
   })
 }
 
@@ -220,17 +268,68 @@ function confirmKeepAwake(mode: string): void {
   })
 }
 
+/**
+ * 保留期。🔴 键名一律取 07 §2 `[retention]`:
+ * 「库内消息正文与其余库表」= **`messages_days`**(不是 `text_days`)、
+ * 「原始载荷」= **`raw_days`**(不是 `raw_enabled`)。E-18 的 30 天上限判在 `messages_days` 上。
+ */
 async function saveRetention(): Promise<void> {
-  const text = Number(retention.value.text_days ?? 30)
-  if (text > 30) { message.error('本地只留近 30 天'); return }
-  await saveGroup('retention', retention.value)
+  const days = Number(retention.value.messages_days ?? 30)
+  if (days > 30) { message.error('本地只留近 30 天'); return }
+  await saveGroup('retention', pickKeys(retention.value, RETENTION_KEYS))
 }
 
+function setQuota(ch: 'qidian' | 'qq' | 'wechat', v: number): void {
+  const g = store.groups.resources ?? (store.groups.resources = {})
+  const q = (g.quota_mb ?? (g.quota_mb = {})) as Record<string, number>
+  q[ch] = v
+}
+
+function setPoolReserved(pool: 'wsl' | 'windows', v: number): void {
+  const g = store.groups.resources ?? (store.groups.resources = {})
+  const pools = (g.pools ?? (g.pools = {})) as Record<string, Record<string, number>>
+  ;(pools[pool] ?? (pools[pool] = {})).reserved_mb = v
+}
+
+function setMemLevel(which: 'mem_warn_mb' | 'mem_critical_mb', v: number): void {
+  const g = store.groups.pool ?? (store.groups.pool = {})
+  g[which] = v
+}
+
+/**
+ * ASR。密钥是**只写不读**的草稿(留空即不改;读回来只有 `api_key_ref`),
+ * 不挂在 `groups.asr` 上 —— 挂上去会跟着整组一起被下发成一个 07 没有的野键。
+ */
+async function saveAsr(): Promise<void> {
+  const body = pickKeys(asr.value, ASR_KEYS)
+  if (asrKeyDraft.value) body[ASR_SECRET_KEY] = asrKeyDraft.value
+  await saveGroup('asr', body)
+  asrKeyDraft.value = ''
+}
+
+/** OCR:`engine` 只读不下发(A-1),其余三键按 07 §2 `[ocr]` */
+async function saveOcr(): Promise<void> {
+  await saveGroup('ocr', pickKeys(ocr.value, OCR_KEYS))
+}
+
+/** 资源池:`{pools, quota_mb}` 两键(#88);内存水位另存 `pool` 组(07 §2 `[pool]`) */
+async function saveResources(): Promise<void> {
+  await saveGroup('resources', { pools: resPools.value, quota_mb: resQuota.value })
+}
+
+async function saveMemLevels(): Promise<void> {
+  await saveGroup('pool', pickKeys(poolGroup.value, POOL_KEYS))
+}
+
+/** 「自校准」= `POST /resources/calibrate {apply:true}`(01 §2.7.10「返回建议值,`apply=true` 写回」) */
 async function calibrate(): Promise<void> {
-  const r = await settingsApi.put('resources', resGroup.value)
-  await systemApi.version()
-  // resources 组是 v1 唯一不需要重启的组(#89);真回了 restart_required 就照实说
-  message.success(r.restartRequired ? '已保存资源池设置,需要重启 Agent 才生效' : '已保存资源池设置')
+  try {
+    const r = await resourcesApi.calibrate(true)
+    await store.loadGroup('resources')
+    message.success(r.job_id ? `已提交自校准作业 ${r.job_id}` : '已按自校准结果写回资源池')
+  } catch (e) {
+    message.error(saveErrorText(e))
+  }
 }
 
 /**
@@ -267,7 +366,17 @@ onMounted(async () => {
     await store.loadWechatModule().catch(() => undefined)
     await store.loadWslConfig().catch(() => undefined)
   }
-  await store.loadGroup('compliance').catch(() => undefined)
+  // 内存水位阈值在 `pool` 组(07 §2 `[pool]`),`loadAll()` 只拉了 P-SET 的六组
+  await store.loadGroup('pool').catch(() => undefined)
+  /*
+   * 🔴 合规块的数据源 = #86 `GET /system/notice`。
+   * `/settings/compliance` **不在 #88 的 group 枚举里**(真后端 404,`client.ts` 与
+   * `stores/setup.ts` 早已写明),此前每次打开 P-SET 都白打一条 404、合规两行恒显示「—」(D-E)。
+   * 这里直接调 API、结果只存本组件:不写 `setup` store,免得跟首启向导抢状态。
+   */
+  notice.value = await systemApi.notice()
+    .then((n) => ({ notice_version: n.notice_version, acked_at: n.acked_at ?? null, ack_ms: n.ack_ms ?? null }))
+    .catch(() => null)
   if (!env.version) await env.loadAll().catch(() => undefined)
 })
 </script>
@@ -314,22 +423,35 @@ onMounted(async () => {
     <section class="qt-card box">
       <div class="qt-section-title">局域网开放</div>
       <a-form layout="vertical">
+        <!-- 开关与下拉改的是**同一个键** `[api] bind`(07 §2);07 里没有 `lan_enabled` -->
         <a-form-item label="允许局域网访问 17600">
-          <a-switch :data-testid="T.lanEnable" :checked="!!apiGroup.lan_enabled"
-                    @change="(v: any) => apiGroup.lan_enabled = !!v" />
+          <a-switch :data-testid="T.lanEnable" :checked="lanEnabled"
+                    @change="(v: any) => setLanEnabled(!!v)" />
         </a-form-item>
-        <a-form-item label="绑定地址">
+        <a-form-item label="绑定地址(bind)">
           <a-select :data-testid="T.lanBind" :value="apiGroup.bind ?? '127.0.0.1'"
-                    :options="[{ value: '127.0.0.1', label: '127.0.0.1' }, { value: '0.0.0.0', label: '0.0.0.0' }]"
-                    @change="(v: any) => apiGroup.bind = v" />
+                    :options="[{ value: '127.0.0.1', label: '127.0.0.1(仅本机)' }, { value: '0.0.0.0', label: '0.0.0.0(局域网可达)' }]"
+                    @change="(v: any) => setLanEnabled(v !== '127.0.0.1')" />
         </a-form-item>
+        <!--
+          🔴 IP 白名单与 HTTPS:07 §2 `[api]` 里**没有**对应的配置键(IP 白名单只在 API 客户端
+          逐条的 `ip_allow`;HTTPS 那三个键 `https_port`/`tls_cert`/`tls_key` 07 有、后端
+          `ApiConfig` 还没有),`#89` 又对未知键回 400 ⇒ 这两项现在**保存不了**。
+          与其让人填完以为存上了,不如禁用 + 明说,并把「键名待登记」转文档方/后端。
+        -->
         <a-form-item label="IP 白名单(CIDR,每行一条)">
-          <a-textarea :data-testid="T.lanAllowlist" :rows="2" :value="apiGroup.ip_allow as string"
-                      @change="(e: any) => apiGroup.ip_allow = e.target.value" />
+          <a-textarea :data-testid="T.lanAllowlist" :rows="2" :value="(apiGroup.ip_allow as string) ?? ''" disabled />
+          <div class="qt-small qt-muted">
+            07 §2 <code>[api]</code> 未登记本机 API 的 IP 白名单键,暂不可在此保存;
+            按客户端限制来源请用上方「API 客户端」的 <code>ip_allow</code>。
+          </div>
         </a-form-item>
         <a-form-item label="HTTPS">
-          <a-switch :data-testid="T.lanHttps" :checked="!!apiGroup.https"
-                    @change="(v: any) => apiGroup.https = !!v" />
+          <a-switch :data-testid="T.lanHttps" :checked="!!apiGroup.https_port" disabled />
+          <span class="qt-small qt-muted">
+            证书状态:{{ apiGroup.tls_cert ? '已配置' : '未配置' }};
+            <code>https_port/tls_cert/tls_key</code> 尚未出现在 <code>GET/PUT /settings/api</code> 的键集里,暂不可改。
+          </span>
         </a-form-item>
       </a-form>
       <a-button type="primary" :data-testid="T.lanSave" @click="confirmLanSave">保存</a-button>
@@ -548,9 +670,14 @@ onMounted(async () => {
           <a-input :data-testid="T.asr('endpoint')" :value="asr.endpoint as string"
                    @change="(e: any) => asr.endpoint = e.target.value" />
         </a-form-item>
-        <a-form-item label="密钥(只写不读)">
-          <a-input :data-testid="T.asr('key')" type="password" autocomplete="new-password"
-                   :value="asr.key as string" @change="(e: any) => asr.key = e.target.value" />
+        <a-form-item label="密钥(只写不读:留空即不改)">
+          <span class="qt-row">
+            <a-input :data-testid="T.asr('key')" type="password" autocomplete="new-password"
+                     placeholder="留空即不改"
+                     :value="asrKeyDraft" @change="(e: any) => asrKeyDraft = e.target.value" />
+            <!-- 服务端唯一回读的是 `api_key_ref`(07 §2 `[asr]`),不是密钥值 -->
+            <span class="qt-small qt-muted">{{ asr.api_key_ref ? '已配置' : '未配置' }}</span>
+          </span>
         </a-form-item>
         <a-form-item label="并发">
           <a-input-number :data-testid="T.asr('concurrency')" :value="asr.concurrency as number"
@@ -561,7 +688,7 @@ onMounted(async () => {
                           @change="(v: any) => asr.min_confidence = v" />
         </a-form-item>
       </a-form>
-      <a-button type="primary" :data-testid="T.asrSave" @click="saveGroup('asr', asr)">保存</a-button>
+      <a-button type="primary" :data-testid="T.asrSave" @click="saveAsr">保存</a-button>
       <span v-if="store.isPendingRestart('asr')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
     </section>
 
@@ -585,7 +712,7 @@ onMounted(async () => {
       </a-form>
       <div class="qt-row">
         <a-button :data-testid="T.ocrSelftest" @click="systemApi.selftestRun()">自检</a-button>
-        <a-button type="primary" :data-testid="T.ocrSave" @click="saveGroup('ocr', ocr)">保存</a-button>
+        <a-button type="primary" :data-testid="T.ocrSave" @click="saveOcr">保存</a-button>
         <span v-if="store.isPendingRestart('ocr')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
       </div>
     </section>
@@ -598,14 +725,20 @@ onMounted(async () => {
           <a-input-number :data-testid="T.retention('files')" :value="(retention.files_days as number) ?? 7"
                           @change="(v: any) => retention.files_days = v" />
         </a-form-item>
+        <!-- 🔴 键名以 07 §2 `[retention]` 为准:`messages_days`(不是 `text_days`) -->
         <a-form-item label="库内消息正文与其余库表保留天数(上限 30)">
-          <a-input-number :data-testid="T.retention('text')" :max="30" :value="(retention.text_days as number) ?? 30"
-                          @change="(v: any) => retention.text_days = v" />
+          <a-input-number :data-testid="T.retention('text')" :max="30" :value="(retention.messages_days as number) ?? 30"
+                          @change="(v: any) => retention.messages_days = v" />
           <div class="qt-small qt-warn" :data-testid="T.retentionTextCapHint">本地只留近 30 天</div>
         </a-form-item>
-        <a-form-item label="原始载荷落盘">
-          <a-switch :data-testid="T.retention('raw')" :checked="!!retention.raw_enabled"
-                    @change="(v: any) => retention.raw_enabled = !!v" />
+        <!--
+          🔴 `raw_days`(不是 `raw_enabled`):07 §2 `[retention]` 里与原始载荷有关的键只有保留天数;
+          「是否落盘」是另一个设置(`[messages] raw_payload`),不在本组,01 §2.7.10 正文与 §4 元素表
+          的这处出入已转文档方。
+        -->
+        <a-form-item label="原始载荷保留天数">
+          <a-input-number :data-testid="T.retention('raw')" :min="0" :value="(retention.raw_days as number) ?? 7"
+                          @change="(v: any) => retention.raw_days = v" />
         </a-form-item>
         <a-form-item label="审计保留天数">
           <a-input-number :data-testid="T.retention('audit')" :max="30" :value="(retention.audit_days as number) ?? 30"
@@ -711,29 +844,37 @@ onMounted(async () => {
     <section class="qt-card box">
       <div class="qt-section-title">资源池 / 内存保护</div>
       <a-form layout="inline">
+        <!-- 🔴 三通道预算在 `quota_mb.*`、WSL 基础占用在 `pools.wsl.reserved_mb`(#88 的 resources 两键形状) -->
         <a-form-item label="企点 MB">
-          <a-input-number :data-testid="T.resQuota('qidian')" :value="resGroup.qidian_mb as number"
-                          @change="(v: any) => resGroup.qidian_mb = v" />
+          <a-input-number :data-testid="T.resQuota('qidian')" :value="resQuota.qidian"
+                          @change="(v: any) => setQuota('qidian', v)" />
         </a-form-item>
         <a-form-item label="QQ MB">
-          <a-input-number :data-testid="T.resQuota('qq')" :value="resGroup.qq_mb as number"
-                          @change="(v: any) => resGroup.qq_mb = v" />
+          <a-input-number :data-testid="T.resQuota('qq')" :value="resQuota.qq"
+                          @change="(v: any) => setQuota('qq', v)" />
         </a-form-item>
         <a-form-item label="微信 MB">
-          <a-input-number :data-testid="T.resQuota('wechat')" :value="resGroup.wechat_mb as number"
-                          @change="(v: any) => resGroup.wechat_mb = v" />
+          <a-input-number :data-testid="T.resQuota('wechat')" :value="resQuota.wechat"
+                          @change="(v: any) => setQuota('wechat', v)" />
         </a-form-item>
         <a-form-item label="WSL 基础 MB">
-          <a-input-number :data-testid="T.resQuota('base')" :value="resGroup.base_mb as number"
-                          @change="(v: any) => resGroup.base_mb = v" />
+          <a-input-number :data-testid="T.resQuota('base')" :value="resPools.wsl?.reserved_mb"
+                          @change="(v: any) => setPoolReserved('wsl', v)" />
         </a-form-item>
+      </a-form>
+      <!-- 🔴 内存水位阈值是 `pool` 组的键(07 §2 `[pool]`),与上面的资源池分开保存 -->
+      <a-form layout="inline">
         <a-form-item label="mem_warn_mb">
-          <a-input-number :data-testid="T.resMem('warn')" :value="resGroup.mem_warn_mb as number"
-                          @change="(v: any) => resGroup.mem_warn_mb = v" />
+          <a-input-number :data-testid="T.resMem('warn')" :value="poolGroup.mem_warn_mb as number"
+                          @change="(v: any) => setMemLevel('mem_warn_mb', v)" />
         </a-form-item>
         <a-form-item label="mem_critical_mb">
-          <a-input-number :data-testid="T.resMem('critical')" :value="resGroup.mem_critical_mb as number"
-                          @change="(v: any) => resGroup.mem_critical_mb = v" />
+          <a-input-number :data-testid="T.resMem('critical')" :value="poolGroup.mem_critical_mb as number"
+                          @change="(v: any) => setMemLevel('mem_critical_mb', v)" />
+        </a-form-item>
+        <a-form-item>
+          <a-button @click="saveMemLevels">保存内存水位</a-button>
+          <span v-if="store.isPendingRestart('pool')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
         </a-form-item>
       </a-form>
       <p class="qt-small qt-muted" :data-testid="T.autostopNote">
@@ -742,7 +883,7 @@ onMounted(async () => {
       </p>
       <div class="qt-row">
         <a-button :data-testid="T.resCalibrate" @click="calibrate">自校准</a-button>
-        <a-button type="primary" :data-testid="T.resSave" @click="saveGroup('resources', resGroup)">保存</a-button>
+        <a-button type="primary" :data-testid="T.resSave" @click="saveResources">保存</a-button>
         <span v-if="store.isPendingRestart('resources')" class="qt-small qt-warn">已保存,重启 Agent 后生效</span>
       </div>
     </section>
@@ -789,8 +930,14 @@ onMounted(async () => {
     <!-- 合规 / 关于 / 控制台 -->
     <section class="qt-card box">
       <div class="qt-section-title">合规</div>
-      <div :data-testid="T.compliance('version')">告知版本 {{ store.groups.compliance?.notice_version ?? '—' }}</div>
-      <div :data-testid="T.compliance('ack')">确认时间 {{ store.groups.compliance?.ack_ms ?? '—' }}</div>
+      <!--
+        🔴 数据源 = #86 `GET /system/notice`(`/settings/compliance` 不在 #88 的 group 枚举里)。
+        确认时间优先取 `acked_at`(ISO,00 §6「时间一律 ISO 8601 带时区偏移」),没有才回落毫秒。
+      -->
+      <div :data-testid="T.compliance('version')">告知版本 {{ notice?.notice_version || '—' }}</div>
+      <div :data-testid="T.compliance('ack')">
+        确认时间 {{ notice?.acked_at ?? (notice?.ack_ms ? new Date(notice.ack_ms).toLocaleString('zh-CN') : '—') }}
+      </div>
       <a-button :data-testid="T.rerunSetup" @click="rerunSetup">重新运行向导</a-button>
     </section>
 

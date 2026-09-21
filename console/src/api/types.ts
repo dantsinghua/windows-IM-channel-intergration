@@ -1,6 +1,8 @@
 /** Agent `/api/v1` 的数据模型(00 §7,02 §3.4 出参口径) */
 
-import type { AccountState, Channel, ResultCode, Severity } from '@/i18n/zh-CN/codes'
+import type { AccountState, Channel, ProbeResultMeta, ResultCode, Severity } from '@/i18n/zh-CN/codes'
+// 自检行的探测结论要按 01 §2.7.9 的色/中文渲染,文案与芯片色只此一份来源(01 §2.9 约定 6)
+import { PROBE_RESULTS } from '@/i18n/zh-CN/codes'
 
 /* ── 统一信封(00 §10 / 02 §3.4) ── */
 
@@ -451,21 +453,44 @@ export function normalizeMailStatus(raw: unknown): MailStatus {
   return { enabled: o.enabled === true, routes: [] }
 }
 
+/**
+ * `#58 GET /mail/inbox` 的行。🔴 键集以 backend-api-4 §1 P-1 的出参视图为准
+ * (时间一律 ISO `*_at`、`id` 为字符串、**列表不含 `body_text`**,详情 `#59` 才给)。
+ * 这里只列页面真正用到的键;后端那张表还有 `mailbox`/`uid`/`attach_json` 等库列,用到再补。
+ */
 export interface MailInboxRow {
   id: string
   received_at: string
-  route: string
+  /** 派生列:`default` / `qidian|qq|wechat` / `<account_id>` —— **scope 名,不是中文显示名** */
+  route: string | null
+  route_id?: number | string | null
   from_addr: string
   subject: string
   status: string
   reason?: string | null
   trace_id?: string | null
   req_id?: string | null
+  /**
+   * ⚠️ **后端没有这个键**(`mail_inbox` 无此列,02 也没写它的算法;回执其实是 `mail_outbox` 里
+   * `ref_inbox_id=… AND kind='receipt'` 的行)。定义与出处**待裁决**,在那之前一律当它不存在:
+   * 页面显示处必须做空值兜底,不许依赖它。
+   */
   receipt_status?: string | null
+  /** 派生列:`archived_path`/`archived_ms` 任一非空即真(01 §2.7.8「是否已归档」) */
   archived?: boolean
+  date_at?: string | null
+  confirm_expires_at?: string | null
+  archived_at?: string | null
+  deleted_at?: string | null
+  sig_ok?: boolean | null
+  to_addrs?: string | null
+  attach_cnt?: number | null
 }
 
+/** `#59 GET /mail/inbox/{id}` = `#58` 的行 **+ `body_text`**,其余一字不差(backend-api-4 §1 P-1) */
 export interface MailInboxDetail extends MailInboxRow {
+  /** 正文只在详情下发;列表端点一律不带(02 #58 逐字) */
+  body_text?: string | null
   template_alias?: string
   parsed?: {
     op: string
@@ -479,6 +504,12 @@ export interface MailInboxDetail extends MailInboxRow {
   result?: { code: string; cost_ms: number }
 }
 
+/**
+ * `#61 GET /mail/outbox` 的行(13 键)。键集出处 = 01 §2.7.8 发件队列逐字
+ * `kind/to/subject/status/attempts/next_attempt_at/last_error/ref`,
+ * 加 `id`/`route_id`/`route`/`created_at`/`sent_at`(backend-api-4 §1 P-1)。
+ * 🔴 不下发正文(`body_text`/`body_html`)与 `smtp_response`/`dedup_key` 等库列。
+ */
 export interface MailOutboxRow {
   id: string
   kind: string
@@ -486,8 +517,16 @@ export interface MailOutboxRow {
   subject: string
   status: string
   attempts: number
+  /** ISO;`next_attempt_ms=0`(DDL 默认 = 没有下次)后端回 `null`,不回 1970 */
   next_attempt_at?: string | null
+  /** C-42 的排序列 */
+  created_at?: string | null
+  sent_at?: string | null
+  /** 派生列,同 `#58`:scope 名,不是中文显示名 */
+  route?: string | null
+  route_id?: number | string | null
   last_error?: string | null
+  /** 派生:`ref_trace_id` → `ref_message_id` → `str(ref_inbox_id)`,都空则 `null` */
   ref?: string | null
 }
 
@@ -717,8 +756,38 @@ export interface SampleRow {
 export interface SelftestRow {
   item: string
   label: string
-  level: 'ok' | 'warn' | 'error'
+  /**
+   * `skip` = 灰「未探测」:**不计红黄、不阻断**(C-18,01 §2.7.9 探测结论表 `SKIPPED` 灰;
+   * 01 M4-7「SKIPPED 不计红项,P-SETUP 步 3 不因它阻断」)。把「没测」显示成「有问题」= 界面说假话。
+   */
+  level: 'ok' | 'warn' | 'error' | 'skip'
   message?: string
+}
+
+/**
+ * 探测 `detail` 的**已知枚举** → 中文(04 §3.4/§4/§9;真后端就发这些串)。
+ * 枚举之外的 `detail` 是诊断摘要原文(errno、TLS issuer、HTTP 状态,04 §3.2),按原文显示。
+ * ⚠️ 文案单一来源本应是 `i18n/zh-CN/codes.ts`(01 §2.9 约定 6);本批为守文件边界暂放这里,建议后续搬家。
+ */
+const PROBE_DETAIL_ZH: Record<string, string> = {
+  not_configured: '目标未配置',
+  agent_probe_disabled: 'Agent 未开启出网探测',
+  agent_unreachable: 'Agent 不可达',
+  wrong_side: '该目标不归这一侧探测',
+}
+
+/** 未知结论不伪装成「正常」:按黄处理(诚实标不确定),色/文案仍走 i18n 单一来源 */
+function probeToneOf(status: string): ProbeResultMeta['tone'] {
+  return PROBE_RESULTS[status]?.tone ?? 'warn'
+}
+
+/** 一条探测 → 人话一句:结论走 i18n 中文(不甩裸枚举),detail 已知枚举转中文、未知按原文 */
+export function probeLineZh(r: ProbeRow): string {
+  const status = probeStatusOf(r)
+  const statusZh = PROBE_RESULTS[status]?.zh ?? `未知结论(${status})`
+  const detail = probeDetailOf(r)
+  const detailZh = detail ? (PROBE_DETAIL_ZH[detail] ?? detail) : ''
+  return `${r.target ?? r.side ?? '?'}:${statusZh}${detailZh ? `(${detailZh})` : ''}`
 }
 
 function boolRow(item: string, label: string, v: boolean | null | undefined, skipped: string | null): SelftestRow {
@@ -747,17 +816,25 @@ export function selftestRows(run: SelftestRun | SelftestRow[] | null | undefined
   ]
   const probes = run.probes ?? []
   if (probes.length) {
-    const statuses = probes.map(probeStatusOf)
-    const level = statuses.some((x) => ['FAIL', 'DNS_FAIL', 'TCP_FAIL', 'TLS_FAIL', 'BLOCKED'].includes(x))
+    /**
+     * 色按 01 §2.7.9 探测结论表的**芯片色**单一来源(`PROBE_RESULTS[*].tone`),不再自列枚举名
+     * (原先写死的 `FAIL/TCP_FAIL/BLOCKED` 在 00 §8.5 里根本不存在 ⇒ 真红项 `TCP_TIMEOUT`/
+     * `PROXY_REQUIRED`/`BLOCKED_BY_POLICY` 反而被判成黄)。`SKIPPED`(tone=`na`)不计红黄:
+     * 全是 `na` ⇒ 整行灰 `skip`;与 OK 混排时按 OK 算。
+     */
+    const tones = probes.map((r) => probeToneOf(probeStatusOf(r)))
+    const level: SelftestRow['level'] = tones.includes('fail')
       ? 'error'
-      : statuses.some((x) => x !== 'OK')
+      : tones.includes('warn')
         ? 'warn'
-        : 'ok'
+        : tones.every((t) => t === 'na')
+          ? 'skip'
+          : 'ok'
     rows.push({
       item: 'probes',
       label: `连通性探测(${probes.length} 项)`,
       level,
-      message: probes.map((r) => `${r.target ?? r.side ?? '?'}:${probeStatusOf(r)}${probeDetailOf(r) ? `(${probeDetailOf(r)})` : ''}`).join('、'),
+      message: probes.map(probeLineZh).join('、'),
     })
   }
   return rows

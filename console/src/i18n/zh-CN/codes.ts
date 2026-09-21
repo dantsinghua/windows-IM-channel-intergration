@@ -528,6 +528,18 @@ export const CHANNEL_TEXT: Record<Channel, string> = {
   wechat: '微信',
 }
 
+/**
+ * 邮件路由列(`#58`/`#61` 的派生列 `route`)的中文显示。
+ * 🔴 后端下发的是 **scope 名**(`default` / `qidian|qq|wechat` / `<account_id>`,
+ * backend-api-4 §1 P-1),不是中文显示名 —— 原样渲染会在界面上甩英文枚举。
+ * 认不出来的值(按账号覆盖时就是账号 id)原样显示,空值给「—」。
+ */
+export function mailRouteText(scope: string | null | undefined): string {
+  if (!scope) return '—'
+  if (scope === 'default') return '全局默认'
+  return CHANNEL_TEXT[scope as Channel] ?? scope
+}
+
 export const CHANNEL_TOKEN: Record<Channel, string> = {
   qidian: '--qt-ch-qidian',
   qq: '--qt-ch-qq',

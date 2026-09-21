@@ -152,7 +152,8 @@ function add(ch: Channel): void {
 }
 
 onMounted(() => {
-  void accounts.load()
+  // D-H:`App.vue` 首启的 `fullReload()` 可能刚拉过(或正在拉)⇒ 搭同一班车,别再发一次 `GET /accounts`
+  void accounts.loadFirst()
   void resources.load()
   tick = setInterval(() => { now.value = Date.now() }, 1000)
 })

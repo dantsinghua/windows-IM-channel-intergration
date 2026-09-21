@@ -78,10 +78,20 @@ const state = {
     },
     // 🔴 M-6:02 #88 的 group 枚举逐字含 runtime / pool / events / log 四组(mock 原先 404)
     runtime: { adb_connect_timeout_s: 10, ui_action_timeout_ms: 8000, screenshot_format: 'png' },
-    pool: { max_parallel_commands: 4, queue_max: 64, idle_stop_minutes: 0 },
+    // 🔴 键名 = 07 §2 `[pool]` / 后端 `PoolConfig`(原先那套 max_parallel_commands… docs 里没有);
+    //    **内存水位阈值 `mem_warn_mb`/`mem_critical_mb` 在这一组**,不在 `resources`
+    pool: {
+      wsl_reserved_mb: 2048, windows_reserved_mb: 4096,
+      quota_qidian_mb: 2560, quota_qq_mb: 614, quota_wechat_mb: 1536,
+      autocalibrate_on_first_login: true, mem_warn_mb: 2048, mem_critical_mb: 1024,
+    },
     events: { outbox_max_rows: 5000, replay_window_rows: 2000, ws_send_timeout_ms: 5000 },
     log: { level: 'INFO', rotate_mb: 64, keep_files: 7, body_logging: false },
-    asr: { endpoint: 'http://10.0.0.8:9000/asr', concurrency: 2, min_confidence: 0.6 },
+    // 07 §2 `[asr]`:密钥只回引用 `api_key_ref`(写入走 `api_key_secret`,#88 密码类只写不读)
+    asr: {
+      provider: 'none', endpoint: 'http://10.0.0.8:9000/asr', api_key_ref: 'vault://asr/key',
+      model: '', concurrency: 2, min_confidence: 0.6, prefer_native: true,
+    },
     ocr: { engine: 'offline', model_dir: '/opt/qtrade/ocr', min_conf: 0.8, lang: 'zh' },
     // 🔴 R6-58 (ac):`mail` 组逐字四键 + scopes 每块 {override, route_id, enabled, inbound, outbound}
     mail: {
@@ -126,19 +136,29 @@ const state = {
     short_name: 'ops', sender: 'ops@corp', route_id: null, enabled: true,
     secret_ref: 'vault://mail/hmac/cmd/ops', created_at: now(),
   }],
-  /** #58 收件时间线(排序列 `received_at`;够翻两页以上,好验 `limit/cursor`) */
+  /*
+   * #58 收件时间线(排序列 `received_at`;够翻两页以上,好验 `limit/cursor`)。
+   * 🔴 键集 = backend-api-4 §1 P-1 的出参视图:时间一律 ISO `*_at`、`id` 字符串、
+   *    **列表不含 `body_text`**(详情 #59 才给)、`route` 是**派生的 scope 名**
+   *    (`default`/`qidian|qq|wechat`/`<account_id>`)——**不是中文显示名**,中文由前端 `mailRouteText()` 渲染。
+   *    `receipt_status` 后端**没有这个键**(库无此列,待裁决)⇒ mock 也不造。
+   */
   mailInbox: [
-    { id: 'mi_0001', received_at: agoIso(1), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 停账号', status: 'CONFIRM_REQUIRED', trace_id: '01TRACEMOCK' },
-    { id: 'mi_0002', received_at: agoIso(2), route: '企点', from_addr: 'x@corp', subject: '格式不对', status: 'PARSE_FAILED', reason: 'bad template' },
-    { id: 'mi_0003', received_at: agoIso(3), route: '全局', from_addr: 'evil@x.com', subject: '越权', status: 'OP_DENIED', reason: 'NOT_ALLOWED:vault_write' },
-    { id: 'mi_0004', received_at: agoIso(4), route: 'QQ', from_addr: 'ops@corp', subject: '[QTrade] 查会话', status: 'DONE' },
-    { id: 'mi_0005', received_at: agoIso(5), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 导出', status: 'RECEIPT_SENT' },
+    { id: 'mi_0001', received_at: agoIso(1), date_at: agoIso(1), route_id: 1, route: 'default', from_addr: 'ops@corp', to_addrs: 'qtrade@corp', subject: '[QTrade] 停账号', status: 'CONFIRM_REQUIRED', sig_ok: true, attach_cnt: 0, archived: false, trace_id: '01TRACEMOCK' },
+    { id: 'mi_0002', received_at: agoIso(2), date_at: agoIso(2), route_id: 2, route: 'qidian', from_addr: 'x@corp', to_addrs: 'qtrade@corp', subject: '格式不对', status: 'PARSE_FAILED', sig_ok: null, attach_cnt: 0, archived: false, reason: 'bad template' },
+    { id: 'mi_0003', received_at: agoIso(3), date_at: agoIso(3), route_id: 1, route: 'default', from_addr: 'evil@x.com', to_addrs: 'qtrade@corp', subject: '越权', status: 'OP_DENIED', sig_ok: false, attach_cnt: 0, archived: false, reason: 'NOT_ALLOWED:vault_write' },
+    { id: 'mi_0004', received_at: agoIso(4), date_at: agoIso(4), route_id: 3, route: 'qq', from_addr: 'ops@corp', to_addrs: 'qtrade@corp', subject: '[QTrade] 查会话', status: 'DONE', sig_ok: true, attach_cnt: 0, archived: true, archived_at: agoIso(4) },
+    { id: 'mi_0005', received_at: agoIso(5), date_at: agoIso(5), route_id: 1, route: 'default', from_addr: 'ops@corp', to_addrs: 'qtrade@corp', subject: '[QTrade] 导出', status: 'RECEIPT_SENT', sig_ok: true, attach_cnt: 1, archived: false },
   ],
-  /** #61 发件队列(排序列 `created_at`) */
+  /*
+   * #61 发件队列(排序列 `created_at`)。键集 = backend-api-4 §1 P-1 的 13 键;
+   * `next_attempt_at` 在「没有下次」时回 **`null`**(后端把 `next_attempt_ms=0` 转 null,不回 1970);
+   * `ref` = `ref_trace_id` → `ref_message_id` → `ref_inbox_id` 三选一;**不下发正文与 smtp_response**。
+   */
   mailOutbox: [
-    { id: 'mo_1', kind: 'digest', to: 'team@corp', subject: '[QTrade] 报价汇总', status: 'QUEUED', attempts: 0, next_attempt_at: now(), created_at: agoIso(1) },
-    { id: 'mo_2', kind: 'receipt', to: 'ops@corp', subject: 'Re: 停账号', status: 'RECEIPT_SENT', attempts: 1, created_at: agoIso(2) },
-    { id: 'mo_3', kind: 'receipt', to: 'ops@corp', subject: 'Re: 查会话', status: 'DEAD', attempts: 5, created_at: agoIso(3) },
+    { id: 'mo_1', kind: 'digest', route_id: 1, route: 'default', to: 'team@corp', subject: '[QTrade] 报价汇总', status: 'QUEUED', attempts: 0, next_attempt_at: now(), created_at: agoIso(1), sent_at: null, last_error: null, ref: null },
+    { id: 'mo_2', kind: 'receipt', route_id: 1, route: 'default', to: 'ops@corp', subject: 'Re: 停账号', status: 'RECEIPT_SENT', attempts: 1, next_attempt_at: null, created_at: agoIso(2), sent_at: agoIso(2), last_error: null, ref: '01TRACEMOCK' },
+    { id: 'mo_3', kind: 'receipt', route_id: 3, route: 'qq', to: 'ops@corp', subject: 'Re: 查会话', status: 'DEAD', attempts: 5, next_attempt_at: null, created_at: agoIso(3), sent_at: null, last_error: 'smtp 550 mailbox unavailable', ref: 'mi_0004' },
   ],
   /** 建号/工作流的幂等键 → 结果(R6-54:重放回 409 IDEMPOTENT_REPLAY + 同一份 data) */
   idempotency: new Map(),
@@ -174,6 +194,16 @@ const state = {
     },
   ],
 }
+
+/**
+ * 各设置组的**默认值快照** —— `#89` 的两条语义都靠它:
+ *  ① 「整组替换,**缺省键回默认**」:PUT 时没给的键回到这里的值;
+ *  ② 「**未知键 ⇒ 400**」:已知键集 = 这里的键集(= 真后端各配置 dataclass 的字段名)。
+ * 在任何 PUT 改动 `state.settings` 之前深拷贝一份,之后不再变。
+ */
+const SETTINGS_DEFAULTS = structuredClone(state.settings)
+/** #88 密码类字段的判据(与后端 `SECRET_KEYS` 同一套后缀):只写不读,读回来只有 `*_ref` */
+const SECRET_KEY_RE = /(secret|password|token)$/
 
 const sockets = new Set()
 
@@ -289,13 +319,20 @@ function ok(res, data, extra = {}, status = 200) {
   res.end(JSON.stringify({ ok: true, data, trace_id: `01MOCK${Date.now()}`, ...extra }))
 }
 
-/** 顶层平铺 + ok 的端点(R6-55:#7/#9/#10/#19/#69/#72/#28) */
-function flat(res, obj, status = 200) {
+/**
+ * 顶层平铺 + ok 的端点(R6-55:#7/#9/#10/#19/#69/#72/#28)。
+ *
+ * 🔴 `noTrace` = **不注入 `trace_id`**。02 §3.4 通用段例外①(= 00 §15g R6-62 Ⅵ W1)逐字:
+ * 「`#72 GET /system/health` 这个路径(免鉴权摘要与带令牌全量**两种形态都不注入** `trace_id`)
+ * ……排除是**按 path 整端点**做的、与带不带令牌无关」。mock 原先照常注入,
+ * 会让页面开发以为 health 也能串 trace(M-13)。
+ */
+function flat(res, obj, status = 200, noTrace = false) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-QT-Api-Version': API_VERSION,
   })
-  res.end(JSON.stringify({ ok: true, ...obj, trace_id: `01MOCK${Date.now()}` }))
+  res.end(JSON.stringify(noTrace ? { ok: true, ...obj } : { ok: true, ...obj, trace_id: `01MOCK${Date.now()}` }))
 }
 
 /** 错误信封(00 §10):`code` 在**顶层**,`error` 四键齐全 */
@@ -822,6 +859,7 @@ const server = createServer(async (req, res) => {
   }
   if (p === '/system/health') {
     // #72 顶层平铺;R6-58 (y):`checks` 另带 per-account 子键(01 §2.7.3.4 的账号健康行取这里)
+    // 🔴 M-13:这个 path **两种形态都不注入 `trace_id`**(02 §3.4 例外① = R6-62 Ⅵ W1)⇒ noTrace
     return flat(res, {
       agent: { version: '1.0.3-mock', api_version: API_VERSION, uptime_s: 3600, db_mb: 120, wal_mb: 8 },
       dockerd: true,
@@ -838,7 +876,7 @@ const server = createServer(async (req, res) => {
       },
       scheduler: { retention_cleanup: { runs: 3, skipped: 0, errors: 0 } },
       alerts: [],
-    })
+    }, 200, true)
   }
   if (p === '/system/env') {
     // 🔴 #74:Windows 侧(= /wa/v1/net)与 WSL 侧分成两半;WinAgent 不可达时 windows 为 null
@@ -1035,8 +1073,12 @@ const server = createServer(async (req, res) => {
     return page && okPage(res, page)
   }
   if ((mm = /^\/mail\/inbox\/([^/]+)$/.exec(p))) {
+    // #59 = #58 的行 **+ `body_text`**(其余一字不差);`route` 同样是 scope 名
     return ok(res, {
-      id: mm[1], received_at: now(), route: '全局', from_addr: 'ops@corp', subject: '[QTrade] 停账号',
+      id: mm[1], received_at: now(), date_at: now(), route_id: 1, route: 'default',
+      from_addr: 'ops@corp', to_addrs: 'qtrade@corp', subject: '[QTrade] 停账号',
+      sig_ok: true, attach_cnt: 0, archived: false,
+      body_text: '请停用账号 qd01。\n--\nreq_id: 20260920-ops-0007',
       status: 'CONFIRM_REQUIRED', template_alias: 'qtrade-cmd',
       parsed: { op: 'account_stop', args: { 账号: 'qd01' }, args_digest: 'a1b2c3d4e5f60718', target: 'qd01', req_id: '20260920-ops-0007', nonce: 'n1', sig_ok: true },
       trace_id: '01TRACEMOCK', result: { code: 'OK', cost_ms: 120 },
@@ -1055,7 +1097,12 @@ const server = createServer(async (req, res) => {
   if (p === '/mail/cleanup/run') return flat(res, { job_id: newJob('mail_cleanup', () => ({ freed_mb: 20 })) }, 202)
   if (p === '/mail/test') return flat(res, { imap_ok: false, pop3_ok: true })
   // 短名表的唯一来源(R6-58 (ac)):不回密钥
-  if (p === '/mail/hmac-keys' && m === 'GET') return ok(res, state.hmacKeys, { next_cursor: null })
+  /*
+   * 🔴 M-15:**不回 `next_cursor`** —— 短名表是「全集小列表」,真后端也只有 `limit`、没有游标。
+   * mock 原先带 `next_cursor` 与真后端反着(P-6)。⚠️ 该端点(暂记 #67b)要么彻底不分页、
+   * 要么接完整 C-42,后端正在定稿;定稿后请回来把两边对齐。
+   */
+  if (p === '/mail/hmac-keys' && m === 'GET') return ok(res, state.hmacKeys)
   if (p === '/mail/hmac-keys' && m === 'POST') {
     if (!/^[A-Za-z0-9._-]{1,32}$/.test(String(body.short_name ?? ''))) {
       return fail(res, 400, 'INVALID_ARGS', '短名只能是字母/数字/点/下划线/连字符,长度 1~32', {
@@ -1070,7 +1117,13 @@ const server = createServer(async (req, res) => {
       short_name: body.short_name, sender: body.sender, route_id: null, enabled: true,
       secret_ref: `vault://mail/hmac/cmd/${body.short_name}`, created_at: now(),
     })
-    return ok(res, { secret: `hmac_${Math.random().toString(36).slice(2)}` })
+    // 🔴 M-14:一次性明文**顶层平铺**(R6-55 单一形状),不包进 `data` —— 真后端就是平铺的
+    return flat(res, {
+      short_name: body.short_name,
+      sender: body.sender,
+      secret: `hmac_${Math.random().toString(36).slice(2)}`,
+      secret_ref: `vault://mail/hmac/cmd/${body.short_name}`,
+    })
   }
   if ((mm = /^\/mail\/hmac-keys\/([^/]+)$/.exec(p)) && m === 'DELETE') {
     const i = state.hmacKeys.findIndex((k) => k.short_name === mm[1])
@@ -1143,8 +1196,33 @@ const server = createServer(async (req, res) => {
     }
     if (m === 'GET') return ok(res, state.settings[g], { group: g })
     if (m === 'PUT') {
-      // #89 是**整组替换**(缺省键回默认);v1 除 resources 外一律 restart_required
-      state.settings[g] = { ...body }
+      /*
+       * 🔴 #89 **未知键 ⇒ `400 INVALID_ARGS`,整个请求不落库**(总控 2026-09-21 裁决,独立联调 P-3)。
+       * 不复现这一条,前端那种键名笔误(P-2 的 `text_days`/`raw_enabled`)在 mock 下永远是绿的 ——
+       * 到了真 Agent 才炸。已知键集 = 本组默认值的键集(= 真后端各配置 dataclass 的字段名);
+       * 密码类(`*_secret`/`*_password`/`*_token`)是只写不读的入参,不在读回的键里,按后缀放行。
+       */
+      const known = new Set(Object.keys(SETTINGS_DEFAULTS[g] ?? {}))
+      const unknown = Object.keys(body).filter((k) => !known.has(k) && !SECRET_KEY_RE.test(k))
+      if (unknown.length) {
+        return fail(res, 400, 'INVALID_ARGS',
+          `未知配置键:${unknown.join(', ')}(#89 是整组替换,收下笔误等于把整组洗回默认)`, {
+            reason: 'unknown_key',
+            details: unknown.map((k) => ({
+              pointer: '/' + k.replace(/~/g, '~0').replace(/\//g, '~1'),
+              message: `${g} 组没有这个配置键`,
+              kind: 'unknown_key',
+            })),
+          })
+      }
+      // 密码类**只写不读**:收进保险库并只回 `*_ref`,明文一个字节都不回显(#88)
+      const next = {}
+      for (const [k, v] of Object.entries(body)) {
+        if (SECRET_KEY_RE.test(k)) next[k.replace(SECRET_KEY_RE, 'ref')] = `vault://settings/${g}/${k}`
+        else next[k] = v
+      }
+      // #89 是**整组替换(缺省键回默认)**:没给的键回到默认值,不是保留上一次的
+      state.settings[g] = { ...structuredClone(SETTINGS_DEFAULTS[g] ?? {}), ...next }
       return ok(res, state.settings[g], { group: g, restart_required: g !== 'resources', config_written: true })
     }
   }

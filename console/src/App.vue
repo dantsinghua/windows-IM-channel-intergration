@@ -104,8 +104,13 @@ onMounted(async () => {
   await ui.loadFromConfig()
   ui.applyTheme()
   await setup.loadConfig()
-  installGuards(() => setup.done)
+  installGuards(() => setup.done, () => setup.reackRequired)
   if (!setup.done && route.path !== '/setup') void router.replace('/setup')
+  // 告知页改版 ⇒ 已完成向导的机器重启后也要重新勾一次(05 §6.1 末句 / §8b.6 U1)。
+  // 异步核对、不挡首屏;#86 拉不到时不判(见 store.refreshAck)。
+  void setup.refreshAck().then(() => {
+    if (setup.reackRequired && route.path !== '/setup') void router.replace('/setup')
+  }).catch(() => undefined)
 
   accounts.bindEvents()
   resources.bindEvents()

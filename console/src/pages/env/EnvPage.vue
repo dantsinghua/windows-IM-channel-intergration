@@ -271,8 +271,13 @@ onMounted(async () => {
         <table class="tbl" :data-testid="T.selfcheckTable">
           <tbody>
             <tr v-for="r in store.selftest" :key="r.item" :data-testid="T.selfcheckRow(r.item)">
-              <td :class="r.level === 'error' ? 'qt-danger' : r.level === 'warn' ? 'qt-warn' : 'qt-ok'">
-                {{ r.level === 'error' ? '✗' : r.level === 'warn' ? '⚠' : '✔' }}
+              <!--
+                C-18 / 01 §2.7.9 探测结论表:`skip` = 灰「未探测」,**既不是 ✔ 也不是 ⚠**
+                (01 M4-7「SKIPPED 不计红项」)。把「没测」显示成 ✔ 或 ⚠ 都是界面说假话。
+                中文说明由 `selftestRows()` 内部的 `probeLineZh()` 生成,这里只管色与图标,与 `P-SETUP` 步 3 同款。
+              -->
+              <td :class="r.level === 'error' ? 'qt-danger' : r.level === 'warn' ? 'qt-warn' : r.level === 'skip' ? 'qt-muted' : 'qt-ok'">
+                {{ r.level === 'error' ? '✗' : r.level === 'warn' ? '⚠' : r.level === 'skip' ? '—' : '✔' }}
               </td>
               <td>{{ r.label }}</td>
               <td class="qt-small">{{ r.message }}</td>
@@ -288,11 +293,21 @@ onMounted(async () => {
           <a-popconfirm title="重导入发行版并从最近备份恢复?" @confirm="waAction('wsl.distro.repair', {}, '已请求修复发行版')">
             <a-button :data-testid="T.distroRepair">修复发行版</a-button>
           </a-popconfirm>
-          <a-button
+          <!--
+            🔴 01 §2.7.9 :696「**运行期动作按钮**(C-39/C-45;**全部二次确认** + 审计)」——
+            本按钮直接调 WinAgent 改 Windows 防火墙规则,与同组其余动作一样必须先确认(D-F)。
+          -->
+          <a-popconfirm
+            title="按端口精确放行 Windows 防火墙规则(不放 Any),并写审计。确认执行?"
+            ok-type="danger"
             :disabled="!session.winagentOnline"
-            :data-testid="T.firewallFix"
-            @click="waAction('firewall.ensure', {}, '防火墙规则已修复')"
-          >修复防火墙规则</a-button>
+            @confirm="waAction('firewall.ensure', {}, '防火墙规则已修复')"
+          >
+            <a-button
+              :disabled="!session.winagentOnline"
+              :data-testid="T.firewallFix"
+            >修复防火墙规则</a-button>
+          </a-popconfirm>
           <a-popconfirm
             title="容器拉镜像将经公司代理,是否启用?"
             @confirm="systemApi.dockerProxy(true).then(() => message.success('已为 docker 启用系统代理'))"

@@ -16,6 +16,7 @@ import { ApiFailure } from '@/api/http'
 import PageState from '@/components/PageState.vue'
 import {
   ALERT_CODES, ARGS_DIGEST_MISMATCH_TEXT, MAIL_BANNER_CODES, capabilityText, mailInboxStatusText,
+  mailRouteText,
 } from '@/i18n/zh-CN/codes'
 
 const router = useRouter()
@@ -264,7 +265,8 @@ onUnmounted(() => {
             <tbody>
               <tr v-for="(r, i) in store.inbox" :key="r.id" :data-testid="T.inboxRow(i)">
                 <td class="qt-small">{{ r.received_at }}</td>
-                <td :data-testid="T.inboxRowRoute(i)">{{ r.route }}</td>
+                <!-- 后端给的是 scope 名(default/qidian/…),这里按 01 的中文显示名渲染 -->
+                <td :data-testid="T.inboxRowRoute(i)">{{ mailRouteText(r.route) }}</td>
                 <td>{{ r.from_addr }}</td>
                 <td class="subj">{{ r.subject }}</td>
                 <td :class="{ 'qt-danger': mailInboxStatusText(r.status, r.reason).red }">

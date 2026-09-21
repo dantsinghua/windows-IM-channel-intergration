@@ -8,6 +8,7 @@
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { message } from 'ant-design-vue'
 import { setup as T } from '@/testids'
 import { NOTICE_FIXED_PARAGRAPHS, useSetupStore } from '@/stores/setup'
 import { useSessionStore } from '@/stores/session'
@@ -21,7 +22,13 @@ const session = useSessionStore()
 const env = useEnvStore()
 const ui = useUiStore()
 
-const step = ref(0)
+/**
+ * 🔴 步骤存在 `setup` store 里(不是组件内存):首登步「现在添加」要跳 `P-ACCT-NEW`,
+ * 01 §2.7.1 步 4 要求「完成后回到本步」——组件一重挂就回第 1 步的话这条做不到。
+ */
+const step = computed({ get: () => store.step, set: (v: number) => { store.step = v } })
+/** 只差重新勾一次告知(05 §6.1 告知改版):不重走五步,勾完直接进控制台 */
+const reackOnly = computed(() => store.done && store.reackRequired)
 const autoLaunch = ref(true)
 const trayOnClose = ref(true)
 const running = ref(false)
@@ -68,16 +75,48 @@ async function toggleAck(checked: boolean): Promise<void> {
   await store.ack()
 }
 
+/**
+ * 步 3 的「总体结论」(01 §2.7.1 步 3「结果表 + 总体结论」)。
+ * `skip` 灰项不计红黄(C-18 / M4-7),只在结论里如实点出「未探测」。
+ */
+const selftestVerdict = computed(() => {
+  const rows = env.selftest
+  if (!rows.length) return '还没有自检结果,点「运行自检」开始'
+  const n = (lv: string): number => rows.filter((r) => r.level === lv).length
+  const parts = [`${n('ok')} 项通过`]
+  if (n('warn')) parts.push(`${n('warn')} 项警告`)
+  if (n('error')) parts.push(`${n('error')} 项未通过`)
+  if (n('skip')) parts.push(`${n('skip')} 项未探测`)
+  const head = n('error') ? '有红色项,必须先解决才能继续' : n('warn') ? '有黄色项,可以继续' : '全部通过'
+  return `${head}(${parts.join('、')})`
+})
+
 async function runSelfcheck(): Promise<void> {
   running.value = true
   try { await env.runSelftest() } finally { running.value = false }
 }
 
 async function finish(): Promise<void> {
-  await store.finish(autoLaunch.value, trayOnClose.value)
+  try {
+    await store.finish(autoLaunch.value, trayOnClose.value)
+  } catch (e) {
+    // 写不进 console.toml ⇒ 下次启动还会进向导,不能一声不吭地放人走
+    message.error(`没能保存「向导已完成」:${e instanceof Error ? e.message : String(e)}`)
+    return
+  }
   ui.autoLaunch = autoLaunch.value
   ui.trayOnClose = trayOnClose.value
   void router.replace('/dash')
+}
+
+/** 「下一步」:告知改版那一路只需重勾告知,勾完即进控制台,不重走五步 */
+function goNext(): void {
+  if (reackOnly.value) {
+    store.reackRequired = false
+    void router.replace('/dash')
+    return
+  }
+  step.value += 1
 }
 
 function quitApp(): void {
@@ -93,6 +132,8 @@ onMounted(async () => {
   await store.loadNotice().catch(() => undefined)
   await session.pingAgent()
   await env.loadAll().catch(() => undefined)
+  // R6-58 (ab):不带 run_id 取最近一轮,页面直开就能显示上次结论(P-ENV 一直这么做,向导漏了)
+  await env.loadSelftest().catch(() => undefined)
 })
 </script>
 
@@ -105,6 +146,14 @@ onMounted(async () => {
     <!-- 步 1 告知 -->
     <section v-if="step === 0" class="qt-card pane">
       <h3>使用前请阅读</h3>
+      <!-- 05 §6.1:告知页文本改版则要求重新勾选;这一路只需重勾,不重走五步 -->
+      <a-alert
+        v-if="reackOnly"
+        type="info"
+        show-icon
+        class="mb"
+        message="合规告知已更新,请重新阅读并确认"
+      />
       <!-- #86 未就绪时要说清「为什么空」并给重试,不能只挂一句「正在读取」转到底 -->
       <a-alert
         v-if="store.error"
@@ -160,21 +209,26 @@ onMounted(async () => {
     <!-- 步 3 自检 -->
     <section v-else-if="step === 2" class="qt-card pane">
       <h3>一键自检</h3>
-      <a-button type="primary" :loading="running" :data-testid="T.selfcheckRun" @click="runSelfcheck">运行自检</a-button>
+      <div class="qt-row">
+        <a-button type="primary" :loading="running" :data-testid="T.selfcheckRun" @click="runSelfcheck">运行自检</a-button>
+        <span class="qt-small qt-muted">上次 {{ env.selftestAt ?? '—' }}</span>
+      </div>
+      <p class="verdict" :class="env.selftestHasError ? 'qt-danger' : 'qt-muted'">总体结论:{{ selftestVerdict }}</p>
       <table class="tbl" :data-testid="T.selfcheckTable">
         <thead><tr><th>项</th><th>结果</th><th>说明</th></tr></thead>
         <tbody>
           <tr v-for="r in env.selftest" :key="r.item">
             <td>{{ r.label }}</td>
-            <td :class="r.level === 'error' ? 'qt-danger' : r.level === 'warn' ? 'qt-warn' : 'qt-ok'">
-              {{ r.level === 'error' ? '✗' : r.level === 'warn' ? '⚠' : '✔' }}
+            <!-- C-18 / M4-7:`skip` = 灰「未探测」,既不是 ✔ 也不是 ⚠ -->
+            <td :class="r.level === 'error' ? 'qt-danger' : r.level === 'warn' ? 'qt-warn' : r.level === 'skip' ? 'qt-muted' : 'qt-ok'">
+              {{ r.level === 'error' ? '✗' : r.level === 'warn' ? '⚠' : r.level === 'skip' ? '—' : '✔' }}
             </td>
             <td class="qt-small">{{ r.message }}</td>
           </tr>
           <tr v-if="!env.selftest.length"><td colspan="3" class="qt-muted">还没有自检结果</td></tr>
         </tbody>
       </table>
-      <p class="qt-small qt-muted">黄色项可以继续;红色项(Agent 不健康、内核不是 OURS)必须先解决。</p>
+      <p class="qt-small qt-muted">黄色项可以继续;灰色「未探测」不算问题、不阻断;红色项(Agent 不健康、内核不是 OURS)必须先解决。</p>
     </section>
 
     <!-- 步 4 首登 -->
@@ -214,8 +268,8 @@ onMounted(async () => {
         type="primary"
         :data-testid="T.next"
         :disabled="nextDisabled"
-        @click="step += 1"
-      >下一步</a-button>
+        @click="goNext"
+      >{{ reackOnly ? '确认并进入控制台' : '下一步' }}</a-button>
     </footer>
   </div>
 </template>
@@ -229,6 +283,7 @@ onMounted(async () => {
 .notice-text { white-space: pre-wrap; }
 .notice-fixed { margin-top: var(--qt-space-3); border-top: 1px dashed var(--qt-border); padding-top: var(--qt-space-2); }
 .probe-row { display: grid; grid-template-columns: 1fr auto auto; gap: var(--qt-space-3); padding: 6px 0; border-bottom: 1px solid var(--qt-border); }
+.verdict { margin: var(--qt-space-2) 0 0; }
 .tbl { width: 100%; border-collapse: collapse; margin-top: var(--qt-space-3); }
 .tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--qt-border); }
 .cards { display: flex; gap: var(--qt-space-3); margin: var(--qt-space-3) 0; }

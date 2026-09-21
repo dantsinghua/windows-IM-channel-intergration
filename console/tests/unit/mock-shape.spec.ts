@@ -18,6 +18,9 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import {
+  API_KEYS, ASR_KEYS, OCR_KEYS, POOL_KEYS, RETENTION_KEYS,
+} from '../../src/api/settingsKeys'
 
 const PORT = 17698
 const BASE = `http://127.0.0.1:${PORT}/api/v1`
@@ -115,6 +118,15 @@ async function get(path: string): Promise<{ status: number; body: Env }> {
 async function post(path: string, body?: unknown): Promise<{ status: number; body: Env }> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
+    headers: { 'X-QT-Api-Min': '1.0', 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  return { status: res.status, body: (await res.json()) as Env }
+}
+
+async function put(path: string, body?: unknown): Promise<{ status: number; body: Env }> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PUT',
     headers: { 'X-QT-Api-Min': '1.0', 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
@@ -253,6 +265,14 @@ describe('响应键集 ⊆ src/api/types.ts', () => {
     assertSubset(biz, 'SystemHealth', '#72 健康')
     const checks = biz.checks as Record<string, unknown>
     expect(checks.accounts, '#72 checks.accounts 缺席 ⇒ 账号健康行无处取数').toBeTruthy()
+  })
+
+  it('#72 健康:**两种形态都不注入 `trace_id`**(02 §3.4 例外① = R6-62 Ⅵ W1,按 path 整端点)', async () => {
+    const { body } = await get('/system/health')
+    expect(body.checks, '先确认拿到的是全量体').toBeTruthy()
+    expect('trace_id' in body, 'mock 给 health 注了 trace_id,与现行口径反着(M-13)').toBe(false)
+    // 对照组:同一个 mock 的其它端点照常注入 —— 证明不是 mock 整体不发 trace
+    expect('trace_id' in (await get('/system/version')).body, '对照组 /system/version 该有 trace_id').toBe(true)
   })
 
   it('#77 监控:两组并排 + ours.procs_detail(R6-58 (aa));扁平两键不嵌套(R6-30)', async () => {
@@ -847,16 +867,159 @@ describe('#67b 短名表(R6-58 (ac) 指名的唯一来源)', () => {
     expect(JSON.stringify(body)).not.toContain('hmac_')
   })
 
+  it('M-15 短名表**不回 `next_cursor`**(全集小列表;真后端也只有 limit、没有游标)', async () => {
+    const { body } = await get('/mail/hmac-keys')
+    expect('next_cursor' in body, 'mock 带了 next_cursor、真后端没有 ⇒ 两边对不上(P-6)').toBe(false)
+  })
+
   it('#67 建密钥后短名表里能看到它,且只有 secret_ref 没有明文', async () => {
     const short = `gw${Date.now().toString(36)}`.slice(0, 16)
     const made = await post('/mail/hmac-keys', { sender: 'guard@corp', short_name: short })
     expect(made.status).toBe(200)
-    expect(typeof (made.body.data as Record<string, unknown>).secret, '#67 那一次必须回明文').toBe('string')
+    // 🔴 R6-55 单一形状:一次性明文**顶层平铺**,不包进 `data`(M-14:mock 原先包在 data.secret 里)
+    expect(typeof made.body.secret, '#67 那一次必须在顶层回明文').toBe('string')
+    expect(made.body.data, '#67 不该再包 data(R6-55 顶层平铺)').toBeUndefined()
 
     const rows = (await get('/mail/hmac-keys')).body.data as Record<string, unknown>[]
     const hit = rows.find((r) => r.short_name === short)
     expect(hit, '新建的短名没出现在表里').toBeTruthy()
     expect(hit!.secret_ref).toBe(`vault://mail/hmac/cmd/${short}`)
     expect(hit!.route_id, '#67 入参没有 route ⇒ 全局短名').toBeNull()
+  })
+})
+
+/* ───────────────── 10. #89 整组替换的两条硬语义(P-2 / P-3 的闸门) ───────────────── */
+
+describe('#89 PUT /settings/{group}:未知键拒收 + 缺省键回默认', () => {
+  it('未知键 ⇒ 400 INVALID_ARGS,且 details[].pointer 指到那个键(不是照单全收 200)', async () => {
+    /* P-2 的现场:P-SET 保留期卡片曾提交 `text_days`/`raw_enabled` —— 07 `[retention]` 没有这两个键。
+       旧行为是 200 + 回显,于是「改了等于没改」,同组其余键还被整组替换洗回默认。 */
+    const { status, body } = await put('/settings/retention', { files_days: 7, text_days: 20, raw_enabled: true })
+    expect(status, '未知键必须在任何落库动作之前被拒').toBe(400)
+    expect(body.code).toBe('INVALID_ARGS')
+    const err = body.error as Record<string, unknown>
+    const pointers = ((err.details ?? []) as { pointer: string }[]).map((d) => d.pointer)
+    expect(pointers.sort(), '哪个键不认必须说清楚,否则前端只能显示一句「未知配置键」')
+      .toEqual(['/raw_enabled', '/text_days'])
+    // 被拒的请求一个字节都不该落库
+    const after = (await get('/settings/retention')).body.data as Record<string, unknown>
+    expect(after.text_days, '400 之后仍把野键写进去了').toBeUndefined()
+    expect(after.messages_days, '400 不该动到同组其它键').toBe(30)
+  })
+
+  it('已知键全通过;没给的键回默认(整组替换语义)', async () => {
+    const { status, body } = await put('/settings/retention', { messages_days: 14 })
+    expect(status).toBe(200)
+    const data = body.data as Record<string, unknown>
+    expect(data.messages_days).toBe(14)
+    expect(data.audit_days, '没给的键应回默认值 30,而不是消失或保留上一次').toBe(30)
+    await put('/settings/retention', { messages_days: 30 })          // 还原,免得影响别的用例
+  })
+
+  it('密码类只写不读:`*_secret` 进去、`*_ref` 出来,明文不回显(#88)', async () => {
+    const { status, body } = await put('/settings/asr', { endpoint: 'http://x/asr', api_key_secret: 'plain-秘密-42' })
+    expect(status).toBe(200)
+    expect(JSON.stringify(body), '响应里出现了明文密钥').not.toContain('plain-秘密-42')
+    const data = body.data as Record<string, unknown>
+    expect(data.api_key_secret, '明文不该被存下来').toBeUndefined()
+    expect(String(data.api_key_ref ?? ''), '应改存保险库引用').toContain('vault://')
+  })
+})
+
+/* ───────────────── 11. 前端下发的键 ↔ 各组**真实出参**键集(P-2 的正闸门) ───────────────── */
+
+describe('#88 GET /settings/{group} 的出参键集 == 前端白名单(src/api/settingsKeys.ts)', () => {
+  /** 读回的键集 = 该组的已知键集(真后端就是各配置 dataclass 的字段名,mock 按 07 写同一份) */
+  async function groupKeys(group: string): Promise<string[]> {
+    const { status, body } = await get(`/settings/${group}`)
+    expect(status, `GET /settings/${group} 没回 200`).toBe(200)
+    return Object.keys(body.data as Record<string, unknown>).sort()
+  }
+
+  const sorted = (v: readonly string[]): string[] => [...v].sort()
+
+  it('retention:一个键不多、一个键不少(`text_days`/`raw_enabled` 这类野键会在这里现形)', async () => {
+    expect(sorted(RETENTION_KEYS)).toEqual(await groupKeys('retention'))
+  })
+
+  it('api:白名单 == 出参键集(含 public_domain,02 #102)', async () => {
+    expect(sorted(API_KEYS)).toEqual(await groupKeys('api'))
+  })
+
+  it('pool:白名单 == 出参键集(内存水位阈值在这一组)', async () => {
+    expect(sorted(POOL_KEYS)).toEqual(await groupKeys('pool'))
+  })
+
+  it('ocr:白名单 = 出参键集去掉只读的 `engine`', async () => {
+    const keys = await groupKeys('ocr')
+    expect(keys, 'engine 要回出来供只读展示').toContain('engine')
+    expect(sorted(OCR_KEYS)).toEqual(keys.filter((k) => k !== 'engine'))
+  })
+
+  it('asr:白名单 = 出参键集去掉只读的 `api_key_ref`(密钥只写不读)', async () => {
+    const keys = await groupKeys('asr')
+    expect(keys, '密钥应以 api_key_ref 的形式回出来').toContain('api_key_ref')
+    expect(sorted(ASR_KEYS)).toEqual(keys.filter((k) => k !== 'api_key_ref'))
+  })
+
+  it('resources:两键形状 `{pools, quota_mb}`(#88 逐字),不是一堆 *_mb 顶层键', async () => {
+    expect(await groupKeys('resources')).toEqual(['pools', 'quota_mb'])
+  })
+
+  it('mail:四键形状(R6-58 (ac) 逐字)', async () => {
+    expect(await groupKeys('mail')).toEqual(['enabled', 'require_signature', 'scopes', 'template_version'])
+  })
+})
+
+/* ───────── 12. #58/#59/#61 的出参视图(backend-api-4 §1 P-1 定稿的三张表) ───────── */
+
+describe('邮件收发件行:ISO 时间、列表不带正文、route 是 scope 名', () => {
+  const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$/
+  /** route 的合法取值:`default` / 三通道 / `<account_id>`;**中文显示名是前端的事** */
+  const SCOPES = ['default', 'qidian', 'qq', 'wechat']
+
+  it('#58 收件行:无 body_text、无 *_ms、id 是字符串、时间是 ISO', async () => {
+    const rows = (await get('/mail/inbox')).body.data as Record<string, unknown>[]
+    expect(rows.length).toBeGreaterThan(0)
+    for (const r of rows) {
+      assertSubset(r, 'MailInboxRow', '#58 收件行')
+      // 02 #58 逐字:列表**不含 body_text**(详情才给)—— 列表页把邮件正文全量下发是数据面与隐私面都不该的
+      assertHasNot(r, ['body_text', 'body_html', 'attach_json', 'dedup_key'], '#58 收件行')
+      expect(typeof r.id, 'id 要是字符串(库里是 int)').toBe('string')
+      expect(String(r.received_at), `received_at 不是 ISO:${r.received_at}`).toMatch(ISO)
+      // R6-62 (f):`*_ms` 的例外只有 Account 的两个键,邮件行一个都不许有
+      for (const k of Object.keys(r)) expect(k.endsWith('_ms'), `收件行透出了库列 ${k}`).toBe(false)
+      expect(SCOPES, `route 应是 scope 名而不是中文显示名,实得 ${r.route}`).toContain(String(r.route))
+    }
+  })
+
+  it('#59 详情 = 收件行 + body_text', async () => {
+    const d = (await get('/mail/inbox/mi_0001')).body.data as Record<string, unknown>
+    assertSubset(d, 'MailInboxDetail', '#59 详情')
+    expect(typeof d.body_text, '详情必须给正文').toBe('string')
+    expect(String(d.received_at)).toMatch(ISO)
+    expect(SCOPES).toContain(String(d.route))
+  })
+
+  it('#61 发件行:13 键形状,时间 ISO,没有下次重投时 next_attempt_at 为 null(不回 1970)', async () => {
+    const rows = (await get('/mail/outbox')).body.data as Record<string, unknown>[]
+    expect(rows.length).toBeGreaterThan(0)
+    for (const r of rows) {
+      assertSubset(r, 'MailOutboxRow', '#61 发件行')
+      assertHas(r, ['id', 'kind', 'to', 'subject', 'status', 'attempts', 'created_at', 'route'], '#61 发件行')
+      assertHasNot(r, ['body_text', 'body_html', 'smtp_response', 'dedup_key', 'to_addrs'], '#61 发件行')
+      expect(String(r.created_at), 'created_at 是 C-42 的排序列,必须是 ISO').toMatch(ISO)
+      for (const k of Object.keys(r)) expect(k.endsWith('_ms'), `发件行透出了库列 ${k}`).toBe(false)
+      if (r.next_attempt_at !== null) expect(String(r.next_attempt_at)).toMatch(ISO)
+    }
+    const dead = rows.find((r) => r.status === 'DEAD')
+    expect(dead?.next_attempt_at, '终态行不该还有下次重投时间').toBeNull()
+  })
+
+  it('前端不依赖 `receipt_status`(后端无此列,定义待裁决)', async () => {
+    const rows = (await get('/mail/inbox')).body.data as Record<string, unknown>[]
+    for (const r of rows) {
+      expect('receipt_status' in r, 'mock 造了一个后端根本没有的键,页面会被养出错误假设').toBe(false)
+    }
   })
 })

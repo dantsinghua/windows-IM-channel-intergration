@@ -15,7 +15,8 @@
     "build:dir": "npm run build && electron-builder --dir --win --x64",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:pw": "playwright test -c tests/e2e-pw"
   },
   "dependencies": {
     "@ant-design/icons-vue": "^7.0.1",
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
+    "@playwright/test": "^1.63.0",
     "@types/node": "^22.9.0",
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-vue": "^5.2.1",

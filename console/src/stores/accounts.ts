@@ -56,10 +56,49 @@ export const useAccountsStore = defineStore('accounts', () => {
   /**
    * 拉账号列表。`more=true` = 用游标续下一页并**追加**,否则从头拉并重置游标(C-42)。
    *
+   * 🔴 本函数的语义是「**无条件**发那一次请求」 —— C-42 的翻页判据、页面上的「刷新」、
+   * 批量操作之后的回拉都依赖它,不在这里加任何跳过条件。
+   * 需要「进页面时别跟 `App.vue` 的首启全量拉撞车」的,用下面的 `loadFirst()`(D-H)。
+   */
+  let headInflight: Promise<void> | null = null
+  let headLoadedAt = 0
+
+  async function load(more = false): Promise<void> {
+    if (more) return loadOnce(true)
+    const p = loadOnce(false).finally(() => {
+      if (headInflight === p) headInflight = null
+      headLoadedAt = Date.now()
+    })
+    headInflight = p
+    return p
+  }
+
+  /**
+   * **页面首拉专用**(D-H)。
+   *
+   * 现象:进 `P-ACCT` 时 `GET /accounts` 连发两次 —— `App.vue` 首启的 `fullReload()` 一次、
+   * 页面自己 `onMounted` 一次。真机上每进一次页面就多一次 Agent 往返。
+   *
+   * 判据只有两条,都不碰 `load()` 的语义:
+   *  ① 已经有一次首页拉在飞 ⇒ **搭同一班车**(复用它的 promise),不再开一次往返;
+   *  ② 距上次首页拉不到 `FIRST_FRESH_MS` ⇒ 跳过(首启那两次就落在这个窗口里)。
+   * 窗口取 2 s:只吃掉「刚拉完立刻又挂载一次」这种重复;离开页面再回来(远不止 2 s)照常重拉,
+   * 期间的状态变化本来也由 WS 的 `account_state` 事件实时归约,不靠这一次轮询。
+   */
+  const FIRST_FRESH_MS = 2000
+
+  async function loadFirst(): Promise<void> {
+    if (headInflight) return headInflight
+    if (headLoadedAt && Date.now() - headLoadedAt < FIRST_FRESH_MS) return
+    return load()
+  }
+
+  /**
+   * 真正发那一次请求。
    * 🔴 后端已按 **`created_ms` 降序**下发(backend-api-3 §7-8:C-42 的游标要求排序列 = 游标里的 `ts_ms`),
    * 所以这里**不再自己排一遍** —— 页面的 `byChannel` 只是展示层分桶,桶内保持后端顺序。
    */
-  async function load(more = false): Promise<void> {
+  async function loadOnce(more: boolean): Promise<void> {
     loading.value = true
     error.value = null
     try {
@@ -134,6 +173,6 @@ export const useAccountsStore = defineStore('accounts', () => {
   return {
     items, nextCursor, loading, error, selectedId, prompts, loginSessions,
     byId, selected, byChannel, wechatProfiles, summary,
-    ops, load, upsert, applyAccountState, bindEvents, refreshPrompt, errorMinutes, errorSeconds,
+    ops, load, loadFirst, upsert, applyAccountState, bindEvents, refreshPrompt, errorMinutes, errorSeconds,
   }
 })

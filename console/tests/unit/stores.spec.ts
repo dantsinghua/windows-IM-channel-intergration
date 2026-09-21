@@ -314,6 +314,24 @@ describe('C-42 分页:store 存游标并续页(N-2)', () => {
     expect(s.items.map((a) => a.id)).toEqual(['a9'])
   })
 
+  it('D-H accounts:loadFirst() 与首启的 load() 合流成一次往返;load() 本身照常无条件发', async () => {
+    const urls = pagedFetch([
+      { data: [{ id: 'a1', channel: 'qidian' }], next_cursor: null },
+      { data: [{ id: 'a1', channel: 'qidian' }], next_cursor: null },
+    ])
+    const s = useAccountsStore()
+    // App.vue 的 fullReload() 与页面 onMounted 的首拉几乎同时发生 ⇒ 后者搭前者的车
+    const both = Promise.all([s.load(), s.loadFirst()])
+    await both
+    expect(urls.length, 'loadFirst 又开了一次往返(D-H 没修住)').toBe(1)
+    // 紧接着再 loadFirst(仍在新鲜期内)⇒ 还是不发
+    await s.loadFirst()
+    expect(urls.length, '新鲜期内的页面首拉不该再发').toBe(1)
+    // 🔴 但 load() 的语义不变:点「刷新」/ 批量操作后回拉一律照发
+    await s.load()
+    expect(urls.length, 'load() 被误加了跳过条件').toBe(2)
+  })
+
   it('messages:会话列表有自己的一条翻页线(与消息列表的游标互不干扰)', async () => {
     const urls = pagedFetch([
       { data: [{ id: 's1', name: '群一', last_msg_at: 'b' }], next_cursor: 'sc-1' },

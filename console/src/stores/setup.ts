@@ -16,9 +16,43 @@ export const NOTICE_FIXED_PARAGRAPHS = [
   '升级不会清除登录信息与数据(账号、登录态、消息库、保险库、微信档案全部保留)。',
 ]
 
+/**
+ * 「向导已完成」的真值落点 = `console.toml [setup] done`(01 §2.7.1 首句「只在 `[setup] done=false`
+ * 时进入;完成后不再出现」+ 01 §7 配置表)。Electron 里经 `window.qt.config` 读写(主进程原子写盘)。
+ *
+ * 🔴 浏览器(`dev:web`、无 preload)里 `window.qt` 不存在 ⇒ `config.read()` 读不到、`config.patch()`
+ * 写不进 ⇒ 完成向导后一刷新又从向导进(安琳实测)。规格里**没有**「首启完成」的后端字段
+ * (#86 只管告知版本与 ack),所以此处用本机 `localStorage` 兜底镜像:
+ * **有 `window.qt` 时一律以它为准**(规格口径),无 `window.qt` 时才用镜像;读写全包 try/catch
+ * (隐私模式 / 站点数据被禁时 `localStorage` 会抛)。
+ */
+const DONE_MIRROR_KEY = 'qt.setup.done'
+
+function readDoneMirror(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(DONE_MIRROR_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function writeDoneMirror(v: boolean): void {
+  try {
+    globalThis.localStorage?.setItem(DONE_MIRROR_KEY, v ? 'true' : 'false')
+  } catch {
+    // 存储不可用:不影响主流程(Electron 里真值本来就在 console.toml)
+  }
+}
+
 export const useSetupStore = defineStore('setup', () => {
   const done = ref(true)
+  /**
+   * 向导当前步(0..4)。**必须放 store**:页面自己 `ref(0)` 时组件一重挂(首登去 `P-ACCT-NEW`
+   * 再回来 / HMR)就回第 1 步,而 01 §2.7.1 步 4 明写「现在添加 → 进 P-ACCT-NEW(**完成后回到本步**)」。
+   */
   const step = ref(0)
+  /** 告知页改版 ⇒ 已完成向导的机器重启后也要重新勾(05 §6.1 末句 / §8b.6 U1) */
+  const reackRequired = ref(false)
   const noticeText = ref('')
   const noticeVersion = ref('')
   const scrolledToBottom = ref(false)
@@ -28,8 +62,17 @@ export const useSetupStore = defineStore('setup', () => {
   const error = ref<string | null>(null)
 
   async function loadConfig(): Promise<void> {
-    const cfg = await window.qt?.config.read()
-    done.value = cfg?.setup?.done === true
+    try {
+      const cfg = await window.qt?.config.read()
+      if (cfg) {
+        done.value = cfg.setup?.done === true
+        writeDoneMirror(done.value)
+        return
+      }
+    } catch {
+      // 读 console.toml 失败:退回本机镜像,不能让它把 App 的启动序列(装守卫、绑事件)整条打断
+    }
+    done.value = readDoneMirror()
   }
 
   async function loadNotice(): Promise<void> {
@@ -54,25 +97,54 @@ export const useSetupStore = defineStore('setup', () => {
     await systemApi.noticeAck(noticeVersion.value)
     // 以 Agent 为准:写完重读一次,别让界面记住一个服务端没落下的勾
     await loadNotice()
+    if (acked.value) reackRequired.value = false
+  }
+
+  /**
+   * 启动时核对「这一版告知勾过没有」。
+   * 只在**已完成向导**时有意义(没完成本来就要走向导);#86 拉不到(后端未就绪)时**不判**,
+   * 否则会把人锁死在告知页 —— 判据以 Agent 为准,取不到就不是「没勾」。
+   */
+  async function refreshAck(): Promise<void> {
+    if (!done.value) return
+    await loadNotice()
+    if (error.value) return
+    reackRequired.value = !acked.value
+    // 要重勾就从告知页开始(勾完直接进控制台,不重走五步)
+    if (reackRequired.value) step.value = 0
   }
 
   async function finish(autoLaunch: boolean, trayOnClose: boolean): Promise<void> {
-    await window.qt?.app.setAutoLaunch(autoLaunch)
+    // 先把「向导已完成」落盘:开机自启在部分环境会失败(权限/平台不支持),
+    // 它一抛异常就轮不到下面的 patch ⇒ `done` 没落盘 ⇒ 下次启动又从向导进。
     await window.qt?.config.patch({
       setup: { done: true },
       app: { auto_launch: autoLaunch, minimize_to_tray_on_close: trayOnClose },
     })
     done.value = true
+    writeDoneMirror(true)
+    try {
+      await window.qt?.app.setAutoLaunch(autoLaunch)
+    } catch {
+      // 开机自启设置失败不回滚「向导已完成」;偏好值已写进 console.toml,可在 P-SET 再调
+    }
   }
 
   async function rerun(): Promise<void> {
     await window.qt?.config.patch({ setup: { done: false } })
     done.value = false
+    writeDoneMirror(false)
     step.value = 0
+    /**
+     * 01 §2.7.1「每步『上一步』可退,但告知页勾选不重置」说的是**向导内**退步;
+     * 「重新运行向导」是重走一遍,滚动判定要重来,否则告知区一进去就是解锁态(等于没这道门)。
+     * 「已确认」本身不由这里定 —— 仍以 Agent 的 `acked_version` 为准(`loadNotice()` 回填)。
+     */
+    scrolledToBottom.value = false
   }
 
   return {
-    done, step, noticeText, noticeVersion, scrolledToBottom, acked, ackMs, loading, error,
-    loadConfig, loadNotice, ack, finish, rerun,
+    done, step, reackRequired, noticeText, noticeVersion, scrolledToBottom, acked, ackMs, loading, error,
+    loadConfig, loadNotice, refreshAck, ack, finish, rerun,
   }
 })
