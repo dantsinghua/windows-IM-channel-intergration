@@ -341,8 +341,14 @@ class MailApi:
         from qtrade_agent.config import AgentConfig, ApiConfig
         data_dir = tmp_path / "agent-data"
         data_dir.mkdir(exist_ok=True)
+        # 🔴 运行时后端 / WinAgent 一律假实现(e2e-rootfs-2 D-3 同型整改):本文件只验邮件端点,不该有任何机会碰宿主 adb/docker/网络。
+        from qtrade_agent.runtime.backends import FakeAdb, FakeContainers
+        from qtrade_agent.winagent_client import FakeWinAgent
+        wa = FakeWinAgent()
         self.agent = AgentApp(AgentConfig(api=ApiConfig()), db_path=str(tmp_path / "agent.db"), clock=clock,
-                              data_dir=str(data_dir)).open()
+                              data_dir=str(data_dir), adb=FakeAdb(), containers=FakeContainers(),
+                              winagent_transport=wa, winagent_base_url="http://winagent.fake:17610",
+                              winagent_token=wa.token).open()
         self.agent.store.upsert_api_client(app_id="console", name="控制台", level="admin", token=TOK_A)
         self.rig = Rig(tmp_path=tmp_path, clock=clock, cfg=cfg, store=self.agent.store)
         self.agent.mail = self.rig.svc              # 端点经 agent.mail 取服务(未装配时 503,02 §3.4 状态映射)

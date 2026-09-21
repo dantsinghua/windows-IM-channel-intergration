@@ -162,8 +162,16 @@ class Rig:
         self.land_delay_s = land_delay_s                # 假企点把我方消息落进主库前的真实等待(模拟 7~12 s 出向落库滞后)
         self.cfg = AgentConfig(bus=BusConfig(send_min_interval_ms=0, send_rand_extra_ms=0),
                                qidian=QidianAdapterConfig(confirm_poll_interval_ms=10), api=api_cfg or ApiConfig())
+        # 🔴 运行时后端 / WinAgent 一律假实现(e2e-rootfs-2 D-3 同型整改):不注入则 AgentApp 装真 AdbCliBackend/DockerCliBackend、
+        # 真 WinAgent HTTP 客户端与真 QidianUi 登录执行层,任何走到它们的端点都会碰宿主 adb/docker/网络。
+        from qtrade_agent.runtime.backends import FakeAdb, FakeContainers
+        from qtrade_agent.winagent_client import FakeWinAgent
+        self.fake_adb, self.fake_containers, self.fake_wa = FakeAdb(), FakeContainers(), FakeWinAgent()
         self.agent = AgentApp(self.cfg, db_path=str(tmp_path / "agent.db"), clock=clock, sender=self._sender,
-                              maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path)).open()
+                              maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path),
+                              adb=self.fake_adb, containers=self.fake_containers,
+                              winagent_transport=self.fake_wa, winagent_base_url="http://winagent.fake:17610",
+                              winagent_token=self.fake_wa.token).open()
         self.store = self.agent.store
         s = self.store
         s.ensure_account(QD, "qidian", state="running", self_uid=SELF_UID, label="张三-固收")

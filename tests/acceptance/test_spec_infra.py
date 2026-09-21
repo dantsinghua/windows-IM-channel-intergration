@@ -26,6 +26,7 @@ import hashlib
 import hmac as _hmac
 import json
 import os
+import threading
 import time
 from typing import Any, Optional
 
@@ -2187,18 +2188,36 @@ async def test_WF43_runs_listing_is_newest_first(fstore, clock):
 # ══════════════════════════════════════════════════════════════════════ 十四、端到端:工作流端点 / 作业契约 / 清理与校准端点 / HMAC 入站
 
 class Rig5:
-    """第五批端到端夹具:AgentApp + FastAPI + 三把 Bearer 令牌(级别 A/W/R)。"""
+    """第五批端到端夹具:AgentApp + FastAPI + 三把 Bearer 令牌(级别 A/W/R)。
+
+    🔴 运行时后端一律用仓库自带的假实现(`qtrade_agent.runtime.backends` 的 ``FakeAdb`` / ``FakeContainers``,
+    该模块 docstring:「协议 + 真实 CLI 实现 + 可编程假实现」),企点执行层用本夹具的假 ``sender``(``AgentApp`` 公开构造参数,
+    签名 ``async (acct, native_id, text) -> bool``)。否则 ``AgentApp`` 会装真 ``AdbCliBackend``/``DockerCliBackend``,
+    工作流 run 在后台真的执行宿主 ``adb -P 16000 -s 127.0.0.1:16001 …``(e2e-rootfs-2 D-3):用例结果取决于宿主有没有 adb、
+    且会碰宿主 adb server。假 ``sender`` 带一道闸门 ``send_gate``:缺省打开(点发送键即返回 True);
+    用例关上它就能让 run **确定地**停在执行中(不靠手工改库、不靠宿主命令的快慢)。
+    """
 
     def __init__(self, tmp_path, clock, http, disk):
         from qtrade_agent.app import AgentApp
+        from qtrade_agent.runtime.backends import FakeAdb, FakeContainers
         from qtrade_agent.vault_client import FakeVault
+        from qtrade_agent.winagent_client import FakeWinAgent
         self.clock = clock
         self.http = http
         self.disk = disk
         self.vault = FakeVault()
+        self.wa = FakeWinAgent()
+        self.adb = FakeAdb()
+        self.containers = FakeContainers()
+        self.send_gate = threading.Event()
+        self.send_gate.set()
+        self.sends: list[tuple[str, str]] = []            # 假执行层被调到的 (native_id, text)
         self.cfg = AgentConfig(api=ApiConfig())
         self.agent = AgentApp(self.cfg, db_path=str(tmp_path / "agent.db"), clock=clock, http=http, disk=disk,
-                              data_dir=str(tmp_path), vault=self.vault).open()
+                              data_dir=str(tmp_path), vault=self.vault, adb=self.adb, containers=self.containers,
+                              sender=self._sender, winagent_transport=self.wa,
+                              winagent_base_url="http://winagent.fake:17610", winagent_token=self.wa.token).open()
         self.store = self.agent.store
         self.store.ensure_account(QD, "qidian", state="running", self_uid="3007373675")
         self.store.ensure_account(QQ, "qq", state="running", login_mode="qrcode", self_uid="415011447")
@@ -2206,6 +2225,13 @@ class Rig5:
         self.store.upsert_api_client(app_id="bot_w", name="写机器人", level="write", token=TOK_W)
         self.store.upsert_api_client(app_id="bot_r", name="读机器人", level="read", token=TOK_R)
         self.api = self.agent.create_api()
+
+    async def _sender(self, acct, native_id: str, text: str) -> bool:
+        """假企点执行层:记下调用;闸门关着就一直等(run 因此停在执行中),闸门开了才「点发送键」返回 True。"""
+        self.sends.append((native_id, text))
+        while not self.send_gate.is_set():
+            await asyncio.sleep(0.01)
+        return True
 
     def add_hmac_client(self, app_id: str, secret: str, *, level: str = "admin", allow_ops: Optional[list[str]] = None) -> None:
         mk_hmac_client(self.store, app_id, level=level, allow_ops=allow_ops, now=self.clock())
@@ -2313,13 +2339,54 @@ def test_AP10_validate_endpoint_is_read_level(rig5, c5):
     assert r.status_code == 200 and r.json()["ok"] is True and r.json()["errors"] == []
 
 
+def _run_status(c5, run_id: str) -> Optional[str]:
+    """经 #45 `GET /workflows/runs/{run_id}` 读 run 状态(R6-68 ⑤ 信封平铺 `{ok, run, steps}`)。"""
+    body = c5.get(f"{P}/workflows/runs/{run_id}", headers=H(TOK_R)).json()
+    run = body.get("run") or (body.get("data") or {}).get("run") or {}
+    return run.get("status")
+
+
+def _wait(pred, *, timeout_s: float = 10.0) -> bool:
+    """真实时间轮询(不拨假时钟):run 在 TestClient 的后台事件循环里推进。"""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
 def test_AP11_delete_with_active_run_is_409(rig5, c5):
-    """#42 `DELETE /workflows/{id}`:**有运行中 run → 409**。"""
+    """#42 `DELETE /workflows/{id}`:「有运行中 run(`status ∈ {running, paused}`)→ `409`」;且被挡下的删除**什么都不删**。
+
+    活跃 run 的构造(D-3 整改):假企点执行层(`Rig5.send_gate` 关上)让 run 真的卡在发送步 ⇒ 状态由产品自己推进到
+    `running`、不手工改库、不依赖宿主 adb;断言完再开闸让 run 自然收尾。
+    """
+    wid = rig5.make_wf(c5)
+    rig5.send_gate.clear()
+    try:
+        run_id = c5.post(f"{P}/workflows/{wid}/run", json={}, headers=H(TOK_W)).json()["run_id"]
+        assert _wait(lambda: bool(rig5.sends)), "run 未走到发送步(假执行层没被调到)"
+        assert _run_status(c5, run_id) in ("running", "paused")
+        r = c5.delete(f"{P}/workflows/{wid}", headers=H(TOK_ADMIN))
+        assert r.status_code == 409, r.text
+        assert c5.get(f"{P}/workflows/{wid}", headers=H(TOK_R)).status_code == 200, "409 之后工作流必须还在"
+        assert _run_status(c5, run_id) is not None, "409 之后 run 必须还在"
+    finally:
+        rig5.send_gate.set()
+    assert _wait(lambda: _run_status(c5, run_id) not in ("running", "paused")), "开闸后 run 应收尾到终态"
+
+
+def test_AP11b_delete_without_active_run_succeeds_and_cascades_runs(rig5, c5):
+    """对照组 —— #42:没有 `running`/`paused` 的 run 就不挡;🔴 R6-58 (g):终态 run 与其 steps **连带删**
+    (「没有这一条则……跑过一次的工作流永远删不掉」)。删后 #40 / #45 均 `404`。"""
     wid = rig5.make_wf(c5)
     run_id = c5.post(f"{P}/workflows/{wid}/run", json={}, headers=H(TOK_W)).json()["run_id"]
-    rig5.store.con.execute("UPDATE workflow_runs SET status='running' WHERE run_id=?", (run_id,))
+    assert _wait(lambda: _run_status(c5, run_id) not in (None, "running", "paused")), "run 应自然到终态"
     r = c5.delete(f"{P}/workflows/{wid}", headers=H(TOK_ADMIN))
-    assert r.status_code == 409
+    assert r.status_code in (200, 204), r.text
+    assert c5.get(f"{P}/workflows/{wid}", headers=H(TOK_R)).status_code == 404
+    assert c5.get(f"{P}/workflows/runs/{run_id}", headers=H(TOK_R)).status_code == 404
 
 
 def test_AP12_cleanup_run_returns_202_job_id(rig5, c5):
