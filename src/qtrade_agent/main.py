@@ -21,17 +21,51 @@ log = logging.getLogger("qtrade.main")
 _QUERY_SECRET = re.compile(r"(?i)([?&](?:token|secret|password|access_token)=)[^&\s\"']*")
 
 
+def _mask_arg(v: object) -> object:
+    """单个格式化参数:字符串直接遮;非字符串仅当其 ``str()`` 里含凭据时才换成遮后的字符串(int 等原样保留)。"""
+    if isinstance(v, str):
+        return _QUERY_SECRET.sub(r"\1***", v)
+    try:
+        s = str(v)
+    except Exception:
+        return v
+    masked = _QUERY_SECRET.sub(r"\1***", s)
+    return v if masked == s else masked
+
+
 class MaskQuerySecrets(logging.Filter):
-    """把日志行里 ``?token=…`` 一类查询参数的值换成 ``***``(挂在 uvicorn 的两个 logger 上)。"""
+    """把日志行里 ``?token=…`` 一类查询参数的值换成 ``***``(挂在 uvicorn 的两个 logger 上)。
+
+    🔴 不得清空/改变 ``record.args`` 的形状:uvicorn 的 ``AccessFormatter`` 固定把 args 解包成
+    (client_addr, method, full_path, http_version, status_code) 五元组(e2e-rootfs-2 D-1)。
+    故 msg 与 args **逐项**遮蔽、保持元组长度与非敏感项的类型。
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            msg = record.getMessage()
-        except Exception:                       # 格式化本身出错就原样放行,交给 logging 自己报
+            args = record.args
+            if isinstance(args, tuple):
+                record.args = tuple(_mask_arg(a) for a in args)
+            elif isinstance(args, dict):
+                record.args = {k: _mask_arg(a) for k, a in args.items()}
+            full = record.getMessage()
+            if _QUERY_SECRET.sub(r"\1***", full) == full:
+                return True                     # 常见路径:凭据只在参数里(uvicorn 访问行 / WS 握手行)
+            # 凭据在模板字面量里,或被模板与参数拆开(`"?token=%s", tok`)
+            if isinstance(record.msg, str) and record.args:
+                cand = _QUERY_SECRET.sub(r"\1***", record.msg)
+                try:
+                    out = cand % record.args
+                except Exception:
+                    out = None
+                if out is not None and _QUERY_SECRET.sub(r"\1***", out) == out:
+                    record.msg = cand
+                    return True
+            # 兜底:只剩整行格式化后替换。uvicorn.access 的模板是定值 `'%s - "%s %s HTTP/%s" %d'`、
+            # 凭据只可能在 full_path 参数里,上面已处理 ⇒ 走不到这里,五元组形状不受影响。
+            record.msg, record.args = _QUERY_SECRET.sub(r"\1***", full), ()
+        except Exception:                       # 遮蔽本身绝不能让日志链路抛异常
             return True
-        masked = _QUERY_SECRET.sub(r"\1***", msg)
-        if masked != msg:
-            record.msg, record.args = masked, ()
         return True
 
 

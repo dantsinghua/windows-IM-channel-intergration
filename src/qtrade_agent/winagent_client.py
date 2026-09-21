@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -136,6 +138,27 @@ def _host_hint(path: str) -> Optional[str]:
     return None
 
 
+#: 自动发现的候选只许落在这些本机/内网段(e2e-rootfs-2 O-2):WinAgent 只监听 ``127.0.0.1`` 与 vEthernet (WSL) 的 IPv4
+#: (04 §2.6.3「监听集合」;WSL 子网取不到时退化 ``172.16.0.0/12``)。请求带 ``Authorization: Bearer`` 且是明文 HTTP,
+#: 候选若是公网地址(如被改写的 resolv.conf 里的公网 DNS)就等于把 WinAgent 令牌发到公网。
+_LOCAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",   # 回环 / RFC1918 / 链路本地
+    "::1/128", "fe80::/10"))
+_warned_rejected: set[tuple[str, str]] = set()
+
+
+def _is_local_url(url: str) -> bool:
+    """``url`` 的主机是 IP 字面量且落在 :data:`_LOCAL_NETS` 里才算数;主机名一律不收(不为此做 DNS 解析)。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return False
+        ip = ipaddress.ip_address(parts.hostname.split("%", 1)[0])
+    except ValueError:
+        return False
+    return any(ip in n for n in _LOCAL_NETS)
+
+
 def base_url_candidates(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.conf",
                         gateway: Optional[Callable[[], Optional[str]]] = None) -> list[tuple[str, str]]:
     """按优先级给出 ``[(来源, base_url), …]``(去重、保序)。来源 ∈ ``url|host_json|gateway|resolv_conf``。
@@ -149,7 +172,16 @@ def base_url_candidates(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.
     out: list[tuple[str, str]] = []
 
     def add(source: str, url: Optional[str]) -> None:
-        if url and url not in {u for _s, u in out}:
+        if not url:
+            return
+        if not _is_local_url(url):                           # O-2:非回环/私网/链路本地 ⇒ 丢弃,不探活、不发令牌
+            host = urllib.parse.urlsplit(url).hostname or "?"
+            if (source, host) not in _warned_rejected:
+                _warned_rejected.add((source, host))
+                log.warning("WinAgent 地址发现:丢弃候选 %s(来源 %s)——不在回环/私网/链路本地段,"
+                            "不会向它发送任何请求(04 §2.6.3)", host, source)
+            return
+        if url not in {u for _s, u in out}:
             out.append((source, url))
 
     if cfg.url:

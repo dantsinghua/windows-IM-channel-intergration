@@ -2333,7 +2333,9 @@ def create_api(agent) -> FastAPI:
         await ws.accept()
         try:
             first = await asyncio.wait_for(ws.receive_json(), timeout=10)
-        except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
+        except WebSocketDisconnect:
+            return                                   # 客户端已断(刷新/关标签页):连接已关,再 close 会抛 RuntimeError(e2e-rootfs-2 D-2)
+        except (asyncio.TimeoutError, ValueError):
             await ws.close(code=4400, reason="10 秒内未收到合法的首帧订阅")
             return
         if not isinstance(first, dict) or not isinstance(first.get("subscribe"), dict):   # R6-53:首帧必须是含 subscribe 对象的 JSON

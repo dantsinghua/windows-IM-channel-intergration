@@ -7,7 +7,9 @@ name = "qtrade-agent"
 version = "0.1.0"
 description = "QTrade 多实例 IM 控制台 —— Agent(WSL 侧 systemd 服务)。规格 = docs/00 基线 + docs/01~06 六册。"
 requires-python = ">=3.11"
-# 02 §2.2 技术选型:FastAPI + uvicorn(显式 ws="websockets")+ aiosqlite + docker SDK + websockets。
+# 02 §2.2 技术选型:FastAPI + uvicorn(显式 ws="websockets")+ aiosqlite + websockets。
+# `docker` SDK 已从依赖删除(backend-fix-7):src/ 从未 import 它(对 dockerd 走子进程/假实现),只白给发行版带进
+# docker/requests/urllib3/charset-normalizer 四个包;02 §2.2 选型句里的「docker SDK」待文档方同步。
 # 🔴 uvicorn 必须带 [standard] 之外的显式 websockets(ws="auto" 选中 sansio 实现会让 101 响应带两个 Date 头,
 # ibquote 2026-08-12 麒麟现场 502 事故);docker/adb/WinAgent/邮箱在开发容器里一律注假实现,装了依赖也不会去连。
 dependencies = [
@@ -15,7 +17,6 @@ dependencies = [
   "uvicorn>=0.30",
   "websockets>=12",
   "aiosqlite>=0.20",
-  "docker>=7",
 ]
 
 [project.optional-dependencies]

@@ -229,3 +229,78 @@ def test_subprocess_help_mentions_init_db():
     r = subprocess.run([sys.executable, "-m", "qtrade_agent.main", "--help"],
                        env={**os.environ, "PYTHONPATH": SRC_DIR}, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "--init-db" in r.stdout
+
+
+# ────────────────────────────────────────────── ⑦ 库旁留有未检查点的非空 -wal(e2e-rootfs-2 O-1)
+def _crash_copy_with_wal(tmp_path, *, future_version: int | None, keep_shm: bool) -> str:
+    """造「Agent 崩溃后留下非空 -wal」的现场:在连接未关时把 db/-wal/-shm 拷走(= 断电瞬间的盘面)。"""
+    import shutil
+    import sqlite3
+    src = tmp_path / "src"
+    src.mkdir()
+    sdb = str(src / "agent.db")
+    assert init_db(AgentConfig(), sdb) == EXIT_OK
+    con = sqlite3.connect(sdb, isolation_level=None)
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    if future_version is not None:
+        con.execute("INSERT INTO schema_version(version, name, applied_ms, checksum) VALUES (?, '00xx_future', 0, 'x')",
+                    (future_version,))
+    else:
+        con.execute("INSERT INTO settings(key, value_json, updated_ms) VALUES ('o1.probe', '\"v\"', 0)")
+    dst = tmp_path / "live"
+    dst.mkdir()
+    for suf in ("", "-wal") + (("-shm",) if keep_shm else ()):
+        shutil.copyfile(sdb + suf, str(dst / "agent.db") + suf)
+    con.close()
+    db = str(dst / "agent.db")
+    assert os.path.getsize(db + "-wal") > 0
+    return db
+
+
+@pytest.mark.parametrize("keep_shm", [True, False])
+def test_too_new_with_nonempty_wal_touches_neither_file(tmp_path, keep_shm):
+    """过新的那行 schema_version **只在 -wal 里** ⇒ 探测必须读得到 WAL(不能用 immutable),且主库与 -wal 字节都不动。"""
+    db = _crash_copy_with_wal(tmp_path, future_version=7, keep_shm=keep_shm)
+    before = (sha256(db), sha256(db + "-wal"))
+    for _ in range(2):
+        assert init_db(AgentConfig(), db) == EXIT_SCHEMA_TOO_NEW
+        assert (sha256(db), sha256(db + "-wal")) == before
+        assert os.path.exists(db + "-shm") == keep_shm                    # 探测新建的索引文件收回,原有的不删
+    with pytest.raises(store_mod.SchemaTooNew, match="7"):
+        Store(db).open()                                                   # 正常启动路径同样拒绝
+    assert (sha256(db), sha256(db + "-wal")) == before
+
+
+def test_corrupt_main_with_nonempty_wal_touches_neither_file(tmp_path):
+    db = _crash_copy_with_wal(tmp_path, future_version=None, keep_shm=True)
+    with open(db, "r+b") as f:                                            # 主库截掉一半
+        f.truncate(os.path.getsize(db) // 2)
+    before = (sha256(db), sha256(db + "-wal"))
+    assert init_db(AgentConfig(), db) == EXIT_DB_CORRUPT
+    assert (sha256(db), sha256(db + "-wal")) == before
+
+
+def test_too_new_without_wal_leaves_no_side_files(tmp_path):
+    db = str(tmp_path / "agent.db")
+    assert init_db(AgentConfig(), db) == EXIT_OK
+    s = Store(db).open()
+    s.con.execute("INSERT INTO schema_version(version, name, applied_ms, checksum) VALUES (99, '0099_future', 0, 'x')")
+    s.close()
+    before = sha256(db)
+    assert init_db(AgentConfig(), db) == EXIT_SCHEMA_TOO_NEW
+    assert sha256(db) == before
+    assert not os.path.exists(db + "-wal") and not os.path.exists(db + "-shm")
+
+
+def test_current_db_with_nonempty_wal_recovers_then_idempotent(tmp_path):
+    """对照:完好最新库 + 非空 -wal ⇒ 首跑 0(正常恢复,WAL 内容并回、数据不丢);再跑主库字节不变。"""
+    db = _crash_copy_with_wal(tmp_path, future_version=None, keep_shm=False)
+    assert init_db(AgentConfig(), db) == EXIT_OK
+    s = Store(db).open()
+    try:
+        assert s.con.execute("SELECT value_json FROM settings WHERE key='o1.probe'").fetchone()[0] == '"v"'
+    finally:
+        s.close()
+    before = sha256(db)
+    assert init_db(AgentConfig(), db) == EXIT_OK
+    assert sha256(db) == before

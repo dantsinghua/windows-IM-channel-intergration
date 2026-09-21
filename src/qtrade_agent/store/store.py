@@ -20,6 +20,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.parse
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
@@ -152,9 +153,10 @@ class Store:
         # 02 §2.6:已有库先 `PRAGMA quick_check` —— 损坏/不是 SQLite ⇒ 拒绝启动并指向最近备份,**不动该文件**。
         # 新建库(文件不存在或零字节)与 :memory: 跳过:没有内容可校验。
         preexisting = self.path != ":memory:" and os.path.exists(self.path) and os.path.getsize(self.path) > 0
+        probed = preexisting and self._probe_readonly()
         con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         con.row_factory = sqlite3.Row
-        if preexisting:
+        if preexisting and not probed:      # 只读探测开不了(极少:目录不可写等)⇒ 退回原读写连接上判
             self._quick_check(con)
             self._check_supported(con)      # 02 §3.8:库比代码新 ⇒ 在动 PRAGMA/写任何一页之前就拒绝,库文件一字不改
         # 读 ``PRAGMA auto_vacuum`` 不写库;只有不是 INCREMENTAL(新建库读回 0)时才设,已是 2 的库字节不动(D-05)
@@ -198,6 +200,42 @@ class Store:
             con.close()
             raise StoreCorrupt(f"{self.path} 完整性校验未通过(PRAGMA quick_check = {got});已停止,该文件一字未改。"
                                f"请按 02 §3.3 用 /var/lib/qtrade/backup 下最近一份备份替换后重试")
+
+    def _probe_readonly(self) -> bool:
+        """损坏 / 过新判定用**只读**连接做(e2e-rootfs-2 O-1)。
+
+        读写连接关闭时若库旁有未检查点的非空 ``-wal``,SQLite 会把它**检查点并回主库**并删掉 ``-wal/-shm``
+        ⇒ 拒绝路径(退 3/4)也改了主库字节。``mode=ro`` 连接不写主库、不写 ``-wal``、关闭时不做检查点,
+        且**会读到 WAL 里尚未合并的数据**(不用 ``immutable=1``:它无视 WAL,会漏看 WAL 里的 ``schema_version`` 行)。
+        只读连接可能新建空 ``-wal`` / ``-shm``(索引文件),探测完把**本次新建的**删掉,目录恢复原状。
+        开不了只读连接(``SQLITE_CANTOPEN``)⇒ 回 False,由调用方退回读写连接上判。
+        """
+        side = [self.path + "-wal", self.path + "-shm"]
+        existed = {f: os.path.exists(f) for f in side}
+        uri = "file:" + urllib.parse.quote(os.path.abspath(self.path)) + "?mode=ro"
+        try:
+            try:
+                ro = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
+            except sqlite3.OperationalError:
+                return False
+            try:
+                try:
+                    ro.execute("PRAGMA schema_version").fetchone()      # 触发真正打开文件
+                except sqlite3.DatabaseError as e:
+                    if (getattr(e, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_CANTOPEN:
+                        return False
+                self._quick_check(ro)
+                self._check_supported(ro)
+            finally:
+                ro.close()
+            return True
+        finally:
+            for f in side:
+                if not existed[f] and os.path.exists(f) and (not f.endswith("-wal") or os.path.getsize(f) == 0):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
 
     def _too_new(self, cur: int, code_v: int) -> "SchemaTooNew":
         return SchemaTooNew(f"{self.path} 的 schema_version={cur} 高于本版 Agent 支持的上限 {code_v}:"
