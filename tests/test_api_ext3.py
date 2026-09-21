@@ -160,7 +160,13 @@ def test_sessions_pagination_orders_by_last_msg(rig):
 
 
 def test_mail_inbox_and_outbox_pagination(rig):
-    """#58 / #61:收件按 `received_ms`、出件按 `created_ms` 降序分页。"""
+    """#58 / #61:收件按 `received_ms`、出件按 `created_ms` 降序分页。
+
+    🔴 第四批(独立联调 P-1)起,两个端点的**出参**走视图:时间键是 ISO 的 `received_at`/`created_at`
+    (00 §6「时间(API/事件/**邮件**)= ISO 8601 带时区偏移」),库列 `*_ms` 不再下发 ——
+    **排序与游标仍按库行的 `received_ms`/`created_ms`**(这条用例断的就是排序与翻页,只把读的键换成出参键;
+    同偏移的 ISO 串按字典序比较与按毫秒比较同序)。
+    """
     ms = rig.agent.mail.ms
     for i in range(3):
         ms.inbox_insert(mailbox="default", protocol="imap", uid=100 + i, rfc_message_id=f"<in{i}@qtrade>",
@@ -169,7 +175,7 @@ def test_mail_inbox_and_outbox_pagination(rig):
         ms.outbox_enqueue(kind="receipt", to_addrs=f"ops{i}@corp", subject=f"回执 {i}", body_text="x",
                           rfc_message_id=f"<m{i}@qtrade>", dedup_key=f"d{i}", template_version="v1",
                           now_ms=1_700_000_000_000 + i * 1000)
-    for path, key in (("/mail/inbox", "received_ms"), ("/mail/outbox", "created_ms")):
+    for path, key in (("/mail/inbox", "received_at"), ("/mail/outbox", "created_at")):
         first = _page(rig, path, limit=2)
         assert len(first["data"]) == 2 and first["next_cursor"]
         assert first["data"][0][key] >= first["data"][1][key]

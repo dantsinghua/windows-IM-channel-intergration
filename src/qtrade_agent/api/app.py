@@ -31,12 +31,13 @@ from ..hmac_inbound import has_hmac_headers
 from ..ids import ulid
 from ..maintenance import DiskFullError
 from ..models import Command, CommandOrigin, RESULT_CODES
+from ..store import SeqExhausted
 from ..workflow import WorkflowParseError
 from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
 from .routes_ext import register_ext
 from .routes_ext2 import job_is_irreversible, register_ext2
-from .serialize import (account_view, command_view, decode_cursor, encode_cursor, message_view, result_view, session_view,
-                        stored_result_view)
+from .serialize import (account_view, command_view, decode_cursor, encode_cursor, mail_inbox_row_view,
+                        mail_outbox_row_view, message_view, result_view, session_view, stored_result_view)
 
 log = logging.getLogger("qtrade.api")
 
@@ -188,6 +189,20 @@ def create_api(agent) -> FastAPI:
             response = JSONResponse(status_code=e.http_status, content=_error_body(e.code, e.message, reason=e.reason, retryable=e.retryable,
                                                                                   needs_human=e.needs_human, trace_id=request.state.trace_id,
                                                                                   extra=e.extra))
+        except Exception as e:
+            # 🔴 **兜底异常处理器**(独立联调 P-4):任何没被上面各 handler 接住的异常,一律包成 00 §10 信封的
+            # `INTERNAL`(§8.3 已登记的那个未归类错误码,**不新造原因码**)+ `trace_id`,并把堆栈记进日志。
+            # 为什么必须有:裸异常会让 FastAPI 回 `500 text/plain "Internal Server Error"` —— 控制台的
+            # `readEnvelope` 拿不到 `code`/`trace_id`(只能显示兜底文案、现场无从按 trace 查审计),
+            # 02 §3.4 还注明 500 `INTERNAL` 会触发**自动重试**,而此时连「重试了什么」都查不到。
+            # 🔴 **响应体不带堆栈**(§11.9 同源口径:细节只进日志,不进响应);
+            # `/system/health` 这个路径按 §3.4 例外① 两种形态都不注入 `trace_id`,这里同样不带。
+            log.exception("未捕获异常:%s %s trace_id=%s", request.method, request.url.path, request.state.trace_id)
+            is_health = request.url.path == f"{API_PREFIX}/system/health"
+            response = JSONResponse(status_code=500, content=_error_body(
+                "INTERNAL", "内部错误,请把 trace_id 交给运维排查" if not is_health else "内部错误",
+                reason="unhandled_exception", retryable=True,
+                trace_id=None if is_health else request.state.trace_id))
         if has_hmac_headers(dict(request.headers)):
             # §3.5 时钟容差:把服务端时间放进 Date 头让对方校时(成功与 401 skew 都要带,否则对方没法自校)
             response.headers["Date"] = formatdate(agent.clock() / 1000, usegmt=True)
@@ -253,6 +268,20 @@ def create_api(agent) -> FastAPI:
             "DISK_FULL", e.message, reason="disk_full", retryable=False, needs_human=True,
             trace_id=getattr(request.state, "trace_id", None),
             extra={"hint_actions": ["open_env", "run_cleanup"], "evidence": e.evidence()})))
+
+    @app.exception_handler(SeqExhausted)
+    async def _seq_exhausted(request: Request, e: SeqExhausted):
+        """00 §6 `NN=01–98` 且**永不复用** ⇒ 一个通道累计建满 98 个号后必然建不了。
+
+        这是**可预见的业务边界**,按 00 §8.3/§10 回 `RESOURCE_EXHAUSTED`(资源池不足,**HTTP 409**,
+        `retryable=false`);此前 `Store._next_seq` 抛裸 `ValueError` ⇒ `500 text/plain`,控制台只能显示
+        「请求失败」,而 500 `INTERNAL` 还会被当成服务器故障**自动重试**(02 §3.4),重试多少次都建不出来。
+        `needs_human=true`:要人去清理/归并旧号(软删的号也占着 seq,这是 00 §6 的设计,不是 bug)。
+        """
+        return _with_version_headers(JSONResponse(status_code=409, content=_error_body(
+            "RESOURCE_EXHAUSTED", f"{e.channel} 通道的账号序号已用尽(NN 上限 {e.max_seq},分配后永不复用)",
+            reason="seq_exhausted", retryable=False, needs_human=True,
+            trace_id=getattr(request.state, "trace_id", None), extra={"channel": e.channel, "max_seq": e.max_seq})))
 
     #: 未知路由 / 方法不对时的结果码(00 §10;FastAPI 默认的 `{"detail": "Not Found"}` **不是**本项目的信封,
     #: 控制台的 `readEnvelope` 见到它只能退化成「请求失败(HTTP 404)」,trace_id 也对不上日志)
@@ -1256,6 +1285,51 @@ def create_api(agent) -> FastAPI:
             out["public_domain"] = agent.store.settings_get(API_PUBLIC_DOMAIN_KEY)
         return out
 
+    def _known_setting_keys(group: str) -> Optional[set[str]]:
+        """#89 整组替换时的**已知键集**;``None`` = 本组的键集在规格里没有出处 ⇒ 不做未知键判定。
+
+        - 有配置段的组:键集 = 该段 dataclass 的字段名(``AgentConfig`` 是 02 §7.1 配置总表的落地);
+          ``api`` 组另加 ``public_domain``(它不在 ``agent.toml`` 里,唯一存放处是 ``settings``,02 #102)。
+        - ``adapters``/``resources``/``mail``:形状由 #88 逐字定死,按那三套顶层键判。
+        - ``asr``/``ocr``/``log``:02 §7.1 有段但本期**没有消费者**(``_group_view`` 如实回 ``{}``),
+          键集无出处 ⇒ 回 ``None``,维持现状不判(待文档方登记后再收紧)。
+        """
+        import dataclasses
+        if group == "resources":
+            return {"pools", "quota_mb"}
+        if group == "adapters":
+            return {"qidian", "qq", "wechat"}
+        if group == "mail":
+            return {"enabled", "require_signature", "template_version", "scopes"}       # #88 R6-58 (ac) 逐字
+        field = SETTINGS_GROUPS[group]
+        if field is None:
+            return None
+        keys = {f.name for f in dataclasses.fields(getattr(cfg, str(field)))}
+        if group == "api":
+            keys.add("public_domain")
+        return keys
+
+    def _reject_unknown_keys(group: str, body: dict[str, Any]) -> None:
+        """#89 **未知键 ⇒ `400 INVALID_ARGS`,整个请求不落库**(总控 2026-09-21 裁决,独立联调 P-3)。
+
+        为什么不能「照单全收」:#89 是**整组替换(缺省键回默认)**,一处键名笔误既不会被写进去、又会把
+        同组其它键**静默洗回默认值**(实测 `PUT /settings/retention {"text_days":20}` 回 200 且回显,
+        而 `messages_days` 等同时被重置)。显式优于隐式 ⇒ 认不出来的键一律拒,**在任何落库动作之前**拒。
+        已知键的语义一个字不变;密码类(``*_secret``/``*_password``/``*_token``)是「只写不读」的入参,
+        不在读回的字段里,故按后缀放行(``_stash_secrets`` 收走它们)。
+        """
+        known = _known_setting_keys(group)
+        if known is None:
+            return
+        unknown = [k for k in body if k not in known and not any(k.endswith(x) for x in SECRET_KEYS)]
+        if not unknown:
+            return
+        details = [{"pointer": "/" + str(k).replace("~", "~0").replace("/", "~1"),     # RFC 6901 转义
+                    "message": f"{group} 组没有这个配置键", "kind": "unknown_key"} for k in unknown]
+        raise ApiError(400, "INVALID_ARGS",
+                       f"未知配置键:{', '.join(map(str, unknown))}(#89 是整组替换,收下笔误等于把整组洗回默认)",
+                       reason="unknown_key", extra={"details": details})
+
     def _validate_retention(body: dict[str, Any]) -> dict[str, Any]:
         """#89:数据类 ``*_days > 30`` **按 30 截断并 WARN**(E-18);三级水位顺序非法 → 400。"""
         out, warnings = dict(body), []
@@ -1586,6 +1660,9 @@ def create_api(agent) -> FastAPI:
         _principal(request, "admin")
         mail = _mail_or_503()
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ApiError(400, "INVALID_ARGS", "请求体须为对象", reason="bad_body")
+        _reject_unknown_keys("mail", body)         # 与 `PUT /settings/{group}` 同一道门(P-3)
         scopes = body.get("scopes")
         if not isinstance(scopes, dict) or any(s not in MAIL_SCOPES for s in scopes):
             raise ApiError(400, "INVALID_ARGS", f"scopes 的键须为 {'|'.join(MAIL_SCOPES)}", reason="bad_scopes",
@@ -1634,6 +1711,7 @@ def create_api(agent) -> FastAPI:
         body = await request.json()
         if not isinstance(body, dict):
             raise ApiError(400, "INVALID_ARGS", "请求体须为对象", reason="bad_body")
+        _reject_unknown_keys(group, body)          # 🔴 在**任何**落库动作之前(含下面的 public_domain)
         if group == "api" and "public_domain" in body:
             # 与 `_group_view` 同一把键 ⇒ 写进读得回;空串/None = 清除(P-SET 把域名删掉的动作)。
             pub = body.pop("public_domain")
@@ -1665,6 +1743,18 @@ def create_api(agent) -> FastAPI:
         if getattr(agent, "mail", None) is None:
             raise ApiError(503, "NOT_READY", "邮件服务未装配", reason="mail_not_wired", retryable=True)
         return agent.mail
+
+    def _mail_route_scopes() -> dict[Any, str]:
+        """``route_id → scope``(取值 = 01 §4 ``qt-mail-health-route-{scope}`` 的那一套:
+        ``default`` / ``qidian|qq|wechat`` / ``<account_id>``);给 #58/#59/#61 行的 ``route`` 列用。
+
+        邮件服务没装配时回空表(``route`` 全为 ``null``),不因此让列表整个 503。
+        """
+        try:
+            rows = _mail_or_503().ms.routes_list()
+        except ApiError:
+            return {}
+        return {r["id"]: (r["account_id"] or r["channel"] or "default") for r in rows}
 
     def _hmac_route_id(short: str, routes: list[dict[str, Any]]) -> Optional[str]:
         """短名落在哪条路由的 ``inbound_json.hmac{短名: secret_ref}`` 里(06 §3.1 表);全局短名回 ``None``。
@@ -1869,21 +1959,33 @@ def create_api(agent) -> FastAPI:
     @app.get(f"{API_PREFIX}/mail/inbox")
     async def mail_inbox(request: Request, status: Optional[str] = None, since: Optional[str] = None, until: Optional[str] = None,
                          q: Optional[str] = None, limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
-        """#58,级别 R。**C-42 统一分页**:排序 = ``received_ms`` 降序,游标 G-16。"""
+        """#58,级别 R。**C-42 统一分页**:排序 = ``received_ms`` 降序,游标 G-16。
+
+        🔴 出参走 ``mail_inbox_row_view``(**不是库行原样**):时间列 ISO 8601(00 §6「时间(API/事件/**邮件**)」)、
+        列表**不含** ``body_text``(#58 逐字「详情才给」)。``next_cursor`` 仍按**库行**的 ``received_ms`` 算
+        (视图里已经没有 ``*_ms`` 了,先算游标再转视图,C-42 翻页行为不变)。
+        """
         _principal(request, "read")
         before, since_ms, until_ms = _page_window(cursor, since, until)
         rows = _mail_or_503().ms.inbox_list_page(status=status, since_ms=since_ms, until_ms=until_ms, q=q,
                                                  limit=limit, before=before)
-        return {"ok": True, "data": rows, "next_cursor": _next_cursor(rows, limit, ts_key="received_ms")}
+        nxt = _next_cursor(rows, limit, ts_key="received_ms")
+        scopes = _mail_route_scopes()
+        return {"ok": True, "data": [mail_inbox_row_view(r, route=scopes.get(r.get("route_id"))) for r in rows],
+                "next_cursor": nxt}
 
     @app.get(f"{API_PREFIX}/mail/inbox/{{inbox_id}}")
     async def mail_inbox_get(request: Request, inbox_id: int):
-        """#59,级别 R:含解析字段与 ``reason``。"""
+        """#59,级别 R:含解析字段与 ``reason``;**正文只在本端点给**(#58 逐字「详情才给」)。
+
+        与 #58 同一个视图(时间 ISO、``id`` 字符串),只是多带 ``body_text``。
+        """
         _principal(request, "read")
         row = _mail_or_503().ms.inbox_get(inbox_id)
         if row is None:
             raise ApiError(404, "TARGET_NOT_FOUND", f"邮件不存在:{inbox_id}")
-        return {"ok": True, "data": row}
+        scopes = _mail_route_scopes()
+        return {"ok": True, "data": mail_inbox_row_view(row, route=scopes.get(row.get("route_id")), with_body=True)}
 
     @app.post(f"{API_PREFIX}/mail/inbox/{{inbox_id}}/reparse")
     async def mail_reparse(request: Request, inbox_id: int):
@@ -1902,12 +2004,19 @@ def create_api(agent) -> FastAPI:
     async def mail_outbox(request: Request, status: Optional[str] = None, kind: Optional[str] = None,
                           since: Optional[str] = None, until: Optional[str] = None,
                           limit: int = Query(100, ge=1, le=500), cursor: Optional[str] = None):
-        """#61,级别 R。**C-42 统一分页**:排序 = ``created_ms`` 降序,游标 G-16。"""
+        """#61,级别 R。**C-42 统一分页**:排序 = ``created_ms`` 降序,游标 G-16。
+
+        🔴 出参走 ``mail_outbox_row_view``(01 §2.7.8 发件队列列 + ISO 时间),库行的正文与投递内部列不下发;
+        ``next_cursor`` 同 #58,先按库行 ``created_ms`` 算好再转视图。
+        """
         _principal(request, "read")
         before, since_ms, until_ms = _page_window(cursor, since, until)
         rows = _mail_or_503().ms.outbox_list_page(status=status, kind=kind, since_ms=since_ms, until_ms=until_ms,
                                                   limit=limit, before=before)
-        return {"ok": True, "data": rows, "next_cursor": _next_cursor(rows, limit, ts_key="created_ms")}
+        nxt = _next_cursor(rows, limit, ts_key="created_ms")
+        scopes = _mail_route_scopes()
+        return {"ok": True, "data": [mail_outbox_row_view(r, route=scopes.get(r.get("route_id"))) for r in rows],
+                "next_cursor": nxt}
 
     @app.post(f"{API_PREFIX}/mail/outbox/{{outbox_id}}/resend")
     async def mail_resend(request: Request, outbox_id: int):
@@ -1949,8 +2058,8 @@ def create_api(agent) -> FastAPI:
         return {"ok": True, "data": _mail_or_503().ms.cleanup_log_list(limit=limit)}
 
     @app.get(f"{API_PREFIX}/mail/hmac-keys")
-    async def mail_hmac_keys_list(request: Request, limit: int = Query(100, ge=1, le=500)):
-        """**HMAC 发件人短名表(只读)**,级别 A。
+    async def mail_hmac_keys_list(request: Request):
+        """**HMAC 发件人短名表(只读)**,级别 A。**全量返回,不分页**。
 
         🔴 **本端点是短名表的唯一来源**:02 #88 的 `mail` 组逐字写着「`senders[].shortname` **不随本组下发**
         (它属 `[mail.inbound.hmac]`,从 `GET /mail/hmac-keys` 侧取)——两处都下发会让前端拿到两份可能不一致的短名表」
@@ -1958,13 +2067,21 @@ def create_api(agent) -> FastAPI:
         它就成了 `405`,P-SET 的短名表因此恒空。本端点按 (ac) 那句 + 06 §2.3.4/§3.2 的字段补上,**待文档方补登编号**。
 
         🔴 **绝不回密钥值**:只回 `secret_ref`(`vault://mail/hmac/cmd/<短名>`),明文只在 #67 那一次下发。
+
+        🔴 **不分页(不接受 `limit`,也不回 `next_cursor`)**,理由三条(独立联调 P-5,待文档方随编号一并登记):
+        ① C-42「分页/时间参数全端点统一」是对 **§3.4 端点表里的端点**说的,而本端点**至今没有编号**、不在那张表里;
+        ② C-42 的游标 G-16 = ``base64url(JSON{"ts_ms", "id"})``,要一个**时间排序列 + 行主键**;短名表存在
+           ``settings`` 的 ``mail.hmac.<短名>`` 键值对里,既没有稳定的排序时间列也没有行主键,游标无从构造;
+        ③ 短名表 = ``[mail.inbound.hmac]`` 的发件人白名单,一个发件人一把钥(#67),规模天然很小。
+        此前「收 `limit` 却不回 `next_cursor`」是最坏的一种:**超出 `limit` 的短名被静默丢掉**,P-SET 的白名单看着
+        是全的、实际少几行,而少一行就等于那位发件人的指令邮件全被 ``SENDER_DENIED``。
         """
         _principal(request, "admin")
         try:
             routes = _mail_or_503().ms.routes_list()
         except ApiError:
             routes = []                       # 邮件服务没装配也要能列短名表(短名存在 `settings`,不依赖 mail 服务)
-        rows = agent.store.settings_list_prefix(MAIL_HMAC_PREFIX)[:limit]
+        rows = agent.store.settings_list_prefix(MAIL_HMAC_PREFIX)
         out = []
         for r in rows:
             short = r["key"][len(MAIL_HMAC_PREFIX):]

@@ -110,6 +110,61 @@ def stored_result_view(row: dict[str, Any]) -> Optional[dict[str, Any]]:
     return out
 
 
+# ---------------------------------------------------------------- 邮件出参视图(02 #58/#59/#61)
+#: 收件行的时间列 → 出参键(00 §6 表逐字:「时间(API/事件/**邮件**)= ISO 8601 带时区偏移」;
+#: R6-62 (f):`*_ms` 的例外**只有** Account 的 `error_since_ms`/`deleted_ms`,「新增时间键一律 ISO + `*_at`」)。
+INBOX_TIME_COLS = {"date_ms": "date_at", "received_ms": "received_at", "confirm_expires_ms": "confirm_expires_at",
+                   "archived_ms": "archived_at", "deleted_ms": "deleted_at"}
+#: 列表不下发的列:02 #58 逐字「``mail_inbox`` 行(**不含 `body_text`**,详情才给)」——正文只在 #59 给。
+INBOX_BODY_COLS = ("body_text",)
+
+
+def mail_inbox_row_view(row: dict[str, Any], *, route: Optional[str] = None, with_body: bool = False) -> dict[str, Any]:
+    """#58 列表行 / #59 详情(``with_body=True``)的出参视图。
+
+    口径 = 02 #58 逐字的「``mail_inbox`` 行」**减去 `body_text`**(列表),另做三件事:
+    ① 时间列 `*_ms` → ISO 8601 `*_at`(00 §6);② `id`/`first_inbox_id` 转字符串(01 消费侧 `MailInboxRow.id: string`);
+    ③ 补两个派生键 —— `route`(= 该行 `route_id` 落在哪个 scope,01 §2.7.8 收件时间线的「route 列」)与
+    `archived`(01 同句的「是否已归档」;由 `archived_path`/`archived_ms` 判)。`sig_ok` 由 0/1 转布尔。
+    """
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        if k in INBOX_TIME_COLS:
+            out[INBOX_TIME_COLS[k]] = _iso(v)
+        elif k in INBOX_BODY_COLS:
+            continue
+        else:
+            out[k] = v
+    out["id"] = str(row["id"])
+    out["first_inbox_id"] = None if row.get("first_inbox_id") is None else str(row["first_inbox_id"])
+    out["sig_ok"] = None if row.get("sig_ok") is None else bool(row["sig_ok"])
+    out["route"] = route
+    out["archived"] = row.get("archived_path") is not None or row.get("archived_ms") is not None
+    if with_body:
+        out["body_text"] = row.get("body_text")
+    return out
+
+
+def mail_outbox_row_view(row: dict[str, Any], *, route: Optional[str] = None) -> dict[str, Any]:
+    """#61 列表行的出参视图。
+
+    02 #61 只定了入参,**行的键集出处 = 01 §2.7.8 发件队列逐字**「``kind/to/subject/status/attempts/next_attempt_at/
+    last_error/ref``」,另加 `id`、`route_id`/`route`、分页排序列 `created_at` 与 `sent_at`。
+    正文(`body_text`/`body_html`)与投递内部列(`dedup_key`/`smtp_response`/`rfc_message_id`/`template_*`)不进列表。
+    `ref` = 该封邮件关联的对象引用:优先 `ref_trace_id`,其次 `ref_message_id`,再次 `ref_inbox_id`。
+    `next_attempt_ms` 为 0(DDL 默认值 = 「没有下次」)时回 ``null``,不回 1970 年。
+    """
+    ref = row.get("ref_trace_id") or row.get("ref_message_id")
+    if not ref and row.get("ref_inbox_id") is not None:
+        ref = str(row["ref_inbox_id"])
+    nxt = row.get("next_attempt_ms")
+    return {"id": str(row["id"]), "kind": row["kind"], "route_id": row.get("route_id"), "route": route,
+            "to": row.get("to_addrs") or "", "subject": row.get("subject"), "status": row["status"],
+            "attempts": row.get("attempts", 0), "next_attempt_at": _iso(nxt) if nxt else None,
+            "last_error": row.get("last_error"), "ref": ref,
+            "created_at": _iso(row.get("created_ms")), "sent_at": _iso(row.get("sent_ms"))}
+
+
 def encode_cursor(ts_ms: int, id: str) -> str:
     """02 §3.4 通用 G-16:``cursor = base64url(JSON{"ts_ms":…,"id":…})``(R6-53:R6-52 曾写 "ts_ms:id",按 G-16 改回)。"""
     raw = json.dumps({"ts_ms": int(ts_ms), "id": id}, separators=(",", ":")).encode()

@@ -44,6 +44,20 @@ class SchemaTooNew(Exception):
     """库 ``schema_version`` 高于本版代码支持上限(02 §3.8:拒绝启动指向备份;降级不支持)。"""
 
 
+class SeqExhausted(Exception):
+    """某通道的账号序号 ``NN`` 用尽(00 §6:``NN=01–98``、**分配后永不复用**;99 留给安装自检,C-07)。
+
+    这是**可预见的业务边界**,不是内部故障:一个通道累计建满 98 个号之后必然再也建不出来。
+    因此不能让它以裸 ``ValueError`` 冒到 FastAPI 顶上变成 ``500 text/plain``(00 §10 的信封拿不到、
+    ``INTERNAL`` 还会让调用方自动重试),由 API 层转 00 §8.3/§10 的 ``409 RESOURCE_EXHAUSTED``。
+    """
+
+    def __init__(self, channel: str, max_seq: int):
+        super().__init__(f"{channel} 序号已用尽(seq>{max_seq})")
+        self.channel = channel
+        self.max_seq = max_seq
+
+
 def migration_scripts() -> list[tuple[int, str, str]]:
     """``migrations/NNNN_name.sql`` 升序 ``[(version, name, path)]``(02 §3.3);基线及以下的编号不算迁移。"""
     out: list[tuple[int, str, str]] = []
@@ -318,7 +332,7 @@ class Store:
         cur = int(json.loads(r[0])) if r else 0
         nxt = cur + 1
         if nxt > 98:                                    # 99 保留给安装自检(C-07),seq ∈ 1..98
-            raise ValueError(f"{channel} 序号已用尽(seq>98)")
+            raise SeqExhausted(channel, 98)
         c.execute("INSERT INTO settings(key, value_json, updated_ms, updated_by) VALUES (?,?,?,'system:store') "
                   "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
                   (f"seq.{channel}", json.dumps(nxt), now))
