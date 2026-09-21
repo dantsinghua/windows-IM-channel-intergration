@@ -230,11 +230,12 @@ def make_cfg(**kw):
 
 
 class Rig:
-    def __init__(self, *, tmp_path, clock, cfg=None, caps=None, disk="ok"):
+    def __init__(self, *, tmp_path, clock, cfg=None, caps=None, disk="ok", store=None):
         self.clock = clock
         self.cfg = cfg or make_cfg()
         self.cfg.cleanup.archive_dir = str(tmp_path / "archive")
-        self.store = Store(":memory:", clock=clock).open()
+        # store 给了 = 与 HTTP 夹具(`mail_api`)共用同一个 agent.db,端点读到的就是本 rig 写下的行
+        self.store = store if store is not None else Store(":memory:", clock=clock).open()
         self.store.ensure_account("qd01", "qidian", state="running", self_uid="3007373675")
         self.store.ensure_account("qq03", "qq", state="running", login_mode="qrcode", self_uid="415011447")
         self.imap, self.pop3, self.smtp = FakeImap(), FakePop3(), FakeSmtp()
@@ -310,6 +311,105 @@ def pop_rig(tmp_path, clock):
     r = Rig(tmp_path=tmp_path, clock=clock, cfg=cfg)
     yield r
     r.store.close()
+
+
+# ────────────────────────────────────────────────────────────── HTTP 夹具(端点出参断言用)
+#
+# 端点出参只能在 HTTP 层断:规格(02 §3.4)定的是 `GET /api/v1/mail/...` 的响应,不是服务对象某个方法的返回值。
+# 装配 = 一个真 AgentApp(鉴权、信封、trace_id 注入全走真链路)+ 本文件的 MailService(假 IMAP/POP3/SMTP),
+# 两者共用 agent.db,端点读到的就是 rig 写下的行。
+
+API_P = "/api/v1"                               # 00 §10 前缀(不叫 P:本文件 P 已是 mail.parser)
+TOK_A = "tok-mail-console-admin"                # 级别 A(#68b 需 A;R 级端点 A 也能调,02 §3.4「高包含低」)
+# 00 §6「时间(API/事件/邮件)= ISO 8601 带时区偏移」,样例 `2026-09-18T10:03:00+08:00`;
+# 规格只写死「带偏移」,不写死小数秒 ⇒ 小数秒可有可无,偏移必须是 ±HH:MM。
+ISO_OFFSET_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{2}$")
+
+
+def assert_iso_or_none(v, what):
+    """00 §6:API 时间 = ISO 8601 带偏移的**字符串**;02 各端点写 `|null` 的允许 `null`。"""
+    assert v is None or (isinstance(v, str) and ISO_OFFSET_RE.match(v)), f"{what} 应为 ISO 8601 带偏移或 null,实得 {v!r}"
+
+
+def assert_iso(v, what):
+    assert isinstance(v, str) and ISO_OFFSET_RE.match(v), f"{what} 应为 ISO 8601 带偏移的字符串,实得 {v!r}"
+
+
+class MailApi:
+    def __init__(self, tmp_path, clock, *, cfg=None):
+        from qtrade_agent.app import AgentApp
+        from qtrade_agent.config import AgentConfig, ApiConfig
+        data_dir = tmp_path / "agent-data"
+        data_dir.mkdir(exist_ok=True)
+        self.agent = AgentApp(AgentConfig(api=ApiConfig()), db_path=str(tmp_path / "agent.db"), clock=clock,
+                              data_dir=str(data_dir)).open()
+        self.agent.store.upsert_api_client(app_id="console", name="控制台", level="admin", token=TOK_A)
+        self.rig = Rig(tmp_path=tmp_path, clock=clock, cfg=cfg, store=self.agent.store)
+        self.agent.mail = self.rig.svc              # 端点经 agent.mail 取服务(未装配时 503,02 §3.4 状态映射)
+        self.api = self.agent.create_api()
+
+    def get(self, client, path, **params):
+        return client.get(f"{API_P}{path}", params=params, headers={"Authorization": f"Bearer {TOK_A}"})
+
+
+@pytest.fixture
+def mail_api(tmp_path, clock):
+    """产出 `(MailApi, TestClient)`;用例需要特殊 `[mail]` 配置时自己 `MailApi(tmp_path, clock, cfg=…)` + `MailClient(…)`。"""
+    m = MailApi(tmp_path, clock)
+    with MailClient(m) as c:
+        yield m, c
+
+
+class MailClient:
+    def __init__(self, m):
+        from starlette.testclient import TestClient
+        self.m = m
+        self.tc = TestClient(m.api, client=("127.0.0.1", 40000))
+
+    def __enter__(self):
+        return self.tc.__enter__()
+
+    def __exit__(self, *exc):
+        try:
+            try:
+                self.tc.portal.call(self.m.agent.bus.close)
+            except Exception:
+                pass
+            return self.tc.__exit__(*exc)
+        finally:
+            self.m.agent.store.close()
+
+
+def status_payload(body):
+    """取 #56 的载荷,**不在这里判信封**(信封只在 M201e 一条里判,一条用例一个行为:信封红不遮住键名红)。
+
+    02 §3.4 通用 R6-55 定的是顶层平铺;若实现包了 `data`,这里照样取出来让键名/类型断言各自生效。"""
+    assert body.get("ok") is True, body
+    inner = body.get("data")
+    return inner if isinstance(inner, dict) else body
+
+
+def status_routes(body):
+    """02 #56:**不带 `route_id`** 返回 `routes:[{route_id, channel, account_id, …下同}]`(全部启用路由)。"""
+    routes = status_payload(body).get("routes")
+    assert isinstance(routes, list), f"02 #56:不带 route_id 应回 `routes:[…]`,实得 {body!r}"
+    return routes
+
+
+def status_single(client, m, route_id):
+    """02 #56:**带 `route_id`** 返回单条 `{enabled, route:{…}, inbound:{…}, outbound:{…}, cleanup:{…}}`。"""
+    resp = m.get(client, "/mail/status", route_id=route_id)
+    assert resp.status_code == 200, resp.text
+    return status_payload(resp.json())
+
+
+def first_route_id(client, m):
+    """路由 id 从 #56 列表形态本身取(`routes[].route_id`),不碰服务内部对象。"""
+    resp = m.get(client, "/mail/status")
+    assert resp.status_code == 200, resp.text
+    routes = status_routes(resp.json())
+    assert routes, "默认配置下应有一条启用的全局路由(02 §2.2.9 / 06 §2.15)"
+    return routes[0]["route_id"]
 
 
 # ══════════════════════════════════════════════════ 一、取信循环与 SIZE 门(06 §2.1 / §5 / §2.9.3)
@@ -537,17 +637,40 @@ def test_M21_no_fallback_host_only_alerts(tmp_path, clock):
     r.store.close()
 
 
-def test_M22_status_shows_configured_and_effective(tmp_path, clock):
-    """06 §2.1.1 /§2.7:`GET /mail/status` 的 `inbound.configured_protocol="imap"`、
-    `effective_protocol="pop3"`、`fallback_since`——两者不等即回落中。"""
-    r = Rig(tmp_path=tmp_path, clock=clock, cfg=_fallback_cfg())
-    r.imap.raise_on_connect = MailConnectError("超时", kind="connect_timeout")
-    for _ in range(3):
-        r.svc.fetch_once()
-    st = r.svc.status()[0]["inbound"]
-    assert st["configured_protocol"] == "imap" and st["effective_protocol"] == "pop3"
-    assert st.get("fallback_since")
-    r.store.close()
+def test_M22_status_shows_protocol_configured_and_active(tmp_path, clock):
+    """回落中:`GET /mail/status?route_id=` 的 `inbound.protocol_configured="imap"`、`protocol_active="pop3"`、
+    `fallback={since_at, reason}`,`since_at` 为 ISO 8601 带偏移的字符串。
+
+    出处:02 §3.4.5 #56 响应列 `inbound:{protocol_configured, protocol_active, fallback:{since_at, reason}|null, …}`
+    与同行「E-1:`protocol_active≠protocol_configured` 即处于 IMAP→POP3 回落」;回落触发条件见 06 §2.1.1
+    (连续 `fallback.after_failures`=3 次 connect 类失败);时间类型见 00 §6「时间(API)= ISO 8601 带时区偏移」。
+    ⚠️ 键名以 02 为准(00 §4「端点全集以 02 §3.4/§3.6 为准」;总控 2026-09-21 裁决「#56 以 02 为准」)——
+    06 §2.1.1/§2.7/§3.2 与 §8b M5 行仍写 `configured_protocol/effective_protocol/fallback_since`,那是 06 未同步的旧写法,
+    本用例**不**断旧键名(旧版曾断它,等于给实现现状背书)。"""
+    m = MailApi(tmp_path, clock, cfg=_fallback_cfg())
+    with MailClient(m) as c:
+        m.rig.imap.raise_on_connect = MailConnectError("超时", kind="connect_timeout")
+        for _ in range(3):
+            m.rig.svc.fetch_once()
+        inb = status_single(c, m, first_route_id(c, m))["inbound"]
+        assert inb["protocol_configured"] == "imap"
+        assert inb["protocol_active"] == "pop3"
+        fb = inb["fallback"]
+        assert isinstance(fb, dict), f"回落中 `fallback` 应为对象 {{since_at, reason}},实得 {fb!r}"
+        assert {"since_at", "reason"} <= set(fb)
+        assert_iso(fb["since_at"], "inbound.fallback.since_at")
+
+
+def test_M22b_status_no_fallback_is_null(tmp_path, clock):
+    """未回落:`protocol_active == protocol_configured == "imap"`、`fallback` 为 `null`。
+
+    出处:02 §3.4.5 #56 `fallback:{since_at, reason}|null`;E-1「两者不等即回落」⇒ 相等时不在回落、无回落对象。"""
+    m = MailApi(tmp_path, clock, cfg=_fallback_cfg())
+    with MailClient(m) as c:
+        m.rig.ingest_imap(build_command_mail(clock=m.rig.clock, req_id="NF-1", nonce="nf1"))
+        inb = status_single(c, m, first_route_id(c, m))["inbound"]
+        assert inb["protocol_configured"] == "imap" and inb["protocol_active"] == "imap"
+        assert inb["fallback"] is None
 
 
 def test_M23_recheck_switches_back_and_resolves(tmp_path, clock):
@@ -1101,6 +1224,40 @@ def test_M88_remaining_ttl_computed_by_server(tmp_path, clock):
     clock.advance(300 * 1000)
     assert r.svc.confirms.list()[0]["remaining_ttl_s"] == 600
     r.store.close()
+
+
+def _danger_cfg():
+    cfg = make_cfg()
+    cfg.inbound.allow_ops = ["*", "account_stop", "messages_purge"]
+    return cfg
+
+
+def test_M87b_pending_confirms_http_eight_keys_iso_times(tmp_path, clock):
+    """HTTP 层 `GET /mail/pending-confirms`:每项恰 R6-7 八键;`created_at`/`expires_at` 为 ISO 8601 带偏移,
+    `expires_at - created_at` = `danger_confirm_ttl_s`(默认 900s);`remaining_ttl_s` 为整数。
+
+    出处:02 §3.4.5 #68b「出参逐字定死(R6-7)」`[{id, op, from_addr, account_id, args_digest, created_at, expires_at,
+    remaining_ttl_s}]`,`created_at = received_ms 序列化`、`expires_at = confirm_expires_ms 序列化`(= 受理时刻 +
+    `danger_confirm_ttl_s`×1000,默认 900s);序列化口径 = 00 §6「时间(API)ISO 8601 带时区偏移」。
+    信封:数组无法平铺 ⇒ 按 02 §3.4 通用 `{ok:true, data:[…]}` 取 `data`。
+    ⚠️ 规格空白:`id` 的类型(02 只写「= `mail_inbox.id`」,没像 #58 那样写「出字符串」)⇒ 不断类型;
+    是否分页、`next_cursor` 回不回,02 #68b 未写(R6-64 末「#68b 出参视图留下一批」)⇒ 不断。"""
+    m = MailApi(tmp_path, clock, cfg=_danger_cfg())
+    with MailClient(m) as c:
+        _accept_danger(m.rig)
+        resp = m.get(c, "/mail/pending-confirms")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("ok") is True and isinstance(body.get("data"), list), body
+        assert len(body["data"]) == 1
+        it = body["data"][0]
+        assert set(it) == {"id", "op", "from_addr", "account_id", "args_digest",
+                           "created_at", "expires_at", "remaining_ttl_s"}
+        assert_iso(it["created_at"], "created_at")
+        assert_iso(it["expires_at"], "expires_at")
+        delta = datetime.fromisoformat(it["expires_at"]) - datetime.fromisoformat(it["created_at"])
+        assert delta == timedelta(seconds=900)
+        assert isinstance(it["remaining_ttl_s"], int) and not isinstance(it["remaining_ttl_s"], bool)
 
 
 def test_M89_approve_from_email_is_403(tmp_path, clock):
@@ -2266,31 +2423,111 @@ def test_M200_cleanup_disabled_does_nothing(rig):
 # ══════════════════════════════════════════════════ 十四、状态、重新解析与告警码表(06 §2.7 / §3.2)
 
 
-def test_M201_status_shape(rig):
-    """06 §2.7 `GET /api/v1/mail/status?route=`:每条返回 `route/inbound/outbound/cleanup` 四段;
-    E-5:不带 `route` 返回**全部路由**的数组。"""
-    st = rig.svc.status()
-    assert isinstance(st, list) and len(st) == 1
-    assert set(st[0]) == {"route", "inbound", "outbound", "cleanup"}
-    assert st[0]["route"]["mailbox_key"] == MAILBOX
-    assert {"queued", "retrying", "dead", "rate_per_min", "template_profile"} <= set(st[0]["outbound"])
+def test_M201_status_all_routes_shape(mail_api):
+    """不带 `route_id`:顶层 `routes:[…]`,每条至少带 `route_id/channel/account_id` 与单条形态的
+    `inbound/outbound/cleanup`;默认配置只有全局路由 ⇒ 恰 1 条,`channel`/`account_id` 为 `null`。
+
+    出处:02 §3.4.5 #56「不带 `route_id` 返回 `routes:[{route_id, channel, account_id, …下同}]` 全部启用路由」;
+    信封按 02 §3.4 通用 R6-55(字面键集 ⇒ 顶层平铺);键集按 02 §3.4 通用「至少这些键」读(多出的键不判);
+    全局路由 = `channel IS NULL AND account_id IS NULL`(06 §3.1 R6-58 (cf) 引 02 §3.1 DDL)。
+    ⚠️ 旧版断的 `route.mailbox_key`、`outbound.template_profile` 出自 06 §2.7 示例,02 #56 没有 ⇒ 不断。
+    ⚠️ 规格空白:「…下同」是否也含 `route:{…}` 子对象、`enabled` 是逐路由还是 `[mail] enabled` 全局一份
+    (列表只含「启用路由」,逐路由 `enabled` 恒真,更像全局)未写死 ⇒ 列表元素里这两个都不断。"""
+    m, c = mail_api
+    resp = m.get(c, "/mail/status")
+    assert resp.status_code == 200, resp.text
+    routes = status_routes(resp.json())
+    assert len(routes) == 1
+    r0 = routes[0]
+    assert {"route_id", "channel", "account_id", "inbound", "outbound", "cleanup"} <= set(r0)
+    assert r0["channel"] is None and r0["account_id"] is None
 
 
-def test_M202_status_single_route(rig):
-    """06 §2.7 / §3.2:带 `route=<id>` 返回一条。"""
-    rid = rig.svc.routes.lookup(None).id
-    assert len(rig.svc.status(rid)) == 1
-    assert rig.svc.status(999999) == []
+def test_M201e_status_envelope_is_flat(mail_api):
+    """信封:#56 两种形态都**顶层平铺 + `ok`**,不包 `data` —— 不带 `route_id` 顶层有 `routes`,带则顶层有
+    `enabled/route/inbound/outbound/cleanup`。
+
+    出处:02 §3.4 通用「单对象端点的信封(R6-55)」:「响应列直接给出字面键集的端点 **顶层平铺 + `ok`**,不再包 `data`」;
+    #56 响应列直接给出字面键集(`routes:[{…}]` / `{enabled, route:{…}, inbound:{…}, outbound:{…}, cleanup:{…}}`),
+    不是 00 §7 对象名、也不是 C-42 分页列表。
+    ⚠️ 本条是验收方对 R6-55 的逐字判读;#56 行本身没单独写信封,若总控另裁(如定为包 `data`),只改本条。"""
+    m, c = mail_api
+    whole = m.get(c, "/mail/status").json()
+    assert whole.get("ok") is True and isinstance(whole.get("routes"), list), whole
+    rid = status_routes(whole)[0]["route_id"]
+    one = m.get(c, "/mail/status", route_id=rid).json()
+    assert one.get("ok") is True and {"enabled", "route", "inbound", "outbound", "cleanup"} <= set(one), one
 
 
-def test_M203_inbound_folders_watermark_in_status(rig):
-    """06 §2.7:`inbound.folders[{name, uidvalidity, last_uid}]` + `last_success_at`
-    (02 #46 的 `watermark/backlog` 并进 `inbound.folders[]`)。"""
-    rig.ingest_imap(build_command_mail(clock=rig.clock, req_id="ST-1", nonce="st1"))
-    inb = rig.svc.status()[0]["inbound"]
-    names = {f["name"] for f in inb["folders"]}
-    assert {"INBOX", "Junk"} <= names
-    assert inb["last_success_at"] is not None
+def test_M202_status_single_route_shape(mail_api):
+    """带 `route_id`:单条 `{enabled, route:{id, channel, account_id, outbound_template_id, inbound_template_id},
+    inbound, outbound, cleanup}`,`route.id` 即所查的那条。
+
+    出处:02 §3.4.5 #56「带则单条」及其响应列;信封 R6-55 顶层平铺。
+    ⚠️ 规格空白:`route_id` 不存在时回什么(404?空?)02 #56 未写 ⇒ 不断(旧版断「空列表」是实现现状)。"""
+    m, c = mail_api
+    rid = first_route_id(c, m)
+    body = status_single(c, m, rid)
+    assert {"enabled", "route", "inbound", "outbound", "cleanup"} <= set(body)
+    assert {"id", "channel", "account_id", "outbound_template_id", "inbound_template_id"} <= set(body["route"])
+    assert str(body["route"]["id"]) == str(rid)
+
+
+def test_M203_status_inbound_keys_and_folders(mail_api):
+    """`inbound` 至少含 `protocol_configured/protocol_active/fallback/folders/last_success_at/last_error/
+    idle_supported/consecutive_failures/quota`;`folders[]` 每项 `{name, uidvalidity, last_uid}` 且含 INBOX 与 Junk;
+    `quota` = `{used_mb, limit_mb, source}`;成功收过一轮后 `last_success_at` 为 ISO 8601 带偏移。
+
+    出处:02 §3.4.5 #56 `inbound:{…}` 响应列逐键;INBOX+Junk 两个文件夹见 06 §2.1(IMAP 扫垃圾箱,本文件 M06);
+    时间类型 00 §6。`quota` 在 02 里没写 `|null` ⇒ 按对象断键,值不断(规格没定类型)。"""
+    m, c = mail_api
+    m.rig.ingest_imap(build_command_mail(clock=m.rig.clock, req_id="ST-1", nonce="st1"))
+    inb = status_single(c, m, first_route_id(c, m))["inbound"]
+    assert {"protocol_configured", "protocol_active", "fallback", "folders", "last_success_at", "last_error",
+            "idle_supported", "consecutive_failures", "quota"} <= set(inb)
+    for f in inb["folders"]:
+        assert {"name", "uidvalidity", "last_uid"} <= set(f)
+    assert {"INBOX", "Junk"} <= {f["name"] for f in inb["folders"]}
+    assert isinstance(inb["quota"], dict) and {"used_mb", "limit_mb", "source"} <= set(inb["quota"])
+    assert_iso(inb["last_success_at"], "inbound.last_success_at")
+
+
+def test_M203b_status_outbound_keys_and_last_sent_at(mail_api):
+    """`outbound` 至少含 `queued/retrying/dead/last_sent_at/consecutive_failures/rate_per_min`;
+    发出一封后 `last_sent_at` 为 ISO 8601 带偏移。
+
+    出处:02 §3.4.5 #56 `outbound:{…}` 响应列;时间类型 00 §6。回执由 `OP_DENIED` 触发(06 §2.2 第 3 闸,本文件 M32)。"""
+    m, c = mail_api
+    m.rig.ingest_imap(build_command_mail(clock=m.rig.clock, op="account_stop", req_id="SO-1", nonce="so1"))
+    m.rig.svc.send_once()
+    assert m.rig.outbox()[0]["status"] == "SENT"
+    out = status_single(c, m, first_route_id(c, m))["outbound"]
+    assert {"queued", "retrying", "dead", "last_sent_at", "consecutive_failures", "rate_per_min"} <= set(out)
+    assert_iso(out["last_sent_at"], "outbound.last_sent_at")
+
+
+def test_M203c_status_cleanup_keys_and_time_types(mail_api):
+    """`cleanup` 至少含 `last_run_at/last_status/archived_mb/next_run_at`;两个时间键为 ISO 8601 带偏移或 `null`。
+
+    出处:02 §3.4.5 #56 `cleanup:{last_run_at, last_status, archived_mb, next_run_at}`(「清理状态并入此处,
+    不单设 `GET /mail/cleanup`」);时间类型 00 §6。未跑过清理时是否为 `null` 规格未写 ⇒ 只断「ISO 或 null」。"""
+    m, c = mail_api
+    cl = status_single(c, m, first_route_id(c, m))["cleanup"]
+    assert {"last_run_at", "last_status", "archived_mb", "next_run_at"} <= set(cl)
+    assert_iso_or_none(cl["last_run_at"], "cleanup.last_run_at")
+    assert_iso_or_none(cl["next_run_at"], "cleanup.next_run_at")
+
+
+def test_M203d_status_cleanup_last_run_at_after_a_round(mail_api):
+    """跑过一轮清理后 `cleanup.last_run_at` 为 ISO 8601 带偏移的字符串(不是毫秒整数)。
+
+    出处:02 §3.4.5 #56 `cleanup.last_run_at`;00 §6。清理一轮见 06 §2.6(本文件 M186 同一驱动方式)。"""
+    m, c = mail_api
+    _terminal_rows(m.rig, n=1)
+    m.rig.cfg.cleanup.retention_days = 0
+    m.rig.svc.cleaners[MAILBOX].run(m.rig.imap, "imap")
+    cl = status_single(c, m, first_route_id(c, m))["cleanup"]
+    assert_iso(cl["last_run_at"], "cleanup.last_run_at")
 
 
 def test_M204_inbound_stalled_threshold(rig):
@@ -2574,3 +2811,157 @@ def test_M233_from_toml_dict_uses_defaults():
                                      "inbound": {"host": "imap.163.com", "user": "ops@163.com"}})
     assert cfg.enabled is True and cfg.inbound.host == "imap.163.com"
     assert cfg.inbound.protocol == "imap" and cfg.cleanup.retention_days == 7
+
+
+# ══════════════════════════════════════════════════ 十六、收发件与清理日志端点出参(02 §3.4.5 #58/#59/#61/#65,R6-64 ①)
+#
+# 只断 02 行里写死的东西:#58/#59/#61 的出参由 R6-64 ① 登记进 02(时间 ISO 的 `*_at`、库列 `*_ms` 不下发、
+# `id` 字符串、列表不带正文、#61 显式 13 键与排除列);#65 只有「分页」二字 ⇒ 只断 C-42 通用分页信封与 00 §6 时间口径。
+
+INBOX_TIME_KEYS = ("date_at", "received_at", "confirm_expires_at", "archived_at", "deleted_at")
+INBOX_TIME_COLS = ("date_ms", "received_ms", "confirm_expires_ms", "archived_ms", "deleted_ms")
+OUTBOX_KEYS = {"id", "kind", "route_id", "route", "to", "subject", "status", "attempts", "next_attempt_at",
+               "last_error", "ref", "created_at", "sent_at"}
+OUTBOX_EXCLUDED = {"body_text", "body_html", "dedup_key", "smtp_response", "rfc_message_id", "cc_addrs", "attachments_json"}
+
+
+def _seed_inbox_and_receipt(r):
+    """一封 `OP_DENIED` 指令信 ⇒ `mail_inbox` 1 行 + 回执 `mail_outbox` 1 行(06 §2.2 第 3 闸,本文件 M32)。"""
+    r.ingest_imap(build_command_mail(clock=r.clock, op="account_stop", req_id="IO-1", nonce="io1"))
+    assert len(r.inbox()) == 1 and len(r.outbox(kind="receipt")) == 1
+
+
+def test_M240_inbox_list_envelope_and_no_body_text(mail_api):
+    """#58 `GET /mail/inbox`:`{ok, data:[行], next_cursor}`;行**不含 `body_text`**。
+
+    出处:02 §3.4.5 #58「`mail_inbox` 行(不含 `body_text`,详情才给)」+ 🔵 出参(R6-64 ①)`{ok, data:[行], next_cursor}`。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    resp = m.get(c, "/mail/inbox")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("ok") is True and isinstance(body.get("data"), list) and "next_cursor" in body, body
+    assert len(body["data"]) == 1
+    assert "body_text" not in body["data"][0]
+
+
+def test_M241_inbox_row_times_are_iso_at_keys(mail_api):
+    """#58 行:五个时间列换成 ISO 8601 的 `*_at`(`date_at/received_at/confirm_expires_at/archived_at/deleted_at`),
+    库列 `*_ms` **不下发**;`received_at` 必有值。
+
+    出处:02 §3.4.5 #58 🔵 出参 ①「五个时间列换成 ISO 8601 的 `*_at` …(库列 `*_ms` 不下发;基线 §6)」。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    row = m.get(c, "/mail/inbox").json()["data"][0]
+    for k in INBOX_TIME_KEYS:
+        assert k in row, f"#58 行缺 `{k}`"
+        assert_iso_or_none(row[k], k)
+    assert_iso(row["received_at"], "received_at")
+    for col in INBOX_TIME_COLS:
+        assert col not in row, f"#58:库列 `{col}` 不得下发"
+
+
+def test_M242_inbox_row_ids_strings_and_derived_keys(mail_api):
+    """#58 行:`id` 出**字符串**(`first_inbox_id` 非空时同);`sig_ok` 为布尔或 `null`;补派生键 `route`(全局路由 =
+    `"default"`)与 `archived`(布尔)。
+
+    出处:02 §3.4.5 #58 🔵 出参 ②③④:「`id` 与 `first_inbox_id` 出字符串」「`sig_ok` 出布尔(未验签 `null`)」
+    「`route` = scope 名(`default` / …;没绑路由为 `null`)」「`archived` = 已归档」。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    row = m.get(c, "/mail/inbox").json()["data"][0]
+    assert isinstance(row["id"], str)
+    assert row.get("first_inbox_id") is None or isinstance(row["first_inbox_id"], str)
+    assert row["sig_ok"] is None or isinstance(row["sig_ok"], bool)
+    assert row["route"] == "default"
+    assert isinstance(row["archived"], bool)
+
+
+def test_M243_inbox_detail_same_view_plus_body_text(mail_api):
+    """#59 `GET /mail/inbox/{id}`:`{ok, data:{…}}`,`data` = #58 同一视图 + `body_text`;不存在 ⇒ `404 TARGET_NOT_FOUND`。
+
+    出处:02 §3.4.5 #59 🔵 出参(R6-64 ①)「`data` 与 #58 的行同一个视图,只多一个 `body_text`」「不存在 ⇒ 404」;
+    错误码见 00 §10 / 02 §3.4 状态映射。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    listed = m.get(c, "/mail/inbox").json()["data"][0]
+    resp = m.get(c, f"/mail/inbox/{listed['id']}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("ok") is True and isinstance(body.get("data"), dict), body
+    detail = body["data"]
+    assert "body_text" in detail and detail["body_text"]
+    assert {k: v for k, v in detail.items() if k != "body_text"} == listed
+    miss = m.get(c, "/mail/inbox/99999999")
+    assert miss.status_code == 404 and miss.json()["code"] == "TARGET_NOT_FOUND"
+
+
+def test_M244_outbox_list_thirteen_keys_no_body(mail_api):
+    """#61 `GET /mail/outbox`:`{ok, data:[行], next_cursor}`;行含显式 13 键、`id` 字符串、`to` = 收件地址、
+    时间 ISO;**不带正文与投递内部列**。
+
+    出处:02 §3.4.5 #61 🔵 出参(R6-64 ①)「行 = 显式 13 键 …(时间一律 ISO 8601)」「列表不带正文(`body_text`/`body_html`)
+    与投递内部列(`dedup_key`/`smtp_response`/`rfc_message_id`/`template_*`/`cc_addrs`/`attachments_json` 等)」。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    m.rig.svc.send_once()
+    body = m.get(c, "/mail/outbox").json()
+    assert body.get("ok") is True and isinstance(body.get("data"), list) and "next_cursor" in body, body
+    row = body["data"][0]
+    assert OUTBOX_KEYS <= set(row)
+    assert not (OUTBOX_EXCLUDED & set(row)), OUTBOX_EXCLUDED & set(row)
+    assert not [k for k in row if k.startswith("template_")]
+    assert isinstance(row["id"], str)
+    assert SENDER in (row["to"] if isinstance(row["to"], str) else json.dumps(row["to"]))
+    assert_iso(row["created_at"], "created_at")
+    assert_iso(row["sent_at"], "sent_at")
+    assert row["route"] == "default"
+
+
+def test_M245_outbox_next_attempt_zero_is_null(mail_api):
+    """#61:库列 `next_attempt_ms` 为 `0`(DDL 缺省 = 没有下一次)时 `next_attempt_at` 回 **`null`**,不回 1970 年那个时刻。
+
+    出处:02 §3.4.5 #61 🔵 出参「`next_attempt_at`:库列 `next_attempt_ms` 为 `0` … 时回 `null`」。
+    夹具把该列直接置成 DDL 缺省值 0(02 §3.1),不依赖实现何时写 0。"""
+    m, c = mail_api
+    _seed_inbox_and_receipt(m.rig)
+    m.rig.store.con.execute("update mail_outbox set next_attempt_ms=0")
+    row = m.get(c, "/mail/outbox").json()["data"][0]
+    assert row["next_attempt_at"] is None
+
+
+def test_M246_cleanup_log_is_paginated_with_next_cursor(mail_api):
+    """#65 `GET /mail/cleanup/log`:「分页」⇒ C-42 通用信封 `{ok:true, data:[…], next_cursor}`;两轮日志、`limit=1`
+    ⇒ 第一页满页、`next_cursor` 非空,透传后拿到的是另一行。
+
+    出处:02 §3.4.5 #65「分页」+ 02 §3.4 通用 C-42(`?since&until&limit&cursor`,响应 `{ok:true, data:[…], next_cursor}`,
+    cursor 客户端只透传)。⚠️ 行键集规格空白(R6-64 末「#65 出参视图留下一批」)⇒ 行内只断 00 §6 时间口径(见 M247)。"""
+    m, c = mail_api
+    _terminal_rows(m.rig, n=2)
+    m.rig.cfg.cleanup.retention_days = 0
+    m.rig.svc.cleaners[MAILBOX].run(m.rig.imap, "imap")
+    m.rig.clock.advance(1000)
+    m.rig.svc.cleaners[MAILBOX].run(m.rig.imap, "imap")
+    assert len(m.rig.cleanup_logs()) >= 2
+    p1 = m.get(c, "/mail/cleanup/log", limit=1)
+    assert p1.status_code == 200, p1.text
+    b1 = p1.json()
+    assert b1.get("ok") is True and isinstance(b1.get("data"), list) and len(b1["data"]) == 1, b1
+    assert b1.get("next_cursor"), "满页必须给 next_cursor(C-42)"
+    b2 = m.get(c, "/mail/cleanup/log", limit=1, cursor=b1["next_cursor"]).json()
+    assert len(b2["data"]) == 1 and b2["data"][0] != b1["data"][0]
+
+
+def test_M247_cleanup_log_rows_have_no_ms_time_keys(mail_api):
+    """#65 行:不下发存储口径的 `*_ms` 时间键(API 时间一律 ISO 8601 带偏移)。
+
+    出处:00 §6「时间(存储)= INTEGER 毫秒、列名后缀 `_ms`」vs「时间(API/事件/邮件)= ISO 8601 带时区偏移」;
+    `*_ms` 沿用毫秒的只有 00 §7.1 R6-62 (f) 登记的两个 Account 例外键,#65 不在其列。行的具体键名规格空白,不断。"""
+    m, c = mail_api
+    _terminal_rows(m.rig, n=1)
+    m.rig.cfg.cleanup.retention_days = 0
+    m.rig.svc.cleaners[MAILBOX].run(m.rig.imap, "imap")
+    rows = m.get(c, "/mail/cleanup/log").json()["data"]
+    assert rows
+    leaked = [k for k in rows[0] if k.endswith("_ms")]
+    assert not leaked, f"#65 行下发了存储口径的毫秒时间键 {leaked}"

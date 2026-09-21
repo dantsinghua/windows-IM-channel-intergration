@@ -996,7 +996,10 @@ def test_S01_sessions_global_list_and_filters(rig, client):
 
 def test_L01_api_calls_are_audited(rig, client):
     """02 §2.2.1:api 把每次调用记 `audit_log`;§3.1 audit_log:`kind='api'`、`actor = token:console | app:xxx`、`action = 'METHOD path'`;
-    #95 `GET /audit?kind=api`(A 级可看全部 actor)。"""
+    #95 `GET /audit?kind=api`(A 级可看全部 actor)。
+    行键:#95 JSON 行键集 02 没写死,唯一逐字给出的列名是 R6-58 (ag) CSV 十列;取其中非时间的五列断言。
+    ⚠️ 旧版还断了 `ts_ms`:那是库列/CSV 列名,JSON 出参按 00 §6「时间(API)= ISO 8601 带偏移」不该下发毫秒键
+    (R6-62 (f) 只给 Account 的两个键开了例外)⇒ 删去;JSON 里时间键叫什么规格空白,不断。"""
     assert client.get(f"{P}/accounts", headers=H(TOK_W)).status_code == 200
     assert client.get(f"{P}/accounts/{QD}", headers=H(TOK_ADMIN)).status_code == 200
     r = client.get(f"{P}/audit", params={"kind": "api"}, headers=H(TOK_ADMIN))
@@ -1004,7 +1007,7 @@ def test_L01_api_calls_are_audited(rig, client):
     data = r.json()["data"]
     assert data and all(row["kind"] == "api" for row in data)
     for row in data:
-        assert {"ts_ms", "kind", "transport", "actor", "action", "result_code"} <= set(row)
+        assert {"kind", "transport", "actor", "action", "result_code"} <= set(row)
     assert any(row["action"] == f"GET {P}/accounts" and row["actor"] == "app:bot_w" for row in data), data
     assert any(row["action"] == f"GET {P}/accounts/{QD}" and row["actor"] == "token:console" for row in data), data
 
