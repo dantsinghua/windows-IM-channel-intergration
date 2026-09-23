@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import os
+import socket
 import sys
 import time
 from typing import Any, Optional
@@ -164,19 +165,19 @@ async def periodic(d: SvcDeps) -> None:
     while True:
         now = int(time.time() * 1000)
         try:
-            d.monitor.sample_fast()
-            d.monitor.check_session_locked()
-            listen = d.netprobe.desired_listen()
+            await asyncio.to_thread(d.monitor.sample_fast)
+            await asyncio.to_thread(d.monitor.check_session_locked)
+            listen = await asyncio.to_thread(d.netprobe.desired_listen)
             if set(listen) != set(d.listen):
-                d.netprobe.reconcile_listen(actual=d.listen)           # H16 自愈:刷防火墙 + 推 WSL_SUBNET_CHANGED
+                await asyncio.to_thread(d.netprobe.reconcile_listen, actual=d.listen)
                 d.listen = listen
             if now >= next_slow:
-                d.monitor.sample_slow()
-                d.monitor.check_disks()
-                d.monitor.check_pending_reboot()
-                d.monitor.aggregate()
+                await asyncio.to_thread(d.monitor.sample_slow)
+                await asyncio.to_thread(d.monitor.check_disks)
+                await asyncio.to_thread(d.monitor.check_pending_reboot)
+                await asyncio.to_thread(d.monitor.aggregate)
                 await d.netprobe.refresh()
-                d.power.recheck()
+                await asyncio.to_thread(d.power.recheck)
                 next_slow = now + cfg.monitor.slow_interval_s * 1000
             if next_sweep == 0:
                 next_sweep = Db.next_sweep_ms(now)
@@ -227,10 +228,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         await boot()
 
     import uvicorn
-    host = d.netprobe.desired_listen()[0] if not args.dev else "127.0.0.1"
+    # 规格要求同时听 127.0.0.1 和 vEthernet (WSL)。uvicorn 单 host 只会绑 desired_listen()[0],
+    # WSL 里的 Agent 打到网关地址会连不上。这里把期望集合里的每个地址都绑上。
+    hosts = ("127.0.0.1",) if args.dev else d.netprobe.desired_listen()
+    sockets: list[socket.socket] = []
+    for host in hosts:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, cfg.api.port))
+        sock.setblocking(False)
+        sock.listen(2048)
+        sockets.append(sock)
     log.info("WinAgent 服务启动", extra={"op": "svc.start", "code": "OK",
-                                        "kv": {"listen": ",".join(d.listen), "port": cfg.api.port}})
-    uvicorn.run(app, host=host, port=cfg.api.port, ws="websockets", log_config=None)
+                                        "kv": {"listen": ",".join(hosts), "port": cfg.api.port}})
+    config = uvicorn.Config(app, ws="websockets", log_config=None)
+    uvicorn.Server(config).run(sockets=sockets)
     return 0
 
 

@@ -55,15 +55,81 @@ export function parseFrame(buf: ArrayBuffer): { ptsMs: number; nal: Uint8Array }
   return { ptsMs, nal: new Uint8Array(buf, 8) }
 }
 
-/** Annex-B 关键帧判定:找 NAL type 5(IDR)或 7(SPS) */
-export function isKeyFrame(nal: Uint8Array): boolean {
-  for (let i = 0; i + 4 < nal.length; i++) {
-    if (nal[i] === 0 && nal[i + 1] === 0 && nal[i + 2] === 1) {
-      const t = nal[i + 3] & 0x1f
-      if (t === 5 || t === 7) return true
+export interface AnnexNal {
+  /** NAL 头的低 5 位:7=SPS,8=PPS,5=IDR */
+  type: number
+  /** 不含起始码,含 NAL 头 */
+  bytes: Uint8Array
+}
+
+/** 拆 Annex-B。4 字节起始码 `00 00 00 01` 与 3 字节 `00 00 01` 都认。 */
+export function splitAnnexB(data: Uint8Array): AnnexNal[] {
+  const marks: { sc: number; payload: number }[] = []
+  for (let i = 0; i + 3 < data.length; i++) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+      marks.push({ sc: i, payload: i + 4 })
+      i += 3
+    } else if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+      marks.push({ sc: i, payload: i + 3 })
+      i += 2
     }
   }
-  return false
+  const out: AnnexNal[] = []
+  for (let n = 0; n < marks.length; n++) {
+    const end = n + 1 < marks.length ? marks[n + 1].sc : data.length
+    const bytes = data.subarray(marks[n].payload, end)
+    if (!bytes.length) continue
+    out.push({ type: bytes[0] & 0x1f, bytes })
+  }
+  return out
+}
+
+/** Annex-B 关键帧判定:找 NAL type 5(IDR)或 7(SPS) */
+export function isKeyFrame(nal: Uint8Array): boolean {
+  return splitAnnexB(nal).some((n) => n.type === 5 || n.type === 7)
+}
+
+/**
+ * WebCodecs 解 `avc1` 要的是 avcC 描述 + 4 字节长度前缀的 NAL,不是裸 Annex-B。
+ * 把 Annex-B 直接塞进 `EncodedVideoChunk` 时,解码器报错、画布保持空白。
+ */
+export function buildAvcC(sps: Uint8Array, pps: Uint8Array): { codec: string; description: Uint8Array } {
+  const hex = (b: number) => b.toString(16).toUpperCase().padStart(2, '0')
+  const codec = `avc1.${hex(sps[1] ?? 0)}${hex(sps[2] ?? 0)}${hex(sps[3] ?? 0)}`
+  const description = new Uint8Array(11 + sps.length + pps.length)
+  let o = 0
+  description[o++] = 1
+  description[o++] = sps[1] ?? 0x42
+  description[o++] = sps[2] ?? 0xe0
+  description[o++] = sps[3] ?? 0x1f
+  description[o++] = 0xff
+  description[o++] = 0xe1
+  description[o++] = (sps.length >> 8) & 0xff
+  description[o++] = sps.length & 0xff
+  description.set(sps, o)
+  o += sps.length
+  description[o++] = 1
+  description[o++] = (pps.length >> 8) & 0xff
+  description[o++] = pps.length & 0xff
+  description.set(pps, o)
+  return { codec, description }
+}
+
+/** 一条访问单元里的 NAL 串成 AVCC(每条前面 4 字节大端长度)。 */
+export function lengthPrefixed(nals: Uint8Array[]): Uint8Array {
+  let size = 0
+  for (const n of nals) size += 4 + n.length
+  const out = new Uint8Array(size)
+  let o = 0
+  for (const n of nals) {
+    out[o++] = (n.length >>> 24) & 0xff
+    out[o++] = (n.length >>> 16) & 0xff
+    out[o++] = (n.length >>> 8) & 0xff
+    out[o++] = n.length & 0xff
+    out.set(n, o)
+    o += n.length
+  }
+  return out
 }
 
 /**
@@ -124,6 +190,11 @@ export class ScreenStream {
   private fpsTimer: ReturnType<typeof setInterval> | null = null
   private decodeErrors = 0
   private header: StreamHeader | null = null
+  private sps: Uint8Array | null = null
+  private pps: Uint8Array | null = null
+  private configuring = false
+  private tsUs = 0
+  private triedSoftware = false
   /** 收到不可重试的关闭码(4401/4400/4409/4503)后置位:服务端的 `restart` 一律不再理会 */
   private fatalClosed = false
 
@@ -190,14 +261,45 @@ export class ScreenStream {
       this.header = obj as unknown as StreamHeader
       this.hooks.onHeader(this.header)
       this.hooks.onStats({ codec: this.header.codec })
-      void this.configureDecoder(this.header)
     }
   }
 
-  private async configureDecoder(h: StreamHeader): Promise<void> {
+  /**
+   * 等到带 SPS/PPS 的关键帧再 `configure`。
+   * `description` 是 avcC;之后每帧用长度前缀,不用 Annex-B 起始码。
+   */
+  private async configureDecoder(accessUnit: Uint8Array, key: boolean): Promise<void> {
     const VD = (globalThis as { VideoDecoder?: typeof VideoDecoder }).VideoDecoder
-    if (!VD) { this.degrade('本机不支持 WebCodecs'); return }
+    if (!VD || !this.sps || !this.pps || !this.header) {
+      this.degrade('本机不支持 WebCodecs')
+      return
+    }
+    const { codec, description } = buildAvcC(this.sps, this.pps)
+    const hardwareAcceleration = this.path === 'software' ? 'prefer-software' : 'prefer-hardware'
+    const config = {
+      codec,
+      description,
+      codedWidth: this.header.width,
+      codedHeight: this.header.height,
+      optimizeForLatency: true,
+      hardwareAcceleration,
+    } as VideoDecoderConfig
     try {
+      if (typeof VD.isConfigSupported === 'function') {
+        const supported = await VD.isConfigSupported(config)
+        if (!supported.supported) {
+          if (hardwareAcceleration === 'prefer-hardware' && !this.triedSoftware) {
+            this.triedSoftware = true
+            this.path = 'software'
+            this.hooks.onStats({ decoder: 'software' })
+            await this.configureDecoder(accessUnit, key)
+            return
+          }
+          this.degrade('WebCodecs 解不了这路 H.264')
+          return
+        }
+      }
+      try { this.decoder?.close() } catch { /* 已关闭 */ }
       this.decoder = new VD({
         output: (frame) => {
           this.queue = Math.max(0, this.queue - 1)
@@ -206,34 +308,62 @@ export class ScreenStream {
         },
         error: () => {
           this.decodeErrors += 1
-          // 连续 3 次解码 error → 降档
+          if (this.path === 'hardware' && !this.triedSoftware) {
+            this.triedSoftware = true
+            this.path = 'software'
+            this.hooks.onStats({ decoder: 'software' })
+            try { this.decoder?.close() } catch { /* 已关闭 */ }
+            this.decoder = null
+            return
+          }
           if (this.decodeErrors >= 3) this.degrade('解码器连续出错')
         },
       })
-      this.decoder.configure({
-        codec: h.codec.startsWith('avc') ? h.codec : 'avc1.42E01E',
-        codedWidth: h.width,
-        codedHeight: h.height,
-        optimizeForLatency: true,
-      })
+      this.decoder.configure(config)
+      this.hooks.onStats({ codec, decoder: this.path })
+      this.decodeAccessUnit(accessUnit, key)
     } catch (e) {
       this.degrade(e instanceof Error ? e.message : '解码器初始化失败')
+    } finally {
+      this.configuring = false
     }
   }
 
   private handleBinary(buf: ArrayBuffer): void {
-    if (!this.decoder || this.decoder.state !== 'configured') return
     const { ptsMs, nal } = parseFrame(buf)
-    const key = isKeyFrame(nal)
-    // 队列 > 3 帧丢到最新关键帧:画面要「实时」不要「完整」
-    if (this.queue > MAX_QUEUE && !key) return
+    const parts = splitAnnexB(nal)
+    const vcl: Uint8Array[] = []
+    let key = false
+    for (const part of parts) {
+      if (part.type === 7) this.sps = part.bytes
+      else if (part.type === 8) this.pps = part.bytes
+      else if (part.type === 5) { key = true; vcl.push(part.bytes) }
+      else if (part.type === 1) vcl.push(part.bytes)
+    }
+    if (!vcl.length) return
+    const access = lengthPrefixed(key && this.sps && this.pps ? [this.sps, this.pps, ...vcl] : vcl)
     this.hooks.onStats({ latencyMs: Math.max(0, Date.now() - ptsMs) })
+    if (!this.decoder || this.decoder.state !== 'configured') {
+      if (key && this.sps && this.pps && !this.configuring) {
+        this.configuring = true
+        void this.configureDecoder(access, true)
+      }
+      return
+    }
+    if (this.queue > MAX_QUEUE && !key) return
+    this.decodeAccessUnit(access, key)
+  }
+
+  private decodeAccessUnit(data: Uint8Array, key: boolean): void {
+    if (!this.decoder || this.decoder.state !== 'configured') return
     try {
       this.decoder.decode(new EncodedVideoChunk({
         type: key ? 'key' : 'delta',
-        timestamp: ptsMs * 1000,
-        data: nal,
+        timestamp: this.tsUs,
+        duration: 100_000,
+        data,
       }))
+      this.tsUs += 100_000
       this.queue += 1
     } catch {
       this.decodeErrors += 1
@@ -249,9 +379,7 @@ export class ScreenStream {
       this.hooks.onStats({ decoder: 'software' })
       this.hooks.onFatal(`已降为软解(540p@5fps):${reason}`)
     } else if (this.path === 'software') {
-      this.path = 'static'
-      this.hooks.onStats({ decoder: 'static' })
-      this.hooks.onFatal(`已降为静态预览:${reason}`)
+      this.hooks.onFatal(`WebCodecs 解码失败:${reason}`)
     }
   }
 

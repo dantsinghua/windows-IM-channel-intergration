@@ -37,6 +37,7 @@ param(
     [switch] $WhatIfOnly
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 
 function Write-Head([string] $Text) {

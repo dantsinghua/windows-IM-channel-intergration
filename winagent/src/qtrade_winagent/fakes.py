@@ -336,6 +336,9 @@ class FakePipeConn:
         self.sent.append(frame)
         await self._out.put(frame)
 
+    def inbound_ready(self) -> bool:
+        return not self._in.empty()
+
     async def recv(self) -> Optional[PipeFrame]:
         return await self._in.get()
 

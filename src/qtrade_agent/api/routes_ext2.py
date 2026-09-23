@@ -47,7 +47,7 @@ STREAM_PROFILES = ("thumb", "focus", "focus15", "thumb10")
 #: #35 REST 注入的类型(02 #35 逐字)
 STREAM_INPUT_TYPES = ("tap", "swipe", "key", "text")
 #: #34 控制帧类型(02 #34 逐字)
-STREAM_CONTROL_TYPES = ("touch", "key", "scroll", "text", "pause", "resume", "profile", "pong")
+STREAM_CONTROL_TYPES = ("touch", "key", "scroll", "text", "pause", "resume", "profile", "pong", "rotate")
 #: 00 §8.1 R-06:`login_required` 下允许的**画面注入类**(不过 GATE,但逐条记 `audit_log.kind='stream_input'`)
 LOGIN_PHASE_STATES = ("login_required", "logging_in")
 #: #54 清理模式(02 #54 逐字)
@@ -412,6 +412,14 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         if row["channel"] == "qq":
             raise ApiError(409, "NOT_APPLICABLE", "QQ 通道不支持截图(§3.10 目录 channels.qq='not_applicable')",
                            reason="not_applicable")
+        # 企点适配器的 screenshot 仍是 UNSUPPORTED。真机画面流挂上之后,这里直接回 framebuffer,
+        # 给不支持 WebCodecs 的控制台当静态预览(像素仍是 redroid,不是占位图)。
+        grab = getattr(getattr(agent, "stream_backend", None), "capture_png", None)
+        if row["channel"] == "qidian" and grab is not None and not region:
+            raw_live = await grab(account_id)
+            if raw_live:
+                return Response(content=bytes(raw_live), media_type="image/png",
+                                headers={"Cache-Control": "no-store"})
         res = await _submit_op(request, p, account_id, "screenshot", args)
         if not res.ok:
             code = res.code

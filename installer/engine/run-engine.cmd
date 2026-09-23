@@ -1,27 +1,32 @@
 @echo off
 rem ===========================================================================
-rem  QTrade 安装器 —— SFX 链首(**自编存根 QTradeSD.sfx** 路径)
-rem  docs/03 §2.1
+rem  QTrade installer -- SFX chain entry (custom stub QTradeSD.sfx path)
+rem  docs/03 section 2.1
 rem
-rem  【和 precheck-disk.cmd 的关系】
-rem    两条路都保留,用哪条取决于出包时缝进去的是哪个存根:
-rem      * 官方 7zSD.sfx  -> precheck-disk.cmd:它要在 %TEMP% 里判空间、
-rem        再把载荷搬到 %ProgramData%\QTrade,因为官方存根解到临时目录且跑完即删;
-rem      * 自编 QTradeSD.sfx -> 本脚本:存根已经把载荷解到 %ProgramData%\QTrade
-rem        并留存了,解压前的空间判据也在存根里做完了(不足直接退 26,压根不会跑到这)。
-rem        所以这里只剩两件事:拉引擎、把退出码落盘。
+rem  Relation to precheck-disk.cmd:
+rem    Both paths stay; which one runs depends on which stub was sewn in:
+rem      * Official 7zSD.sfx  - use precheck-disk.cmd: it checks free space
+rem        under %TEMP%, then moves the payload to %ProgramData%\QTrade,
+rem        because the official stub extracts to a temp dir and deletes it.
+rem      * Custom QTradeSD.sfx - this script: the stub already extracted to
+rem        %ProgramData%\QTrade and kept it; pre-extract space check is done
+rem        in the stub (exit 26 on short disk, so we never reach here).
+rem        So this script only: launch engine, persist exit code to disk.
 rem
-rem  【退出码】自编存根会用 GetExitCodeProcess 把本脚本的退出码原样透传成 EXE 的
-rem    退出码,所以验收可以直接读 EXE 退出码。last-exit-code.txt 仍然落,
-rem    作为旁证(以及万一有人拿官方存根缝了这份配置时的兜底证据)。
+rem  Exit codes: the custom stub uses GetExitCodeProcess to pass this
+rem    script's exit code through as the EXE exit code. Acceptance can read
+rem    the EXE exit code directly. last-exit-code.txt is still written as
+rem    side evidence (and as fallback if someone sewed the official stub).
 rem
-rem  🔴 编码约束:可执行行(非 rem 行)必须纯 ASCII,文件不带 BOM,换行必须 CRLF。
-rem     它由 SFX 在未知代码页下拉起;.cmd 带 BOM 会让第一行解析失败,
-rem     LF-only 会让 for/if/call/标签解析错乱。rem 行不参与执行,允许中文。
+rem  Encoding: the ENTIRE file must be pure ASCII (including rem lines).
+rem    No UTF-8 BOM. Newlines must be CRLF. SFX launches .cmd under an
+rem    unknown code page; non-ASCII bytes in rem lines can eat newlines
+rem    when cmd.exe misreads UTF-8 as GBK, and comment fragments then run
+rem    as commands. BOM breaks the first line; LF-only breaks for/if/call.
 rem ===========================================================================
 setlocal
 
-rem -- 本脚本在 <安装根>\install\engine\ 下,上两级就是安装根 --------------
+rem -- this script lives under <install root>\install\engine\; two levels up --
 set "QT_DST=%~dp0..\.."
 for %%I in ("%QT_DST%") do set "QT_DST=%%~fI"
 

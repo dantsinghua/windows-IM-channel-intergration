@@ -30,8 +30,8 @@ param(
     [string] $VMName     = 'QTrade-Test-Win11',
     [string] $GuestUser  = 'qtest',
     [string] $GuestDir   = 'C:\QTrade-Test',
-    # 主机上要送进去的文件;路径相对仓库根目录解析
-    [string] $RepoRoot   = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
+    # 主机上要送进去的文件;路径相对仓库根目录解析(默认值勿用 $PSScriptRoot,见正文)
+    [string] $RepoRoot   = '',
     [string] $SetupExe   = 'installer\out\QTrade-Setup-1.0.0.exe',
     [string] $EvidencePs1 = 'fieldtest\collect-evidence.ps1',
     [ValidateSet('Auto', 'Direct', 'VMFile')]
@@ -42,7 +42,28 @@ param(
     [switch] $WhatIfOnly
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
+
+# param 默认值阶段 $PSScriptRoot 可能为空;正文里再解析仓库根
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $baseDir = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($baseDir)) {
+        $baseDir = (Get-Location).Path
+    }
+    if ([string]::IsNullOrWhiteSpace($baseDir)) {
+        Write-Host '  ❌ 无法定位目录以解析仓库根。请用 -RepoRoot 显式指定。' -ForegroundColor Red
+        exit 3
+    }
+    $candidate = Join-Path $baseDir '..\..'
+    try {
+        $RepoRoot = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+    } catch {
+        Write-Host ("  ❌ 无法解析仓库根目录:{0}" -f $candidate) -ForegroundColor Red
+        Write-Host '     请用 -RepoRoot 显式指定仓库根路径。' -ForegroundColor Yellow
+        exit 3
+    }
+}
 
 function Write-Head([string] $Text) {
     Write-Host ''
@@ -157,17 +178,23 @@ if (Test-Path -LiteralPath $evidenceFull) {
 
 # ---------- 计划 ----------
 Write-Head '将要做的事'
-Write-Host ("    1) 在虚拟机里确保目录存在:{0}" -f $GuestDir) -ForegroundColor Gray
+$stepNo = 1
+Write-Host ("    {0}) 在虚拟机里确保目录存在:{1}" -f $stepNo, $GuestDir) -ForegroundColor Gray
+$stepNo++
 foreach ($f in $toCopy) {
-    Write-Host ("    2) 拷贝 {0}  →  虚拟机的 {1}\" -f (Split-Path $f -Leaf), $GuestDir) -ForegroundColor Gray
+    Write-Host ("    {0}) 拷贝 {1}  →  虚拟机的 {2}\" -f $stepNo, (Split-Path $f -Leaf), $GuestDir) -ForegroundColor Gray
+    $stepNo++
 }
-Write-Host ("    3) 打印「在虚拟机里静默安装 + 取回退出码与日志」的骨架命令") -ForegroundColor Gray
+Write-Host ("    {0}) 打印「在虚拟机里静默安装 + 取回退出码与日志」的骨架命令" -f $stepNo) -ForegroundColor Gray
+$stepNo++
 if ($RunInstall) {
-    Write-Host ("    4) -RunInstall:真的在虚拟机里跑一遍静默安装,并把日志取回主机") -ForegroundColor Yellow
+    Write-Host ("    {0}) -RunInstall:真的在虚拟机里跑一遍静默安装,并把日志取回主机" -f $stepNo) -ForegroundColor Yellow
 }
+$copyTotalBytes = ($toCopy | ForEach-Object { (Get-Item -LiteralPath $_).Length } | Measure-Object -Sum).Sum
+$copyTotalGB = [math]::Round($copyTotalBytes / 1GB, 2)
 Write-Host ''
 Write-Host '  会改动什么:' -ForegroundColor Yellow
-Write-Host ("    · 虚拟机里多出 {0} 下的文件(2.26 GB 左右)" -f $GuestDir) -ForegroundColor Gray
+Write-Host ("    · 虚拟机里多出 {0} 下的文件(即将拷贝合计 {1} GB)" -f $GuestDir, $copyTotalGB) -ForegroundColor Gray
 Write-Host '    · 主机:只读取仓库里的文件,不写、不改任何设置' -ForegroundColor Gray
 Write-Host '  撤销办法:回滚到基线检查点(.\03-快照与回滚.ps1 -Restore),虚拟机里的一切改动一笔勾销' -ForegroundColor Gray
 Write-Host ''
@@ -183,7 +210,7 @@ $usedMethod = ''
 
 if ($Method -eq 'Auto' -or $Method -eq 'Direct') {
     Write-Head 'PowerShell Direct 连接'
-    Write-Info ("要用虚拟机里的账号登录。账号:{0}(密码 = 你在 02b 里设的那个)" -f $GuestUser)
+    Write-Info ("要用虚拟机里的账号登录。账号:{0}(密码 = 虚拟机本地账号的密码)" -f $GuestUser)
     Write-Cmd ("New-PSSession -VMName '{0}' -Credential <{1}>" -f $VMName, $GuestUser)
     try {
         $cred = Get-Credential -UserName $GuestUser -Message ("请输入虚拟机 {0} 里账号 {1} 的密码" -f $VMName, $GuestUser)

@@ -32,7 +32,7 @@
 
 [CmdletBinding()]
 param(
-    [string] $TemplatePath = (Join-Path $PSScriptRoot 'autounattend.xml.template'),
+    [string] $TemplatePath = '',
     [string] $OutDir       = 'D:\HyperV\QTrade-Test',
     [string] $AdminUser    = 'qtest',
     [string] $ComputerName = 'QTRADE-TEST',
@@ -43,7 +43,21 @@ param(
     [switch] $WhatIfOnly
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
+
+# param 默认值阶段 $PSScriptRoot 可能为空;正文里再解析模板路径
+if ([string]::IsNullOrWhiteSpace($TemplatePath)) {
+    $scriptDir = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+        $scriptDir = (Get-Location).Path
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+        Write-Host '  ❌ 无法定位脚本目录,应答模板路径为空。请用 -TemplatePath 显式指定。' -ForegroundColor Red
+        exit 3
+    }
+    $TemplatePath = Join-Path $scriptDir 'autounattend.xml.template'
+}
 
 function Write-Head([string] $Text) {
     Write-Host ''

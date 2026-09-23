@@ -17,3 +17,6 @@ console/tests/e2e-pw/.pw-results/
 
 # 浏览器抓包(可能含登录 Cookie 与持牌行情数据),一律不进库
 *.har
+
+# 与本项目无关的个人脚本(羿珩 DM 行情旁路),误入过一次
+qb_tap.user.js

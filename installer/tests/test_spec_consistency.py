@@ -617,15 +617,15 @@ def test_ruling_1_sfx_disk_maps_to_26() -> None:
     cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
     assert "exit /b 26" in cmd
     assert "6442450944" in cmd, "6 GB 门槛要写成明确的字节数"
-    assert "裁决" in cmd, "偏差要在脚本里写明,而不是只在交接里"
-    # 🔴 **可执行行(非 rem 行)必须纯 ASCII** —— 它由 SFX 在未知代码页下拉起,
-    #    给用户看的字符串带中文就是乱码;rem 注释行不参与执行,允许中文。
+    assert "Ruling (1)" in cmd, "偏差要在脚本里写明,而不是只在交接里"
+    # 可执行行与 rem 行都必须纯 ASCII。SFX 在未知代码页下拉起 .cmd,
+    # rem 里的非 ASCII 会在 GBK 误读时吃掉换行,注释碎片被当成命令。
     bad = [
         f"{i}: {line}"
         for i, line in enumerate(cmd.splitlines(), 1)
-        if line.strip() and not line.lstrip().lower().startswith("rem") and not line.isascii()
+        if line.strip() and not line.isascii()
     ]
-    assert not bad, f"precheck-disk.cmd 的可执行行里有非 ASCII 字符:{bad}"
+    assert not bad, f"precheck-disk.cmd 含非 ASCII 字符:{bad}"
     assert (INSTALLER_ROOT / "engine" / "precheck-disk.cmd").read_bytes()[:3] != b"\xef\xbb\xbf", \
         ".cmd 不能带 BOM —— 会让第一行命令解析失败"
 

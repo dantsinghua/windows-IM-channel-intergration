@@ -73,3 +73,19 @@ sonnet 只配给真正的小活(单文件小改、查一个事实)。派工时�
 
 在 `Desktop/work` 开工:**先 `git fetch --all` / `git pull` 拉到最新开发分支,再加载 `qtrade-redroid-resume` skill**,
 读的是**仓库内**那份 `.claude/skills/qtrade-redroid-resume/SKILL.md`——全局 `~/.claude/skills/` 那份会落后好几批。
+
+## 10. 🔴 绝不 `cd` 进会被打包收集的目录(2026-09-21 晚新增)
+
+本机装了 oh-my-claudecode 钩子,**会在当前工作目录写 `.omc/state/…`**。出包方曾因 `cd` 进 `installer/out/presign/winagent-app/` 查签名,让这个状态文件被 collect 收进载荷,整轮出包作废重跑(总控自己随后也在 `fieldtest/vm-lab` 犯了一次,幸而不在打包路径上)。
+
+- 打包 / 出包 / 校验类 agent 的派工硬禁区里**必须写**:不 `cd` 进 `installer/out/**`、`winagent/dist/**`、`console/release/**`、产物根 `C:\Users\anlin\qtrade-payload\**`;一律绝对路径,工作目录停在仓库根或 scratch。
+- 出包后的独立校验**必须含**「包内与 stage 零 `.omc` / `.old-*` / `.void-*`」。
+- 删这类杂物前照旧先 `git ls-files` 查跟踪、看 mtime 确认是自己这个会话产生的。
+
+## 11. 实现方自检不当结论;复测方同时是新守卫的验收方(2026-09-21 晚新增)
+
+- rootfs 线一晚走了「复测三轮 → 修两轮」:E3-1(wheel hash 坏了退回 sdist)→ E4-1(多候选 wheel 静默换件)→ 通过。每一轮的新问题都出在上一轮的修复留下的缝里——与文档终审「每轮 REVISE 都出自上一轮新写的句子」是同一个规律。
+- 收敛靠三条:①修法要求**按「类」设防**(对全部 15 个包成立的断言),不是只补当下那一个包;②派复测方时明说「你同时是这条新守卫的验收方,专门找绕过,每条怀疑都实跑」;③明说「**不采信实现方的自检**」——那一晚实现方的自检脚本就被查出 `docker exec` 缺 `-i`、检查空跑恒通过。
+- 出包同理:出包方自校验之后,**另起**独立校验方全部重算(三段切段、逐条 sha256、剥签名比对、引擎脚本对 HEAD)。
+- 保留项要不要先修再出包,**由安琳定**(那一晚两次都选了「先修」);总控给建议,不替她定。
+

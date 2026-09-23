@@ -4,13 +4,13 @@
 > **接手先读 [`HANDOFF.md`](HANDOFF.md)**(第一入口:现状、接手第一步、下一步),再读断点续接 skill `.claude/skills/qtrade-redroid-resume/SKILL.md`。
 
 一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点 / QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。
-**阶段(2026-09-21)**:全部部件已编码,正在做**端到端验证与出包**;正式包出过一版但被端到端测试证明装上起不来,缺陷已修、**包未重出**、真装验证未开始。详见 `HANDOFF.md` §4。
+**阶段(2026-09-21 深夜)**:全部部件已编码;**带签名的正式包已出、独立校验通过**(修掉了凌晨那一版「装上起不来」的全部已知缺陷),但**尚未在任何机器上运行过**——下一步是真装验证,时机与测试机待安琳定。详见 `HANDOFF.md` §3b / §4。
 
 ## 目录地图
 
 | 目录 | 内容 | 测试 / 跑法 |
 |---|---|---|
-| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表;裁决表 `00` §15g 当前至 **R6-62** | `cd docs && python3 check-truth-tables.py`(真值表对账器,改文档后必跑,须 **exit 0**) |
+| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表;裁决表 `00` §15g 当前至 **R6-68** | `cd docs && python3 check-truth-tables.py`(真值表对账器,改文档后必跑,须 **exit 0**) |
 | `src/qtrade_agent/` | **Agent**(WSL 侧 systemd 服务):`store`(DDL 逐字抽自 02 §3.1)、`adapters/qidian`(旁路读库 + UI 执行层)、`adapters/qq`(OneBot)、`adapters/wechat` + `login`、`bus` + `gate`(安全闸)、`scheduler`、`health`/`healthloop`、`api/`(FastAPI + WS + HMAC middleware)、`runtime/`(docker·adb 后端 + 可编程假实现)、`pool`/`pressure`、`accounts`(生命周期)、`vault_client`/`winagent_client`/`timesync`、`mail/`、`maintenance`/`media`/`monitor`/工作流引擎。**开发容器里一律注入假后端,绝不碰真 docker/adb/WinAgent** | 见下方「跑起来」 |
 | `winagent/` | **WinAgent**:服务 + 会话代理两进程、`/wa/v1` 全量、Vault(DPAPI)、monitor/netprobe/power、命名管道 IPC、wslctl、installer_ops、wechat;`winagent.db` DDL 逐字抽自 `docs/02` §3.2;PyInstaller 打包 | `cd winagent && ~/.venvs/qtrade/bin/python -m pytest -q` = **329**(真 Windows 上同样 329) |
 | `console/` | **Electron + Vue3 控制台**(`docs/01` 全册);`src/i18n/zh-CN/codes.ts` 与 00 §8.1/§8.3、02 §3.7 逐码对账;`mock/` 已逐端点对齐真后端并有 `mock-shape` 自检 | 仓库里**不装 `node_modules`**:先 `rsync -a --exclude node_modules --exclude dist console/ ~/work/qtrade-build/console/`,再在那边 `npm test` = **151** |

@@ -21,6 +21,7 @@ param(
     [string] $VmRoot  = 'D:\HyperV\QTrade-Test'
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Continue'
 
 # ---------- 输出辅助 ----------

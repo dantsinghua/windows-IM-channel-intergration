@@ -72,7 +72,7 @@ class WinNet:
     def proxy(self) -> ProxyInfo:
         require_windows("代理识别")
         winhttp = None
-        out = subprocess.run(["netsh", "winhttp", "show", "proxy"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(["netsh", "winhttp", "show", "proxy"], capture_output=True, text=True, timeout=10).stdout or ""
         for line in out.splitlines():
             if ":" in line and ("Proxy Server" in line or "代理服务器" in line):
                 v = line.split(":", 1)[1].strip()

@@ -150,6 +150,37 @@ def init_db(cfg: AgentConfig, db_path: str | None) -> int:
     return EXIT_OK
 
 
+def _attach_screen(agent, db_path: str) -> None:
+    """真机在 adb 上时把画面流接上。测试不走 main,缺省仍是 4503,不会造假帧。"""
+    import sqlite3
+
+    from .screen_adb import AdbScreenBackend, ffmpeg_bin
+
+    if ffmpeg_bin() is None:
+        log.warning("未找到 ffmpeg,画面流保持未装配")
+        return
+
+    def serial_of(account_id: str) -> str:
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT adb_serial, adb_port FROM account_runtime WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            con.close()
+        except sqlite3.Error as e:
+            log.warning("读 adb 串口失败: %s", e)
+            return "127.0.0.1:5555"
+        if row and row[0]:
+            return str(row[0])
+        if row and row[1]:
+            return f"127.0.0.1:{row[1]}"
+        return "127.0.0.1:5555"
+
+    agent.stream_backend = AdbScreenBackend(serial_of)
+    log.info("画面流已接上真机 adb(竖屏 screencap)")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="qtrade-agent")
     ap.add_argument("--config", default="/etc/qtrade/agent.toml")
@@ -167,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         # `--config` 只用来取 `[db] path` 等建库参数;`[api]`/`[scheduler]` 这类运行期配置本次一律不生效。
         return init_db(cfg, args.db)
     agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
+    _attach_screen(agent, args.db or cfg.db.path)
     import uvicorn
     server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
                                            workers=1, log_level=args.log_level.lower()))

@@ -33,6 +33,7 @@ beforeEach(() => {
   routerSpy.replace.mockReset()
   setActivePinia(createPinia())
   localStorage.clear()
+  sessionStorage.clear()
   stubFetch(NOTICE_ACKED)
 })
 
@@ -160,6 +161,16 @@ describe('向导步骤存 store(D-B)', () => {
     expect(store.step).toBe(3)
     expect(again.text()).toContain('添加第一个账号')
     again.unmount()
+  })
+
+  it('整页刷新后步骤还在,不退回第 1 步', () => {
+    const store = useSetupStore()
+    store.step = 2
+    expect(sessionStorage.getItem('qt.setup.step')).toBe('2')
+
+    setActivePinia(createPinia())
+    const fresh = useSetupStore()
+    expect(fresh.step).toBe(2)
   })
 
   it('页面推进步骤写回 store', async () => {

@@ -46,6 +46,7 @@ param(
     [switch] $WhatIfOnly
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 
 # ---------- 日志 ----------

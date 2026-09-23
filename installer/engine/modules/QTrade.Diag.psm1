@@ -28,6 +28,8 @@ $script:QtDiagItems = @(
     [pscustomobject]@{ name = 'kcheck-dmesg'; kind = 'cmd' }       # [install] diag_include_dmesg 控制
     [pscustomobject]@{ name = 'docker-logs'; kind = 'cmd' }
     [pscustomobject]@{ name = 'wsl-eventlog'; kind = 'cmd' }       # §2.6.8 第 8 条:K1 型失败只在这里有痕迹
+    [pscustomobject]@{ name = 'Hyper-V-Compute-Admin'; kind = 'cmd' }
+    [pscustomobject]@{ name = 'Hyper-V-Worker-Admin'; kind = 'cmd' }
 )
 
 # 🔴 §5.3「**不含**」+ §6「日志不含」+ 红线 2:任何命中都必须被挡在包外
@@ -173,11 +175,22 @@ function New-QtDiagBundle {
             $included += $c.Name
         }
         if ($IncludeDmesg) {
-            $r = Invoke-QtWsl -WslArgs @('-d', (Get-QtKCheckDistroName), '--user', 'root', '--exec', 'sh', '-c', 'dmesg | tail -200') -TimeoutSec 60
-            if (-not $r.TimedOut -and $r.ExitCode -eq 0) {
-                Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text $r.StdOut | Out-Null
+            $kname = Get-QtKCheckDistroName
+            $listed = Invoke-QtWsl -WslArgs @('--list', '--quiet') -TimeoutSec 30
+            $present = (-not $listed.TimedOut) -and ($listed.ExitCode -eq 0) -and ($listed.StdOut -match [regex]::Escape($kname))
+            if (-not $present) {
+                Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text '采集时发行版已注销' | Out-Null
                 $included += 'kcheck-dmesg'
-            } else { $skipped += 'kcheck-dmesg' }
+            } else {
+                $r = Invoke-QtWsl -WslArgs @('-d', $kname, '--user', 'root', '--exec', 'sh', '-c', 'dmesg | tail -200') -TimeoutSec 60
+                if (-not $r.TimedOut -and $r.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.StdOut)) {
+                    Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text $r.StdOut | Out-Null
+                    $included += 'kcheck-dmesg'
+                } else {
+                    Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text '采集时发行版已注销' | Out-Null
+                    $included += 'kcheck-dmesg'
+                }
+            }
         } else { $skipped += 'kcheck-dmesg(diag_include_dmesg=false)' }
 
         $dl = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'sh', '-c',
@@ -211,6 +224,20 @@ function New-QtDiagBundle {
     } catch { $evt = '(该事件日志不存在或不可读)' }
     Add-QtDiagText -StagingDir $staging -Name 'wsl-eventlog' -Text $evt | Out-Null
     $included += 'wsl-eventlog'
+
+    foreach ($hv in @(
+            @{ Name = 'Hyper-V-Compute-Admin'; Log = 'Microsoft-Windows-Hyper-V-Compute-Admin' }
+            @{ Name = 'Hyper-V-Worker-Admin'; Log = 'Microsoft-Windows-Hyper-V-Worker-Admin' }
+        )) {
+        $hvText = ''
+        try {
+            $hvText = (Get-WinEvent -LogName $hv.Log -MaxEvents 40 -ErrorAction Stop |
+                ForEach-Object { '{0} {1} {2}' -f $_.TimeCreated, $_.Id, $_.Message }) -join "`n"
+        } catch { $hvText = '(该事件日志不存在或不可读)' }
+        if ([string]::IsNullOrWhiteSpace($hvText)) { $hvText = '(该事件日志不存在或不可读)' }
+        Add-QtDiagText -StagingDir $staging -Name $hv.Name -Text $hvText | Out-Null
+        $included += $hv.Name
+    }
 
     # ── 压包前最后一道排除检查(红线 2 的执行点)────────────────────────
     $all = @(Get-ChildItem -LiteralPath $staging -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })

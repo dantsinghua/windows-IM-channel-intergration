@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import time
 from dataclasses import dataclass, field
@@ -128,9 +129,9 @@ class NetProbe:
 
     async def net_state(self) -> str:
         """04 §2.6.6 判定算法(逐行照抄伪代码)。"""
-        has_default_route = self._net.has_default_route()
-        vpn = bool(self.vpn_adapters())
-        proxy = self._proxy_active()
+        has_default_route = await asyncio.to_thread(self._net.has_default_route)
+        vpn = bool(await asyncio.to_thread(self.vpn_adapters))
+        proxy = await asyncio.to_thread(self._proxy_active)
         if not has_default_route:
             return "OFFLINE"
         reachable = False
@@ -159,10 +160,11 @@ class NetProbe:
         """重算 ``net_state`` / VPN / 子网 / MTU;有实质变化则 ``bump_seq()`` 并推 ``NET_STATE_CHANGED``。"""
         old_state, old_subnet = self.state.net_state, self.state.wsl_subnet
         ns = await self.net_state()
-        wsl = self._net.wsl_adapter()
+        wsl = await asyncio.to_thread(self._net.wsl_adapter)
         subnet = wsl_subnet_cidr(wsl) if wsl else None
-        vpns = [a.name for a in self.vpn_adapters()]
-        mtu = {"vpn": next((a.mtu for a in self.vpn_adapters()), None), "eth0": wsl.mtu if wsl else None}
+        vpn_list = await asyncio.to_thread(self.vpn_adapters)
+        vpns = [a.name for a in vpn_list]
+        mtu = {"vpn": next((a.mtu for a in vpn_list), None), "eth0": wsl.mtu if wsl else None}
         self.state.net_state, self.state.wsl_subnet = ns, subnet
         self.state.vpn_adapters, self.state.mtu = vpns, mtu
         self.state.host_ip = wsl.ipv4 if wsl else None

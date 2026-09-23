@@ -34,6 +34,8 @@ function Write-QtStepResult {
         [string] $ExitName = 'OK'
     )
     $code = Get-QtExitCode -Name $ExitName
+    $logMsg = ('reason={0} exit={1} message={2}' -f $Reason, $ExitName, $Message)
+    try { Write-QtLog -Message $logMsg -Level $(if ($Ok) { 'INFO' } else { 'ERROR' }) -Step $(if ($State) { $State } else { 'ENGINE' }) } catch { }
     $payload = [ordered]@{
         ok      = $Ok
         state   = $State
@@ -358,18 +360,26 @@ try {
                 # 内核自身失败 → 自动回滚(§2.6.5)
                 $rb = Invoke-QtKernelRollback -WslConfigPath $wslConfig -ShutdownConfirmed $true -KCheckDirectory $paths.KCheck
                 Clear-QtRunOnce -State $state | Out-Null
+                $note = if ([string]::IsNullOrWhiteSpace([string]$rb.OfficialKernel)) {
+                    'rollback: 本机 WSL2 无法启动'
+                } else {
+                    'rolled back to ' + $rb.OfficialKernel
+                }
+                $human = [string]$ver.Message
+                if (-not $human) { $human = ('切换失败({0}),已恢复原内核' -f $ver.Reason) }
                 if (-not $rb.Ok) {
-                    Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note 'rollback failed' | Out-Null
+                    Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note $note | Out-Null
                     Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason 'KERNEL_ROLLBACK_FAILED') | Out-Null
                     Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                    $rbMsg = if ($ver.Reason -eq 'KERNEL_BOOT_FAILED' -and $human) { $human } else { '回滚失败:请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑' }
                     Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KERNEL_ROLLBACK_FAILED' -ExitName 'E_INSTALL_KERNEL_ROLLBACK_FAILED' `
-                        -Message '回滚失败:请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑'
+                        -Message $rbMsg
                 }
-                Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note ('rolled back to ' + $rb.OfficialKernel) | Out-Null
+                Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note $note | Out-Null
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $ver.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $ver.Reason -ExitName ('E_INSTALL_' + $ver.Reason) `
-                    -Message ('切换失败({0}),已恢复原内核' -f $ver.Reason) -Data ([ordered]@{ official_kernel = $rb.OfficialKernel })
+                    -Message $human -Data ([ordered]@{ official_kernel = $rb.OfficialKernel })
             }
 
             Remove-QtKCheck -Directory $paths.KCheck | Out-Null

@@ -20,7 +20,7 @@
 
 [Setup]
 AppId={{9B2F1C64-2F1E-4E1A-9A1B-0C7A5E3D1B02}
-AppName={#EngineName}
+AppName=QTrade
 AppVersion={#EngineVersion}
 AppPublisher={#EnginePublisher}
 VersionInfoVersion={#EngineVersion}
@@ -67,9 +67,14 @@ FinishedHeadingLabel=QTrade 安装完成
 [Files]
 ; 引擎自带的 PowerShell 模块与派发器(§2.1:引擎 = Inno [Code] + PowerShell 模块)
 ; 🔴 全部 ps1/psm1 必须 UTF-8 with BOM(§2.6.7 W1),由 build.ps1 在打包前逐个检查
+; 落盘到 {app}:卸载 / 人工查看仍需要。另各加 dontcopy:向导阶段 {app} 尚未初始化,
+; ssInstall 时 [Files] 拷贝也尚未发生,RunStep 必须先 ExtractTemporaryFile 到 {tmp}\qte。
 Source: "run-step.ps1";     DestDir: "{app}\install\engine";         Flags: ignoreversion
 Source: "lang\*.isl";       DestDir: "{app}\install\engine\lang";    Flags: ignoreversion
 Source: "modules\*.psm1";   DestDir: "{app}\install\engine\modules"; Flags: ignoreversion
+Source: "run-step.ps1";     Flags: dontcopy ignoreversion
+Source: "lang\*.isl";       Flags: dontcopy ignoreversion
+Source: "modules\*.psm1";   Flags: dontcopy ignoreversion
 
 [UninstallRun]
 ; §2.14:卸载指向落盘引擎;`/QT_KEEP_DATA` 缺省 1(保留数据)。
@@ -223,6 +228,7 @@ var
   WeChatUserApproved: Boolean;
   WeChatBackupModeSel: String;     // auto | copy | rename | skip
   AcceptSchemaBreaking: Boolean;
+  EngineScriptsReady: Boolean;
 
 // ── 命令行解析 ─────────────────────────────────────────────────────────────
 function GetSwitchValue(const Prefix: String; const Default: String): String;
@@ -300,9 +306,11 @@ end;
 // ── 极简 JSON 取值(run-step.ps1 的输出是一行扁平 JSON,无需完整解析器)──────
 function JsonStr(const Json, Key: String): String;
 var
-  P, Q: Integer;
-  Pat: String;
+  P, Q, I: Integer;
+  Pat, Raw, Out: String;
+  C: Char;
 begin
+  // JSON unescape \\ \" \n \r \t \/ —— 路径里的反斜杠不能原样显示成 \\
   Result := '';
   Pat := '"' + Key + '":"';
   P := Pos(Pat, Json);
@@ -310,7 +318,30 @@ begin
   P := P + Length(Pat);
   Q := P;
   while (Q <= Length(Json)) and (Json[Q] <> '"') do Q := Q + 1;
-  Result := Copy(Json, P, Q - P);
+  Raw := Copy(Json, P, Q - P);
+  Out := '';
+  I := 1;
+  while I <= Length(Raw) do
+  begin
+    if (Raw[I] = '\') and (I < Length(Raw)) then
+    begin
+      C := Raw[I + 1];
+      if C = 'n' then Out := Out + #10
+      else if C = 'r' then Out := Out + #13
+      else if C = 't' then Out := Out + #9
+      else if C = '\' then Out := Out + '\'
+      else if C = '"' then Out := Out + '"'
+      else if C = '/' then Out := Out + '/'
+      else Out := Out + C;
+      I := I + 2;
+    end
+    else
+    begin
+      Out := Out + Raw[I];
+      I := I + 1;
+    end;
+  end;
+  Result := Out;
 end;
 
 function JsonInt(const Json, Key: String; const Default: Integer): Integer;
@@ -393,6 +424,34 @@ begin
     end;
 end;
 
+// 向导阶段 {app} 尚未初始化,[Files] 拷贝也在 ssInstall 之后。脚本先从 dontcopy 释放到 {tmp}\qte。
+procedure EnsureEngineScripts();
+var
+  FindRec: TFindRec;
+  Tmp, Qte, ModDir: String;
+begin
+  if EngineScriptsReady then Exit;
+  Tmp := ExpandConstant('{tmp}');
+  Qte := Tmp + '\qte';
+  ModDir := Qte + '\modules';
+  ForceDirectories(ModDir);
+  ExtractTemporaryFile('run-step.ps1');
+  FileCopy(Tmp + '\run-step.ps1', Qte + '\run-step.ps1', False);
+  try
+    ExtractTemporaryFiles('*.psm1');
+  except
+  end;
+  if FindFirst(Tmp + '\*.psm1', FindRec) then
+  try
+    repeat
+      FileCopy(Tmp + '\' + FindRec.Name, ModDir + '\' + FindRec.Name, False);
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+  EngineScriptsReady := True;
+end;
+
 // 跑一个步骤。返回 True = ok;LastStepExit 带回 §3.4 的退出码,LastStepJson 带回整行结果。
 function RunStep(const StepName: String): Boolean;
 var
@@ -400,6 +459,7 @@ var
   OptLines: TArrayOfString;
   Code: Integer;
 begin
+  EnsureEngineScripts();
   OutFile := ExpandConstant('{tmp}\qt-step-') + StepName + '.json';
   // 选项经**临时文件**传入,不走命令行 —— JSON 里的双引号穿 cmd /c 的引号规则极易被弄坏(同 W7 的教训)
   OptFile := ExpandConstant('{tmp}\qt-options.json');
@@ -411,12 +471,12 @@ begin
   SaveStringsToUTF8File(OptFile, OptLines, False);
   Cmd := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
   // 🔴 ps1 一律 `-ExecutionPolicy Bypass -File` 调用(§2.2.3);同时对 ps1 做 Authenticode 签名,AllSigned 机器也能跑
-  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
-            ExpandConstant('{app}\install\engine\run-step.ps1') + '"' +
-            ' -Step ' + StepName +
-            ' -Root "' + ExpandConstant('{app}') + '"' +
-            ' -OptionsPath "' + OptFile + '"' +
-            ' > "' + OutFile + '"';
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\qte\run-step.ps1') + '" -Step ' + StepName + ' -Root "' + ExpandConstant('{commonappdata}\QTrade') + '" -OptionsPath "' + OptFile + '" > "' + OutFile + '"';
+  if not WizardSilent() then
+  begin
+    WizardForm.StatusLabel.Caption := StepName + '，可能需要几分钟';
+    WizardForm.Update;
+  end;
   // 经 cmd /c 重定向 stdout,免得 Inno 拿不到输出
   if not Exec(ExpandConstant('{cmd}'), '/c ""' + Cmd + '" ' + Params + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) then
   begin
@@ -440,8 +500,18 @@ var
 begin
   Result := '';
   OutFile := ExpandConstant('{tmp}\qt-running.txt');
-  Cmd := '/c "set WSL_UTF8=1 && "' + ExpandConstant('{sys}\wsl.exe') + '" --list --running --quiet > "' + OutFile + '""';
-  if not Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then Exit;
+  // 超时上限 3000 毫秒:界面线程不得无界等待 wsl --list --running
+  Cmd := '/c "' + ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe') + ' -NoProfile -NonInteractive -Command ""$p = Start-Process -FilePath ''' + ExpandConstant('{sys}\wsl.exe') + ''' -ArgumentList ''--list'',''--running'',''--quiet'' -RedirectStandardOutput ''' + OutFile + ''' -WindowStyle Hidden -PassThru; if (-not $p.WaitForExit(3000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 1 }""';
+  if not Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    Result := '(检测超时)';
+    Exit;
+  end;
+  if Code <> 0 then
+  begin
+    Result := '(检测超时)';
+    Exit;
+  end;
   if not LoadStringsFromFile(OutFile, Lines) then Exit;
   for I := 0 to GetArrayLength(Lines) - 1 do
     if Trim(Lines[I]) <> '' then
@@ -455,12 +525,13 @@ end;
 procedure FailWith(const Code: Integer; const Msg: String);
 var
   Answer: Integer;
+  DiagMsg: String;
 begin
   if not IsSilentRun() then
   begin
     // §5.3:每个失败页带日志路径与【导出诊断包】。诊断包**不含** vault / 密码 / 微信数据 / 消息正文(红线 2)。
     Answer := MsgBox(Msg + #13#10#13#10 +
-      '日志:' + ExpandConstant('{app}\logs\') + #13#10#13#10 +
+      '日志:' + ExpandConstant('{commonappdata}\QTrade\logs\') + #13#10#13#10 +
       '要导出一份诊断包吗?它只包含安装日志、.wslconfig、WSL 状态与策略键,' +
       '不包含任何密码、凭据、微信数据或聊天内容。',
       mbCriticalError, MB_YESNO);
@@ -468,7 +539,13 @@ begin
     begin
       RunStep('diag');
       if LastStepJson <> '' then
-        MsgBox('诊断包已导出:' + #13#10 + JsonStr(LastStepJson, 'message'), mbInformation, MB_OK);
+      begin
+        DiagMsg := JsonStr(LastStepJson, 'message');
+        if Pos('诊断包已导出', DiagMsg) > 0 then
+          MsgBox(DiagMsg, mbInformation, MB_OK)
+        else
+          MsgBox('诊断包已导出:' + #13#10 + DiagMsg, mbInformation, MB_OK);
+      end;
     end;
   end;
   ExitProcess(Code);

@@ -12,6 +12,7 @@ import { accountsApi } from '@/api/client'
 import { ScreenStream, type DecodePath, type StreamClosed, type StreamProfile } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
+import { normInContain } from './pointer'
 
 const route = useRoute()
 const router = useRouter()
@@ -82,12 +83,9 @@ async function startFocus(): Promise<void> {
     onFrame: draw,
     onFatal: (why) => {
       degradeMsg.value = why
-      if (stream?.path === 'static') startStaticPreview()
     },
     onClosed: (info) => {
       streamClosed.value = info
-      // 🔴 4503 = 画面流后端本期没有执行体:显示静态提示,**不重连、也不去轮截图**
-      // (企点截图执行层同样未接,轮询只会一直 409),见 backend-api-2 §3。
       if (info.reason === 'stream_backend_missing') { stopAll(); return }
       // 4401 由 App.vue 的事件流横幅统一引导「重取令牌」;4409/4400 重试无意义,都停手。
       if (!info.retryable) stopAll()
@@ -127,21 +125,50 @@ async function pollWechat(): Promise<void> {
 }
 
 /** 归一化坐标 (x/w, y/h) → 控制帧 touch;无 WS 时走 REST 兜底 */
+const zoom = ref(100)
+/** 按下时落在画面内的坐标。松手若在黑边上,仍用这个点收尾,避免划到屏幕边缘触发系统返回。 */
+let pointerDown: { x: number; y: number } | null = null
+
+function mediaSize(el: HTMLElement): { w: number; h: number } {
+  if (el instanceof HTMLCanvasElement) return { w: el.width, h: el.height }
+  if (el instanceof HTMLImageElement) return { w: el.naturalWidth, h: el.naturalHeight }
+  return { w: 0, h: 0 }
+}
+
 function onPointer(e: PointerEvent, action: 'down' | 'move' | 'up'): void {
-  const c = canvas.value
-  if (!c || isWechat.value) return
-  const r = c.getBoundingClientRect()
-  const x = (e.clientX - r.left) / r.width
-  const y = (e.clientY - r.top) / r.height
-  if (stream && stats.value.connected) stream.send({ type: 'touch', action, x, y, pointer: e.pointerId })
-  else if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'tap', x, y })
+  const el = e.currentTarget as HTMLElement | null
+  if (!el || isWechat.value) return
+  const r = el.getBoundingClientRect()
+  const { w, h } = mediaSize(el)
+  const inside = normInContain(e.clientX, e.clientY, r, w, h)
+  if (action === 'down') {
+    pointerDown = inside
+    if (!inside) return
+  } else if (!pointerDown) {
+    return
+  }
+  const point = inside ?? pointerDown
+  if (!point) return
+  if (action === 'up') pointerDown = null
+  if (stream && stats.value.connected) stream.send({ type: 'touch', action, x: point.x, y: point.y, pointer: e.pointerId })
+  else if (focus.value && action === 'up') void accountsApi.streamInput(focus.value.id, { type: 'tap', x: point.x, y: point.y })
+}
+
+const KEYCODE_OF: Record<string, string> = {
+  Enter: 'ENTER', Backspace: 'DEL', Escape: 'ESCAPE',
 }
 
 function onKey(e: KeyboardEvent): void {
   if (isWechat.value || !stream) return
+  if (e.key.length === 1) {
+    e.preventDefault()
+    stream.send({ type: 'text', text: e.key })
+    return
+  }
+  const keycode = KEYCODE_OF[e.key]
+  if (!keycode) return
   e.preventDefault()
-  if (e.key.length === 1) stream.send({ type: 'text', text: e.key })
-  else stream.send({ type: 'key', keycode: e.key, action: 'down' })
+  stream.send({ type: 'key', keycode, action: 'down' })
 }
 
 function onWheel(e: WheelEvent): void {
@@ -153,7 +180,9 @@ function tool(t: string): void {
   if (!stream) return
   if (t === 'back') stream.send({ type: 'key', keycode: 'BACK', action: 'down' })
   else if (t === 'home') stream.send({ type: 'key', keycode: 'HOME', action: 'down' })
-  else if (t === 'rotate') stream.send({ type: 'key', keycode: 'ROTATE', action: 'down' })
+  // 不发 keycode ROTATE:正在跑的 Agent 把它收成返回键,点一次就退一层。
+  // 新进程认 type=rotate,但旧进程会把未知类型当成坏帧并断开画面,所以这里先不发。
+  else if (t === 'rotate') return
   else if (t === 'shot') void takeShot()
   else if (t === 'keyboard') canvas.value?.focus()
 }
@@ -194,7 +223,12 @@ watch(() => route.params.id, (v) => { if (v) focusId.value = String(v) })
 
 onMounted(async () => {
   if (!accounts.items.length) await accounts.load()
-  if (!focusId.value && streamable.value.length) focusId.value = streamable.value[0].id
+  // 这里再调一次 startFocus 会和上面的 watch 各开一条 focus 流。
+  // 后到的那条被服务端拒绝(同时只允许 1 个),页面就停在空白画布上。
+  if (!focusId.value && streamable.value.length) {
+    focusId.value = streamable.value[0].id
+    return
+  }
   await startFocus()
   // 窗口最小化/隐藏 → 全部 pause(§2.7.4 规格策略)
   visibilityOff = window.qt?.window.onVisibility((visible) => {
@@ -302,13 +336,23 @@ onUnmounted(() => {
             <a-button size="small" @click="startFocus">再试一次</a-button>
           </div>
 
-          <img v-if="stats.decoder === 'static' && staticSrc" class="wxpreview" :src="staticSrc" alt="静态预览" />
+          <img
+            v-if="stats.decoder === 'static' && staticSrc"
+            class="wxpreview"
+            :src="staticSrc"
+            alt="静态预览"
+            :style="{ width: zoom + '%' }"
+            @pointerdown="(e) => onPointer(e, 'down')"
+            @pointermove="(e) => onPointer(e, 'move')"
+            @pointerup="(e) => onPointer(e, 'up')"
+          />
           <canvas
             v-else
             ref="canvas"
             class="canvas"
             tabindex="0"
             :data-testid="T.canvas"
+            :style="{ width: zoom + '%' }"
             @pointerdown="(e) => onPointer(e, 'down')"
             @pointermove="(e) => onPointer(e, 'move')"
             @pointerup="(e) => onPointer(e, 'up')"
@@ -340,6 +384,10 @@ onUnmounted(() => {
             <span :data-testid="T.statusLatency">延迟 {{ stats.latencyMs }} ms</span>
             <span :data-testid="T.statusStreamDot" class="dot"
                   :style="{ background: stats.connected ? 'var(--qt-state-running)' : 'var(--qt-state-stopped)' }" />
+            <label class="zoom">缩放
+              <input type="range" min="40" max="160" v-model.number="zoom" />
+              {{ zoom }}%
+            </label>
           </div>
         </template>
       </template>
@@ -368,8 +416,11 @@ onUnmounted(() => {
 .focus { flex: 1 1 auto; padding: var(--qt-space-3); overflow: auto; }
 .banner { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); margin: var(--qt-space-2) 0; }
 .banner.crit { background: #FFF1F0; color: var(--qt-sev-crit); }
-.canvas { width: 100%; max-width: 720px; background: #000; display: block; outline: none; }
-.wxpreview { max-width: 720px; border: 1px solid var(--qt-border); display: block; }
+.canvas, .wxpreview {
+  width: 100%; max-width: 720px; max-height: 70vh; object-fit: contain;
+  background: #000; display: block; outline: none; cursor: pointer;
+}
+.zoom { display: inline-flex; align-items: center; gap: 6px; }
 .tools { margin-top: var(--qt-space-2); flex-wrap: wrap; }
 .status { margin-top: var(--qt-space-2); gap: var(--qt-space-3); }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }

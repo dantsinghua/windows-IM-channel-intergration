@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -78,6 +79,7 @@ class Monitor:
                                 DiskTarget("wechat_data", "D:\\", product_level=False)]
         self._clock = clock
         self.state = MonitorState()
+        self._host_cache: Optional[dict[str, float]] = None
 
     # ---------------------------------------------------------------- 落库
     def write_sample(self, *, resolution: str, scope: str, subject: str, ts_ms: Optional[int] = None,
@@ -108,10 +110,12 @@ class Monitor:
                           committed_mb=mem.get("committed_mb"), session_locked=self._sys.session_locked())
         for iface, (rx, tx) in self._sys.net_throughput_kbps().items():
             self.write_sample(resolution="raw", scope="net", subject=iface, ts_ms=now, net_rx_kbps=rx, net_tx_kbps=tx)
-        for p in self._sys.processes(WATCHED_PROCESSES):
+        procs = {p.name: p for p in self._sys.processes(WATCHED_PROCESSES)}
+        for p in procs.values():
             scope = "wsl" if p.name in VMMEM_NAMES else "process"
             self.write_sample(resolution="raw", scope=scope, subject=p.name, ts_ms=now,
                               cpu_pct=p.cpu_pct, mem_mb=p.rss_mb, pid=p.pid)
+        self._host_cache = self._host_from(mem, procs)
         self.state.last_sample_ms = now
 
     def sample_slow(self) -> None:
@@ -119,7 +123,7 @@ class Monitor:
         now = self._clock()
         seen: set[str] = set()
         for t in self._disks:
-            if t.path in seen:
+            if t.path in seen or not os.path.exists(t.path):
                 continue
             seen.add(t.path)
             free, total = self._sys.disk_free_mb(t.path)
@@ -295,6 +299,8 @@ class Monitor:
         """
         product_free: list[tuple[str, float, float]] = []
         for t in self._disks:
+            if not os.path.exists(t.path):
+                continue
             free, total = self._sys.disk_free_mb(t.path)
             if t.product_level:
                 product_free.append((t.key, free, total))
@@ -340,20 +346,30 @@ class Monitor:
                 "free_mb": worst[1] if worst else None, "wechat_free_mb": wechat_free}
 
     # ---------------------------------------------------------------- #2 health 的 host 段
-    def host_snapshot(self, *, wsl_vm_mb: Optional[float] = None) -> dict[str, float]:
-        """``GET /wa/v1/health.host``(02 §3.6 #2):**是 pool 的 windows 池输入**,字段名逐字。"""
-        mem = self._sys.memory_mb()
-        procs = {p.name: p for p in self._sys.processes(WATCHED_PROCESSES)}
-        vm = wsl_vm_mb
-        if vm is None:
-            for n in VMMEM_NAMES:
-                if n in procs:
-                    vm = procs[n].rss_mb
-                    break
+    def _host_from(self, mem: dict[str, float], procs: dict[str, Any]) -> dict[str, float]:
+        vm = 0.0
+        for n in VMMEM_NAMES:
+            if n in procs:
+                vm = procs[n].rss_mb
+                break
         wechat_mb = sum(procs[n].rss_mb for n in WECHAT_PROCESS_NAMES if n in procs)
-        chatlog_mb = procs["chatlog.exe"].rss_mb if "chatlog.exe" in procs else 0.0
-        return {"total_mb": mem["total_mb"], "available_mb": mem["available_mb"], "wsl_vm_mb": vm or 0.0,
-                "wechat_mb": wechat_mb, "chatlog_mb": chatlog_mb}
+        chatlog = procs.get("chatlog.exe")
+        return {"total_mb": mem["total_mb"], "available_mb": mem["available_mb"], "wsl_vm_mb": vm,
+                "wechat_mb": wechat_mb, "chatlog_mb": chatlog.rss_mb if chatlog else 0.0}
+
+    def host_snapshot(self, *, wsl_vm_mb: Optional[float] = None) -> dict[str, float]:
+        """``GET /wa/v1/health.host``(02 §3.6 #2):**是 pool 的 windows 池输入**,字段名逐字。
+
+        进程表扫描放在采样线程里。健康检查直接回上一轮缓存,避免在请求里扫全进程、把 2 秒探活拖超时。
+        """
+        cached = dict(self._host_cache) if self._host_cache else None
+        if cached is None:
+            mem = self._sys.memory_mb()
+            cached = {"total_mb": mem["total_mb"], "available_mb": mem["available_mb"],
+                      "wsl_vm_mb": 0.0, "wechat_mb": 0.0, "chatlog_mb": 0.0}
+        if wsl_vm_mb is not None:
+            cached["wsl_vm_mb"] = float(wsl_vm_mb)
+        return cached
 
     def health_checks(self) -> dict[str, Optional[bool]]:
         """``GET /wa/v1/health.checks``(02 §3.6 #2)。🔴 **R6-58 (ao):恒八键,没跑过的给 ``None``** ——

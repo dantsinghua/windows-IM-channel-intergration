@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from .contacts import CONTACT_SQL
 from .msgdata import MainDbRow
 
 MESSAGE_TABLE_GLOBS = ("mr_friend_*_New", "mr_troop_*_New")
@@ -47,6 +48,7 @@ class MainDb(Protocol):
     def uniseq_at(self, table: str, row_id: int) -> Optional[int]: ...
     def rows_after(self, table: str, last: int) -> list[MainDbRow]: ...
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]: ...
+    def list_contact_source_rows(self) -> list[tuple[str, str, str, str]]: ...
 
 
 def _q(table: str) -> str:
@@ -113,6 +115,10 @@ class LocalSqliteMainDb:
         mn, mx, cnt, f, l = rows[0]
         return GapStats(int(mn), int(mx), int(cnt), int(f), int(l))
 
+    def list_contact_source_rows(self) -> list[tuple[str, str, str, str]]:
+        rows = self._run(CONTACT_SQL)
+        return [(str(r[0]), r[1] or "", r[2] or "", r[3] or "") for r in rows if len(r) >= 4]
+
 
 class AdbMainDb:
     """产品后端:``adb -s 127.0.0.1:160NN shell sqlite3 -separator '|' 'file:…?mode=ro' "<sql>"``。
@@ -174,3 +180,7 @@ class AdbMainDb:
             return None
         mn, mx, cnt, f, l = rows[0]
         return GapStats(int(mn), int(mx), int(cnt), int(f), int(l))
+
+    def list_contact_source_rows(self) -> list[tuple[str, str, str, str]]:
+        rows = self._sql(CONTACT_SQL)
+        return [(r[0], r[1] if len(r) > 1 else "", r[2] if len(r) > 2 else "", r[3] if len(r) > 3 else "") for r in rows if r]

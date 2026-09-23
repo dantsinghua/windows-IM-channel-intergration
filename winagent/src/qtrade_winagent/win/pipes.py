@@ -53,6 +53,12 @@ class WinPipeConn:
             return None
         return PipeFrame.from_wire(json.loads(line.decode("utf-8")))
 
+    def inbound_ready(self) -> bool:
+        """有没有一帧在等读。用 Peek,避免同步 ReadFile 占住句柄、把心跳 WriteFile 卡住。"""
+        import win32pipe
+        _data, avail, _left = win32pipe.PeekNamedPipe(self._h, 0)
+        return int(avail or 0) > 0
+
     async def close(self) -> None:
         import win32file
         try:

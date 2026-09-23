@@ -31,6 +31,7 @@ const saved: Record<string, PropertyDescriptor | undefined> = {}
 const PROPS = ['scrollHeight', 'clientHeight', 'scrollTop'] as const
 
 beforeEach(() => {
+  sessionStorage.clear()
   setActivePinia(createPinia())
   FakeResizeObserver.instances = []
   vi.stubGlobal('ResizeObserver', FakeResizeObserver)

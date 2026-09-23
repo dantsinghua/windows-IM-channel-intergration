@@ -27,3 +27,26 @@ def decode_uin(data: bytes | str) -> str:
     """``senderuin``/``frienduin`` 列(XOR 后是 ASCII 数字串)→ 纯数字 uin 字符串。"""
     raw = xor_hex(data) if isinstance(data, str) else xor(data)
     return raw.decode("ascii", errors="replace").strip("\x00")
+
+
+def cxor(text: str) -> str:
+    """名称类 TEXT 列:按 UTF-16 码元逐个 XOR 同一把 17 字节密钥(与 ``qidian_monitor_all.cxor`` 一致)。
+
+    自反:``cxor(cxor(s)) == s``。不要用 ``xor()`` 解中文名,那是逐字节,解出来是乱码。
+    """
+    if not text:
+        return text
+    raw = text.encode("utf-16-le", "surrogatepass")
+    units = [int.from_bytes(raw[i:i + 2], "little") ^ KEY[(i // 2) % len(KEY)] for i in range(0, len(raw), 2)]
+    return b"".join(x.to_bytes(2, "little") for x in units).decode("utf-16-le", "replace")
+
+
+def decode_name_hex(hex_str: str) -> str:
+    """``hex(remark|name|nickname)`` → 显示字符串。空串、非法 hex 回 ``""``。"""
+    if not hex_str:
+        return ""
+    try:
+        blob = bytes.fromhex(hex_str)
+    except ValueError:
+        return ""
+    return cxor(blob.decode("utf-8", "replace")).replace("\x00", "").strip()

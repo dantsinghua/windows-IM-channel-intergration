@@ -33,6 +33,7 @@ param(
     [switch] $WhatIfOnly
 )
 
+$ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logFile = $null

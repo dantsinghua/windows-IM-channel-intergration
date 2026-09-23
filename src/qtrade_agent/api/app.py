@@ -31,6 +31,9 @@ from ..hmac_inbound import has_hmac_headers
 from ..ids import ulid
 from ..mail.route_secrets import BadSecretRef, check_route, upsert_route
 from ..maintenance import DiskFullError
+from ..adapters.base import Account
+from ..adapters.qidian.contacts import list_private_contacts
+from ..adapters.qidian.maindb import MainDbError
 from ..models import Command, CommandOrigin, RESULT_CODES
 from ..settings_secrets import VAULT_SCOPE as SETTINGS_VAULT_SCOPE, seal as seal_settings
 from ..store import SeqExhausted
@@ -465,6 +468,34 @@ def create_api(agent) -> FastAPI:
             raise ApiError(404, "TARGET_NOT_FOUND", f"账号不存在:{account_id}")
         request.state.account_id = account_id
         return {"ok": True, "data": account_view(row, _acct_caps(row))}
+
+    @app.get(f"{API_PREFIX}/accounts/{{account_id}}/contacts")
+    async def list_account_contacts(request: Request, account_id: str):
+        """询价工作台通讯录。只读主库 Friends / QidianExternalInfo。未登录或主库打不开回 503,不回空列表冒充在线。"""
+        p = _principal(request, "read")
+        require_account(p, account_id)
+        row = agent.store.get_account_full(account_id)
+        if row is None or row.get("deleted_ms"):
+            raise ApiError(404, "TARGET_NOT_FOUND", f"账号不存在:{account_id}")
+        if row["channel"] != "qidian":
+            raise ApiError(404, "TARGET_NOT_FOUND", "只有企点账号有通讯录")
+        request.state.account_id = account_id
+        if row["state"] != "running" or not row.get("self_uid"):
+            raise ApiError(503, "NOT_READY", "账号未登录,不能读通讯录", reason="login_required")
+        seq = int(row["seq"])
+        agent._current_qidian_account = Account(
+            id=row["id"], channel="qidian", state=row["state"], self_uid=row.get("self_uid"),
+            extra={"adb_serial": row.get("adb_serial") or f"127.0.0.1:{16000 + seq}"})
+        try:
+            db = agent._maindb_for_uid(str(row["self_uid"]))
+            if not db.exists():
+                raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable")
+            src_rows = db.list_contact_source_rows()
+        except MainDbError as e:
+            raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable") from e
+        finally:
+            agent._current_qidian_account = None
+        return {"ok": True, "data": list_private_contacts(src_rows)}
 
     # ------------------------------------------------------------------ 账号生命周期(02 §3.4.1 #2/#4/#5/#6/#7/#9/#10/#11/#19)
     IDEM_PREFIX = "idem.accounts."

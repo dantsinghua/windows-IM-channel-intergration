@@ -7,7 +7,7 @@
  * 判据仍**以 Agent 为准**:`acked_version === notice_version` 才算这一版勾过(05 §6.1)。
  */
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { systemApi } from '@/api/client'
 
 /** 控制台自己固定追加的两段(不依赖法务改稿):A-7 + A-5 */
@@ -27,6 +27,32 @@ export const NOTICE_FIXED_PARAGRAPHS = [
  * (隐私模式 / 站点数据被禁时 `localStorage` 会抛)。
  */
 const DONE_MIRROR_KEY = 'qt.setup.done'
+/**
+ * 当前步。上一轮只放进 Pinia:组件重挂(去建号页再回来)能保住,
+ * **整页刷新保不住** —— store 随文档一起重建,`step` 回到 0,人就回到第 1 步。
+ * 本机 `127.0.0.1` 转发把 Vite 热更新的长连接掐断时,页面会自己刷新,
+ * 点「运行自检」正好撞上,看起来像按钮把人打回告知页。
+ * `sessionStorage` 活过刷新、关标签就丢,所以中途刷新留在原来的步,新开一次从第 1 步走。
+ */
+const STEP_KEY = 'qt.setup.step'
+
+function readStep(): number {
+  try {
+    const n = Number(globalThis.sessionStorage?.getItem(STEP_KEY))
+    if (Number.isInteger(n) && n >= 0 && n <= 4) return n
+  } catch {
+    // 隐私模式 / 站点数据被禁:退回第 1 步,不让读存储把向导整页打断
+  }
+  return 0
+}
+
+function writeStep(v: number): void {
+  try {
+    globalThis.sessionStorage?.setItem(STEP_KEY, String(v))
+  } catch {
+    // 写不进就只留在内存里;这次不跳步,下次刷新才可能回到第 1 步
+  }
+}
 
 function readDoneMirror(): boolean {
   try {
@@ -47,10 +73,12 @@ function writeDoneMirror(v: boolean): void {
 export const useSetupStore = defineStore('setup', () => {
   const done = ref(true)
   /**
-   * 向导当前步(0..4)。**必须放 store**:页面自己 `ref(0)` 时组件一重挂(首登去 `P-ACCT-NEW`
-   * 再回来 / HMR)就回第 1 步,而 01 §2.7.1 步 4 明写「现在添加 → 进 P-ACCT-NEW(**完成后回到本步**)」。
+   * 向导当前步(0..4)。组件重挂靠这份 store(01 §2.7.1 步 4「完成后回到本步」);
+   * 整页刷新靠 `STEP_KEY`,只放内存时刷新必回第 1 步。
    */
-  const step = ref(0)
+  const step = ref(readStep())
+  // sync:刷新可能紧跟在改步之后,等下一拍再写就来不及
+  watch(step, writeStep, { flush: 'sync' })
   /** 告知页改版 ⇒ 已完成向导的机器重启后也要重新勾(05 §6.1 末句 / §8b.6 U1) */
   const reackRequired = ref(false)
   const noticeText = ref('')

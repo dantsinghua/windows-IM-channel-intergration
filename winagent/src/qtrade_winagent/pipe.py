@@ -128,7 +128,7 @@ class PipeHub:
 
     async def _accept_loop(self) -> None:
         while True:
-            conn = await self._backend.serve(self._pipe_name)
+            conn = await self._backend.serve(self._pipe_name, allow_sid=self._install_user_sid or None)
             try:
                 await self.handshake(conn)
             except asyncio.CancelledError:
@@ -307,10 +307,27 @@ class UserAgentLink:
         return reply.result
 
     async def run(self) -> None:
-        """启动请求处理与心跳两个任务(会话代理主循环)。"""
-        self._tasks = [asyncio.create_task(self._serve_loop(), name="ua-serve"),
-                       asyncio.create_task(self._heartbeat_loop(), name="ua-heartbeat")]
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        """收请求、发心跳,放在同一个循环里。
+
+        Windows 命名管道的同步句柄不能同时 ReadFile 和 WriteFile:心跳线程一写就被
+        正在读的那个调用堵住,服务 15 秒收不到心跳就把会话代理判离线。
+        没有入站帧时才写心跳。
+        """
+        assert self.conn is not None
+        next_hb = self._clock()
+        while self.conn is not None:
+            if self.conn.inbound_ready():
+                frame = await self.conn.recv()
+                if frame is None:
+                    return
+                if frame.id != HEARTBEAT_ID:
+                    asyncio.create_task(self._dispatch(frame))
+                continue
+            now = self._clock()
+            if now >= next_hb:
+                await self.conn.send(PipeFrame(id=HEARTBEAT_ID, method=PING))
+                next_hb = now + self._cfg.heartbeat_s * 1000
+            await asyncio.sleep(0.05)
 
     async def stop(self) -> None:
         for t in self._tasks:

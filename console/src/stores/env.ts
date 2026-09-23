@@ -101,13 +101,20 @@ export const useEnvStore = defineStore('env', () => {
   }
 
   async function runSelftest(): Promise<void> {
-    await systemApi.selftestRun()
-    await loadSelftest()
+    const started = await systemApi.selftestRun()
+    const runId = started.run_id
+    const deadline = Date.now() + 45_000
+    do {
+      await loadSelftest(runId)
+      if (selftestRun.value?.finished_at) return
+      await new Promise((resolve) => setTimeout(resolve, 400))
+    } while (Date.now() < deadline)
+    error.value = '自检结果还没写完,请再点一次'
   }
 
-  /** #79b:不带 `run_id` 取最近一轮;从没跑过时 `data:null` ⇒ 空表(不是错误) */
-  async function loadSelftest(): Promise<void> {
-    const r = await systemApi.selftestResult()
+  /** #79b:不带 `run_id` 取最近一轮;带上则等这一轮落库。从没跑过时 `data:null` ⇒ 空表(不是错误) */
+  async function loadSelftest(runId?: string): Promise<void> {
+    const r = await systemApi.selftestResult(runId)
     selftest.value = r.items
     selftestRun.value = r.run
     selftestRunId.value = r.runId

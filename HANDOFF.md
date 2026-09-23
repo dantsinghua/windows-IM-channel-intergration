@@ -16,7 +16,7 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 | 目录 / 文件 | 一句话 | 细节看 |
 |---|---|---|
-| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表 + `check-truth-tables.py` 真值表对账器(改文档后必跑,须 exit 0)。裁决表在 `00` §15g,当前至 **R6-62** | `docs/00-共享基线与口径.md` §14/§15~§15g |
+| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表 + `check-truth-tables.py` 真值表对账器(改文档后必跑,须 exit 0)。裁决表在 `00` §15g,当前至 **R6-68** | `docs/00-共享基线与口径.md` §14/§15~§15g |
 | `src/qtrade_agent/` | **Agent**(WSL 侧 systemd 服务):store / 企点读库 / 总线 + 安全闸 / scheduler / api(FastAPI + WS)/ runtime(docker·adb)/ pool / 账号生命周期 / 健康循环 / WinAgent 客户端 / mail / QQ / 微信 / 横切基础设施 | SKILL §5「代码现状总表」 |
 | `winagent/` | **WinAgent**:服务 + 会话代理两进程、`/wa/v1` 全量、Vault(DPAPI)、monitor/netprobe/power、IPC、wslctl、installer_ops、wechat;PyInstaller 打包 | `winagent/README.md` |
 | `console/` | **Electron + Vue3 控制台**(`docs/01` 全册);仓库里**不装 `node_modules`** | `console/README.md` |
@@ -58,7 +58,7 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 3. **读 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文**,重点 §4 禁区、§5「🔴 最新状态」与「下一步」、§5b 编排纪律;
    再按你这批要动的东西读对应规格段落与 `reference/e2e-lessons-2026-09-21.md`。
 
-## 3b. 🔴 2026-09-21 23:45 交接快照(带签名正式包已出、独立校验通过;**与下文 §4/§5 矛盾处以本节为准**)
+## 3b. 🔴 2026-09-21 23:45 交接快照(带签名正式包已出、独立校验通过;下文 §4~§6 已同步到同一时点)
 
 > 更细的版本在原机 `.omc/handoffs/team-lead-status.md`(git 忽略、不随仓库走)。本节是它的可携带摘要。
 
@@ -90,35 +90,34 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 **新增工作纪律**(已入项目记忆):🔴 **绝不 `cd` 进会被打包收集的目录**(`installer/out/**`、`winagent/dist/**`、`console/release/**`、产物根)——本机 OMC 钩子会在当前目录写 `.omc/state/…`,被通配收集带进安装包(本段出包第一轮因此作废重跑);一律绝对路径,出包后的校验必须含「包内与 stage 零 `.omc`」。实现方的自检脚本不能当结论(第三批自检 `docker exec` 缺 `-i` ⇒ heredoc 检查空跑恒通过,靠独立复测兜住)⇒ 每条检查都要有「确实执行了」的证据。其余沿用:发给忙碌 agent 的消息要等它这轮结束才到;收尾只 `kill <自己 PID>`、禁 `pkill`/`killall`;删目录前 `git ls-files`;复跑用独占副本;只按精确路径 `git add`;打 wheel / 全量前 `rm -rf build/` + 清杂散 `.omc/`。安琳直接带的羿珩行情采集 + 企点只读监控两条线不在安装包关键路径、已收口。
 
-## 4. 现在卡在哪(2026-09-21 清晨)
+## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。
 
-- 13 项载荷齐全的正式包**出过一版**:`installer/out/QTrade-Setup-1.0.0.exe`,**2,258,242,349 B**,sha256 `11060a07…64ecd5a8`,**未签名**、**从未在任何机器上运行过**。
-- 🔴 **那一版装上必定起不来**:三轮端到端测试揪出首装 P0(首启脚本调的 `--init-db` 参数当时不存在)与「控制台连真后端一条请求都发不出」(版本头 1.3 vs 1.0 ⇒ 全线 426 等五处硬伤)。
-- **这两类问题已修,但修复后的包还没重出;真装验证尚未开始。**
-- 本地有一批提交未推到 GitHub(2026-09-21 07:25 实查 **ahead 6**,当时还有 agent 在陆续提交——**以 `git status -sb` 实查为准**),待文档第七轮终审 ACCEPT、全套复跑全绿后一起 push。
-- 教训(值得先看一眼):**四套单测全绿 ≠ 装得上** —— 跨部件接缝没人对账、前端对着自己的 mock 开发 = 自证、构建不报错但产物是坏的。
-  逐条见 `.claude/skills/qtrade-redroid-resume/reference/e2e-lessons-2026-09-21.md`。
+- ✅ **带签名的正式包已出、独立校验 8 项全过**(身份、载荷溯源、校验要点见上面 §3b)。它修掉了凌晨那一版「装上必定起不来」的全部已知缺陷(首装 `--init-db`、控制台连不上真后端、rootfs 六项、依赖锁两处绕过)。
+- 🔴 **但它至今没在任何机器上运行过** —— 「校验通过」只证明包的身份与内容正确,**不证明装得上、跑得起来**。真装验证是下一步,而且**卡在两件要安琳定的事**上:重启主机启用 Hyper-V 的时机、另一台 Windows 物理机。
+- 教训(值得先看一眼):**四套单测全绿 ≠ 装得上**;出包夜又添五条「看起来过了、其实没验到」(交接漏了一项旧载荷、依赖锁承诺两次被证伪、实现方自检空跑恒通过、`cd` 进产物目录把钩子文件打进包、重签改变 sha256)。
+  逐条见 `.claude/skills/qtrade-redroid-resume/reference/e2e-lessons-2026-09-21.md`(16 条 + 五条通用判据)。
 
 ## 5. 下一步(按先后)
 
-1. **重建发行版 rootfs**(2026-09-21 07:25 实查:已有 agent 在改 `installer/rootfs/`,接手前先确认这批的进度与交接,别重复开工。六项待修:firstboot 里那道不该有的 `--init-db` 前置闸门、`StartLimitIntervalSec` 挪到 `[Unit]`、Python 由 3.11.0rc1 换正式版、机型档案库落点改到 `docs/05` §7 的路径、README 里已裁决却仍标「待裁决」的陈述、**先 `rm -rf build/` 再重打 wheel**)。
-2. **独立复测**(由**另起的**测试方做,不由实现方做):rootfs 冒烟 + 控制台↔真后端复测。
-3. **生成自签名证书 → 带 `-Sign` 重出正式包 → 校验**(`installer/signing/`;判据 = manifest `lightweight=false` + `missing` 空 + `7z t` `Everything is Ok` + 三段拼接算术 + 包内 exe 的 sha256)。
-4. **真装验证**:`fieldtest/真机验收手册.md`(物理机为主)/ `fieldtest/vm-lab/`(虚拟机为辅)。
-5. **文档第七轮终审 → ACCEPT 后 push**。
+1. **安琳重启主机启用 Hyper-V**(`fieldtest/vm-lab/01-启用HyperV.ps1`,先 `-WhatIfOnly`;任何 agent 不得自行执行)→ 重启后拉回容器、核 Hyper-V 状态 → `02b` 应答 ISO → `02` 建虚拟机 → 装 Win11 → `03` 打 `clean-baseline` 检查点。逐步说明与撤销法见 `fieldtest/vm-lab/README.md`。
+2. **真装验证**:`fieldtest/真机验收手册.md` A~I 九组 51 条(另一台物理机为主 + 本机虚拟机为辅);**先按 §1.4 导入证书**、按 §1.1 核包的 sha256(别拷成同目录的 `.void` 作废旧包)。**未经安琳同意不运行安装 EXE。**
+3. 真装揪出的缺陷 → 新起对口 agent 修 → 独立复测 → **整包重出重签**(外壳签名覆盖整个 EXE,改任何载荷都必须重出)。
+4. 验完再谈:合 `main`、cursor 第九轮评审、§3b 里「攒着没做的」那张清单。
 
 ## 6. 要问安琳的事(未决,别自行假设)
 
-- 生成自签名证书的两条命令是否现在跑。
+- **何时重启主机启用 Hyper-V**(会中断 WSL 内 13 个容器、企点登录态、qb 行情采集、企点只读监控)——由安琳决定时机,任何 agent 不得自行重启。
+- 提供另一台 Windows 物理机(Win10 22H2/Win11、x64、BIOS 开虚拟化、≥8 GB 内存、≥40 GB 空闲盘)。
+- 产物根与 `installer/out/` 里的旧件删不删(5 份旧 rootfs tar 约 10 GB、各 `*.old-20260921`、`.void` 作废旧包、`~/work/qtrade-build/console-pack-2/`)。
+- E3-O2:janitor 单元要不要像 Agent 单元一样配 `StartLimit*`(规格没要求,现状 = 一直失败时无限重启)。
 - **发送失败是否计入限速**(倾向计入,护号)——开放项 R6-60 (f)。
 - `#88` settings 读回「当前生效值」而非「已保存待重启值」⇒ 表单回填旧值,正式设计待定。
+- #95 审计 JSON 时间键(规格两可)、#42 删除成功 200 / 204。
 - 磁盘门槛是否按实测体积重算(现偏保守 = 安全侧)。
-- 提供另一台 Windows 物理机(Win10 22H2/Win11、x64、BIOS 开虚拟化、≥8 GB 内存、≥40 GB 空闲盘)。
-- 将来正式分发用公司内部 CA 还是 OV 证书(现阶段自签名 + 目标机导入)。
+- 将来正式分发用公司内部 CA 还是 OV 证书(现阶段自签名 + 目标机导入;换证书只换 `-CertThumbprint`)。
 - 分支何时合 `main`;要不要把这一版回给 cursor 做第九轮评审。
-- **启用 Hyper-V 需要重启主机一次**(会中断 WSL 内 12 个容器)——由安琳决定时机,任何 agent 不得自行重启。
 
 ## 7. 三条硬规矩(展开见 `CLAUDE.md` 与 SKILL §4/§5b)
 

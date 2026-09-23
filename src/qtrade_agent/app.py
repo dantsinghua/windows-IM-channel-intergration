@@ -303,6 +303,7 @@ class AgentApp:
         self.scheduler.register("health_adb", self.cfg.health.adb_check_s, self.healthloop.check_adb)                          # H06
         self.scheduler.register("health_boot", H05_STEADY_INTERVAL_S, self.healthloop.check_boot)                              # H05 稳态
         self.scheduler.register("login_remind", 60, self.accounts.login_remind)                                                # 05 §2.5.4
+        self.scheduler.register("qidian_login_promote", 15, self.healthloop.promote_qidian_login)                               # 画面上手动登完后离开黄标
         self.scheduler.register("health_napcat", H08_INTERVAL_S, self.qqhealth.check)                                          # 04 H08,每 15 s
         self.scheduler.register("health_wechat", self.cfg.wechat_adapter.poll_interval_s, self.healthloop.check_wechat)        # 05 §2.5.4 两条
         self.scheduler.register("wechat_slot_reaper", self.cfg.wechat.slot_reaper_interval_s, self.wechat_slot.reap)           # 02 §2.2.5 ②

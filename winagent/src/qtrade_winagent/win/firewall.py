@@ -19,7 +19,7 @@ from .netinfo import PS
 
 def _ps(script: str, timeout: int = 20) -> tuple[int, str, str]:
     p = subprocess.run(PS + [script], capture_output=True, text=True, timeout=timeout)
-    return p.returncode, p.stdout.strip(), p.stderr.strip()
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 
 class WinFirewall:
