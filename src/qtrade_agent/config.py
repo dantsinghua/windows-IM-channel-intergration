@@ -43,6 +43,11 @@ class QidianAdapterConfig:
     #: ⚠️ 这两键 02 §7.1 尚未登记(见交接 fix-agent-scrcpy-2026-09-26),rootfs 落点见 installer/rootfs/Dockerfile
     scrcpy_server_path: str = "/opt/qtrade/scrcpy/scrcpy-server"
     scrcpy_server_version: str = "4.1"
+    #: 画面流关键帧 / 掉队参数(第三轮验收 B1、缺口 G1)。⚠️ 同样 02 §7.1 尚未登记(见交接 fix-scrcpy-r4-2026-09-26)
+    scrcpy_key_wait_s: float = 3.0              # RESET_VIDEO 后等关键帧,超时重拉 server(真机约 63 ms 就到)
+    scrcpy_reset_min_interval_s: float = 2.0    # 同通道两次 RESET_VIDEO 的最小间隔,间隔内请求合并
+    scrcpy_lag_evict_count: int = 3             # 订阅者在窗口内掉队这么多次 ⇒ 摘下、发 {type:'restart'}
+    scrcpy_lag_evict_window_s: float = 10.0
 
 
 @dataclass(frozen=True)

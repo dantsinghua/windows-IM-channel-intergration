@@ -172,7 +172,11 @@ def _attach_screen(agent, cfg: AgentConfig) -> None:
         return
     backend = ScrcpyBackend(store_target_resolver(agent.store), adb=AsyncAdb(server_port=ADB_SERVER_PORT),
                             server_jar=jar, server_version=cfg.qidian.scrcpy_server_version,
-                            profiles=cfg.qidian.stream_profiles, frame_timeout_s=cfg.health.scrcpy_frame_timeout_s)
+                            profiles=cfg.qidian.stream_profiles, frame_timeout_s=cfg.health.scrcpy_frame_timeout_s,
+                            key_wait_s=cfg.qidian.scrcpy_key_wait_s,
+                            reset_min_interval_s=cfg.qidian.scrcpy_reset_min_interval_s,
+                            lag_evict_count=cfg.qidian.scrcpy_lag_evict_count,
+                            lag_evict_window_s=cfg.qidian.scrcpy_lag_evict_window_s)
     agent.stream_backend = backend
     qidian = agent.adapters.get("qidian")
     if qidian is not None:

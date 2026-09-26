@@ -18,7 +18,16 @@ dummy 字节在 accept 视频后立刻写;``SurfaceEncoder`` 之后才写流头)
 
 关键帧:``i-frame-interval`` 在真机软件编码器上**无效**(整条流只有开头一个关键帧),画面静止时 server 也**一帧不出**。
 ⇒ 新 WS 接入 / ``resume`` / 慢客户端丢帧重对齐时,向控制 socket 发 ``TYPE_RESET_VIDEO``(=17,无额外字段),
-server 重置编码器、再出 session + 配置包 + 关键帧;订阅者只从关键帧开始收。``key_wait_s``(3 s)内没来 ⇒ 重拉 server。
+server 重置编码器、再出 session + 配置包 + 关键帧(真机约 63 ms);订阅者只从关键帧开始收。
+``key_wait_s``(3 s)内没来 ⇒ 重拉 server。
+
+RESET 节流与掉队(第三轮验收 B1):每次 RESET 都让**所有**观看者的编码器重开、多出一个 IDR(约 20 KB)。
+- 同一通道两次 RESET 至少隔 ``reset_min_interval_s``(缺省 2 s);间隔内的请求(掉队 resync / 接入 / resume)
+  合并成一次、到点再发;本 server 生命周期内第一次 RESET 不延迟;已在等关键帧时的请求直接并入。
+- 订阅者队列硬上限 ``_Sub.QUEUE_MAX``(关键帧也算):满了 = 掉队一次 ⇒ **先清空积压**(首帧 JSON 之类留着),
+  来的是关键帧就以它为新起点,是 delta 就等下一个关键帧。
+- ``lag_evict_window_s``(10 s)内掉队 ≥ ``lag_evict_count``(3)次 ⇒ 摘下该订阅者、发 ``{type:'restart'}`` 让客户端重连
+  (不降档:同账号一个 server,降档要重拉整条流、拖累其它观看者)。
 
 健康(04 H07):server 进程在 + 视频 socket 未 EOF + 控制 socket 未 EOF ⇒ 健康;任一断 ⇒ 重建。
 「没有帧」**不是**故障(静止画面本来就 0 帧);``scrcpy_frame_timeout_s`` 只管「开流后等首个关键帧」。
@@ -233,17 +242,34 @@ class _Sub:
         self.waiting_key = True
         self.paused = False
         self.detached = False
+        self.lags: list[float] = []                     # 掉队时刻(通道按窗口计数,连续掉队 ⇒ 摘下)
 
-    def offer(self, pts_ms: int, data: bytes, key: bool) -> None:
-        """``pause`` 中不转发(socket 不动,A.2 待裁决口径);没对齐到关键帧前只丢不送。"""
+    def offer(self, pts_ms: int, data: bytes, key: bool) -> bool:
+        """``pause`` 中不转发(socket 不动,A.2 待裁决口径);没对齐到关键帧前只丢不送。
+
+        队列硬上限 ``QUEUE_MAX``(关键帧也算):满了 ⇒ 先清空积压,关键帧就以它为新起点、delta 则丢到下一个
+        关键帧(通道发 RESET_VIDEO 要,受节流)。返回 True = 这次掉队了。"""
         if self.paused or self.detached:
-            return
-        if not key and (self.waiting_key or self.queue.qsize() >= self.QUEUE_MAX):
-            self.waiting_key = True                     # 慢客户端:丢到下一个关键帧重新对齐(通道发 RESET_VIDEO 要)
-            return
-        if key:
-            self.waiting_key = False
+            return False
+        lagged = self.queue.qsize() >= self.QUEUE_MAX
+        if lagged:
+            self._drop_backlog()
+            self.waiting_key = True
+        if not key and self.waiting_key:
+            return lagged
+        self.waiting_key = False
         self.queue.put_nowait((pts_ms, data))
+        return lagged
+
+    def _drop_backlog(self) -> None:
+        """丢掉排队的帧,只留 JSON(新首帧 meta 等,客户端必须先收到)。"""
+        keep: list[FrameItem] = []
+        while not self.queue.empty():
+            item = self.queue.get_nowait()
+            if isinstance(item, dict):
+                keep.append(item)
+        for item in keep:
+            self.queue.put_nowait(item)
 
     def renew(self, meta: dict[str, Any]) -> None:
         """新 session:发新首帧 JSON,之后从下一个关键帧开始送。"""
@@ -281,6 +307,8 @@ class _Channel:
         self.last_key: Optional[tuple[int, bytes]] = None   # 最近关键帧(已拼配置包)
         self._key_seen = asyncio.Event()
         self._key_wait: Optional[asyncio.Task] = None
+        self._last_reset: Optional[float] = None           # 上次发 RESET_VIDEO 的时刻(b.clock);节流用
+        self._reset_timer: Optional[asyncio.Task] = None   # 节流中延后的那次 RESET(同通道合并成一个)
         self._proc: Any = None
         self._vr: Optional[asyncio.StreamReader] = None
         self._vw: Optional[asyncio.StreamWriter] = None
@@ -330,6 +358,7 @@ class _Channel:
         self.width, self.height = w, h
         self.config = b""
         self.last_key = None
+        self._last_reset = None                            # 新 server:第一次 RESET 不延迟
         self.alive = True
         self._tasks += [asyncio.create_task(self._read_video(), name=f"scrcpy-video:{self.account_id}"),
                         asyncio.create_task(self._drain_control(), name=f"scrcpy-ctrl:{self.account_id}"),
@@ -373,6 +402,7 @@ class _Channel:
                     pass
         self._tasks = []
         self._key_wait = None
+        self._reset_timer = None
         for w in (self._vw, self._cw):
             if w is not None:
                 try:
@@ -453,9 +483,10 @@ class _Channel:
                     self.last_key = (pts_ms, payload)
                     self._key_seen.set()
                 for sub in list(self.subs):
-                    sub.offer(pts_ms, payload, key)
-                if not key and any(s.waiting_key and not s.paused and not s.detached for s in self.subs):
-                    self.request_keyframe("resync")      # 有订阅者掉队:不会再有自然关键帧,主动要
+                    if sub.offer(pts_ms, payload, key):
+                        self._on_lag(sub)
+                if not key and self._anyone_waiting():
+                    self.request_keyframe("resync")      # 有订阅者掉队:不会再有自然关键帧,主动要(受节流)
         except (asyncio.IncompleteReadError, ConnectionError, OSError) as e:
             if not self.alive:
                 return
@@ -477,13 +508,52 @@ class _Channel:
         for sub in list(self.subs):
             sub.renew(meta)
 
+    def _on_lag(self, sub: _Sub) -> None:
+        """订阅者掉队一次(积压已清);``lag_evict_window_s`` 内满 ``lag_evict_count`` 次 ⇒ 摘下、发 restart 让它重连。"""
+        now = self.b.clock()
+        sub.lags = [t for t in sub.lags if now - t < self.b.lag_evict_window_s] + [now]
+        if len(sub.lags) < self.b.lag_evict_count:
+            log.info("画面流订阅者掉队(积压已清,等关键帧)account=%s 窗内第 %d 次", self.account_id, len(sub.lags))
+            return
+        log.warning("画面流订阅者 %.0fs 内掉队 %d 次 account=%s ⇒ 摘下、发 restart 让客户端重连",
+                    self.b.lag_evict_window_s, len(sub.lags), self.account_id)
+        sub.end({"type": "restart"})
+        self.detach(sub)
+
+    def _anyone_waiting(self) -> bool:
+        return any(s.waiting_key and not s.paused and not s.detached for s in self.subs)
+
     # ---------------------------------------------------------------- 关键帧
+    def _key_pending(self) -> bool:
+        return self._key_wait is not None and not self._key_wait.done()
+
     def request_keyframe(self, why: str) -> None:
-        """要一个新关键帧:发 RESET_VIDEO,``key_wait_s`` 内没来 ⇒ 重拉 server(订阅者留着,收新首帧 JSON)。"""
+        """要一个新关键帧:发 RESET_VIDEO,``key_wait_s`` 内没来 ⇒ 重拉 server(订阅者留着,收新首帧 JSON)。
+
+        节流(B1):距上次 RESET 不足 ``reset_min_interval_s`` ⇒ 延后到点再发,间隔内的请求合并成这一次;
+        本 server 第一次 RESET 不延迟;已在等关键帧(首关键帧 / 上次 RESET / 编码器重开)⇒ 直接并入。"""
+        if not self.alive or self._key_pending() or (self._reset_timer is not None and not self._reset_timer.done()):
+            return
+        wait = 0.0 if self._last_reset is None else self._last_reset + self.b.reset_min_interval_s - self.b.clock()
+        if wait <= 0:
+            self._send_reset(why)
+            return
+        task = asyncio.create_task(self._deferred_reset(wait, why), name=f"scrcpy-reset:{self.account_id}")
+        self._reset_timer = task
+        self._tasks.append(task)
+
+    async def _deferred_reset(self, wait: float, why: str) -> None:
+        await asyncio.sleep(wait)
+        # 到点时已没人等(期间来过关键帧 / 等待者走了)就不发
+        if self.alive and not self._key_pending() and self._anyone_waiting():
+            self._send_reset(why)
+
+    def _send_reset(self, why: str) -> None:
+        self._last_reset = self.b.clock()
         self._want_key(reset=True, timeout=self.b.key_wait_s, why=why)
 
     def _want_key(self, *, reset: bool, timeout: float, why: str) -> None:
-        if not self.alive or (self._key_wait is not None and not self._key_wait.done()):
+        if not self.alive or self._key_pending():
             return                                        # 已在等关键帧:来一个就够所有等待者用
         self._key_seen.clear()
         if reset and self._cw is not None:
@@ -562,7 +632,9 @@ class _Channel:
 
     def attach(self, sub: _Sub) -> None:
         """新订阅者从关键帧开始收。通道已出过关键帧 ⇒ 发 RESET_VIDEO 要个新的:缓存的 ``last_key`` 之后
-        可能已有 delta,拿它当起点会花屏;还在等首关键帧 ⇒ 不用发,首关键帧就是它的起点。"""
+        可能已有 delta,拿它当起点会花屏(RESET 受节流:最长晚 ``reset_min_interval_s`` 才发)。
+        还在等首关键帧 ⇒ 不用发,首关键帧就是它的起点;首关键帧最长等 ``frame_timeout_s``(缺省 10 s),
+        超时按 H07 重拉 server、所有 WS(含这个新观看者)收 ``{type:'restart'}`` 重连。"""
         if self._idle_task is not None:
             self._idle_task.cancel()
             self._idle_task = None
@@ -665,7 +737,8 @@ class ScrcpyBackend:
     def __init__(self, target_of: Callable[[str], Target], *, adb: Optional[Any] = None,
                  server_jar: str = "/opt/qtrade/scrcpy/scrcpy-server", server_version: str = "4.1",
                  profiles: Optional[dict[str, str]] = None, frame_timeout_s: float = 10.0,
-                 key_wait_s: float = 3.0, idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0,
+                 key_wait_s: float = 3.0, reset_min_interval_s: float = 2.0, lag_evict_count: int = 3,
+                 lag_evict_window_s: float = 10.0, idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0,
                  connect_retry_s: float = 0.1,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._target_of = target_of
@@ -675,6 +748,9 @@ class ScrcpyBackend:
         self.profiles = dict(profiles or DEFAULT_STREAM_PROFILES)
         self.frame_timeout_s = float(frame_timeout_s)      # 只管开流后等首关键帧(「无帧」不是故障)
         self.key_wait_s = float(key_wait_s)                # RESET_VIDEO 之后等关键帧,超时重拉 server
+        self.reset_min_interval_s = float(reset_min_interval_s)   # 同通道两次 RESET_VIDEO 的最小间隔(B1)
+        self.lag_evict_count = int(lag_evict_count)        # lag_evict_window_s 内掉队这么多次 ⇒ 摘下发 restart
+        self.lag_evict_window_s = float(lag_evict_window_s)
         self.idle_stop_s = float(idle_stop_s)
         self.connect_timeout_s = float(connect_timeout_s)
         self.connect_retry_s = float(connect_retry_s)

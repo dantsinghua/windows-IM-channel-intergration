@@ -267,6 +267,7 @@ class FakeAdbRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.spawned: list[tuple[str, ...]] = []
+        self.order: list[str] = []                    # run / spawn 的统一先后(push → forward → spawn)
         self.procs: list[FakeProc] = []
         self.png = b"\x89PNG\r\n\x1a\nREAL"
         self.wm = b"Physical size: 720x1280\n"
@@ -274,6 +275,7 @@ class FakeAdbRunner:
 
     async def run(self, serial: str, *args: str, timeout: float = 15.0) -> tuple[int, bytes]:
         self.calls.append((serial, *args))
+        self.order.append(args[0] if args else "")
         if args and args[0] in self.fail:
             return 1, b"boom"
         if args[:1] == ("exec-out",):
@@ -284,6 +286,7 @@ class FakeAdbRunner:
 
     async def spawn(self, serial: str, *args: str) -> FakeProc:
         self.spawned.append((serial, *args))
+        self.order.append("spawn")
         p = FakeProc()
         self.procs.append(p)
         return p
@@ -407,6 +410,7 @@ async def test_open_runs_push_forward_server_and_meta(srv):
         assert s.meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "thumb", "fps": 5, "seq0": 0}
         assert adb.calls[0] == (SERIAL, "push", JAR, REMOTE_JAR)
         assert adb.calls[1] == (SERIAL, "forward", f"tcp:{srv.port}", "localabstract:scrcpy")
+        assert adb.order == ["push", "forward", "spawn"]          # 缺口 G4:spawn 必须在 forward 之后
         argv = adb.spawned[0]
         assert argv[:6] == (SERIAL, "shell", f"CLASSPATH={REMOTE_JAR}", "app_process", "/", SERVER_CLASS)
         opts = argv[6:]
@@ -640,6 +644,137 @@ async def test_slow_subscriber_resync_requests_reset_video(srv, monkeypatch):
         assert s._sub.waiting_key
     finally:
         await s.close()
+        await be.aclose()
+
+
+# ══════════════════════════════════════════════════ RESET 节流 / 掉队(第三轮验收 B1)
+def test_sub_queue_hard_cap_counts_keyframes_and_clears_backlog(monkeypatch):
+    """队列硬上限含关键帧:满了先清积压(JSON 留着),关键帧以自己为新起点,delta 丢到下一个关键帧。"""
+    from qtrade_agent import screen_scrcpy
+    monkeypatch.setattr(screen_scrcpy._Sub, "QUEUE_MAX", 3)
+    sub = screen_scrcpy._Sub()
+    meta = {"codec": "h264", "width": 720}
+    sub.renew(meta)                                               # 1(JSON)
+    assert sub.offer(1, b"K1", True) is False                    # 2
+    assert sub.offer(2, b"D1", False) is False                   # 3 = 满
+    assert sub.offer(3, b"D2", False) is True                    # 掉队:清积压,等关键帧
+    assert sub.waiting_key and sub.queue.qsize() == 1 and sub.queue.get_nowait() == meta
+    assert sub.offer(4, b"D3", False) is False and sub.queue.qsize() == 0
+    for i in range(3):
+        sub.offer(10 + i, b"K" if i == 0 else b"D", i == 0)
+    assert sub.queue.qsize() == 3
+    assert sub.offer(20, b"K2", True) is True                    # 满了来关键帧:不突破上限,替换全部旧积压
+    assert sub.queue.qsize() == 1 and sub.queue.get_nowait() == (20, b"K2") and not sub.waiting_key
+
+
+async def test_slow_subscriber_reset_count_and_queue_are_bounded(srv, monkeypatch):
+    """B1 复现口径:QUEUE_MAX=5,快订阅者正常取、慢订阅者一帧不取,30 fps 连推 2 s delta。
+    改前 RESET 56 次、慢订阅者队列涨到 61;改后 RESET ≤ 2(缺省最小间隔 2 s:首次立即 + 至多一次到点),
+    慢订阅者队列任何时刻 ≤ 5,快订阅者 60 个 delta 一个不少。"""
+    from qtrade_agent import screen_scrcpy
+    monkeypatch.setattr(screen_scrcpy._Sub, "QUEUE_MAX", 5)
+    be = make_backend(srv, FakeAdbRunner(), lag_evict_count=1000)   # 只看节流与上限,不让它被摘
+    fast = await be.open("qd01", profile="focus")
+    got: list[Any] = []
+
+    async def consume() -> None:
+        while True:
+            got.append(await next_item(fast, timeout=10))
+
+    reader = asyncio.create_task(consume())
+    await wait_for(lambda: len(got) == 1)                         # 首关键帧到了,再接入慢订阅者
+    slow = await be.open("qd01", profile="focus")
+    try:
+        await wait_for(lambda: srv.resets == 1)                   # slow 接入:首次 RESET 不延迟
+        await wait_for(lambda: slow._sub.queue.qsize() == 1)      # slow 拿到 RESET 关键帧后就不取了
+        base = srv.resets
+        peak = 0
+        for i in range(60):
+            await asyncio.to_thread(srv.push, pkt(10_000_000 + i * 33_333, b"D%02d" % i))
+            await asyncio.sleep(1 / 30)
+            peak = max(peak, slow._sub.queue.qsize())
+        await asyncio.sleep(0.2)
+        peak = max(peak, slow._sub.queue.qsize())
+        assert srv.resets - base <= 2, srv.resets
+        assert peak <= 5
+        deltas = [x[1] for x in got if isinstance(x, tuple) and x[1].startswith(b"D")]
+        assert deltas == [b"D%02d" % i for i in range(60)]        # 快订阅者不受慢订阅者牵连
+    finally:
+        reader.cancel()
+        await slow.close()
+        await fast.close()
+        await be.aclose()
+
+
+async def test_consecutive_lag_evicts_subscriber_with_restart(srv, monkeypatch):
+    """10 s 内掉队 ≥ 3 次 ⇒ 摘下该订阅者、给它发 {type:'restart'}(客户端重连);其它观看者照常、server 不重拉。"""
+    from qtrade_agent import screen_scrcpy
+    monkeypatch.setattr(screen_scrcpy._Sub, "QUEUE_MAX", 3)
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb, reset_min_interval_s=0.2)
+    fast = await be.open("qd01", profile="thumb")
+    slow = await be.open("qd01", profile="thumb")
+    ch = be.channels["qd01"]
+    got: list[Any] = []
+
+    async def consume() -> None:
+        while True:
+            got.append(await next_item(fast, timeout=10))
+
+    reader = asyncio.create_task(consume())
+    try:
+        i = 0
+        while slow._sub in ch.subs and i < 300:
+            await asyncio.to_thread(srv.push, pkt(10_000_000 + i * 33_333, b"D%03d" % i))
+            await asyncio.sleep(1 / 30)
+            i += 1
+        assert slow._sub not in ch.subs and slow._sub.detached
+        assert len(slow._sub.lags) == 3
+        items = []
+        while not slow._sub.queue.empty():
+            items.append(slow._sub.queue.get_nowait())
+        assert items[-2:] == [{"type": "restart"}, None]
+        assert all(not isinstance(x, tuple) or x[1] != b"" for x in items)
+        n = len(got)
+        await asyncio.to_thread(srv.push, pkt(99_000_000, b"AFTER"))
+        await wait_for(lambda: any(isinstance(x, tuple) and x[1] == b"AFTER" for x in got[n:]))
+        assert fast._sub in ch.subs and len(adb.spawned) == 1   # 其它观看者照常,server 没重拉
+    finally:
+        reader.cancel()
+        await slow.close()
+        await fast.close()
+        await be.aclose()
+
+
+async def test_reset_throttle_does_not_delay_first_attach_and_merges_later_ones(srv):
+    """节流不影响首次接入:本 server 第一次 RESET 立即发;间隔内再来的接入 / resume 合并成一次、到点再发,
+    且都从那个关键帧开始收。"""
+    be = make_backend(srv, FakeAdbRunner(), reset_min_interval_s=0.8)
+    s1 = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s1) == (270, REAL_CONFIG + REAL_KEY)          # 首个订阅者:不发 RESET
+        t0 = time.monotonic()
+        s2 = await be.open("qd01", profile="thumb")
+        assert await next_item(s2, timeout=0.5) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.resets == 1 and time.monotonic() - t0 < 0.5             # 立即,不等节流
+        s3 = await be.open("qd01", profile="thumb")
+        await s1.control({"type": "pause"})
+        await s1.control({"type": "resume"})
+        s4 = await be.open("qd01", profile="thumb")
+        await asyncio.sleep(0.3)
+        assert srv.resets == 1                                    # 间隔内:不发,合并等待
+        for s in (s3, s4):
+            assert await next_item(s, timeout=2) == (7000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.resets == 2 and time.monotonic() - t0 >= 0.75  # 合并成 1 次,到点才发
+        assert await next_item(s1) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")   # 老订阅者两次都收
+        for s in (s2, s1):
+            assert await next_item(s) == (7000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        await asyncio.sleep(1.0)
+        assert srv.resets == 2                                    # 没人等了就不再发
+        for s in (s4, s3, s2):
+            await s.close()
+    finally:
+        await s1.close()
         await be.aclose()
 
 
@@ -978,6 +1113,28 @@ def test_ws_route_end_to_end_with_scrcpy_backend(rig, srv):
                 break
             time.sleep(0.02)
         assert len(srv.ctrl) == 64 and srv.ctrl[1] == 0 and srv.ctrl[33] == 1
+
+
+def test_ws_send_timeout_closes_ws_and_session(rig, monkeypatch):
+    """#34 单帧 send 卡住超过 STREAM_SEND_TIMEOUT_S ⇒ 按掉线处理:摘订阅(session.close)、以 1011 关 WS。"""
+    from starlette.websockets import WebSocket, WebSocketDisconnect
+
+    from qtrade_agent.api import routes_ext2
+    from tests.test_api_ext2 import FakeStreamBackend, P, TOK_R
+
+    async def stuck(self, data):                                  # 客户端不读、TCP 窗口满
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(routes_ext2, "STREAM_SEND_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(WebSocket, "send_bytes", stuck)
+    be = FakeStreamBackend()
+    rig.agent.stream_backend = be
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=focus") as ws:
+        assert ws.receive_json()["codec"] == "h264"
+        with pytest.raises(WebSocketDisconnect) as ei:
+            ws.receive_bytes()
+        assert ei.value.code == 1011
+    assert be.sessions[0].closed
 
 
 def test_ws_rotate_control_frame_is_rejected(rig):

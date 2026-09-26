@@ -62,6 +62,9 @@ WS_CLOSE_BAD_FRAME = 4400
 WS_CLOSE_NOT_APPLICABLE = 4409          # 通道不支持画面流(QQ 拒绝 / 微信 NOT_APPLICABLE)
 WS_CLOSE_CONFLICT = 4410                # 同账号已有 focus* 连接(02 #34「后来者 409」的 WS 落点)
 WS_CLOSE_NOT_READY = 4503               # 画面流执行体未装配(本期没有 scrcpy-server)
+#: #34 单帧发送超时:客户端卡住(TCP 窗口满)⇒ 按掉线处理,摘下订阅并以 1011 关 WS(第三轮验收 B1)
+STREAM_SEND_TIMEOUT_S = 5.0
+WS_CLOSE_SEND_TIMEOUT = 1011
 
 
 @contextmanager
@@ -538,10 +541,26 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
                         # restart 先让出 focus 位,客户端立刻重连才不会撞 4410
                         if item.get("type") == "restart" and is_focus and focus_holders.get(account_id) == conn_id:
                             focus_holders.pop(account_id, None)
-                        await ws.send_json(item)
-                        continue
-                    pts_ms, nal = item
-                    await ws.send_bytes(struct.pack(">Q", int(pts_ms)) + bytes(nal))
+                        send = ws.send_json(item)
+                    else:
+                        pts_ms, nal = item
+                        send = ws.send_bytes(struct.pack(">Q", int(pts_ms)) + bytes(nal))
+                    try:
+                        await asyncio.wait_for(send, STREAM_SEND_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        log.warning("#34 发帧超过 %.0fs account=%s conn=%s ⇒ 按掉线处理、关 WS",
+                                    STREAM_SEND_TIMEOUT_S, account_id, conn_id)
+                        if is_focus and focus_holders.get(account_id) == conn_id:
+                            focus_holders.pop(account_id, None)
+                        try:
+                            await session.close()             # 先摘订阅:不再给这条卡住的连接排帧
+                        except Exception:
+                            pass
+                        try:
+                            await ws.close(code=WS_CLOSE_SEND_TIMEOUT, reason="画面帧发送超时")
+                        except Exception:
+                            pass
+                        return
 
             pump = asyncio.create_task(pump_frames(), name=f"stream:{account_id}:{conn_id}")
             while True:
