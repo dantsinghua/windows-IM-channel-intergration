@@ -109,6 +109,8 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 **编排纪律新增**:worktree 隔离派工的三个坑(起点是旧提交要 reset、写不了主树 `.omc`、跑不了 powershell/ISCC)见记忆 `agent-worktree-gotchas`;合并用 cherry-pick。`qb_tap.user.js`(与本项目无关)已从提交剔除并 gitignore。
 
+**2026-09-26 晚补记(scrcpy 三、四轮返修 + 真机实证,已推送)**:安琳指令拉起 `qtrade-redroid`(`up.sh`,10 s 就绪,serial `emulator-5554`),总控用随包 4.1 server 跑真机探针 + 真 Agent `ScrcpyBackend` 端到端冒烟,全部通过:`app_process` 拉起、`OMX.google.h264.encoder`、连接顺序(先连齐两条 socket 再读头)、12 字节 session 无载荷、首关键帧 8 ms、touch/scroll/key/text 注入生效、pause 0 帧、`RESET_VIDEO`→关键帧 63 ms、第二订阅者 3 s 内出画、close 后 5 s 拆 forward、server 退出。真机才发现的三条已修(r3/r4,独立验收 ACCEPT):静止画面 0 帧是正常(健康判据改为进程/socket 存活)、`i-frame-interval` 无效(新观看者/resume 用 `TYPE_RESET_VIDEO`=17)、慢客户端 RESET 风暴(2 s 节流 + 队列上限 + 连续掉队摘下发 restart + 发帧 5 s 超时 1011)。N1 坐实:断视频 socket 即 server 退出 ⇒ 暂停按「只停转发、socket 不动、resume 发 RESET」实现,**A.2 仍待安琳裁决**。新增待登记:关闭码 1011、`[adapters.qidian]` 4 个新键(节流/掉队/key_wait)。细节:`.omc/handoffs/realdevice-scrcpy41-2026-09-26.md`、`accept-r3/r4-*.md`。探针触摸曾落在桌面搜索框(企点未在前台),已按 BACK 恢复桌面;scrcpy text 注入丢首字符,中文一律走 ADBKeyboard。
+
 ## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。
