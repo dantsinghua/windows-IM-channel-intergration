@@ -229,3 +229,98 @@ describe('画布事件透传', () => {
     expect(w.find('[data-testid="qt-screen-tool-rotate"]').exists()).toBe(false)
   })
 })
+
+/* ────────── R6-72:R 令牌只读 ────────── */
+
+describe('4403 / 403 ⇒ 只读模式(R6-72)', () => {
+  const box = { left: 0, top: 0, width: 720, height: 1280, right: 720, bottom: 1280, x: 0, y: 0, toJSON() {} }
+  const injects = (w: FakeWS) => w.sent.filter((f) => ['touch', 'key', 'scroll', 'text'].includes(String(f.type)))
+
+  async function openCanvas(w: VueWrapper) {
+    ws().open()
+    ws().json({ codec: 'h264', width: 720, height: 1280, profile: 'focus', fps: 30, seq0: 0 })
+    const c = w.find('canvas')
+    ;(c.element as HTMLCanvasElement).getBoundingClientRect = () => box as DOMRect
+    return c
+  }
+
+  it('收到 4403 不自动重连;画布指针/键盘/滚轮/工具条都不再发注入', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval'] })
+    try {
+      const w = await mountPage()
+      const c = await openCanvas(w)
+      await c.trigger('pointerdown', { pointerId: 1, clientX: 360, clientY: 640 })
+      const first = ws()
+      first.onclose?.({ code: 4403 })
+      await flushPromises()
+      // 被踢的那一刻手指还按着:松手的 up 也不许补发
+      expect(injects(first).map((f) => f.action)).toEqual(['down'])
+      vi.advanceTimersByTime(60_000)
+      await flushPromises()
+      expect(FakeWS.instances).toHaveLength(1)
+      expect(w.find('[data-testid="qt-screen-readonly-banner"]').text()).toContain('当前令牌只能观看,不能操作画面')
+      expect(w.find('[data-testid="qt-screen-readonly-reconnect"]').exists()).toBe(true)
+      expect(w.find('[data-testid="qt-screen-tool-back"]').attributes('disabled')).toBe('true')
+      expect(w.find('[data-testid="qt-screen-tool-keyboard"]').attributes('disabled')).toBe('true')
+      expect(w.find('[data-testid="qt-screen-tool-shot"]').attributes('disabled')).toBe('false')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('点「重新连接(只看)」才重连,重连后仍只读、不发任何注入', async () => {
+    const w = await mountPage()
+    await openCanvas(w)
+    ws().onclose?.({ code: 4403 })
+    await flushPromises()
+    await w.find('[data-testid="qt-screen-readonly-reconnect"]').trigger('click')
+    for (let i = 0; i < 6; i++) await flushPromises()
+    expect(FakeWS.instances).toHaveLength(2)
+    const c = await openCanvas(w)
+    await c.trigger('pointerdown', { pointerId: 1, clientX: 360, clientY: 640 })
+    await c.trigger('pointerup', { pointerId: 1, clientX: 360, clientY: 640 })
+    await c.trigger('wheel', { deltaY: 120 })
+    await c.trigger('keydown', { key: 'Backspace' })
+    await c.trigger('keydown', { key: 'a' })
+    expect(w.find('input.ime-input').exists()).toBe(false)
+    expect(injects(ws())).toEqual([])
+    expect(w.find('[data-testid="qt-screen-readonly-banner"]').exists()).toBe(true)
+    // 连上以后不再显示重连按钮
+    expect(w.find('[data-testid="qt-screen-readonly-reconnect"]').exists()).toBe(false)
+  })
+
+  it('没收到 4403 时照常注入(对照)', async () => {
+    const w = await mountPage()
+    const c = await openCanvas(w)
+    await c.trigger('keydown', { key: 'Backspace' })
+    expect(injects(ws())).toHaveLength(2)
+    expect(w.find('[data-testid="qt-screen-readonly-banner"]').exists()).toBe(false)
+  })
+
+  it('静态预览档:#35 回 403 ⇒ 进只读,之后不再请求 #35', async () => {
+    vi.stubGlobal('VideoDecoder', undefined)
+    const fetchMock = vi.fn().mockImplementation(async (url: unknown) => {
+      if (String(url).includes('/stream/input')) {
+        return new Response(JSON.stringify({
+          ok: false, code: 'FORBIDDEN', error: { message: '令牌级别不足', retryable: false, needs_human: false },
+        }), { status: 403, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: 'image/png' }),
+        { status: 200, headers: { 'Content-Type': 'image/png' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const w = await mountPage()
+    const img = w.find('img.static-preview')
+    expect(img.exists()).toBe(true)
+    const inputs = () => fetchMock.mock.calls.filter((c) => String(c[0]).includes('/stream/input')).length
+    await img.trigger('keydown', { key: 'Enter' })
+    for (let i = 0; i < 6; i++) await flushPromises()
+    expect(inputs()).toBe(1)
+    expect(w.find('[data-testid="qt-screen-readonly-banner"]').exists()).toBe(true)
+    await img.trigger('keydown', { key: 'Enter' })
+    await img.trigger('keydown', { key: 'Backspace' })
+    await w.find('[data-testid="qt-screen-tool-back"]').trigger('click')
+    for (let i = 0; i < 6; i++) await flushPromises()
+    expect(inputs()).toBe(1)
+  })
+})

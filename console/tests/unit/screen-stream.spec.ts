@@ -408,3 +408,15 @@ describe('关闭码 4408 = 客户端接收超时(R6-74)', () => {
     expect(classifyClose(1011, true).reason, '1011 已不再是发帧超时的码,只按通用断线处理').toBe('transport')
   })
 })
+
+describe('关闭码 4403 = R 令牌画面注入被拒(R6-72)', () => {
+  it('登记在 STREAM_CLOSE_CODES,分诊为 forbidden_inject 且不可重试', () => {
+    expect(STREAM_CLOSE_CODES[4403]).toEqual({
+      reason: 'forbidden_inject', text: '当前令牌只能观看,不能操作画面', retryable: false,
+    })
+    const c = classifyClose(4403, true)
+    expect(c.reason).toBe('forbidden_inject')
+    expect(c.retryable).toBe(false)
+    expect(c.text).toBe('当前令牌只能观看,不能操作画面')
+  })
+})

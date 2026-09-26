@@ -9,7 +9,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { screen as T, SCREEN_PERF_ITEMS, SCREEN_TOOLS } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
 import { useUiStore } from '@/stores/ui'
+import { useSessionStore } from '@/stores/session'
 import { accountsApi } from '@/api/client'
+import { ApiFailure } from '@/api/http'
 import { ScreenStream, type DecodePath, type StreamClosed, type StreamProfile } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
@@ -19,6 +21,7 @@ const route = useRoute()
 const router = useRouter()
 const accounts = useAccountsStore()
 const ui = useUiStore()
+const session = useSessionStore()
 
 const focusId = ref<string>(String(route.params.id ?? ''))
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -31,6 +34,13 @@ const shotOpen = ref(false)
 const wechatSrc = ref('')
 const wechatNotReady = ref(false)
 const staticSrc = ref('')
+/**
+ * R6-72:画面注入是 W 级。R 令牌注入 ⇒ #34 以 4403 关 WS、#35 回 403。
+ * 渲染进程拿不到令牌级别(session store 只有 authState 三值),只能兜底:
+ * 收到 4403 / 403 就进只读 —— 不再发 touch/key/scroll/text、不自动重连;
+ * 只读跨账号保持(令牌是同一张),直到令牌变化(authState 离开 ok 再回到 ok = 重新取过令牌)。
+ */
+const readOnly = ref(false)
 let stream: ScreenStream | null = null
 let previewTimer: ReturnType<typeof setInterval> | null = null
 let visibilityOff: (() => void) | undefined
@@ -51,7 +61,7 @@ const isStatic = computed(() => stats.value.decoder === 'static')
 const PROFILE_OF: Record<string, StreamProfile> = { focus30: 'focus', focus15: 'focus15', thumb10: 'thumb10' }
 
 /** 画布指针 → #34 控制帧(首帧前不发、move ≤ 60 Hz、长按期间不发任何东西) */
-const relay = new PointerRelay((f) => { stream?.send(f) })
+const relay = new PointerRelay((f) => { if (!readOnly.value) stream?.send(f) })
 
 function draw(frame: VideoFrame): void {
   const c = canvas.value
@@ -100,6 +110,8 @@ async function startFocus(): Promise<void> {
     },
     onClosed: (info) => {
       streamClosed.value = info
+      // 4403:令牌只能看。停手、不自动重连,等用户点「重新连接(只看)」
+      if (info.reason === 'forbidden_inject') { enterReadOnly(); stopAll(); return }
       if (info.reason === 'stream_backend_missing') { stopAll(); return }
       // 4401 由 App.vue 的事件流横幅统一引导「重取令牌」;4409/4400 重试无意义,都停手。
       if (!info.retryable) stopAll()
@@ -113,6 +125,19 @@ async function startFocus(): Promise<void> {
   stream = s
   if (hidden) s.pause()
   await s.start()
+}
+
+/** 进只读:先置位再松开指针(松开时的 up/cancel 也不许再发) */
+function enterReadOnly(): void {
+  readOnly.value = true
+  relay.releaseAll()
+  staticDown = null
+  closeIme()
+}
+
+/** #35 REST 注入被拒(R 令牌 ⇒ 403):进只读,之后不再请求 */
+function onRestInjectError(e: unknown): void {
+  if (e instanceof ApiFailure && e.status === 403) enterReadOnly()
 }
 
 function startStaticPreview(): void {
@@ -172,7 +197,7 @@ const zoom = ref(100)
 
 /** 流模式:canvas 指针事件原样透传(down / move / up / cancel),前端不合成 tap / longpress */
 function onCanvasPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel'): void {
-  if (isWechat.value || !stream) return
+  if (isWechat.value || !stream || readOnly.value) return
   const el = e.currentTarget as HTMLElement | null
   if (!el) return
   const box = el.getBoundingClientRect()
@@ -193,7 +218,7 @@ function onCanvasPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel
 }
 
 function onWheel(e: WheelEvent): void {
-  if (isWechat.value || !stream) return
+  if (isWechat.value || !stream || readOnly.value) return
   const el = e.currentTarget as HTMLElement | null
   if (el) relay.wheel(e, e.deltaX, e.deltaY, el.getBoundingClientRect())
 }
@@ -211,7 +236,7 @@ function staticPoint(e: PointerEvent): { x: number; y: number } | null {
 }
 
 function onStaticPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel'): void {
-  if (isWechat.value || !focus.value) return
+  if (isWechat.value || !focus.value || readOnly.value) return
   const el = e.currentTarget as HTMLElement | null
   if (kind === 'down') {
     const p = staticPoint(e)
@@ -232,13 +257,14 @@ function onStaticPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel
   staticDown = null
   if (kind === 'cancel') return
   const end = staticPoint(e) ?? start.last
-  void accountsApi.streamInput(focus.value.id, restGesture(start, end, Date.now() - start.t)).catch(() => undefined)
+  void accountsApi.streamInput(focus.value.id, restGesture(start, end, Date.now() - start.t)).catch(onRestInjectError)
 }
 
 /** 控制键 → `key`(按下 + 抬起各一帧);静态预览走 #35 */
 function sendKey(keycode: string): void {
+  if (readOnly.value) return
   if (isStatic.value) {
-    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'key', keycode }).catch(() => undefined)
+    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'key', keycode }).catch(onRestInjectError)
     return
   }
   if (!stream) return
@@ -247,9 +273,9 @@ function sendKey(keycode: string): void {
 }
 
 function sendText(text: string): void {
-  if (!text) return
+  if (!text || readOnly.value) return
   if (isStatic.value) {
-    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'text', text }).catch(() => undefined)
+    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'text', text }).catch(onRestInjectError)
     return
   }
   stream?.send({ type: 'text', text })
@@ -271,6 +297,7 @@ const imeText = ref('')
 const imeInput = ref<HTMLInputElement | null>(null)
 
 function openIme(initial = ''): void {
+  if (readOnly.value) return
   imeOpen.value = true
   imeText.value += initial
   void nextTick(() => imeInput.value?.focus())
@@ -296,7 +323,7 @@ function onImeKey(e: KeyboardEvent): void {
 }
 
 function onKey(e: KeyboardEvent): void {
-  if (isWechat.value || (!stream && !isStatic.value) || e.isComposing) return
+  if (isWechat.value || readOnly.value || (!stream && !isStatic.value) || e.isComposing) return
   if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault()
     openIme(e.key)
@@ -354,6 +381,8 @@ function selectThumb(id: string): void {
 }
 
 watch(focusId, () => void startFocus())
+// 令牌变化(离开 ok 再回到 ok = 重新取过令牌)才解除只读;换账号不解除
+watch(() => session.authState, (v, old) => { if (v === 'ok' && old !== 'ok') readOnly.value = false })
 watch(() => route.params.id, (v) => { if (v) focusId.value = String(v) })
 
 onMounted(async () => {
@@ -454,7 +483,17 @@ onUnmounted(() => {
             不一律「连接失败」;不可重试的一律停手,不无限重连。
             ⚠️ 01 §4 还没有这块提示的元素 id(关闭码表 01 §5.1 也缺 4409/4410/4503),已列给文档方。
           -->
-          <div v-if="streamClosed && !streamClosed.retryable" class="banner crit">
+          <!-- R6-72:R 令牌只读。4403 后停流,点「重新连接(只看)」才重连,重连后仍只读 -->
+          <div v-if="readOnly" class="banner" :data-testid="T.readonlyBanner">
+            当前令牌只能观看,不能操作画面
+            <a-button
+              v-if="streamClosed?.reason === 'forbidden_inject'"
+              size="small"
+              :data-testid="T.readonlyReconnect"
+              @click="startFocus"
+            >重新连接(只看)</a-button>
+          </div>
+          <div v-else-if="streamClosed && !streamClosed.retryable" class="banner crit">
             <strong>{{ streamClosed.text }}</strong>
             <span class="qt-small qt-muted">(关闭码 {{ streamClosed.code }} · {{ streamClosed.reason }})</span>
             <p v-if="streamClosed.reason === 'stream_backend_missing'" class="qt-small qt-muted">
@@ -474,6 +513,7 @@ onUnmounted(() => {
             <img
               v-if="staticSrc"
               class="wxpreview static-preview"
+            :class="{ readonly: readOnly }"
               :src="staticSrc"
               alt="静态预览"
               tabindex="0"
@@ -491,6 +531,7 @@ onUnmounted(() => {
             v-else
             ref="canvas"
             class="canvas"
+            :class="{ readonly: readOnly }"
             tabindex="0"
             :data-testid="T.canvas"
             :style="{ width: zoom + '%' }"
@@ -518,7 +559,14 @@ onUnmounted(() => {
             <a-button size="small" @click="closeIme">取消</a-button>
           </div>
           <div class="qt-row tools">
-            <a-button v-for="t in SCREEN_TOOLS" :key="t" size="small" :data-testid="T.tool(t)" @click="tool(t)">
+            <a-button
+              v-for="t in SCREEN_TOOLS"
+              :key="t"
+              size="small"
+              :disabled="readOnly && t !== 'shot'"
+              :data-testid="T.tool(t)"
+              @click="tool(t)"
+            >
               {{ ({ back: '返回', home: '主页', shot: '截图', keyboard: '键盘输入' } as Record<string, string>)[t] }}
             </a-button>
             <a-dropdown>
@@ -580,6 +628,7 @@ onUnmounted(() => {
 }
 /* 触屏/笔:不让浏览器把拖动当成页面滚动或缩放吞掉 */
 .canvas, .static-preview { touch-action: none; user-select: none; }
+.canvas.readonly, .static-preview.readonly { cursor: default; }
 .ime { margin-top: var(--qt-space-2); gap: var(--qt-space-2); }
 .ime-input { flex: 1 1 auto; max-width: 480px; padding: 2px 8px; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-sm); }
 .zoom { display: inline-flex; align-items: center; gap: 6px; }
