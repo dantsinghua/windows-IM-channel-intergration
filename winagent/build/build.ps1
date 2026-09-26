@@ -90,10 +90,6 @@ Invoke-Native "升级 pip/wheel" { & $py -m pip install --upgrade pip wheel }
 Invoke-Native "装 windows+dev 依赖与 pyinstaller" { & $py -m pip install -e ".[windows,dev]" pyinstaller }
 # 会话代理侧的 UI 自动化栈(不进 pyproject 的硬依赖:Linux 上装不了)
 Invoke-Native "装 pywinauto/pillow" { & $py -m pip install pywinauto pillow }
-# 🔴 websockets:main_svc 起 uvicorn 用 ws="websockets"(02 §2.4,不许 auto),但 pyproject 只依赖裸 uvicorn,
-#    不会带上它;测试走 ASGI 传输用不到,所以 pytest 全绿而 exe 一起服务就崩。2026-09-27 由 exe 冒烟门
-#    (--selfcheck)首次抓到。本该进 pyproject 的 dependencies —— 那不归打包线改,先在这里装上,交接已记。
-Invoke-Native "装 websockets" { & $py -m pip install "websockets>=12" }
 # 就地自检:第 3 步要用的东西现在就确认装到了**这个** venv 里,别等跑到第 3 步才发现缺件。
 Invoke-Native "自检 pytest/pyinstaller 可导入" { & $py -c "import pytest, PyInstaller" }
 Write-Host "    ⚠️ pyweixin 不在公共源上:按 03 的随包清单从本地 wheel 安装后再打包(缺它则微信发送不可用)" -ForegroundColor Yellow

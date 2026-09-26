@@ -7,7 +7,9 @@ name = "qtrade-winagent"
 version = "0.1.0"
 description = "QTrade 多实例 IM 控制台 —— WinAgent(Windows 侧:LocalSystem 服务 qtrade-winagent-svc + 用户会话代理 qtrade-winagent-user)。规格 = docs/00 基线 + docs/02 §2.4/§2.4.1/§2.5/§2.9/§3.2/§3.6/§3.7/§7.2 + docs/03/04/05。"
 requires-python = ">=3.11"
-dependencies = ["fastapi>=0.115", "uvicorn>=0.30"]
+# websockets:main_svc 起 uvicorn 用 ws="websockets"(02 §2.4,不许 auto),裸 uvicorn 不会带上它;
+# 版本与 Agent 侧锁定一致(installer/rootfs/requirements.lock websockets==17.1)。缺它 exe 一起服务就崩(2026-09-27)。
+dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "websockets>=17,<18"]
 
 # Windows 专有依赖只在 Windows 真机装(pywin32 = 服务壳/命名管道/DPAPI/WTS;psutil = 采样;wmi = 子网事件)。
 # 开发/CI 在 Linux 上只装 dev,全部 Win* 后端延迟导入、测试一律走 Fake*。
