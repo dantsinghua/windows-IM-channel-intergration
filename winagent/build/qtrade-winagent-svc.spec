@@ -11,10 +11,12 @@
 import os
 
 block_cipher = None
-SRC = os.path.join(os.path.dirname(os.path.abspath(SPEC)), "..", "src")     # noqa: F821
+HERE = os.path.dirname(os.path.abspath(SPEC))                               # noqa: F821
+SRC = os.path.join(HERE, "..", "src")
 
 a = Analysis(
-    [os.path.join(SRC, "qtrade_winagent", "main_svc.py")],
+    # 🔴 入口必须是**包外**薄壳(entry_svc.py 文件头有原因);指向包内 main_svc.py 会因相对导入启动即崩
+    [os.path.join(HERE, "entry_svc.py")],
     pathex=[SRC],
     binaries=[],
     # winagent.db 的 DDL 逐字抽自 docs/02 §3.2,必须随包(db.py 启动时读它建库)
@@ -34,6 +36,7 @@ a = Analysis(
         "qtrade_winagent.win.netinfo", "qtrade_winagent.win.pipes", "qtrade_winagent.win.power",
         "qtrade_winagent.win.probe", "qtrade_winagent.win.proc", "qtrade_winagent.win.sysinfo",
         "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat",
+        "qtrade_winagent.main_svc", "qtrade_winagent.fakes",
     ],
     hookspath=[],
     runtime_hooks=[],

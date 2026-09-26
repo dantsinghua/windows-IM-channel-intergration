@@ -4,17 +4,19 @@
 02 §2.4 / C-02:它要**交互桌面**(微信 UI 自动化)与用户自己的 WSL 登记,所以是独立执行体;
 **不监听任何端口**(04 §2.6.3 R-14:防火墙规则里绝不出现它),只作命名管道客户端。
 
-与服务 spec 的两处差别:
+与服务 spec 的差别:
 1. 多带 UI 自动化与图像栈(pywinauto / pyweixin / Pillow),那是微信模块要用的;
-2. 不带 uvicorn / fastapi —— 它不起 HTTP。
+2. 不带 uvicorn —— 它不起 HTTP(fastapi 因 main_user→main_svc→svc 的顶层导入链仍会被带上)。
 """
 import os
 
 block_cipher = None
-SRC = os.path.join(os.path.dirname(os.path.abspath(SPEC)), "..", "src")     # noqa: F821
+HERE = os.path.dirname(os.path.abspath(SPEC))                               # noqa: F821
+SRC = os.path.join(HERE, "..", "src")
 
 a = Analysis(
-    [os.path.join(SRC, "qtrade_winagent", "main_user.py")],
+    # 🔴 入口必须是**包外**薄壳(entry_user.py 文件头有原因);指向包内 main_user.py 会因相对导入启动即崩
+    [os.path.join(HERE, "entry_user.py")],
     pathex=[SRC],
     binaries=[],
     datas=[],
@@ -24,10 +26,13 @@ a = Analysis(
         "pywinauto", "pywinauto.application", "pyweixin", "PIL", "PIL.ImageGrab",
         "qtrade_winagent.win.pipes", "qtrade_winagent.win.power", "qtrade_winagent.win.proc",
         "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat", "qtrade_winagent.win.sysinfo",
+        "qtrade_winagent.main_user", "qtrade_winagent.fakes",
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "fastapi", "uvicorn", "starlette", "pytest", "matplotlib"],
+    # ⚠️ 不能排除 fastapi/starlette:main_user 顶层 import main_svc(取 DEFAULT_ROOT 等),main_svc 顶层 import svc,
+    #    svc 顶层 import fastapi —— 排掉它 exe 一启动就 ModuleNotFoundError。uvicorn 在 main_svc.main() 里才导入,可排。
+    excludes=["tkinter", "uvicorn", "pytest", "matplotlib"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
