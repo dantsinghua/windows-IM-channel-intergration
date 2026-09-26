@@ -239,3 +239,106 @@ def test_engine_iss_compiles(tmp_path: Path) -> None:
     assert proc.returncode == 0, f"ISCC 编译失败(退出码 {proc.returncode}),日志末尾:\n{tail}"
     exes = list(out_dir.glob("*.exe"))
     assert exes, f"ISCC 退出码 0 但没产出 EXE,日志末尾:\n{tail}"
+
+
+# ── 版本可覆盖(验收 B1,2026-09-27)──────────────────────────────────────────
+# build.ps1 以 `/DEngineVersion=<包版本>` 编引擎;.iss 若无条件 `#define EngineVersion` 就把它盖掉 ⇒
+# 包内引擎 VersionInfo / AppVersion / package_version 永远是 .iss 里的默认值,已装旧版的机器
+# 被判 repair 而非 upgrade(run-step.ps1 §2.13)。
+
+_VS_FIXEDFILEINFO_SIG = b"\xbd\x04\xef\xfe"
+
+
+def _pe_fixed_versions(exe: Path) -> tuple[str, str]:
+    """从 PE 版本资源的 VS_FIXEDFILEINFO 读 (FileVersion, ProductVersion),形如 ``9.9.9.0``。"""
+    data = exe.read_bytes()
+    i = data.find(_VS_FIXEDFILEINFO_SIG)
+    assert i >= 0, f"{exe.name} 里找不到 VS_FIXEDFILEINFO(没有版本资源)"
+
+    def dword(off: int) -> int:
+        return int.from_bytes(data[i + off : i + off + 4], "little")
+
+    def ver(ms: int, ls: int) -> str:
+        return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+    # 布局:Signature, StrucVersion, FileVersionMS, FileVersionLS, ProductVersionMS, ProductVersionLS
+    return ver(dword(8), dword(12)), ver(dword(16), dword(20))
+
+
+def _compile_engine_with_version(tmp_path: Path, version: str, iss_text: str | None = None) -> tuple[Path, str]:
+    """在临时副本里带 ``/DEngineVersion=<version>`` 编引擎;返回 (EXE 路径, 预处理后的脚本文本)。
+
+    预处理结果靠在副本末尾追加 ISPP ``SaveToFile`` 导出 —— [Code] 段进 EXE 后是压缩的,
+    直接搜 EXE 字节看不到 ``package_version``,只能从预处理输出里核。
+    """
+    iscc = _find_iscc()
+    if iscc is None:
+        pytest.fail("找不到 ISCC.exe,版本覆盖门没法验(不许 skip)。设 QT_ISCC=<ISCC.exe 路径> 后重跑。")
+    work = tmp_path / "engine"
+    shutil.copytree(ENGINE_DIR, work)
+    iss = work / ISS.name
+    text = iss_text if iss_text is not None else ISS.read_text(encoding="utf-8-sig")
+    text += '\n#expr SaveToFile(AddBackslash(SourcePath) + "preprocessed.iss")\n'
+    iss.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    cmd = [
+        iscc,
+        "/O" + _to_windows_path(out_dir, iscc),
+        f"/DEngineVersion={version}",
+        _to_windows_path(iss, iscc),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=600)
+    log = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+    tail = "\n".join(log.strip().splitlines()[-30:])
+    assert proc.returncode == 0, f"ISCC 编译失败(退出码 {proc.returncode}),日志末尾:\n{tail}"
+    exes = list(out_dir.glob("*.exe"))
+    assert len(exes) == 1, f"期望恰好 1 个 EXE,实得 {exes};日志末尾:\n{tail}"
+    pp = work / "preprocessed.iss"
+    assert pp.is_file(), f"ISPP 没导出预处理结果;日志末尾:\n{tail}"
+    raw = pp.read_bytes()
+    pp_text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig", errors="replace")
+    return exes[0], pp_text
+
+
+def _assert_engine_version(exe: Path, pp_text: str, version: str) -> None:
+    file_ver, prod_ver = _pe_fixed_versions(exe)
+    assert file_ver == f"{version}.0", f"VersionInfo 文件版本 {file_ver},期望 {version}.0"
+    assert prod_ver == f"{version}.0", f"VersionInfo 产品版本 {prod_ver},期望 {version}.0"
+    assert re.search(rf"^AppVersion={re.escape(version)}\s*$", pp_text, re.M), "预处理后 AppVersion 不是命令行版本"
+    assert re.search(rf"^VersionInfoVersion={re.escape(version)}\s*$", pp_text, re.M), "预处理后 VersionInfoVersion 不是命令行版本"
+    assert f"',\"package_version\":\"' + '{version}' + '\"'" in pp_text, "[Code] 写进 package_version 的常量不是命令行版本"
+
+
+def test_engine_version_overridable_from_command_line(tmp_path: Path) -> None:
+    exe, pp_text = _compile_engine_with_version(tmp_path, "9.9.9")
+    _assert_engine_version(exe, pp_text, "9.9.9")
+
+
+def test_engine_version_override_check_catches_b1(tmp_path: Path) -> None:
+    """反向:把 `#ifndef EngineVersion` 守卫拆掉(= B1 原状)⇒ 上面的断言必须红。"""
+    src = ISS.read_text(encoding="utf-8-sig")
+    b1 = re.sub(r"^#ifndef EngineVersion\s*\n(.*?)^#endif\s*\n", r"\1", src, count=1, flags=re.M | re.S)
+    assert b1 != src, "没找到 `#ifndef EngineVersion ... #endif` 块,无法构造 B1 反例"
+    exe, pp_text = _compile_engine_with_version(tmp_path, "9.9.9", iss_text=b1)
+    with pytest.raises(AssertionError):
+        _assert_engine_version(exe, pp_text, "9.9.9")
+
+
+def test_engine_version_define_guarded_by_ifndef() -> None:
+    """静态守卫:.iss 里每一处 `#define EngineVersion` 都必须落在 `#ifndef EngineVersion ... #endif` 块内。"""
+    depth_stack: list[bool] = []  # 每层条件编译是否为 `#ifndef EngineVersion`
+    found = 0
+    for lineno, line in enumerate(ISS.read_text(encoding="utf-8-sig").splitlines(), 1):
+        s = line.strip()
+        if re.match(r"#\s*if(n?def)?\b", s):
+            depth_stack.append(bool(re.match(r"#\s*ifndef\s+EngineVersion\b", s)))
+        elif re.match(r"#\s*endif\b", s):
+            assert depth_stack, f"第 {lineno} 行 #endif 无配对"
+            depth_stack.pop()
+        elif re.match(r"#\s*define\s+EngineVersion\b", s):
+            found += 1
+            assert depth_stack and depth_stack[-1], (
+                f"第 {lineno} 行 `{s}` 不在 `#ifndef EngineVersion` 块内 —— 会盖掉 build.ps1 的 /DEngineVersion(B1)"
+            )
+    assert found, ".iss 里没有 `#define EngineVersion` 默认值"

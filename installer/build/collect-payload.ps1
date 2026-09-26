@@ -39,7 +39,7 @@ $PayloadMap = @(
         Hint = 'busybox 微型 rootfs,~3 MB;/etc/wsl.conf 里要关 systemd/interop/automount(§2.6.1)' }
 
     @{ Dest = 'wsl/wsl.msi'; Sources = @('third_party/wsl/wsl.msi'); Kind = 'file'; Critical = $true; Packed = $true
-        Purpose = 'WSL 2.6.x 离线安装包(MSI)'; EnvVar = 'QT_SRC_WSL_MSI'
+        Purpose = 'WSL 离线安装包(MSI,版本以 SOURCES.md 为准)'; EnvVar = 'QT_SRC_WSL_MSI'
         Hint = '微软官方 WSL release 的 .msi;§2.5.2 要求装完 wsl --version ≥ 2.4.0' }
 
     @{ Dest = 'wsl/rootfs.tar'; Sources = @('rootfs/out/rootfs.tar'); Kind = 'file'; Critical = $true; Packed = $false

@@ -14,7 +14,10 @@
 ; ============================================================================
 
 #define EngineName       "QTrade 安装程序"
-#define EngineVersion    "1.0.0"
+; EngineVersion 必须可被命令行 /DEngineVersion=x.y.z 覆盖(build.ps1 传包版本);无条件 #define 会把它盖掉 ⇒ 包内引擎永远 1.0.0,旧版机器被判 repair 而非 upgrade(§2.13,验收 B1)
+#ifndef EngineVersion
+  #define EngineVersion  "1.0.0"
+#endif
 #define EnginePublisher  "QTrade"
 #define EngineExeName    "qtrade-setup-engine"
 
