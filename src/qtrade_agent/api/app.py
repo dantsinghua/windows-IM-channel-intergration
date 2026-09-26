@@ -483,18 +483,23 @@ def create_api(agent) -> FastAPI:
         if row["state"] != "running" or not row.get("self_uid"):
             raise ApiError(503, "NOT_READY", "账号未登录,不能读通讯录", reason="login_required")
         seq = int(row["seq"])
-        agent._current_qidian_account = Account(
-            id=row["id"], channel="qidian", state=row["state"], self_uid=row.get("self_uid"),
-            extra={"adb_serial": row.get("adb_serial") or f"127.0.0.1:{16000 + seq}"})
+        acct = Account(id=row["id"], channel="qidian", state=row["state"], self_uid=row.get("self_uid"),
+                       extra={"adb_serial": row.get("adb_serial") or f"127.0.0.1:{16000 + seq}"})
+
+        def read_rows() -> Optional[list]:
+            # 主库读取走 adb(几秒级),放线程里跑;账号显式传,不碰轮询共用的 `_current_qidian_account`
+            db = agent._maindb_for_uid(str(row["self_uid"]), acct)
+            return db.list_contact_source_rows() if db.exists() else None
+
         try:
-            db = agent._maindb_for_uid(str(row["self_uid"]))
-            if not db.exists():
-                raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable")
-            src_rows = db.list_contact_source_rows()
+            src_rows = await asyncio.to_thread(read_rows)
         except MainDbError as e:
             raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable") from e
-        finally:
-            agent._current_qidian_account = None
+        except Exception as e:              # adb 超时 / 子进程起不来 / 解码异常:同样是「主库暂不可读」,不冒 500
+            log.warning("读企点通讯录失败 account=%s: %s: %s", account_id, type(e).__name__, e)
+            raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable") from e
+        if src_rows is None:
+            raise ApiError(503, "NOT_READY", "企点主库不可读", reason="maindb_unavailable")
         return {"ok": True, "data": list_private_contacts(src_rows)}
 
     # ------------------------------------------------------------------ 账号生命周期(02 §3.4.1 #2/#4/#5/#6/#7/#9/#10/#11/#19)

@@ -226,15 +226,3 @@ class HealthLoop:
             else:
                 self._runtime.qidian_root_fail_streak[aid] = 0
                 self._alerts.resolve(QIDIAN_NOT_ROOT, subject=subject, account_id=aid)
-
-    async def promote_qidian_login(self) -> None:
-        """人在画面里登完后,身份已经回填(self_uid)但仍停在 login_required 的企点账号升为 running。
-
-        05:凭 /data 里的登录态进入主界面则直接 running;人在画面完成登录后应离开黄标。
-        自动登录流程只在 logging_in 里轮询,画面上手动登完不会再走那条,所以这里补一轮。
-        """
-        for row in self._store.list_accounts(channel="qidian", state="login_required"):
-            if not (row.get("self_uid") or "").strip() or self._accounts.busy(row["id"]):
-                continue
-            self._accounts.transition(row["id"], "running", state_code=None, state_reason="",
-                                      self_uid=row["self_uid"])

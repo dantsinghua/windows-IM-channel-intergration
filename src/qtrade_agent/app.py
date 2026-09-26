@@ -303,7 +303,6 @@ class AgentApp:
         self.scheduler.register("health_adb", self.cfg.health.adb_check_s, self.healthloop.check_adb)                          # H06
         self.scheduler.register("health_boot", H05_STEADY_INTERVAL_S, self.healthloop.check_boot)                              # H05 稳态
         self.scheduler.register("login_remind", 60, self.accounts.login_remind)                                                # 05 §2.5.4
-        self.scheduler.register("qidian_login_promote", 15, self.healthloop.promote_qidian_login)                               # 画面上手动登完后离开黄标
         self.scheduler.register("health_napcat", H08_INTERVAL_S, self.qqhealth.check)                                          # 04 H08,每 15 s
         self.scheduler.register("health_wechat", self.cfg.wechat_adapter.poll_interval_s, self.healthloop.check_wechat)        # 05 §2.5.4 两条
         self.scheduler.register("wechat_slot_reaper", self.cfg.wechat.slot_reaper_interval_s, self.wechat_slot.reap)           # 02 §2.2.5 ②
@@ -415,8 +414,8 @@ class AgentApp:
         self.accounts.transition(account_id, "login_required", state_code=state_code,
                                  state_reason="napcat 报离线超过 2 分钟(H08)")
 
-    def _maindb_for_uid(self, self_uid: str) -> MainDb:
-        acct = self._current_qidian_account
+    def _maindb_for_uid(self, self_uid: str, acct: Optional[Account] = None) -> MainDb:
+        acct = acct or self._current_qidian_account
         if self._maindb_factory is not None:
             return self._maindb_factory(self_uid, acct)
         serial = acct.extra.get("adb_serial") if acct else None
@@ -601,13 +600,23 @@ class AgentApp:
         return {"serial": serial, "reconnected": bool(ok), "adb_state": devices.get(serial) or "missing"}
 
     async def restart_stream(self, row: dict[str, Any]) -> dict[str, Any]:
-        """#101 / 04 H07 自愈同一实现:重建 ``adb forward``。
+        """#101 / 04 H07 自愈同一实现:重建 ``adb forward`` 与 scrcpy-server。
 
-        ⚠️ scrcpy-server 的拉起在**画面流**里,本期没有执行体 ⇒ 如实回 ``stream_restarted:false``,
-        **不假装重建了 scrcpy**(rulings R6-58 (cw))。
+        画面流执行体(``screen_scrcpy.ScrcpyBackend``)装配了 ⇒ 交给它:有在跑的流就真重拉、已连 WS 收
+        ``{type:'restart'}``;没人在看只重建 forward、``stream_restarted:false``。
+        没装配 ⇒ 只重建 ``adb forward``,如实回 ``stream_restarted:false``(rulings R6-58 (cw))。
         """
         serial = row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"
         port = row.get("stream_port") or (16500 + int(row["seq"]))
+        restart = getattr(getattr(self, "stream_backend", None), "restart", None)
+        if restart is not None:
+            try:
+                res = await restart(row["id"])
+            except Exception as e:
+                log.warning("#101 重建画面流失败 account=%s: %s", row["id"], e)
+                res = {"forward_rebuilt": False, "stream_restarted": False}
+            return {"serial": serial, "stream_port": port, "forward_rebuilt": bool(res.get("forward_rebuilt")),
+                    "stream_restarted": bool(res.get("stream_restarted"))}
         forwarded = False
         fn = getattr(self.runtime._adb, "forward", None)
         if fn is not None:
@@ -761,6 +770,9 @@ class AgentApp:
         if wa is not None:
             for row in self.store.list_accounts(channel="wechat"):
                 await self._stop_quietly(wa.stop(self._wechat_account(row), graceful=True), f"微信读循环 {row['id']}")
+        sb = getattr(self, "stream_backend", None)
+        if sb is not None and hasattr(sb, "aclose"):
+            await self._stop_quietly(sb.aclose(), "画面流(scrcpy-server)")
         if getattr(self, "bus", None) is not None:
             await self.bus.close()
         self.store.close()

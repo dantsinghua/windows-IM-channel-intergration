@@ -150,35 +150,34 @@ def init_db(cfg: AgentConfig, db_path: str | None) -> int:
     return EXIT_OK
 
 
-def _attach_screen(agent, db_path: str) -> None:
-    """真机在 adb 上时把画面流接上。测试不走 main,缺省仍是 4503,不会造假帧。"""
-    import sqlite3
+def _attach_screen(agent, cfg: AgentConfig) -> None:
+    """真机上把 #34 画面流 / #33 企点截图 / #35 注入兜底接到 scrcpy-server + adb(``screen_scrcpy.ScrcpyBackend``)。
 
-    from .screen_adb import AdbScreenBackend, ffmpeg_bin
+    随包 scrcpy-server 或 adb 不在 ⇒ 保持未装配(#34 如实 4503、#33 企点 UNSUPPORTED),不造假帧。
+    账号 → adb serial / 165NN 按库里 ``account_runtime`` 取、缺了按 00 §3 由序号推导;查不到账号即报错(WS 4503),
+    **不回退到任何固定设备**。测试不走 main。
+    """
+    import shutil
 
-    if ffmpeg_bin() is None:
-        log.warning("未找到 ffmpeg,画面流保持未装配")
+    from .runtime.runtime import ADB_SERVER_PORT
+    from .screen_adb import AsyncAdb
+    from .screen_scrcpy import ScrcpyBackend, store_target_resolver
+
+    jar = cfg.qidian.scrcpy_server_path
+    if not os.path.isfile(jar):
+        log.warning("随包 scrcpy-server 不在 %s,画面流保持未装配", jar)
         return
-
-    def serial_of(account_id: str) -> str:
-        try:
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = con.execute(
-                "SELECT adb_serial, adb_port FROM account_runtime WHERE account_id=?",
-                (account_id,),
-            ).fetchone()
-            con.close()
-        except sqlite3.Error as e:
-            log.warning("读 adb 串口失败: %s", e)
-            return "127.0.0.1:5555"
-        if row and row[0]:
-            return str(row[0])
-        if row and row[1]:
-            return f"127.0.0.1:{row[1]}"
-        return "127.0.0.1:5555"
-
-    agent.stream_backend = AdbScreenBackend(serial_of)
-    log.info("画面流已接上真机 adb(竖屏 screencap)")
+    if shutil.which("adb") is None:
+        log.warning("找不到 adb,画面流保持未装配")
+        return
+    backend = ScrcpyBackend(store_target_resolver(agent.store), adb=AsyncAdb(server_port=ADB_SERVER_PORT),
+                            server_jar=jar, server_version=cfg.qidian.scrcpy_server_version,
+                            profiles=cfg.qidian.stream_profiles, frame_timeout_s=cfg.health.scrcpy_frame_timeout_s)
+    agent.stream_backend = backend
+    qidian = agent.adapters.get("qidian")
+    if qidian is not None:
+        qidian.screenshot_fn = backend.capture_png
+    log.info("画面流已接上 scrcpy-server %s(%s)", cfg.qidian.scrcpy_server_version, jar)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         # `--config` 只用来取 `[db] path` 等建库参数;`[api]`/`[scheduler]` 这类运行期配置本次一律不生效。
         return init_db(cfg, args.db)
     agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
-    _attach_screen(agent, args.db or cfg.db.path)
+    _attach_screen(agent, cfg)
     import uvicorn
     server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
                                            workers=1, log_level=args.log_level.lower()))

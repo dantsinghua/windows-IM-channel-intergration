@@ -36,6 +36,13 @@ class QidianAdapterConfig:
     gap_check_interval_s: int = 60              # R6-39:check_group_gaps 周期
     gap_window_days: int = 3
     gap_min_missing: int = 5
+    #: #34 画面流四档(02 §7.1 逐字;A.2 / C-08)
+    stream_profiles: dict[str, str] = field(default_factory=lambda: {
+        "thumb": "540p@5", "thumb10": "540p@10", "focus": "720p@30", "focus15": "720p@15"})
+    #: 随包 scrcpy-server 的位置与版本(版本须与 jar 严格一致,作 server 第一个参数)。
+    #: ⚠️ 这两键 02 §7.1 尚未登记(见交接 fix-agent-scrcpy-2026-09-26),rootfs 落点见 installer/rootfs/Dockerfile
+    scrcpy_server_path: str = "/opt/qtrade/scrcpy/scrcpy-server"
+    scrcpy_server_version: str = "4.1"
 
 
 @dataclass(frozen=True)

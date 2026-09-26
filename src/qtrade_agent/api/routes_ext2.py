@@ -47,7 +47,7 @@ STREAM_PROFILES = ("thumb", "focus", "focus15", "thumb10")
 #: #35 REST 注入的类型(02 #35 逐字)
 STREAM_INPUT_TYPES = ("tap", "swipe", "key", "text")
 #: #34 控制帧类型(02 #34 逐字)
-STREAM_CONTROL_TYPES = ("touch", "key", "scroll", "text", "pause", "resume", "profile", "pong", "rotate")
+STREAM_CONTROL_TYPES = ("touch", "key", "scroll", "text", "pause", "resume", "profile", "pong")
 #: 00 §8.1 R-06:`login_required` 下允许的**画面注入类**(不过 GATE,但逐条记 `audit_log.kind='stream_input'`)
 LOGIN_PHASE_STATES = ("login_required", "logging_in")
 #: #54 清理模式(02 #54 逐字)
@@ -110,14 +110,15 @@ class RealFs:
 class StreamBackend:
     """#34 / #35 画面流与输入回注的执行体协议(04 H07 / 02 #34/#35)。
 
-    🔴 **本期没有实现**(scrcpy-server 拉流与 adb 输入回注都还没接),`create_api` 只在 ``agent.stream_backend``
-    被显式注入时才走真流;缺省一律 ``503 NOT_READY(stream_backend_missing)`` / WS ``4503``,**不伪造帧**。
+    真机实现 = ``screen_scrcpy.ScrcpyBackend``,由 ``main`` 在随包 scrcpy-server 与 adb 都在时装配;
+    没装配(测试 / 开发容器 / 缺 jar)一律 ``503 NOT_READY(stream_backend_missing)`` / WS ``4503``,**不伪造帧**。
 
     Fake 只要实现下面两个方法即可编程:
 
     - ``async open(account_id, *, profile) -> session``,``session`` 需有
       ``meta: dict``(首帧 JSON 的 `{codec,width,height,profile,fps,seq0}`)、
-      ``frames() -> AsyncIterator[tuple[int, bytes]]``(``(pts_ms, Annex-B NAL)``;8 字节 PTS 头由本模块拼)、
+      ``frames() -> AsyncIterator[tuple[int, bytes] | dict]``(``(pts_ms, Annex-B NAL)``;8 字节 PTS 头由本模块拼;
+      ``dict`` = 原样发给客户端的 JSON,如换档后的新 meta、``{type:'restart'}``)、
       ``async control(msg: dict)``、``async close()``。
     - ``async inject(account_id, msg: dict) -> dict``(#35 的 REST 兜底,与 #34 控制帧同一条 adb input 路径)。
     """
@@ -412,14 +413,6 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         if row["channel"] == "qq":
             raise ApiError(409, "NOT_APPLICABLE", "QQ 通道不支持截图(§3.10 目录 channels.qq='not_applicable')",
                            reason="not_applicable")
-        # 企点适配器的 screenshot 仍是 UNSUPPORTED。真机画面流挂上之后,这里直接回 framebuffer,
-        # 给不支持 WebCodecs 的控制台当静态预览(像素仍是 redroid,不是占位图)。
-        grab = getattr(getattr(agent, "stream_backend", None), "capture_png", None)
-        if row["channel"] == "qidian" and grab is not None and not region:
-            raw_live = await grab(account_id)
-            if raw_live:
-                return Response(content=bytes(raw_live), media_type="image/png",
-                                headers={"Cache-Control": "no-store"})
         res = await _submit_op(request, p, account_id, "screenshot", args)
         if not res.ok:
             code = res.code
@@ -491,8 +484,8 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         首帧由服务端发 JSON ``{codec,width,height,profile,fps,seq0}``;此后二进制帧 =
         **8 字节 PTS(毫秒,big-endian uint64)+ Annex-B NAL**;控制帧由客户端发 JSON。
 
-        🔴 **本期没有执行体**(scrcpy-server 拉流没接)⇒ 鉴权与参数校验照做,到真要出帧时
-        ``close(4503, stream_backend_missing)``,**一帧都不伪造**。装配方注入 ``agent.stream_backend`` 即可真连。
+        🔴 执行体没装配 ⇒ 鉴权与参数校验照做,到真要出帧时 ``close(4503, stream_backend_missing)``,
+        **一帧都不伪造**;``open`` 失败(拉不起 scrcpy-server)同样 4503。
         """
         p = _ws_principal(ws)
         if p is None:
@@ -539,7 +532,15 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
             await ws.send_json(meta)                      # 首帧 = 服务端发的 JSON(02 #34 逐字)
 
             async def pump_frames() -> None:
-                async for pts_ms, nal in session.frames():
+                async for item in session.frames():
+                    if isinstance(item, dict):
+                        # 执行体下发的 JSON(换档后的新 meta / 02 #101「已连 WS 收到 {type:'restart'} 后重连」)。
+                        # restart 先让出 focus 位,客户端立刻重连才不会撞 4410
+                        if item.get("type") == "restart" and is_focus and focus_holders.get(account_id) == conn_id:
+                            focus_holders.pop(account_id, None)
+                        await ws.send_json(item)
+                        continue
+                    pts_ms, nal = item
                     await ws.send_bytes(struct.pack(">Q", int(pts_ms)) + bytes(nal))
 
             pump = asyncio.create_task(pump_frames(), name=f"stream:{account_id}:{conn_id}")
@@ -605,6 +606,11 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         if kind == "key" and not isinstance(body.get("keycode"), (int, str)):
             raise ApiError(400, "INVALID_ARGS", "key 须带 keycode", reason="bad_keycode",
                            extra={"details": [{"pointer": "/keycode"}]})
+        dur = body.get("duration_ms")
+        if kind == "swipe" and dur is not None and (isinstance(dur, bool) or not isinstance(dur, (int, float)) or dur < 0):
+            # 规格外字段(控制台长按兜底用;待 02 #35 登记):缺省 120 ms、上限 5000 ms,由执行体钳
+            raise ApiError(400, "INVALID_ARGS", "duration_ms 须为非负数字", reason="bad_duration",
+                           extra={"details": [{"pointer": "/duration_ms"}]})
         if kind == "text" and not isinstance(body.get("text"), str):
             raise ApiError(400, "INVALID_ARGS", "text 须带 text 字符串", reason="bad_text",
                            extra={"details": [{"pointer": "/text"}]})
@@ -616,7 +622,12 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
             raise ApiError(503, "NOT_READY", "stream_backend_missing:输入回注执行体本期未装配",
                            reason="stream_backend_missing", needs_human=True)
         _audit_stream_input(p, account_id, body, via="rest")
-        out = await backend.inject(account_id, dict(body))
+        try:
+            out = await backend.inject(account_id, dict(body))
+        except ValueError as e:                     # 不认识的键名等:参数问题,不冒 500
+            raise ApiError(400, "INVALID_ARGS", str(e), reason="bad_input") from e
+        except (LookupError, RuntimeError, OSError) as e:      # 查不到设备 / adb 失败
+            raise ApiError(503, "NOT_READY", f"输入回注失败:{e}", reason="inject_failed") from e
         return {"ok": True, "account_id": account_id, "type": kind, "result": json_safe(out or {})}
 
     # ================================================================== #37 广播作业查询

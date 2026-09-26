@@ -1,0 +1,621 @@
+"""企点画面流执行体(02 #34 / #35 / #101、04 H07 与 §2.7.4「scrcpy 转发」):scrcpy-server 4.1。
+
+拉起(每账号一个 server,端口 = 00 §3 ``16500 + NN``):
+``adb push <jar> /data/local/tmp/scrcpy-server.jar`` → ``adb forward tcp:165NN localabstract:scrcpy`` →
+``adb shell CLASSPATH=… app_process / com.genymobile.scrcpy.Server 4.1 tunnel_forward=true …`` →
+依次连两条 TCP 到 ``127.0.0.1:165NN``:第一条视频、第二条控制。
+
+视频 socket(big-endian):1 字节 dummy → 12 字节 codec meta(codec id / 宽 / 高)→ 每包 8 字节 ``pts_flags``
+(bit63 配置包 SPS/PPS、bit62 关键帧、低 62 位 PTS 微秒)+ 4 字节包长 + Annex-B。转给 #34 时去掉包长、
+PTS 转毫秒;配置包缓存下来,拼在每个关键帧前面发(02 #34「SPS/PPS 随每个 IDR 重发」),
+新连上的 WS 从下一个关键帧开始送(首个二进制帧就是 SPS/PPS + IDR)。
+
+控制 socket:``touch/scroll/key/text`` 编成 scrcpy 控制消息写进去,**不经任何 shell**。
+
+模型(规格 A.2):同账号一个 server,多条 WS 共享;``focus*`` 同时只 1 条由路由层保证。
+``profile`` 切换 / #101 / H07 自愈 = 重建 forward + server,并给已连 WS 发 ``{type:'restart'}`` 让它重连;
+全体 ``pause`` ⇒ 断视频 socket、留控制 socket;``resume`` ⇒ 重拉 server(不打断已连 WS)。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import struct
+import time
+from typing import Any, AsyncIterator, Callable, Optional, Union
+
+from . import screen_adb
+from .screen_adb import AsyncAdb, keycode_of
+
+log = logging.getLogger("qtrade.screen.scrcpy")
+
+REMOTE_JAR = "/data/local/tmp/scrcpy-server.jar"
+SERVER_CLASS = "com.genymobile.scrcpy.Server"
+CODEC_H264 = 0x68323634                  # "h264"
+FLAG_CONFIG = 1 << 63
+FLAG_KEY = 1 << 62
+PTS_MASK = FLAG_KEY - 1
+
+# 控制消息类型(scrcpy ControlMessage)
+MSG_INJECT_KEYCODE = 0
+MSG_INJECT_TEXT = 1
+MSG_INJECT_TOUCH = 2
+MSG_INJECT_SCROLL = 3
+KEY_ACTIONS = {"down": 0, "up": 1}                       # KeyEvent.ACTION_*
+TOUCH_ACTIONS = {"down": 0, "up": 1, "move": 2}          # MotionEvent.ACTION_*
+BUTTON_PRIMARY = 1
+TEXT_CHUNK_MAX = 300                                     # scrcpy 单条 INJECT_TEXT 上限(字节)
+SCROLL_FULL_PX = 100.0                                   # 浏览器 wheel 一格 ≈ 100 px ⇒ 满值 1.0
+
+#: 02 §7.1 ``[adapters.qidian] stream_profiles`` 缺省四档
+DEFAULT_STREAM_PROFILES = {"thumb": "540p@5", "thumb10": "540p@10", "focus": "720p@30", "focus15": "720p@15"}
+#: 关键帧间隔(秒):新连上的 WS 最多等这么久出第一帧
+I_FRAME_INTERVAL_S = 1
+
+Target = tuple[str, int]                                 # (adb serial, 165NN)
+FrameItem = Union[tuple[int, bytes], dict[str, Any]]
+
+
+class ScrcpyError(RuntimeError):
+    pass
+
+
+# ══════════════════════════════════════════════════════════════════ 纯函数(协议字节)
+def parse_profile(spec: str) -> tuple[int, int]:
+    """``"540p@5"`` → ``(540, 5)``。"""
+    res, _, fps = str(spec).strip().lower().partition("@")
+    short = int(res.rstrip("p"))
+    return short, int(fps)
+
+
+def profile_params(spec: str) -> dict[str, int]:
+    """档位 → scrcpy 的 ``max_size``(长边)/ ``max_fps`` / ``video_bit_rate``。竖屏 9:16:540p ⇒ 960、720p ⇒ 1280。"""
+    short, fps = parse_profile(spec)
+    long_side = (short * 16 // 9 + 7) // 8 * 8
+    bit_rate = max(800_000, int(short * long_side * fps * 0.12))
+    return {"max_size": long_side, "max_fps": fps, "video_bit_rate": bit_rate}
+
+
+def server_args(version: str, spec: str) -> list[str]:
+    p = profile_params(spec)
+    return [
+        version, "tunnel_forward=true", "video=true", "audio=false", "control=true", "video_codec=h264",
+        f"max_size={p['max_size']}", f"max_fps={p['max_fps']}", f"video_bit_rate={p['video_bit_rate']}",
+        f"video_codec_options=i-frame-interval={I_FRAME_INTERVAL_S}",
+        "send_frame_meta=true", "send_codec_meta=true", "send_device_meta=false", "send_dummy_byte=true",
+    ]
+
+
+def _coord(v: Any, size: int) -> int:
+    """归一化 0~1 → 视频像素;大于 1 视为已是视频像素。"""
+    f = float(v if v is not None else 0)
+    px = f * size if 0 <= f <= 1 else f
+    return max(0, min(size - 1, int(round(px))))
+
+
+def _i16fp(v: float) -> int:
+    """scrcpy ``sc_float_to_i16fp``:[-1, 1] → 定点 i16,满值 0x7FFF。"""
+    v = max(-1.0, min(1.0, v))
+    return max(-0x8000, min(0x7FFF, int(round(v * 0x8000))))
+
+
+def encode_touch(action: str, pointer: int, x: int, y: int, w: int, h: int) -> bytes:
+    code = TOUCH_ACTIONS[action]
+    pressure = 0 if action == "up" else 0xFFFF
+    buttons = 0 if action == "up" else BUTTON_PRIMARY
+    return struct.pack(">BBqiiHHHII", MSG_INJECT_TOUCH, code, int(pointer), x, y, w, h, pressure,
+                       BUTTON_PRIMARY, buttons)
+
+
+def encode_scroll(x: int, y: int, w: int, h: int, hscroll: float, vscroll: float) -> bytes:
+    return struct.pack(">BiiHHhhI", MSG_INJECT_SCROLL, x, y, w, h, _i16fp(hscroll), _i16fp(vscroll), 0)
+
+
+def encode_key(action: str, keycode: int) -> bytes:
+    return struct.pack(">BBIII", MSG_INJECT_KEYCODE, KEY_ACTIONS[action], keycode, 0, 0)
+
+
+def encode_text(text: str) -> list[bytes]:
+    """按 UTF-8 字符边界切成 ≤300 字节的几条 INJECT_TEXT。"""
+    out: list[bytes] = []
+    chunk = b""
+    for ch in text:
+        b = ch.encode("utf-8")
+        if len(chunk) + len(b) > TEXT_CHUNK_MAX:
+            out.append(chunk)
+            chunk = b""
+        chunk += b
+    if chunk:
+        out.append(chunk)
+    return [struct.pack(">BI", MSG_INJECT_TEXT, len(c)) + c for c in out]
+
+
+def control_bytes(msg: dict[str, Any], width: int, height: int) -> list[bytes]:
+    """#34 控制帧 → scrcpy 控制消息字节;不认识 / 参数不全回空列表(不猜默认值)。"""
+    kind = msg.get("type")
+    if kind == "touch":
+        action = str(msg.get("action") or "")
+        if action not in TOUCH_ACTIONS:
+            return []
+        pointer = msg.get("pointer")
+        pointer = int(pointer) if isinstance(pointer, (int, float)) and not isinstance(pointer, bool) else 0
+        return [encode_touch(action, pointer, _coord(msg.get("x"), width), _coord(msg.get("y"), height),
+                             width, height)]
+    if kind == "scroll":
+        x = _coord(msg.get("x", 0.5), width)
+        y = _coord(msg.get("y", 0.5), height)
+        dx = float(msg.get("dx") or 0) / SCROLL_FULL_PX
+        dy = float(msg.get("dy") or 0) / SCROLL_FULL_PX
+        # 浏览器 deltaY>0 = 往下翻(内容上移);Android AXIS_VSCROLL>0 = 往上 ⇒ 取反;水平同理
+        return [encode_scroll(x, y, width, height, -dx, -dy)]
+    if kind == "key":
+        action = str(msg.get("action") or "down")
+        code = keycode_of(msg.get("keycode"))
+        if action not in KEY_ACTIONS or code is None:
+            return []
+        return [encode_key(action, code)]
+    if kind == "text":
+        text = msg.get("text")
+        return encode_text(text) if isinstance(text, str) and text else []
+    return []
+
+
+async def read_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    hdr = await reader.readexactly(12)
+    pts_flags, size = struct.unpack(">QI", hdr)
+    return pts_flags, await reader.readexactly(size)
+
+
+def store_target_resolver(store) -> Callable[[str], Target]:
+    """账号 → ``(adb serial, 165NN)``;serial / 端口没落库就按 00 §3 由序号推导(不回退到任何固定设备)。"""
+    def target_of(account_id: str) -> Target:
+        row = store.get_account_full(account_id)
+        if row is None or row.get("deleted_ms"):
+            raise LookupError(f"账号不存在:{account_id}")
+        if row.get("channel") != "qidian":
+            raise LookupError(f"{account_id} 不是企点账号,没有画面流")
+        seq = row.get("seq")
+        serial = row.get("adb_serial") or (f"127.0.0.1:{16000 + int(seq)}" if seq else None)
+        port = row.get("stream_port") or (16500 + int(seq) if seq else None)
+        if not serial or not port:
+            raise LookupError(f"{account_id} 查不到 adb serial / 画面端口")
+        return str(serial), int(port)
+    return target_of
+
+
+# ══════════════════════════════════════════════════════════════════ 订阅者 / 通道
+class _Sub:
+    QUEUE_MAX = 90
+
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[Optional[FrameItem]] = asyncio.Queue()
+        self.waiting_key = True
+        self.paused = False
+        self.detached = False
+
+    def offer(self, pts_ms: int, data: bytes, key: bool) -> None:
+        if self.paused or self.detached:
+            return
+        if not key and (self.waiting_key or self.queue.qsize() >= self.QUEUE_MAX):
+            self.waiting_key = True                     # 慢客户端:丢到下一个关键帧重新对齐
+            return
+        if key:
+            self.waiting_key = False
+        self.queue.put_nowait((pts_ms, data))
+
+    def end(self, last: Optional[dict[str, Any]] = None) -> None:
+        if self.detached:
+            return
+        self.detached = True
+        if last is not None:
+            self.queue.put_nowait(last)
+        self.queue.put_nowait(None)
+
+
+class _Channel:
+    """一个账号的 scrcpy-server:视频读循环、控制写、看门狗(H07)。"""
+
+    def __init__(self, backend: "ScrcpyBackend", account_id: str, serial: str, port: int, profile: str) -> None:
+        self.b = backend
+        self.account_id = account_id
+        self.serial = serial
+        self.port = port
+        self.profile = profile
+        self.width = 0
+        self.height = 0
+        self.config: bytes = b""
+        self.subs: set[_Sub] = set()
+        self.lock = asyncio.Lock()
+        self.alive = False
+        self.video_paused = False
+        self.closed = False
+        self.last_pkt = 0.0
+        self.forward_ok = False
+        self._proc: Any = None
+        self._vr: Optional[asyncio.StreamReader] = None
+        self._vw: Optional[asyncio.StreamWriter] = None
+        self._cr: Optional[asyncio.StreamReader] = None
+        self._cw: Optional[asyncio.StreamWriter] = None
+        self._tasks: list[asyncio.Task] = []
+        self._heal_task: Optional[asyncio.Task] = None
+        self._idle_task: Optional[asyncio.Task] = None
+        self._ctrl_lock = asyncio.Lock()
+        self._proc_tail: list[str] = []
+
+    # ---------------------------------------------------------------- meta
+    def meta(self) -> dict[str, Any]:
+        return {"codec": "h264", "width": self.width, "height": self.height, "profile": self.profile,
+                "fps": parse_profile(self.b.profiles[self.profile])[1], "seq0": 0}
+
+    # ---------------------------------------------------------------- 起停(调用方持 self.lock)
+    async def _start_io(self) -> None:
+        adb = self.b.adb
+        rc, out = await adb.run(self.serial, "push", self.b.server_jar, REMOTE_JAR, timeout=30.0)
+        if rc != 0:
+            raise ScrcpyError(f"push scrcpy-server 失败 rc={rc}: {out.decode('utf-8', 'replace')[-200:]}")
+        rc, out = await adb.run(self.serial, "forward", f"tcp:{self.port}", "localabstract:scrcpy", timeout=10.0)
+        self.forward_ok = rc == 0
+        if rc != 0:
+            raise ScrcpyError(f"adb forward tcp:{self.port} 失败 rc={rc}: {out.decode('utf-8', 'replace')[-200:]}")
+        self._proc_tail = []
+        self._proc = await adb.spawn(self.serial, "shell", f"CLASSPATH={REMOTE_JAR}", "app_process", "/",
+                                     SERVER_CLASS, *server_args(self.b.server_version, self.b.profiles[self.profile]))
+        self._tasks.append(asyncio.create_task(self._drain_proc(), name=f"scrcpy-log:{self.account_id}"))
+        self._vr, self._vw = await self._connect_video()
+        codec, w, h = struct.unpack(">III", await asyncio.wait_for(self._vr.readexactly(12), self.b.connect_timeout_s))
+        if codec != CODEC_H264:
+            raise ScrcpyError(f"scrcpy 回的编码不是 h264(codec_id=0x{codec:08x})")
+        self.width, self.height = w, h
+        self._cr, self._cw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", self.port),
+                                                    self.b.connect_timeout_s)
+        self.config = b""
+        self.alive = True
+        self.video_paused = False
+        self.last_pkt = self.b.clock()
+        self._tasks += [asyncio.create_task(self._read_video(), name=f"scrcpy-video:{self.account_id}"),
+                        asyncio.create_task(self._drain_control(), name=f"scrcpy-ctrl:{self.account_id}"),
+                        asyncio.create_task(self._watchdog(), name=f"scrcpy-h07:{self.account_id}")]
+        log.info("画面流已拉起 account=%s serial=%s port=%d %dx%d profile=%s",
+                 self.account_id, self.serial, self.port, w, h, self.profile)
+
+    async def _connect_video(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """forward 模式下 server 没 listen 时 adb 也会先接住连接再立刻关 ⇒ 以读到 dummy 字节为准,读不到就重试。"""
+        deadline = self.b.clock() + self.b.connect_timeout_s
+        last: Optional[BaseException] = None
+        while self.b.clock() < deadline:
+            if getattr(self._proc, "returncode", None) is not None:
+                raise ScrcpyError(f"scrcpy-server 提前退出 rc={self._proc.returncode}: {' | '.join(self._proc_tail[-5:])}")
+            try:
+                r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", self.port), 1.0)
+                try:
+                    if len(await asyncio.wait_for(r.readexactly(1), 1.0)) == 1:
+                        return r, w
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError) as e:
+                    last = e
+                w.close()
+            except (OSError, asyncio.TimeoutError) as e:
+                last = e
+            await asyncio.sleep(self.b.connect_retry_s)
+        raise ScrcpyError(f"连不上 scrcpy 视频 socket 127.0.0.1:{self.port}: {last!r}")
+
+    async def _stop_io(self, *, remove_forward: bool) -> None:
+        self.alive = False
+        me = asyncio.current_task()
+        for t in self._tasks:
+            if t is not me:
+                t.cancel()
+        for t in self._tasks:
+            if t is not me:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._tasks = []
+        for w in (self._vw, self._cw):
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        self._vr = self._vw = self._cr = self._cw = None
+        proc, self._proc = self._proc, None
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), 3.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            except Exception as e:
+                log.warning("收 scrcpy-server 进程出错 account=%s: %s", self.account_id, e)
+        if remove_forward:
+            await self.b.adb.run(self.serial, "forward", "--remove", f"tcp:{self.port}", timeout=10.0)
+
+    # ---------------------------------------------------------------- 后台任务
+    async def _drain_proc(self) -> None:
+        stream = getattr(self._proc, "stdout", None)
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", "replace").rstrip()
+            self._proc_tail = (self._proc_tail + [text])[-20:]
+            log.debug("scrcpy-server[%s] %s", self.account_id, text)
+
+    async def _drain_control(self) -> None:
+        """设备→Agent 的控制消息(剪贴板等)读掉丢弃,免得 socket 缓冲塞满。"""
+        assert self._cr is not None
+        while await self._cr.read(4096):
+            pass
+
+    async def _read_video(self) -> None:
+        reader = self._vr
+        assert reader is not None
+        try:
+            while True:
+                pts_flags, data = await read_packet(reader)
+                self.last_pkt = self.b.clock()
+                if pts_flags & FLAG_CONFIG:
+                    self.config = data
+                    continue
+                key = bool(pts_flags & FLAG_KEY)
+                pts_ms = (pts_flags & PTS_MASK) // 1000
+                payload = self.config + data if key else data
+                for sub in list(self.subs):
+                    sub.offer(pts_ms, payload, key)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as e:
+            if self.video_paused or not self.alive:
+                return
+            log.warning("画面流视频 socket 断了 account=%s: %r ⇒ 重建(H07)", self.account_id, e)
+            self._spawn_heal("video_eof")
+
+    async def _watchdog(self) -> None:
+        """04 H07:有前台(未暂停)订阅者时 ``scrcpy_frame_timeout_s`` 内没收到包 ⇒ 重建 forward + server。"""
+        timeout = self.b.frame_timeout_s
+        while True:
+            await asyncio.sleep(min(1.0, timeout / 2))
+            active = any(not s.paused for s in self.subs)
+            if not active or self.video_paused:
+                self.last_pkt = self.b.clock()
+                continue
+            if self.b.clock() - self.last_pkt > timeout:
+                log.warning("画面流 %.1fs 无帧 account=%s ⇒ 重建(H07)", timeout, self.account_id)
+                self._spawn_heal("no_frame")
+                return
+
+    def _spawn_heal(self, why: str) -> None:
+        if self._heal_task is not None and not self._heal_task.done():
+            return
+        self._heal_task = asyncio.create_task(self.restart(notify=True, why=why), name=f"scrcpy-heal:{self.account_id}")
+
+    # ---------------------------------------------------------------- 对外动作
+    async def start(self) -> None:
+        async with self.lock:
+            try:
+                await self._start_io()
+            except BaseException:
+                await self._stop_io(remove_forward=False)
+                raise
+
+    async def restart(self, *, notify: bool, profile: Optional[str] = None, why: str = "") -> bool:
+        """重建 forward + server。``notify`` ⇒ 已连 WS 收 ``{type:'restart'}`` 并摘下(客户端重连);否则保留订阅者续流。"""
+        async with self.lock:
+            if self.closed:
+                return False
+            if notify:
+                subs, self.subs = list(self.subs), set()
+                for s in subs:
+                    s.end({"type": "restart"})
+            await self._stop_io(remove_forward=True)
+            if profile is not None:
+                self.profile = profile
+            try:
+                await self._start_io()
+            except Exception as e:
+                log.warning("画面流重建失败 account=%s why=%s: %s", self.account_id, why, e)
+                await self._stop_io(remove_forward=False)
+                for s in list(self.subs):                   # 留着的订阅者也摘下:让客户端重连,重连时如实拿 4503
+                    s.end({"type": "restart"})
+                self.subs.clear()
+                self._close_locked()
+                return False
+            for s in self.subs:
+                s.waiting_key = True
+                s.queue.put_nowait(self.meta())
+            if not self.subs:
+                self._schedule_idle_stop()
+            return True
+
+    async def pause_video(self) -> None:
+        """后台暂停(A.2):断视频 socket、留控制 socket。scrcpy 视频 broken pipe 不算致命,server 与控制仍在。"""
+        async with self.lock:
+            if not self.alive or self.video_paused:
+                return
+            self.video_paused = True
+            if self._vw is not None:
+                self._vw.close()
+
+    async def send_control(self, blobs: list[bytes]) -> None:
+        if not blobs:
+            return
+        async with self._ctrl_lock:
+            w = self._cw
+            if w is None or not self.alive:
+                raise ScrcpyError("控制 socket 未连上")
+            for b in blobs:
+                w.write(b)
+            await w.drain()
+
+    def attach(self, sub: _Sub) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+        self.subs.add(sub)
+
+    def detach(self, sub: _Sub) -> None:
+        self.subs.discard(sub)
+        if not self.subs and not self.closed:
+            self._schedule_idle_stop()
+
+    def _schedule_idle_stop(self) -> None:
+        if self._idle_task is None or self._idle_task.done():
+            self._idle_task = asyncio.create_task(self._idle_stop(), name=f"scrcpy-idle:{self.account_id}")
+
+    async def _idle_stop(self) -> None:
+        await asyncio.sleep(self.b.idle_stop_s)
+        async with self.lock:
+            if self.subs or self.closed:
+                return
+            await self._stop_io(remove_forward=True)
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        self.closed = True
+        if self.b.channels.get(self.account_id) is self:
+            self.b.channels.pop(self.account_id, None)
+
+    async def close(self) -> None:
+        async with self.lock:
+            for s in list(self.subs):
+                s.end()
+            self.subs.clear()
+            await self._stop_io(remove_forward=True)
+            self._close_locked()
+        for t in (self._idle_task, self._heal_task):
+            if t is not None and t is not asyncio.current_task() and not t.done():
+                t.cancel()
+
+
+# ══════════════════════════════════════════════════════════════════ 会话 / 后端
+class ScrcpySession:
+    """一条 #34 WS 对应的会话:``meta`` / ``frames()`` / ``control(msg)`` / ``close()``(routes_ext2 的 StreamBackend 协议)。"""
+
+    def __init__(self, backend: "ScrcpyBackend", channel: _Channel, sub: _Sub) -> None:
+        self._b = backend
+        self._ch = channel
+        self._sub = sub
+        self.meta = channel.meta()
+
+    async def frames(self) -> AsyncIterator[FrameItem]:
+        """``(pts_ms, Annex-B)`` 元组;中途 ``dict`` = 要原样发 JSON 的控制消息(新 meta / ``{type:'restart'}``)。"""
+        while True:
+            item = await self._sub.queue.get()
+            if item is None:
+                return
+            yield item
+
+    async def control(self, msg: dict[str, Any]) -> None:
+        kind = msg.get("type")
+        ch = self._ch
+        if kind == "pong":
+            return
+        if kind == "pause":
+            self._sub.paused = True
+            if ch.subs and all(s.paused for s in ch.subs):
+                await ch.pause_video()
+            return
+        if kind == "resume":
+            self._sub.paused = False
+            self._sub.waiting_key = True
+            if ch.video_paused and not ch.closed:
+                await ch.restart(notify=False, why="resume")
+            return
+        if kind == "profile":
+            new = str(msg.get("profile") or "")
+            if new in self._b.profiles and new != ch.profile:
+                await ch.restart(notify=True, profile=new, why="profile")
+            return
+        blobs = control_bytes(msg, ch.width, ch.height)
+        if not blobs:
+            # 不认识的键名 / 动作一律丢弃,不落成任何默认键
+            log.warning("画面流控制帧丢弃(参数不全或不认识)account=%s type=%s keycode=%r action=%r",
+                        ch.account_id, kind, msg.get("keycode"), msg.get("action"))
+            return
+        await ch.send_control(blobs)
+
+    async def close(self) -> None:
+        self._sub.end()
+        self._ch.detach(self._sub)
+
+
+class ScrcpyBackend:
+    """``agent.stream_backend`` 的真机实现(替换原 ``AdbScreenBackend``)。
+
+    接口:``open(account_id, *, profile) -> ScrcpySession``、``restart(account_id)``(#101 / H07 同一实现)、
+    ``capture_png(account_id)``(#33 企点截图,经适配器、走总线)、``inject(account_id, msg)``(#35 REST 兜底)、``aclose()``。
+    """
+
+    def __init__(self, target_of: Callable[[str], Target], *, adb: Optional[Any] = None,
+                 server_jar: str = "/opt/qtrade/scrcpy/scrcpy-server", server_version: str = "4.1",
+                 profiles: Optional[dict[str, str]] = None, frame_timeout_s: float = 10.0,
+                 idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0, connect_retry_s: float = 0.1,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._target_of = target_of
+        self.adb = adb if adb is not None else AsyncAdb()
+        self.server_jar = server_jar
+        self.server_version = server_version
+        self.profiles = dict(profiles or DEFAULT_STREAM_PROFILES)
+        self.frame_timeout_s = float(frame_timeout_s)
+        self.idle_stop_s = float(idle_stop_s)
+        self.connect_timeout_s = float(connect_timeout_s)
+        self.connect_retry_s = float(connect_retry_s)
+        self.clock = clock
+        self.channels: dict[str, _Channel] = {}
+        self._open_locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _rank(spec: str) -> tuple[int, int]:
+        return parse_profile(spec)
+
+    async def open(self, account_id: str, *, profile: str) -> ScrcpySession:
+        if profile not in self.profiles:
+            raise ScrcpyError(f"未知档位 {profile!r}")
+        lock = self._open_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            ch = self.channels.get(account_id)
+            if ch is None or ch.closed:
+                serial, port = self._target_of(account_id)
+                ch = _Channel(self, account_id, serial, port, profile)
+                await ch.start()
+                self.channels[account_id] = ch
+            elif self._rank(self.profiles[profile]) > self._rank(self.profiles[ch.profile]):
+                if not await ch.restart(notify=True, profile=profile, why="upgrade"):
+                    raise ScrcpyError("画面流按新档位重拉失败")
+            elif ch.video_paused:
+                if not await ch.restart(notify=False, why="attach"):
+                    raise ScrcpyError("画面流重拉失败")
+            sub = _Sub()
+            ch.attach(sub)
+            return ScrcpySession(self, ch, sub)
+
+    async def restart(self, account_id: str) -> dict[str, Any]:
+        """#101 / H07:有在跑的画面流 ⇒ 真重建 forward + server、已连 WS 收 ``{type:'restart'}``;
+        没人在看 ⇒ 只重建 forward,``stream_restarted:false``(没有 server 可重拉,不假装)。"""
+        ch = self.channels.get(account_id)
+        if ch is not None and not ch.closed:
+            ok = await ch.restart(notify=True, why="api")
+            return {"forward_rebuilt": bool(ch.forward_ok and ok), "stream_restarted": bool(ok)}
+        serial, port = self._target_of(account_id)
+        await self.adb.run(serial, "forward", "--remove", f"tcp:{port}", timeout=10.0)
+        rc, _ = await self.adb.run(serial, "forward", f"tcp:{port}", "localabstract:scrcpy", timeout=10.0)
+        return {"forward_rebuilt": rc == 0, "stream_restarted": False}
+
+    async def capture_png(self, account_id: str) -> bytes:
+        serial, _port = self._target_of(account_id)
+        return await screen_adb.screencap_png(self.adb, serial)
+
+    async def inject(self, account_id: str, msg: dict[str, Any]) -> dict[str, Any]:
+        serial, _port = self._target_of(account_id)
+        return await screen_adb.adb_input(self.adb, serial, msg)
+
+    async def aclose(self) -> None:
+        for ch in list(self.channels.values()):
+            try:
+                await ch.close()
+            except Exception as e:
+                log.warning("收画面流出错 account=%s: %s", ch.account_id, e)

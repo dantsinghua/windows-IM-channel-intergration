@@ -1,235 +1,149 @@
-"""企点画面流的真机执行体:adb screencap 取 redroid 当前帧,再编成 Annex-B H.264。
+"""企点画面的两条 adb 旁路:#33 截图(``exec-out screencap -p``)与 #35 REST 注入兜底(``input``)。
 
-像素来自设备 framebuffer,不生成示意图。缺省不注入;生产入口 `main` 在 adb 可达时挂上。
-控制台按首帧 JSON 的 width/height 铺画布,这里给出的是竖屏(高大于宽)。
+画面流本体(#34)在 ``screen_scrcpy.py``,走 scrcpy 控制 socket,不经任何 shell。
+这里的两条都经 ``adb shell``:命令串一律用 ``shlex.join`` 拼,文本参数由 ``shlex.quote`` 包住,
+``; $() ` | & >`` 之类到了设备 shell 里只是字面字符(评审 B1)。
+全部异步(``asyncio.create_subprocess_exec``),不在事件循环里同步跑 subprocess。
 """
 from __future__ import annotations
 
 import asyncio
-import shutil
-import subprocess
-import time
-from typing import AsyncIterator, Optional
+import logging
+import shlex
+from typing import Any, Optional, Protocol
 
-_FFMPEG_CANDIDATES = (
-    "ffmpeg",
-    "/home/linuxbrew/.linuxbrew/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-)
-# 540x960 仍是 9:16,宏块数落在 Baseline 3.1 以内,WebCodecs 的 avc1.42E01F 能解。
-# 点击坐标按设备真实分辨率换算,不按这档缩放。
-_ENC_W, _ENC_H = 540, 960
-_KEYCODE = {
-    "BACK": "4", "HOME": "3", "ENTER": "66", "DEL": "67", "ESCAPE": "111",
+log = logging.getLogger("qtrade.screen.adb")
+
+#: 键名 → Android KEYCODE_*(REST 与 WS 共用;数字 keycode 直接用)
+KEYCODES: dict[str, int] = {
+    "HOME": 3, "BACK": 4, "DPAD_UP": 19, "DPAD_DOWN": 20, "DPAD_LEFT": 21, "DPAD_RIGHT": 22,
+    "TAB": 61, "SPACE": 62, "ENTER": 66, "DEL": 67, "MENU": 82, "PAGE_UP": 92, "PAGE_DOWN": 93,
+    "ESCAPE": 111, "FORWARD_DEL": 112, "MOVE_HOME": 122, "MOVE_END": 123, "APP_SWITCH": 187,
 }
+KEYCODE_MAX = 400                       # Android 11 的 KEYCODE_* 最大值在 300 出头;越界一律拒绝
+#: #35 ``swipe.duration_ms``(规格外字段,控制台静态预览档靠「同点 swipe + 时长」做长按;待 02 #35 登记)
+SWIPE_DURATION_DEFAULT_MS = 120
+SWIPE_DURATION_MAX_MS = 5000
 
 
-def ffmpeg_bin() -> Optional[str]:
-    for c in _FFMPEG_CANDIDATES:
-        found = shutil.which(c) if "/" not in c else (c if shutil.os.path.isfile(c) else None)
-        if found:
-            return found
-    return None
+class AdbRunner(Protocol):
+    async def run(self, serial: str, *args: str, timeout: float = 15.0) -> tuple[int, bytes]: ...
 
 
-def _run(args: list[str], *, timeout: float = 8) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, timeout=timeout)
+class AsyncAdb:
+    """``adb -P <server_port> -s <serial> …`` 的异步封装(04 §2.7.4:adb server 固定 16000,永不裸 adb)。"""
+
+    def __init__(self, adb_bin: str = "adb", server_port: int = 16000):
+        self._base = [adb_bin, "-P", str(server_port)]
+
+    def argv(self, serial: str, *args: str) -> list[str]:
+        return [*self._base, "-s", serial, *args]
+
+    async def run(self, serial: str, *args: str, timeout: float = 15.0) -> tuple[int, bytes]:
+        """跑一条 adb 命令并收全部输出;超时杀掉子进程并回 ``(-1, b"")``。"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.argv(serial, *args), stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        except OSError as e:
+            log.warning("adb 起不来: %s", e)
+            return -1, b""
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return -1, b""
+        return proc.returncode if proc.returncode is not None else -1, out or b""
+
+    async def spawn(self, serial: str, *args: str) -> Any:
+        """起一个常驻子进程(scrcpy-server 的 ``adb shell``),调用方负责收尾。"""
+        return await asyncio.create_subprocess_exec(
+            *self.argv(serial, *args), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
 
-class _Session:
-    def __init__(self, serial: str, profile: str, fps: int):
-        self.serial = serial
-        self.meta = {
-            "codec": "avc1.42E01F",
-            "width": _ENC_W,
-            "height": _ENC_H,
-            "profile": profile,
-            "fps": fps,
-            "seq0": 0,
-        }
-        self._fps = fps
-        self._paused = False
-        self._closed = False
-        self._dev_w, self._dev_h = _device_size(serial)
-        self._down: Optional[tuple[float, float]] = None
-        self._rot = 0
-
-    async def frames(self) -> AsyncIterator[tuple[int, bytes]]:
-        ff = ffmpeg_bin()
-        if not ff:
-            raise RuntimeError("找不到 ffmpeg,无法把真机画面编成 H.264")
-        interval = 1.0 / max(1, self._fps)
-        while not self._closed:
-            if self._paused:
-                await asyncio.sleep(0.2)
-                continue
-            t0 = time.time()
-            png = await asyncio.to_thread(_screencap, self.serial)
-            if png:
-                nal = await asyncio.to_thread(_encode_png, ff, png)
-                if nal:
-                    yield int(time.time() * 1000), nal
-            wait = interval - (time.time() - t0)
-            if wait > 0:
-                await asyncio.sleep(wait)
-
-    async def control(self, msg: dict) -> None:
-        kind = msg.get("type")
-        if kind == "pause":
-            self._paused = True
-            return
-        if kind == "resume":
-            self._paused = False
-            return
-        if kind == "profile":
-            self._fps = _fps_of(str(msg.get("profile") or "thumb"))
-            return
-        await asyncio.to_thread(self._control_sync, msg)
-
-    def _control_sync(self, msg: dict) -> None:
-        kind = msg.get("type")
-        if kind == "touch":
-            x = float(msg.get("x") or 0)
-            y = float(msg.get("y") or 0)
-            action = msg.get("action") or "down"
-            if action == "down":
-                self._down = (x, y)
-                return
-            if action == "move":
-                return
-            x0, y0 = self._down or (x, y)
-            self._down = None
-            px, py = _px(x, y, self._dev_w, self._dev_h)
-            if abs(x - x0) < 0.02 and abs(y - y0) < 0.02:
-                _adb(self.serial, "shell", "input", "tap", str(px), str(py))
-            else:
-                ax, ay = _px(x0, y0, self._dev_w, self._dev_h)
-                _adb(self.serial, "shell", "input", "swipe", str(ax), str(ay), str(px), str(py), "120")
-        elif kind == "scroll":
-            x, y = _px(float(msg.get("x") or 0.5), float(msg.get("y") or 0.5), self._dev_w, self._dev_h)
-            dy = int(msg.get("dy") or 0)
-            y2 = max(0, min(self._dev_h - 1, y - dy))
-            _adb(self.serial, "shell", "input", "swipe", str(x), str(y), str(x), str(y2), "80")
-        elif kind == "key":
-            # 不认识的键名以前落成默认 4(返回)。方向键、旋转都会把应用退回桌面。
-            if str(msg.get("action") or "down") != "down":
-                return
-            code = _KEYCODE.get(str(msg.get("keycode") or "").upper())
-            if not code:
-                return
-            _adb(self.serial, "shell", "input", "keyevent", code)
-        elif kind == "rotate":
-            self._rot = (self._rot + 1) % 4
-            _adb(self.serial, "shell", "settings", "put", "system", "accelerometer_rotation", "0")
-            _adb(self.serial, "shell", "settings", "put", "system", "user_rotation", str(self._rot))
-        elif kind == "text":
-            text = str(msg.get("text") or "")
-            if text:
-                _adb(self.serial, "shell", "input", "text", text.replace(" ", "%s"))
-
-    async def close(self) -> None:
-        self._closed = True
+async def shell(adb: AdbRunner, serial: str, argv: list[str], *, timeout: float = 10.0) -> tuple[int, bytes]:
+    """``adb shell <命令串>``:命令串由 ``shlex.join`` 拼,每个参数各自引号包住。"""
+    return await adb.run(serial, "shell", shlex.join(argv), timeout=timeout)
 
 
-class AdbScreenBackend:
-    """`StreamBackend` 的真机实现。`serial_of(account_id)` 决定连哪台 redroid。"""
-
-    def __init__(self, serial_of):
-        self._serial_of = serial_of
-
-    async def open(self, account_id: str, *, profile: str) -> _Session:
-        serial = self._serial_of(account_id) or "127.0.0.1:5555"
-        _ensure_qidian(serial)
-        return _Session(serial, profile, _fps_of(profile))
-
-    async def capture_png(self, account_id: str) -> bytes:
-        """给没有 WebCodecs 的控制台用:直接回一帧真机 PNG,不经过 H.264。"""
-        serial = self._serial_of(account_id) or "127.0.0.1:5555"
-        return await asyncio.to_thread(_screencap, serial)
-
-    async def inject(self, account_id: str, msg: dict) -> dict:
-        serial = self._serial_of(account_id) or "127.0.0.1:5555"
-        session = _Session(serial, "focus", 1)
-        # REST 的 tap 与 WS 的 touch 字段名不同,这里统一成一次点击
-        if msg.get("type") == "tap":
-            w, h = session._dev_w, session._dev_h
-            x, y = float(msg.get("x") or 0), float(msg.get("y") or 0)
-            # REST 可能给的是像素也可能是 0~1;大于 1 当作像素
-            if x <= 1 and y <= 1:
-                x, y = _px(x, y, w, h)
-            _adb(serial, "shell", "input", "tap", str(int(x)), str(int(y)))
-            return {"ok": True}
-        await session.control(msg)
-        return {"ok": True}
+async def screencap_png(adb: AdbRunner, serial: str) -> bytes:
+    """一帧真机 PNG(``exec-out`` 不经 pty,字节不被改写);不是 PNG 一律回空。"""
+    rc, out = await adb.run(serial, "exec-out", "screencap", "-p", timeout=8.0)
+    return out if rc == 0 and out.startswith(b"\x89PNG") else b""
 
 
-def _fps_of(profile: str) -> int:
-    return {"focus": 8, "focus15": 8, "thumb10": 5}.get(profile, 5)
+async def device_size(adb: AdbRunner, serial: str) -> Optional[tuple[int, int]]:
+    """``wm size`` 的物理分辨率;读不出回 ``None``(调用方据此拒绝归一化坐标,不瞎猜)。"""
+    _rc, out = await shell(adb, serial, ["wm", "size"], timeout=5.0)
+    text = out.decode("utf-8", "replace")
+    found: Optional[tuple[int, int]] = None
+    for line in text.splitlines():                       # 有 Override size 时以它为准(那才是当前显示尺寸)
+        _, _, val = line.partition(":")
+        a, _, b = val.strip().partition("x")
+        if a.isdigit() and b.isdigit():
+            found = (int(a), int(b))
+    return found
 
 
-def _px(x: float, y: float, w: int, h: int) -> tuple[int, int]:
-    return max(0, min(w - 1, int(x * w))), max(0, min(h - 1, int(y * h)))
+def keycode_of(raw: Any) -> Optional[int]:
+    """``4`` / ``"4"`` / ``"BACK"`` / ``"KEYCODE_BACK"`` → 4;认不出回 ``None``(不再落成默认返回键)。"""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if 0 < raw <= KEYCODE_MAX else None
+    s = str(raw or "").strip().upper()
+    if s.isdigit():
+        return keycode_of(int(s))
+    if s.startswith("KEYCODE_"):
+        s = s[len("KEYCODE_"):]
+    return KEYCODES.get(s)
 
 
-def _device_size(serial: str) -> tuple[int, int]:
-    try:
-        out = _run(["adb", "-s", serial, "shell", "wm", "size"], timeout=4).stdout.decode("utf-8", "replace")
-    except (OSError, subprocess.TimeoutExpired):
-        return 720, 1280
-    # Physical size: 720x1280
-    for token in out.replace(":", " ").split():
-        if "x" in token and token[0].isdigit():
-            a, _, b = token.partition("x")
-            if a.isdigit() and b.isdigit():
-                return int(a), int(b)
-    return 720, 1280
+def swipe_duration_ms(raw: Any) -> int:
+    """缺省 120 ms,钳到 1~5000;不是数字抛 ``ValueError``。"""
+    if raw is None:
+        return SWIPE_DURATION_DEFAULT_MS
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"duration_ms 须为数字:{raw!r}")
+    return max(1, min(SWIPE_DURATION_MAX_MS, int(raw)))
 
 
-def _ensure_qidian(serial: str) -> None:
-    """前台不是真企点时拉起 `com.tencent.qidian`,不打开 mock 包。"""
-    try:
-        out = _run(["adb", "-s", serial, "shell", "dumpsys", "window"], timeout=6).stdout.decode("utf-8", "replace")
-    except (OSError, subprocess.TimeoutExpired):
-        return
-    if "com.tencent.qidian" in out and "mCurrentFocus" in out:
-        for line in out.splitlines():
-            if "mCurrentFocus" in line and "com.tencent.qidian" in line:
-                return
-    _adb(serial, "shell", "am", "start", "-n",
-         "com.tencent.qidian/com.tencent.mobileqq.activity.SplashActivity")
+async def adb_input(adb: AdbRunner, serial: str, msg: dict[str, Any]) -> dict[str, Any]:
+    """#35 REST 兜底:``tap|swipe|key|text`` → ``adb shell input …``(02 #35「与 RPA 同一条 adb input 路径」)。
 
-
-def _screencap(serial: str) -> bytes:
-    try:
-        proc = subprocess.run(["adb", "-s", serial, "exec-out", "screencap", "-p"],
-                              capture_output=True, timeout=4)
-    except (OSError, subprocess.TimeoutExpired):
-        return b""
-    data = proc.stdout
-    return data if data.startswith(b"\x89PNG") else b""
-
-
-def _encode_png(ff: str, png: bytes) -> bytes:
-    try:
-        proc = subprocess.run(
-            [ff, "-hide_banner", "-loglevel", "error",
-             "-f", "image2pipe", "-vcodec", "png", "-i", "-",
-             "-vf", f"scale={_ENC_W}:{_ENC_H},format=yuv420p",
-             "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.1",
-             "-g", "1", "-tune", "zerolatency", "-preset", "ultrafast",
-             "-f", "h264", "-frames:v", "1", "pipe:1"],
-            input=png, capture_output=True, timeout=4,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return b""
-    data = proc.stdout
-    if b"\x00\x00\x01" not in data and b"\x00\x00\x00\x01" not in data:
-        return b""
-    return data
-
-
-def _adb(serial: str, *args: str) -> None:
-    try:
-        subprocess.run(["adb", "-s", serial, *args], capture_output=True, timeout=6)
-    except (OSError, subprocess.TimeoutExpired):
-        return
+    坐标:``0~1`` 视为归一化(按 ``wm size`` 换算),大于 1 视为设备像素。
+    """
+    kind = msg.get("type")
+    if kind in ("tap", "swipe"):
+        pts = [float(msg["x"]), float(msg["y"])]
+        if kind == "swipe":
+            pts += [float(msg["x2"]), float(msg["y2"])]
+        if all(0 <= v <= 1 for v in pts):
+            size = await device_size(adb, serial)
+            if size is None:
+                raise RuntimeError("读不出设备分辨率(wm size),归一化坐标无法换算")
+            w, h = size
+            pts = [pts[i] * (w if i % 2 == 0 else h) for i in range(len(pts))]
+        coords = [str(max(0, int(v))) for v in pts]
+        if kind == "tap":
+            argv = ["input", "tap", *coords]
+        else:
+            argv = ["input", "swipe", *coords, str(swipe_duration_ms(msg.get("duration_ms")))]
+    elif kind == "key":
+        code = keycode_of(msg.get("keycode"))
+        if code is None:
+            raise ValueError(f"不认识的 keycode:{msg.get('keycode')!r}")
+        argv = ["input", "keyevent", str(code)]
+    elif kind == "text":
+        text = str(msg.get("text") or "")
+        if not text:
+            return {"ok": True, "skipped": "empty_text"}
+        argv = ["input", "text", text]                   # shlex.join 里逐参数 shlex.quote
+    else:
+        raise ValueError(f"不支持的注入类型:{kind!r}")
+    rc, out = await shell(adb, serial, argv)
+    if rc != 0:
+        raise RuntimeError(f"adb input 失败 rc={rc}: {out.decode('utf-8', 'replace')[:200]}")
+    return {"ok": True}
