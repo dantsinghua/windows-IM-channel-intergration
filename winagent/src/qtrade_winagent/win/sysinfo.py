@@ -45,6 +45,10 @@ class WinSys:
         u = psutil.disk_usage(path)
         return u.free / 1e6, u.total / 1e6
 
+    def path_exists(self, path: str) -> bool:
+        import os
+        return os.path.exists(path)
+
     def net_throughput_kbps(self) -> dict[str, tuple[float, float]]:
         import psutil
         now = time.time()

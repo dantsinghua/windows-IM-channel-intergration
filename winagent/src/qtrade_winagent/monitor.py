@@ -15,7 +15,6 @@
 """
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -37,6 +36,8 @@ WATCHED_PROCESSES = ("Weixin.exe", "WeChat.exe", "chatlog.exe", "QTrade Console.
 WECHAT_PROCESS_NAMES = ("Weixin.exe", "WeChat.exe")
 VMMEM_NAMES = ("vmmem", "vmmemWSL")                     # Win10 是 vmmem,Win11 是 vmmemWSL,两名都找(S5)
 
+# health.host 缓存超过「3 个快采样周期」没刷新 ⇒ 视为过期,当场现采(评审 B3:采样线程停摆时不能一直回旧值)
+HOST_CACHE_STALE_INTERVALS = 3
 FAIL_STREAK_CRIT = 3                                    # 04 H01/H02:连续 3 次失败才 crit(R-09 去抖)
 
 # 02 §3.6 #2 / R6-58 (ao):`GET /wa/v1/health.checks` 恒八键(逐字按文档顺序 H01/H09–H11/H14–H16/H20;
@@ -79,7 +80,7 @@ class Monitor:
                                 DiskTarget("wechat_data", "D:\\", product_level=False)]
         self._clock = clock
         self.state = MonitorState()
-        self._host_cache: Optional[dict[str, float]] = None
+        self._host_cache: Optional[tuple[int, dict[str, float]]] = None      # (采样时刻 ms, host 段)
 
     # ---------------------------------------------------------------- 落库
     def write_sample(self, *, resolution: str, scope: str, subject: str, ts_ms: Optional[int] = None,
@@ -115,7 +116,7 @@ class Monitor:
             scope = "wsl" if p.name in VMMEM_NAMES else "process"
             self.write_sample(resolution="raw", scope=scope, subject=p.name, ts_ms=now,
                               cpu_pct=p.cpu_pct, mem_mb=p.rss_mb, pid=p.pid)
-        self._host_cache = self._host_from(mem, procs)
+        self._host_cache = (now, self._host_from(mem, procs))
         self.state.last_sample_ms = now
 
     def sample_slow(self) -> None:
@@ -123,7 +124,7 @@ class Monitor:
         now = self._clock()
         seen: set[str] = set()
         for t in self._disks:
-            if t.path in seen or not os.path.exists(t.path):
+            if t.path in seen or not self._sys.path_exists(t.path):   # 经注入的 SysBackend(评审 A3)
                 continue
             seen.add(t.path)
             free, total = self._sys.disk_free_mb(t.path)
@@ -299,7 +300,9 @@ class Monitor:
         """
         product_free: list[tuple[str, float, float]] = []
         for t in self._disks:
-            if not os.path.exists(t.path):
+            if not self._sys.path_exists(t.path):                   # 经注入的 SysBackend(评审 A3)
+                log.warning("受检目录不存在,跳过", extra={"op": "monitor.disk", "code": "PATH_MISSING",
+                                                        "kv": {"key": t.key, "path": t.path}})
                 continue
             free, total = self._sys.disk_free_mb(t.path)
             if t.product_level:
@@ -325,7 +328,11 @@ class Monitor:
                                           "media_size_mb": None},
                                 hint_actions=["open_env", "run_cleanup"])
         wechat_free = None
-        if wechat_data_path:
+        if wechat_data_path and not self._sys.path_exists(wechat_data_path):
+            # 微信数据根不存在(换盘 / 未装)⇒ 不是「盘满」,不发 WECHAT_DISK_LOW;记 warn 让排障看得见,不静默吞
+            log.warning("微信数据根不存在,跳过 WECHAT_DISK_LOW 判定", extra={
+                "op": "monitor.disk", "code": "PATH_MISSING", "kv": {"path": wechat_data_path}})
+        elif wechat_data_path:
             wechat_free, _ = self._sys.disk_free_mb(wechat_data_path)
             if wechat_free < self._cfg.wechat_disk_warn_mb:
                 self._alerts.firing(A.WECHAT_DISK_LOW, subject="host",
@@ -360,13 +367,19 @@ class Monitor:
     def host_snapshot(self, *, wsl_vm_mb: Optional[float] = None) -> dict[str, float]:
         """``GET /wa/v1/health.host``(02 §3.6 #2):**是 pool 的 windows 池输入**,字段名逐字。
 
-        进程表扫描放在采样线程里。健康检查直接回上一轮缓存,避免在请求里扫全进程、把 2 秒探活拖超时。
+        进程表扫描放在采样线程里。健康检查平时直接回上一轮缓存,避免在请求里扫全进程、把 2 秒探活拖超时。
+        🔴 评审 B3:**首轮采样之前**或**缓存过期**(> ``HOST_CACHE_STALE_INTERVALS`` 个快采样周期没刷新)时
+        当场同步现采一次——绝不回全 0:pool 的 windows 池会把 0 当真,算出一个虚高的可用额度。
         """
-        cached = dict(self._host_cache) if self._host_cache else None
-        if cached is None:
+        now = self._clock()
+        max_age_ms = self._cfg.sample_interval_s * 1000 * HOST_CACHE_STALE_INTERVALS
+        entry = self._host_cache
+        if entry is None or now - entry[0] > max_age_ms:
             mem = self._sys.memory_mb()
-            cached = {"total_mb": mem["total_mb"], "available_mb": mem["available_mb"],
-                      "wsl_vm_mb": 0.0, "wechat_mb": 0.0, "chatlog_mb": 0.0}
+            procs = {p.name: p for p in self._sys.processes(WATCHED_PROCESSES)}
+            entry = (now, self._host_from(mem, procs))
+            self._host_cache = entry
+        cached = dict(entry[1])
         if wsl_vm_mb is not None:
             cached["wsl_vm_mb"] = float(wsl_vm_mb)
         return cached

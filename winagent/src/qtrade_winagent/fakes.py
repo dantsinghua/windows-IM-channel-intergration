@@ -69,6 +69,7 @@ class FakeSys:
     available_mb: float = 6100.0
     committed_mb: float = 9000.0
     disks: dict[str, tuple[float, float]] = field(default_factory=lambda: {"C:\\": (40960.0, 244140.0)})
+    missing_paths: set[str] = field(default_factory=set)       # 拨进来的路径 ⇒ path_exists=False(演「D: 不存在」)
     throughput: dict[str, tuple[float, float]] = field(default_factory=lambda: {"vEthernet (WSL)": (120.0, 80.0)})
     procs: dict[str, ProcInfo] = field(default_factory=dict)
     locked: bool = False
@@ -89,6 +90,9 @@ class FakeSys:
 
     def disk_free_mb(self, path: str) -> tuple[float, float]:
         return self.disks.get(path, (40960.0, 244140.0))
+
+    def path_exists(self, path: str) -> bool:
+        return path not in self.missing_paths
 
     def net_throughput_kbps(self) -> dict[str, tuple[float, float]]:
         return dict(self.throughput)
