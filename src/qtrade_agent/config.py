@@ -92,7 +92,7 @@ class HealthConfig:
     container_check_s: int = 10                 # H04 周期
     adb_check_s: int = 30                       # H06 周期
     napcat_heartbeat_timeout_s: int = 30
-    scrcpy_frame_timeout_s: int = 10
+    scrcpy_frame_timeout_s: int = 10            # 只管开流后等首关键帧;静止画面 0 帧是常态,不当 H07
     clock_drift_warn_s: int = 2
     container_mem_warn_pct: int = 90
     container_restart_backoff_s: tuple[int, ...] = (60, 120, 300, 600)   # H04 退避重拉

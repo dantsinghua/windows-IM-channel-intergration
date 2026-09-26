@@ -1,9 +1,11 @@
 """画面流执行体 ``screen_scrcpy.ScrcpyBackend`` 与 ``screen_adb`` 的开发者测试。
 
 全部用假件:假 adb(只记命令、不起真进程)+ 假 scrcpy-server 4.1(``asyncio.start_server``,跑在独立线程的事件循环里,
-按 4.1 顺序:accept 视频 → 写 dummy → accept 控制 → 写 codec id / session 包 / 帧包,收控制消息)。
+按 2026-09-26 真机探针的字节与行为造:首连直接关 → 视频 accept 写 dummy → accept 控制 → 写 codec id / 12 字节 session /
+33 B 配置包 / 19588 B 关键帧;静止画面不出帧;RESET_VIDEO 回新关键帧;视频被关 ⇒ 关控制并退出)。
 **不碰真 docker / adb / 任何设备。**
-断言落在协议字节上:首帧 JSON、PTS 与标志位、session 包换尺寸、配置包缓存补发、控制消息的逐字节布局、断线/无帧重建。
+断言落在协议字节上:首帧 JSON、PTS 与标志位、session 包换尺寸、配置包缓存补发、控制消息的逐字节布局、
+新订阅者 / resume 发 RESET_VIDEO、健康判据(静止不重建、socket / 进程断才重建)。
 
 协议依据 = scrcpy **v4.1** 官方源码(随包 ``installer/out/payload/pkg/scrcpy/scrcpy-server`` 的 dex 里
 版本串 ``4.1``、有 ``send_stream_meta``、无 ``send_codec_meta``,与下列源码一致):
@@ -45,8 +47,9 @@ import pytest
 
 from qtrade_agent import screen_adb
 from qtrade_agent.screen_scrcpy import (
-    CODEC_H264, FLAG_CONFIG, FLAG_KEY, FLAG_SESSION, REMOTE_JAR, SERVER_CLASS, ScrcpyBackend, ScrcpyError,
-    control_bytes, encode_text, profile_params, store_target_resolver,
+    CODEC_H264, FLAG_CONFIG, FLAG_KEY, FLAG_SESSION, REMOTE_JAR, RESET_VIDEO, SERVER_CLASS, ScrcpyBackend,
+    ScrcpyError, control_bytes, encode_text, parse_session, profile_params, read_packet, server_args,
+    store_target_resolver,
 )
 
 JAR = "/opt/qtrade/scrcpy/scrcpy-server"
@@ -55,6 +58,13 @@ SPS_PPS = b"\x00\x00\x00\x01\x67SPS\x00\x00\x00\x01\x68PPS"
 
 
 # ══════════════════════════════════════════════════ 假件
+#: 2026-09-26 真机探针(redroid 11 + 随包 4.1 server)抓到的字节:session 包就是这 12 字节,**没有载荷**
+REAL_SESSION = bytes.fromhex("80000000" "000002d0" "00000500")                 # 720×1280
+REAL_CONFIG = b"\x00\x00\x00\x01\x67" + bytes(range(1, 21)) + b"\x00\x00\x00\x01\x68" + b"\xce\x3c\x80"   # 33 B
+REAL_KEY = b"\x00\x00\x00\x01\x65" + bytes(19588 - 5)                           # 19588 B
+REAL_KEY_PTS_US = 270_000                                                       # 首关键帧 0.27 s
+
+
 def pkt(pts_flags: int, data: bytes) -> bytes:
     """4.1 ``writeFrameMeta``:8 字节 ``pts_flags`` + 4 字节长度 + 数据。"""
     return struct.pack(">QI", pts_flags, len(data)) + data
@@ -65,23 +75,42 @@ def session(width: int, height: int, client_resize: bool = False) -> bytes:
     return struct.pack(">III", 0x80000000 | (1 if client_resize else 0), width, height)
 
 
-class FakeScrcpyServer:
-    """假 scrcpy-server 4.1(``tunnel_forward=true video=true audio=false control=true``)。
+def real_script() -> list[bytes]:
+    """真机首段:配置包(``4000000000000000 00000021`` + 33 B)→ 关键帧(19588 B)。"""
+    return [pkt(FLAG_CONFIG, REAL_CONFIG), pkt(FLAG_KEY | REAL_KEY_PTS_US, REAL_KEY)]
 
-    连接按「一次 server 会话 = 视频 + 控制两条」成对:偶数号 = 视频,accept 后立刻写 dummy,然后**等控制那条
-    accept 完**才写 4 字节 codec id + session 包 + 脚本包;奇数号 = 控制(全收下)。
-    ``events`` 记下事件顺序,用来断言「头在控制连上之后才出」。
+
+# 控制消息长度(4.1 ControlMessageReader):keycode 14、text 5+n、touch 32、scroll 21、RESET_VIDEO 1
+_CTRL_FIXED = {0: 14, 2: 32, 3: 21, 17: 1}
+
+
+class FakeScrcpyServer:
+    """假 scrcpy-server 4.1,按真机行为造(``tunnel_forward=true video=true audio=false control=true``)。
+
+    - 每次 server 会话的**第一条**连接直接关(真机:adb forward 先接住 TCP、设备端还没 listen ⇒ 读 dummy 得 EOF),
+      第二条才是视频:写 dummy,等控制 accept 完才写 codec id + session 12 B + ``script``;
+    - 控制 socket 按消息边界解析;收到 RESET_VIDEO(17)且 ``honor_reset`` ⇒ 在视频上补 session + 配置包 + 新关键帧;
+    - Agent 关视频 socket ⇒ **关控制 socket 并「退出」**(真机 N1:视频一断 server rc=0 退出,控制跟着断)。
+    静止画面:``script`` 发完就一帧不出,除非测试 ``push``。
     """
 
-    def __init__(self, width: int = 540, height: int = 960, codec: int = CODEC_H264) -> None:
+    def __init__(self, width: int = 720, height: int = 1280, codec: int = CODEC_H264) -> None:
         self.width, self.height, self.codec = width, height, codec
-        self.script: list[bytes] = []                 # 每次会话出完头就发的包
+        self.script: list[bytes] = real_script()      # 每次会话出完头就发的包
+        self.honor_reset = True
         self.conns = 0
-        self.ctrl = bytearray()
-        self.video_eof = 0                            # 视频连接被对端(Agent)关掉的次数
+        self.probes = 0                               # 被直接关掉的「首连」次数
+        self.ctrl = bytearray()                       # 控制 socket 收到的全部字节
+        self.msgs: list[int] = []                     # 按边界解析出的控制消息类型
+        self.resets = 0
+        self.video_eof = 0                            # 视频连接被 Agent 关掉的次数
+        self.exits = 0                                # 「server 退出」次数(视频断 ⇒ 退出)
+        self.exit_cb: Optional[Any] = None
         self.events: list[str] = []
-        self._video_w: Optional[asyncio.StreamWriter] = None
-        self._ctrl_up: Optional[asyncio.Event] = None
+        self._reset_pts = 5_000_000
+        self._expect_video = True
+        self._probe_pending = True
+        self._cur: dict[str, Any] = {}
         self.loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -96,35 +125,83 @@ class FakeScrcpyServer:
         self.loop.run_forever()
 
     async def _handle(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        idx = self.conns
         self.conns += 1
-        if idx % 2 == 0:
-            self._video_w = w
-            self._ctrl_up = ctrl_up = asyncio.Event()
-            self.events.append("accept_video")
-            w.write(b"\x00")                           # DesktopConnection.open:accept 视频后立刻写 dummy
-            await w.drain()
-            waiter = asyncio.ensure_future(ctrl_up.wait())
-            eof = asyncio.ensure_future(r.read())
-            await asyncio.wait({waiter, eof}, return_when=asyncio.FIRST_COMPLETED)
-            if waiter.done():                          # open() 返回 ⇒ 编码器起来 ⇒ 头 + session + 帧
-                self.events.append("header")
-                w.write(struct.pack(">I", self.codec) + session(self.width, self.height) + b"".join(self.script))
-                await w.drain()
-            else:
-                waiter.cancel()
-            await eof                                  # 等 Agent 关视频 socket(暂停 / 收尾)
-            self.video_eof += 1
+        if self._expect_video and self._probe_pending:
+            self._probe_pending = False
+            self.probes += 1
+            self.events.append("probe_closed")
+            w.close()
+            return
+        if self._expect_video:
+            await self._video(r, w)
         else:
-            self.events.append("accept_control")
-            if self._ctrl_up is not None:
-                self._ctrl_up.set()
-            while True:
-                b = await r.read(4096)
-                if not b:
-                    break
-                self.ctrl += b
+            await self._control(r, w)
+
+    async def _video(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        self._expect_video = False
+        sess: dict[str, Any] = {"vw": w, "cw": None, "ctrl_up": asyncio.Event()}
+        self._cur = sess
+        self.events.append("accept_video")
+        w.write(b"\x00")                               # DesktopConnection.open:accept 视频后立刻写 dummy
+        await w.drain()
+        waiter = asyncio.ensure_future(sess["ctrl_up"].wait())
+        eof = asyncio.ensure_future(r.read())
+        await asyncio.wait({waiter, eof}, return_when=asyncio.FIRST_COMPLETED)
+        if waiter.done():                              # open() 返回 ⇒ 编码器起来 ⇒ 头 + session + 帧
+            self.events.append("header")
+            w.write(struct.pack(">I", self.codec) + session(self.width, self.height) + b"".join(self.script))
+            await w.drain()
+        else:
+            waiter.cancel()
+        await eof                                      # 等 Agent 关视频 socket
+        self.video_eof += 1
+        # 真机 N1:视频 socket 断 ⇒ server 退出,控制 socket 被服务端关
+        if sess["cw"] is not None:
+            sess["cw"].close()
+        self.exits += 1
+        if self.exit_cb is not None:
+            self.exit_cb()
         w.close()
+
+    async def _control(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        self._expect_video = True
+        self._probe_pending = True                     # 下一次 server 会话的首连又会被关
+        sess = self._cur
+        sess["cw"] = w
+        self.events.append("accept_control")
+        sess["ctrl_up"].set()
+        buf = bytearray()
+        while True:
+            try:
+                b = await r.read(4096)
+            except (ConnectionError, OSError):
+                break
+            if not b:
+                break
+            self.ctrl += b
+            buf += b
+            self._parse(buf, sess)
+        w.close()
+
+    def _parse(self, buf: bytearray, sess: dict[str, Any]) -> None:
+        while buf:
+            t = buf[0]
+            if t == 1:
+                if len(buf) < 5:
+                    return
+                n = 5 + struct.unpack(">I", bytes(buf[1:5]))[0]
+            else:
+                n = _CTRL_FIXED.get(t, len(buf))
+            if len(buf) < n:
+                return
+            del buf[:n]
+            self.msgs.append(t)
+            if t == 17:
+                self.resets += 1
+                if self.honor_reset:                   # Controller.resetVideo ⇒ 编码器重开:session + 配置包 + 关键帧
+                    self._reset_pts += 1_000_000
+                    sess["vw"].write(session(self.width, self.height) + pkt(FLAG_CONFIG, REAL_CONFIG)
+                                     + pkt(FLAG_KEY | self._reset_pts, b"\x00\x00\x00\x01\x65RESET"))
 
     def _call(self, coro_fn) -> Any:
         async def go():
@@ -133,16 +210,21 @@ class FakeScrcpyServer:
 
     def push(self, *packets: bytes) -> None:
         async def go():
-            assert self._video_w is not None
-            self._video_w.write(b"".join(packets))
-            await self._video_w.drain()
+            vw = self._cur["vw"]
+            vw.write(b"".join(packets))
+            await vw.drain()
         self._call(go)
 
     def drop_video(self) -> None:
-        """模拟 server 端视频断线(scrcpy-server 崩了 / 容器里被杀)。"""
+        """服务端关视频 socket(scrcpy-server 崩了 / 被杀)。"""
         async def go():
-            assert self._video_w is not None
-            self._video_w.close()
+            self._cur["vw"].close()
+        self._call(go)
+
+    def drop_control(self) -> None:
+        """服务端只关控制 socket(视频还开着)。"""
+        async def go():
+            self._cur["cw"].close()
         self._call(go)
 
     def close(self) -> None:
@@ -159,6 +241,8 @@ class FakeScrcpyServer:
 
 
 class FakeProc:
+    """假 ``adb shell app_process``:不自己退出;``terminate`` / ``kill`` 或 ``exit()`` 才结束。"""
+
     def __init__(self) -> None:
         self.returncode: Optional[int] = None
         self.stdout = asyncio.StreamReader()
@@ -170,6 +254,7 @@ class FakeProc:
         self._done.set()
 
     kill = terminate
+    exit = terminate
 
     async def wait(self) -> int:
         await self._done.wait()
@@ -319,7 +404,7 @@ async def test_open_runs_push_forward_server_and_meta(srv):
     be = make_backend(srv, adb)
     s = await be.open("qd01", profile="thumb")
     try:
-        assert s.meta == {"codec": "h264", "width": 540, "height": 960, "profile": "thumb", "fps": 5, "seq0": 0}
+        assert s.meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "thumb", "fps": 5, "seq0": 0}
         assert adb.calls[0] == (SERIAL, "push", JAR, REMOTE_JAR)
         assert adb.calls[1] == (SERIAL, "forward", f"tcp:{srv.port}", "localabstract:scrcpy")
         argv = adb.spawned[0]
@@ -332,8 +417,9 @@ async def test_open_runs_push_forward_server_and_meta(srv):
             assert want in opts
         assert not any(o.startswith("send_codec_meta") for o in opts)   # 4.1 不认旧名,只会 warn
         assert not any(c[1:3] == ("shell", "am") or "am start" in " ".join(c) for c in adb.calls)   # 开流不拉企点
-        await wait_for(lambda: srv.conns == 2)                     # 视频 + 控制两条
-        assert srv.events == ["accept_video", "accept_control", "header"]   # 4.1:控制连上后才出头
+        await wait_for(lambda: srv.conns == 3)                     # 首连被关 + 视频 + 控制
+        # 真机:首连读 dummy 得 EOF ⇒ 重连;4.1 控制连上后才出头
+        assert srv.events == ["probe_closed", "accept_video", "accept_control", "header"]
     finally:
         await s.close()
         await be.aclose()
@@ -358,10 +444,15 @@ async def test_open_fails_when_server_disables_stream(srv):
 
 def test_flag_bits_match_scrcpy_41():
     assert (FLAG_SESSION, FLAG_CONFIG, FLAG_KEY) == (1 << 63, 1 << 62, 1 << 61)
+    assert RESET_VIDEO == b"\x11"                                 # ControlMessage.TYPE_RESET_VIDEO = 17,无额外字段
 
 
-async def test_header_only_after_control_connected(srv):
-    """4.1 假 server 自检:只连视频不连控制 ⇒ 只有 dummy、等不到头(旧实现「拿到头再连控制」会在此死锁)。"""
+async def test_fake_server_first_connect_eof_then_header_only_after_control(srv):
+    """假 server 自检(照真机):首连直接关;第二条读到 dummy;只连视频不连控制 ⇒ 等不到头;连上控制才出
+    codec id + 12 字节 session(与真机字节逐字相同)。"""
+    r0, w0 = await asyncio.open_connection("127.0.0.1", srv.port)
+    assert await asyncio.wait_for(r0.read(1), 2) == b""            # 首连:EOF
+    w0.close()
     r, w = await asyncio.open_connection("127.0.0.1", srv.port)
     try:
         assert await asyncio.wait_for(r.readexactly(1), 2) == b"\x00"
@@ -369,10 +460,63 @@ async def test_header_only_after_control_connected(srv):
             await asyncio.wait_for(r.readexactly(4), 0.3)
         r2, w2 = await asyncio.open_connection("127.0.0.1", srv.port)
         hdr = await asyncio.wait_for(r.readexactly(16), 2)
-        assert struct.unpack(">I", hdr[:4])[0] == CODEC_H264 and hdr[4:] == session(540, 960)
+        assert struct.unpack(">I", hdr[:4])[0] == CODEC_H264 and hdr[4:] == REAL_SESSION
         w2.close()
     finally:
         w.close()
+
+
+async def test_fake_server_video_close_closes_control_like_real_device(srv):
+    """假 server 自检(真机 N1):Agent 关视频 socket ⇒ server 退出、控制 socket 被服务端关。"""
+    r0, w0 = await asyncio.open_connection("127.0.0.1", srv.port)
+    await asyncio.wait_for(r0.read(1), 2)
+    w0.close()
+    r, w = await asyncio.open_connection("127.0.0.1", srv.port)
+    await asyncio.wait_for(r.readexactly(1), 2)
+    cr, cw = await asyncio.open_connection("127.0.0.1", srv.port)
+    await asyncio.wait_for(r.readexactly(16), 2)
+    w.close()
+    assert await asyncio.wait_for(cr.read(1), 2) == b""            # 控制被关
+    await wait_for(lambda: srv.exits == 1)
+    cw.close()
+
+
+def test_real_device_session_is_12_bytes_without_payload():
+    """编号 1:真机字节 ``80000000 000002d0 00000500`` 自身就是 session 包(宽 = pts_flags 低 32 位、高 = size 字段),
+    紧跟的就是配置包头 ``4000000000000000 00000021``——读 session 不能再吞 12 字节载荷。"""
+    assert parse_session(REAL_SESSION) == (720, 1280)
+    pts_flags, size = struct.unpack(">QI", REAL_SESSION)
+    assert pts_flags & FLAG_SESSION and (pts_flags & 0xFFFFFFFF, size) == (720, 1280)
+    stream = REAL_SESSION + b"".join(real_script()) + pkt(300_000, b"\x00\x00\x00\x01\x41D")
+    assert stream[12:24] == bytes.fromhex("4000000000000000" "00000021")
+
+    async def go():
+        rd = asyncio.StreamReader()
+        rd.feed_data(stream)
+        rd.feed_eof()
+        f0, d0 = await read_packet(rd)
+        assert f0 & FLAG_SESSION and d0 == REAL_SESSION           # session:返回的就是这 12 字节
+        f1, d1 = await read_packet(rd)
+        assert f1 == FLAG_CONFIG and d1 == REAL_CONFIG and len(d1) == 33
+        f2, d2 = await read_packet(rd)
+        assert f2 == FLAG_KEY | REAL_KEY_PTS_US and len(d2) == 19588
+        f3, d3 = await read_packet(rd)
+        assert (f3, d3) == (300_000, b"\x00\x00\x00\x01\x41D")
+    asyncio.run(go())
+
+
+async def test_real_device_byte_sequence_end_to_end(srv):
+    """真机字节序列经 Agent:首帧 JSON 宽高取自 12 字节 session;首个二进制帧 = 33 B 配置包 + 19588 B 关键帧。"""
+    be = make_backend(srv, FakeAdbRunner())
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert (s.meta["width"], s.meta["height"]) == (720, 1280)
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        srv.push(pkt(310_000, b"\x00\x00\x00\x01\x41D1"))
+        assert await next_item(s) == (310, b"\x00\x00\x00\x01\x41D1")
+    finally:
+        await s.close()
+        await be.aclose()
 
 
 async def test_session_packet_midstream_resends_meta_with_new_size(srv):
@@ -381,18 +525,18 @@ async def test_session_packet_midstream_resends_meta_with_new_size(srv):
     be = make_backend(srv, FakeAdbRunner())
     s = await be.open("qd01", profile="focus")
     try:
-        assert s.meta["width"] == 540 and s.meta["height"] == 960
+        assert s.meta["width"] == 720 and s.meta["height"] == 1280
         assert await next_item(s) == (1000, SPS_PPS + b"K1")
         new_cfg = b"\x00\x00\x00\x01\x67NEW"
-        srv.push(session(720, 1280), pkt(2_000_000, b"P-old-session"), pkt(FLAG_CONFIG, new_cfg),
+        srv.push(session(1280, 720), pkt(2_000_000, b"P-old-session"), pkt(FLAG_CONFIG, new_cfg),
                  pkt(FLAG_KEY | 2_100_000, b"K2"))
         meta = await next_item(s)
-        assert meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "focus", "fps": 30, "seq0": 0}
+        assert meta == {"codec": "h264", "width": 1280, "height": 720, "profile": "focus", "fps": 30, "seq0": 0}
         assert await next_item(s) == (2100, new_cfg + b"K2")          # 换尺寸后的 P 帧不送、旧 SPS 不拼
         await s.control({"type": "touch", "action": "down", "x": 1.0, "y": 1.0, "pointer": 0})
         await wait_for(lambda: len(srv.ctrl) == 32)
-        assert struct.unpack(">iiHH", bytes(srv.ctrl[10:22])) == (719, 1279, 720, 1280)   # 坐标按新尺寸
-        srv.push(session(720, 1280), pkt(FLAG_CONFIG, new_cfg), pkt(FLAG_KEY | 3_000_000, b"K3"))
+        assert struct.unpack(">iiHH", bytes(srv.ctrl[10:22])) == (1279, 719, 1280, 720)   # 坐标按新尺寸
+        srv.push(session(1280, 720), pkt(FLAG_CONFIG, new_cfg), pkt(FLAG_KEY | 3_000_000, b"K3"))
         assert await next_item(s) == (3000, new_cfg + b"K3")          # 尺寸没变的 session 不重发首帧
     finally:
         await s.close()
@@ -414,27 +558,93 @@ async def test_packets_pts_flags_and_config_prepended_to_keyframe(srv):
         await be.aclose()
 
 
-async def test_second_subscriber_shares_server_and_starts_at_next_keyframe(srv):
+# ══════════════════════════════════════════════════ 新观看者 / 关键帧(编号 3)
+async def test_new_subscriber_sends_reset_video_and_only_gets_frames_after_keyframe(srv):
+    """真机只有开头一个关键帧 ⇒ 第二个订阅者接入立刻发 RESET_VIDEO;它在新关键帧之前的 delta 一律不收。"""
     srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 1_000_000, b"K1")]
+    srv.honor_reset = False                                       # 先不回,好观察「关键帧前不收」
     adb = FakeAdbRunner()
     be = make_backend(srv, adb)
     s1 = await be.open("qd01", profile="thumb")
     try:
         assert await next_item(s1) == (1000, SPS_PPS + b"K1")
+        assert srv.resets == 0                                    # 首个订阅者:新 server 自带首关键帧,不用要
         s2 = await be.open("qd01", profile="thumb")
         assert len(adb.spawned) == 1                             # 同账号共用一个 server
-        srv.push(pkt(1_100_000, b"P2"), pkt(FLAG_KEY | 1_200_000, b"K2"))
+        await wait_for(lambda: srv.resets == 1)
+        assert bytes(srv.ctrl) == b"\x11"                         # RESET_VIDEO 就 1 字节
+        srv.push(pkt(1_100_000, b"P2"))
         assert await next_item(s1) == (1100, b"P2")
-        assert await next_item(s2) == (1200, SPS_PPS + b"K2")    # 新连接:缓存的配置包 + 下一个关键帧
-        assert await next_item(s1) == (1200, SPS_PPS + b"K2")    # 每个 IDR 都带 SPS/PPS
+        assert s2._sub.queue.qsize() == 0                          # 关键帧前的 delta 不给新订阅者
+        # server 重置编码器:session(同尺寸)+ 新配置包 + 关键帧
+        cfg2 = b"\x00\x00\x00\x01\x67CFG2"
+        srv.push(session(720, 1280), pkt(FLAG_CONFIG, cfg2), pkt(FLAG_KEY | 1_200_000, b"K2"),
+                 pkt(1_300_000, b"P3"))
+        assert await next_item(s2) == (1200, cfg2 + b"K2")        # 新订阅者首个二进制帧 = 配置包 + 关键帧
+        assert await next_item(s2) == (1300, b"P3")
+        assert await next_item(s1) == (1200, cfg2 + b"K2")        # 老订阅者照常收(每个 IDR 都带 SPS/PPS)
+        assert srv.resets == 1 and len(adb.spawned) == 1
         await s2.close()
     finally:
         await s1.close()
         await be.aclose()
 
 
+async def test_new_subscriber_gets_reset_keyframe_from_server(srv):
+    """server 如实响应 RESET_VIDEO(假 server 照 4.1 Controller.resetVideo 补 session + 配置包 + 关键帧)。"""
+    be = make_backend(srv, FakeAdbRunner())
+    s1 = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s1) == (270, REAL_CONFIG + REAL_KEY)
+        s2 = await be.open("qd01", profile="thumb")
+        assert await next_item(s2) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.msgs == [17]
+        await s2.close()
+    finally:
+        await s1.close()
+        await be.aclose()
+
+
+async def test_reset_video_without_keyframe_falls_back_to_server_restart(srv):
+    """RESET_VIDEO 之后 ``key_wait_s`` 内没关键帧 ⇒ 重拉 server(重推 jar);订阅者都留着,收新首帧 JSON + 新关键帧。"""
+    srv.honor_reset = False
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb, key_wait_s=0.3, idle_stop_s=5)
+    s1 = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s1) == (270, REAL_CONFIG + REAL_KEY)
+        s2 = await be.open("qd01", profile="thumb")
+        await wait_for(lambda: len(adb.spawned) == 2)
+        assert len(adb.cmds("push")) == 2
+        for s in (s2, s1):
+            meta = await next_item(s)
+            assert isinstance(meta, dict) and meta["codec"] == "h264" and meta["width"] == 720
+            assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        await s2.close()
+    finally:
+        await s1.close()
+        await be.aclose()
+
+
+async def test_slow_subscriber_resync_requests_reset_video(srv, monkeypatch):
+    """慢客户端队列满 ⇒ 丢到关键帧重对齐;真机没有周期关键帧 ⇒ 主动发 RESET_VIDEO。"""
+    from qtrade_agent import screen_scrcpy
+    monkeypatch.setattr(screen_scrcpy._Sub, "QUEUE_MAX", 2)
+    srv.honor_reset = False
+    be = make_backend(srv, FakeAdbRunner())
+    s = await be.open("qd01", profile="thumb")
+    try:
+        await wait_for(lambda: s._sub.queue.qsize() == 1)         # 首关键帧(不取,模拟慢)
+        srv.push(pkt(1_000_000, b"D1"), pkt(1_100_000, b"D2"), pkt(1_200_000, b"D3"))
+        await wait_for(lambda: srv.resets == 1)
+        assert s._sub.waiting_key
+    finally:
+        await s.close()
+        await be.aclose()
+
+
 async def test_end_to_end_41_open_meta_frames_and_control_bytes():
-    """端到端(4.1 顺序):假 server 先 accept 两条再出头 → ``open`` → 首帧 JSON 宽高来自 session 包 →
+    """端到端(4.1 顺序):假 server 首连关、再 accept 两条才出头 → ``open`` → 首帧 JSON 宽高来自 session 包 →
     配置包 + 关键帧 → touch / scroll / key / text 落到控制 socket 的逐字节内容。"""
     srv = FakeScrcpyServer(width=576, height=1024)
     srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 42_000_777, b"\x00\x00\x00\x01\x65IDR")]
@@ -442,7 +652,7 @@ async def test_end_to_end_41_open_meta_frames_and_control_bytes():
     try:
         s = await be.open("qd01", profile="focus")
         try:
-            assert srv.events == ["accept_video", "accept_control", "header"]
+            assert srv.events == ["probe_closed", "accept_video", "accept_control", "header"]
             assert s.meta == {"codec": "h264", "width": 576, "height": 1024, "profile": "focus", "fps": 30, "seq0": 0}
             assert await next_item(s) == (42000, SPS_PPS + b"\x00\x00\x00\x01\x65IDR")
             for m in ({"type": "touch", "action": "down", "x": 0.25, "y": 0.5, "pointer": 3},
@@ -459,6 +669,7 @@ async def test_end_to_end_41_open_meta_frames_and_control_bytes():
                 + struct.pack(">BI", 1, 6) + "你好".encode("utf-8"))
             await wait_for(lambda: len(srv.ctrl) >= len(want))
             assert bytes(srv.ctrl) == want
+            assert srv.msgs == [2, 2, 3, 0, 1]
             assert _server_scroll(0x1000) == 2.0
         finally:
             await s.close()
@@ -479,8 +690,8 @@ async def test_control_socket_bytes_long_press_and_no_shell(srv):
         await wait_for(lambda: len(srv.ctrl) == 32)
         await s.control({"type": "touch", "action": "up", "x": 0.5, "y": 0.5, "pointer": 0})
         await wait_for(lambda: len(srv.ctrl) == 64)
-        assert bytes(srv.ctrl[:32]) == control_bytes({"type": "touch", "action": "down", "x": 0.5, "y": 0.5, "pointer": 0}, 540, 960)[0]
-        assert bytes(srv.ctrl[32:]) == control_bytes({"type": "touch", "action": "up", "x": 0.5, "y": 0.5, "pointer": 0}, 540, 960)[0]
+        assert bytes(srv.ctrl[:32]) == control_bytes({"type": "touch", "action": "down", "x": 0.5, "y": 0.5, "pointer": 0}, 720, 1280)[0]
+        assert bytes(srv.ctrl[32:]) == control_bytes({"type": "touch", "action": "up", "x": 0.5, "y": 0.5, "pointer": 0}, 720, 1280)[0]
         await s.control({"type": "key", "keycode": "BACK", "action": "down"})
         await s.control({"type": "scroll", "x": 0.5, "y": 0.5, "dx": 0, "dy": 100})
         await s.control({"type": "text", "text": "pw;$(id)"})
@@ -495,7 +706,41 @@ async def test_control_socket_bytes_long_press_and_no_shell(srv):
         await be.aclose()
 
 
-# ══════════════════════════════════════════════════ 断线 / 无帧 / 暂停 / 换档 / #101
+# ══════════════════════════════════════════════════ 健康判据(编号 2)/ 暂停(编号 4)/ 换档 / #101
+async def test_static_screen_15s_without_frames_is_healthy(srv):
+    """编号 2:静止画面 0 帧是常态。首关键帧之后 15 s 一帧不出(> 缺省 scrcpy_frame_timeout_s=10),
+    server / 两条 socket 都在 ⇒ 不重建、不给 WS 发 restart。"""
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb, frame_timeout_s=10.0, idle_stop_s=30)
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        await asyncio.sleep(15.0)
+        assert len(adb.spawned) == 1 and len(adb.cmds("push")) == 1
+        assert s._sub.queue.qsize() == 0 and not s._sub.detached  # 没收到 restart
+        assert srv.video_eof == 0 and srv.exits == 0 and srv.conns == 3
+        srv.push(pkt(15_500_000, b"D-after-touch"))               # 触摸后才出帧:照常送达
+        assert await next_item(s) == (15500, b"D-after-touch")
+    finally:
+        await s.close()
+        await be.aclose()
+
+
+async def test_no_first_keyframe_within_frame_timeout_rebuilds(srv):
+    """``scrcpy_frame_timeout_s`` 只管开流后等首关键帧:没来 ⇒ H07 重建(WS 收 restart)。"""
+    srv.script = []
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb, frame_timeout_s=0.3, idle_stop_s=5)
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert await next_item(s, timeout=5) == {"type": "restart"}
+        await wait_for(lambda: len(adb.spawned) == 2)
+        assert len(adb.cmds("push")) == 2
+    finally:
+        await s.close()
+        await be.aclose()
+
+
 async def test_video_eof_rebuilds_forward_and_server_and_sends_restart(srv):
     srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 1_000_000, b"K1")]
     adb = FakeAdbRunner()
@@ -511,55 +756,67 @@ async def test_video_eof_rebuilds_forward_and_server_and_sends_restart(srv):
         assert (SERIAL, "forward", "--remove", f"tcp:{srv.port}") in adb.calls
         assert len(adb.cmds("forward")) >= 3 and len(adb.cmds("push")) == 2     # forward 与 server 都重建
         s2 = await be.open("qd01", profile="focus")               # 客户端重连:接到重建后的 server
-        assert len(adb.spawned) == 2 and s2.meta["width"] == 540
+        assert len(adb.spawned) == 2 and s2.meta["width"] == 720
         await s2.close()
     finally:
         await s.close()
         await be.aclose()
 
 
-async def test_no_frame_watchdog_rebuilds(srv):
+async def test_control_eof_rebuilds(srv):
+    """编号 2:控制 socket 被服务端关(视频还开着)⇒ 也算断,H07 重建。"""
     adb = FakeAdbRunner()
-    be = make_backend(srv, adb, frame_timeout_s=0.3, idle_stop_s=5)
+    be = make_backend(srv, adb, idle_stop_s=5)
     s = await be.open("qd01", profile="focus")
     try:
-        assert await next_item(s, timeout=5) == {"type": "restart"}
-        await wait_for(lambda: len(adb.spawned) == 2)             # 先通知、再重拉(客户端重连时在锁上等拉起完)
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        srv.drop_control()
+        assert await next_item(s) == {"type": "restart"}
+        await wait_for(lambda: len(adb.spawned) == 2)
+        assert len(adb.cmds("push")) == 2
     finally:
         await s.close()
         await be.aclose()
 
 
-async def test_paused_subscribers_are_not_watched(srv):
+async def test_server_process_exit_rebuilds(srv):
+    """编号 2:scrcpy-server 进程退出(socket 还没察觉)⇒ H07 重建。"""
     adb = FakeAdbRunner()
-    be = make_backend(srv, adb, frame_timeout_s=0.2)
-    s = await be.open("qd01", profile="thumb")
+    be = make_backend(srv, adb, idle_stop_s=5)
+    s = await be.open("qd01", profile="focus")
     try:
-        await s.control({"type": "pause"})
-        await asyncio.sleep(0.8)
-        assert len(adb.spawned) == 1                              # 后台流不检查 H07
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        adb.procs[0].exit()
+        assert await next_item(s) == {"type": "restart"}
+        await wait_for(lambda: len(adb.spawned) == 2)
     finally:
         await s.close()
         await be.aclose()
 
 
-async def test_pause_drops_video_keeps_control_then_resume_restarts(srv):
-    srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 1_000_000, b"K1")]
+async def test_pause_keeps_both_sockets_and_resume_sends_reset_video(srv):
+    """编号 4(A.2 待裁决口径):pause = 只停止向这条 WS 转发,两条 socket 都不动、server 不退;
+    resume = 发 RESET_VIDEO,从新关键帧开始收。"""
     adb = FakeAdbRunner()
     be = make_backend(srv, adb)
     s = await be.open("qd01", profile="thumb")
     try:
-        assert await next_item(s) == (1000, SPS_PPS + b"K1")
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
         await s.control({"type": "pause"})
-        await wait_for(lambda: srv.video_eof == 1)                # 视频 socket 断了
+        srv.push(pkt(400_000, b"D-paused"))
         await s.control({"type": "key", "keycode": 4, "action": "down"})
-        await wait_for(lambda: len(srv.ctrl) == 14)               # 控制 socket 还在
-        assert len(adb.spawned) == 1
+        await wait_for(lambda: len(srv.ctrl) == 14)               # 控制 socket 照常可用
+        await asyncio.sleep(0.2)
+        assert s._sub.queue.qsize() == 0                          # 暂停中不转发
+        assert srv.video_eof == 0 and srv.exits == 0 and srv.conns == 3 and len(adb.spawned) == 1
         await s.control({"type": "resume"})
-        assert len(adb.spawned) == 2                              # 恢复 = 重拉 server,已连 WS 不断
-        meta = await next_item(s)
-        assert isinstance(meta, dict) and meta["codec"] == "h264" and meta["width"] == 540
-        assert await next_item(s) == (1000, SPS_PPS + b"K1")
+        await wait_for(lambda: srv.resets == 1)
+        assert srv.msgs == [0, 17]
+        assert await next_item(s) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")   # 画面立刻刷新
+        assert len(adb.spawned) == 1                              # 没重拉 server
+        await s.control({"type": "resume"})                       # 没暂停时 resume 不重复要关键帧
+        await asyncio.sleep(0.1)
+        assert srv.resets == 1
     finally:
         await s.close()
         await be.aclose()
@@ -574,6 +831,7 @@ async def test_profile_switch_restarts_with_new_params(srv):
         assert await next_item(s) == {"type": "restart"}
         await wait_for(lambda: len(adb.spawned) == 2)
         assert "max_size=1280" in adb.spawned[-1] and "max_fps=30" in adb.spawned[-1]
+        assert len(adb.cmds("push")) == 2
         s2 = await be.open("qd01", profile="focus")
         assert s2.meta["profile"] == "focus" and s2.meta["fps"] == 30 and len(adb.spawned) == 2
         await s2.close()
@@ -583,6 +841,7 @@ async def test_profile_switch_restarts_with_new_params(srv):
 
 
 async def test_restart_api_with_and_without_live_stream(srv):
+    """编号 5:#101 重建每次都先重推 jar(4.1 启动后自删 jar),再 forward、再拉 server。"""
     adb = FakeAdbRunner()
     be = make_backend(srv, adb, idle_stop_s=5)
     assert await be.restart("qd01") == {"forward_rebuilt": True, "stream_restarted": False}   # 没人在看:只重建 forward
@@ -591,9 +850,19 @@ async def test_restart_api_with_and_without_live_stream(srv):
     try:
         assert await be.restart("qd01") == {"forward_rebuilt": True, "stream_restarted": True}
         assert await next_item(s) == {"type": "restart"} and len(adb.spawned) == 2
+        verbs = [c[1] for c in adb.calls]
+        assert verbs.count("push") == 2
+        last = len(verbs) - 1 - verbs[::-1].index("push")
+        assert adb.calls[last] == (SERIAL, "push", JAR, REMOTE_JAR)
+        assert adb.calls[last + 1] == (SERIAL, "forward", f"tcp:{srv.port}", "localabstract:scrcpy")
     finally:
         await s.close()
         await be.aclose()
+
+
+def test_server_args_keep_i_frame_interval_but_it_is_not_relied_on():
+    """编号 5:``i-frame-interval=1`` 留着(server 接受、无害),但关键帧一律靠 RESET_VIDEO,不靠它。"""
+    assert "video_codec_options=i-frame-interval=1" in server_args("4.1", "720p@30")
 
 
 async def test_last_subscriber_close_stops_server_and_removes_forward(srv):
@@ -699,7 +968,7 @@ def test_ws_route_end_to_end_with_scrcpy_backend(rig, srv):
     with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=thumb",
                                       subprotocols=["qtrade-scrcpy-v1"]) as ws:
         meta = ws.receive_json()
-        assert meta == {"codec": "h264", "width": 540, "height": 960, "profile": "thumb", "fps": 5, "seq0": 0}
+        assert meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "thumb", "fps": 5, "seq0": 0}
         frame = ws.receive_bytes()
         assert struct.unpack(">Q", frame[:8])[0] == 7000 and frame[8:] == SPS_PPS + b"\x00\x00\x00\x01\x65IDR"
         ws.send_json({"type": "touch", "action": "down", "x": 0.5, "y": 0.5, "pointer": 0})

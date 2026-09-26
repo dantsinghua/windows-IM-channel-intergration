@@ -12,14 +12,25 @@ dummy 字节在 accept 视频后立刻写;``SurfaceEncoder`` 之后才写流头)
 - ``pts_flags``(8 字节)bit63 置位 = **session 包**:头 12 字节就是 ``int flags(bit31=1, bit0=client resize)
   + int 宽 + int 高``,没有数据段;每次编码会话(重)开都会来一个,分辨率变了 ⇒ 重发首帧 JSON。
 - 否则 ``pts_flags`` + 4 字节包长 + Annex-B;bit62 = 配置包(SPS/PPS)、bit61 = 关键帧、低 61 位 PTS 微秒。
-转给 #34 时去掉包长、PTS 转毫秒;配置包缓存下来,拼在每个关键帧前面发(02 #34「SPS/PPS 随每个 IDR 重发」),
-新连上的 WS 从下一个关键帧开始送(首个二进制帧就是 SPS/PPS + IDR)。
+真机字节(2026-09-26 redroid 11 探针):``80000000 000002d0 00000500``(session,720×1280,无载荷)→
+``4000000000000000 00000021`` + 33 B SPS/PPS → ``2000000000000000|pts`` + 关键帧 → delta ……
+转给 #34 时去掉包长、PTS 转毫秒;配置包缓存下来,拼在每个关键帧前面发(02 #34「SPS/PPS 随每个 IDR 重发」)。
+
+关键帧:``i-frame-interval`` 在真机软件编码器上**无效**(整条流只有开头一个关键帧),画面静止时 server 也**一帧不出**。
+⇒ 新 WS 接入 / ``resume`` / 慢客户端丢帧重对齐时,向控制 socket 发 ``TYPE_RESET_VIDEO``(=17,无额外字段),
+server 重置编码器、再出 session + 配置包 + 关键帧;订阅者只从关键帧开始收。``key_wait_s``(3 s)内没来 ⇒ 重拉 server。
+
+健康(04 H07):server 进程在 + 视频 socket 未 EOF + 控制 socket 未 EOF ⇒ 健康;任一断 ⇒ 重建。
+「没有帧」**不是**故障(静止画面本来就 0 帧);``scrcpy_frame_timeout_s`` 只管「开流后等首个关键帧」。
 
 控制 socket:``touch/scroll/key/text`` 编成 scrcpy 控制消息写进去,**不经任何 shell**。
 
 模型(规格 A.2):同账号一个 server,多条 WS 共享;``focus*`` 同时只 1 条由路由层保证。
-``profile`` 切换 / #101 / H07 自愈 = 重建 forward + server,并给已连 WS 发 ``{type:'restart'}`` 让它重连;
-全体 ``pause`` ⇒ 断视频 socket、留控制 socket;``resume`` ⇒ 重拉 server(不打断已连 WS)。
+``profile`` 切换 / #101 / H07 自愈 = 重建 forward + server(每次都重新 ``adb push`` jar:4.1 启动后自删 jar),
+并给已连 WS 发 ``{type:'restart'}`` 让它重连。
+``pause`` / ``resume``(**待安琳裁决 A.2 的实现口径**):4.1 下视频 socket 一断 server 就退出、控制也跟着断
+(真机坐实),所以 ``pause`` = 只停止向这条 WS 转发帧、两条 socket 都不动(静止时 server 本就不编码,开销可忽略);
+``resume`` = 发一次 RESET_VIDEO 让画面立刻刷新。
 """
 from __future__ import annotations
 
@@ -51,6 +62,9 @@ MSG_INJECT_KEYCODE = 0
 MSG_INJECT_TEXT = 1
 MSG_INJECT_TOUCH = 2
 MSG_INJECT_SCROLL = 3
+# 4.1 ControlMessage.TYPE_RESET_VIDEO;ControlMessageReader 里 createEmpty ⇒ 整条消息只有 1 字节类型号
+MSG_RESET_VIDEO = 17
+RESET_VIDEO = bytes([MSG_RESET_VIDEO])
 KEY_ACTIONS = {"down": 0, "up": 1}                       # KeyEvent.ACTION_*
 TOUCH_ACTIONS = {"down": 0, "up": 1, "move": 2}          # MotionEvent.ACTION_*
 BUTTON_PRIMARY = 1
@@ -62,7 +76,8 @@ SCROLL_RANGE = 16.0
 
 #: 02 §7.1 ``[adapters.qidian] stream_profiles`` 缺省四档
 DEFAULT_STREAM_PROFILES = {"thumb": "540p@5", "thumb10": "540p@10", "focus": "720p@30", "focus15": "720p@15"}
-#: 关键帧间隔(秒):新连上的 WS 最多等这么久出第一帧
+#: 仍按 1 s 传给编码器(无害,server 接受),但真机软件编码器 ``OMX.google.h264.encoder`` 不按它出周期关键帧——
+#: **不能依赖**;要关键帧一律发 RESET_VIDEO(见模块说明)。
 I_FRAME_INTERVAL_S = 1
 
 Target = tuple[str, int]                                 # (adb serial, 165NN)
@@ -220,10 +235,11 @@ class _Sub:
         self.detached = False
 
     def offer(self, pts_ms: int, data: bytes, key: bool) -> None:
+        """``pause`` 中不转发(socket 不动,A.2 待裁决口径);没对齐到关键帧前只丢不送。"""
         if self.paused or self.detached:
             return
         if not key and (self.waiting_key or self.queue.qsize() >= self.QUEUE_MAX):
-            self.waiting_key = True                     # 慢客户端:丢到下一个关键帧重新对齐
+            self.waiting_key = True                     # 慢客户端:丢到下一个关键帧重新对齐(通道发 RESET_VIDEO 要)
             return
         if key:
             self.waiting_key = False
@@ -260,10 +276,11 @@ class _Channel:
         self.subs: set[_Sub] = set()
         self.lock = asyncio.Lock()
         self.alive = False
-        self.video_paused = False
         self.closed = False
-        self.last_pkt = 0.0
         self.forward_ok = False
+        self.last_key: Optional[tuple[int, bytes]] = None   # 最近关键帧(已拼配置包)
+        self._key_seen = asyncio.Event()
+        self._key_wait: Optional[asyncio.Task] = None
         self._proc: Any = None
         self._vr: Optional[asyncio.StreamReader] = None
         self._vw: Optional[asyncio.StreamWriter] = None
@@ -312,12 +329,13 @@ class _Channel:
             raise ScrcpyError(f"scrcpy session 包尺寸无效 {w}x{h}")
         self.width, self.height = w, h
         self.config = b""
+        self.last_key = None
         self.alive = True
-        self.video_paused = False
-        self.last_pkt = self.b.clock()
         self._tasks += [asyncio.create_task(self._read_video(), name=f"scrcpy-video:{self.account_id}"),
                         asyncio.create_task(self._drain_control(), name=f"scrcpy-ctrl:{self.account_id}"),
-                        asyncio.create_task(self._watchdog(), name=f"scrcpy-h07:{self.account_id}")]
+                        asyncio.create_task(self._watch_proc(), name=f"scrcpy-proc:{self.account_id}")]
+        # 新 server 自己会出首关键帧(真机 0.27 s);scrcpy_frame_timeout_s 内没来才算 H07
+        self._want_key(reset=False, timeout=self.b.frame_timeout_s, why="first_keyframe")
         log.info("画面流已拉起 account=%s serial=%s port=%d %dx%d profile=%s",
                  self.account_id, self.serial, self.port, w, h, self.profile)
 
@@ -354,6 +372,7 @@ class _Channel:
                 except (asyncio.CancelledError, Exception):
                     pass
         self._tasks = []
+        self._key_wait = None
         for w in (self._vw, self._cw):
             if w is not None:
                 try:
@@ -391,10 +410,29 @@ class _Channel:
             log.debug("scrcpy-server[%s] %s", self.account_id, text)
 
     async def _drain_control(self) -> None:
-        """设备→Agent 的控制消息(剪贴板等)读掉丢弃,免得 socket 缓冲塞满。"""
-        assert self._cr is not None
-        while await self._cr.read(4096):
-            pass
+        """设备→Agent 的控制消息(剪贴板等)读掉丢弃,免得 socket 缓冲塞满;读到 EOF = server 断了 ⇒ H07 重建。"""
+        reader = self._cr
+        assert reader is not None
+        why: Any = "EOF"
+        try:
+            while await reader.read(4096):
+                pass
+        except (ConnectionError, OSError) as e:
+            why = e
+        if self.alive:
+            log.warning("画面流控制 socket 断了 account=%s: %r ⇒ 重建(H07)", self.account_id, why)
+            self._spawn_heal("control_eof")
+
+    async def _watch_proc(self) -> None:
+        """scrcpy-server 进程退出 ⇒ H07 重建(真机:视频 socket 一断 server 就 rc=0 退出)。"""
+        proc = self._proc
+        if proc is None:
+            return
+        rc = await proc.wait()
+        if self.alive:
+            log.warning("scrcpy-server 进程退出 account=%s rc=%s: %s ⇒ 重建(H07)", self.account_id, rc,
+                        " | ".join(self._proc_tail[-5:]))
+            self._spawn_heal("server_exit")
 
     async def _read_video(self) -> None:
         reader = self._vr
@@ -402,7 +440,6 @@ class _Channel:
         try:
             while True:
                 pts_flags, data = await read_packet(reader)
-                self.last_pkt = self.b.clock()
                 if pts_flags & FLAG_SESSION:
                     self._on_session(data)
                     continue
@@ -412,10 +449,15 @@ class _Channel:
                 key = bool(pts_flags & FLAG_KEY)
                 pts_ms = (pts_flags & PTS_MASK) // 1000
                 payload = self.config + data if key else data
+                if key:
+                    self.last_key = (pts_ms, payload)
+                    self._key_seen.set()
                 for sub in list(self.subs):
                     sub.offer(pts_ms, payload, key)
+                if not key and any(s.waiting_key and not s.paused and not s.detached for s in self.subs):
+                    self.request_keyframe("resync")      # 有订阅者掉队:不会再有自然关键帧,主动要
         except (asyncio.IncompleteReadError, ConnectionError, OSError) as e:
-            if self.video_paused or not self.alive:
+            if not self.alive:
                 return
             log.warning("画面流视频 socket 断了 account=%s: %r ⇒ 重建(H07)", self.account_id, e)
             self._spawn_heal("video_eof")
@@ -425,6 +467,8 @@ class _Channel:
         给已连 WS 重发首帧 JSON 并从下一个关键帧重新对齐;尺寸没变只清缓存(新 SPS/PPS 会紧跟着来)。"""
         size = parse_session(hdr)
         self.config = b""
+        # 编码器重开后自带配置包 + 关键帧:期间掉队的订阅者等它就行,不再另发 RESET_VIDEO
+        self._want_key(reset=False, timeout=self.b.key_wait_s, why="session")
         if size is None or not size[0] or not size[1] or size == (self.width, self.height):
             return
         self.width, self.height = size
@@ -433,24 +477,39 @@ class _Channel:
         for sub in list(self.subs):
             sub.renew(meta)
 
-    async def _watchdog(self) -> None:
-        """04 H07:有前台(未暂停)订阅者时 ``scrcpy_frame_timeout_s`` 内没收到包 ⇒ 重建 forward + server。"""
-        timeout = self.b.frame_timeout_s
-        while True:
-            await asyncio.sleep(min(1.0, timeout / 2))
-            active = any(not s.paused for s in self.subs)
-            if not active or self.video_paused:
-                self.last_pkt = self.b.clock()
-                continue
-            if self.b.clock() - self.last_pkt > timeout:
-                log.warning("画面流 %.1fs 无帧 account=%s ⇒ 重建(H07)", timeout, self.account_id)
-                self._spawn_heal("no_frame")
-                return
+    # ---------------------------------------------------------------- 关键帧
+    def request_keyframe(self, why: str) -> None:
+        """要一个新关键帧:发 RESET_VIDEO,``key_wait_s`` 内没来 ⇒ 重拉 server(订阅者留着,收新首帧 JSON)。"""
+        self._want_key(reset=True, timeout=self.b.key_wait_s, why=why)
 
-    def _spawn_heal(self, why: str) -> None:
+    def _want_key(self, *, reset: bool, timeout: float, why: str) -> None:
+        if not self.alive or (self._key_wait is not None and not self._key_wait.done()):
+            return                                        # 已在等关键帧:来一个就够所有等待者用
+        self._key_seen.clear()
+        if reset and self._cw is not None:
+            self._cw.write(RESET_VIDEO)                   # 同步整条写入,不会与 send_control 的消息交错
+        task = asyncio.create_task(self._await_key(timeout, why), name=f"scrcpy-key:{self.account_id}")
+        self._key_wait = task
+        self._tasks.append(task)
+
+    async def _await_key(self, timeout: float, why: str) -> None:
+        try:
+            await asyncio.wait_for(self._key_seen.wait(), timeout)
+            return
+        except asyncio.TimeoutError:
+            pass
+        if not self.alive:
+            return
+        first = why == "first_keyframe"
+        log.warning("画面流 %.1fs 内没等到关键帧 account=%s why=%s ⇒ 重拉 server", timeout, self.account_id, why)
+        # 首关键帧没来 = 开流失败(H07,通知客户端重连);RESET_VIDEO 没回 = 退回重拉,已连 WS 留着收新首帧 JSON
+        self._spawn_heal(f"no_keyframe:{why}", notify=first)
+
+    def _spawn_heal(self, why: str, *, notify: bool = True) -> None:
         if self._heal_task is not None and not self._heal_task.done():
             return
-        self._heal_task = asyncio.create_task(self.restart(notify=True, why=why), name=f"scrcpy-heal:{self.account_id}")
+        self._heal_task = asyncio.create_task(self.restart(notify=notify, why=why),
+                                              name=f"scrcpy-heal:{self.account_id}")
 
     # ---------------------------------------------------------------- 对外动作
     async def start(self) -> None:
@@ -490,15 +549,6 @@ class _Channel:
                 self._schedule_idle_stop()
             return True
 
-    async def pause_video(self) -> None:
-        """后台暂停(A.2):断视频 socket、留控制 socket。scrcpy 视频 broken pipe 不算致命,server 与控制仍在。"""
-        async with self.lock:
-            if not self.alive or self.video_paused:
-                return
-            self.video_paused = True
-            if self._vw is not None:
-                self._vw.close()
-
     async def send_control(self, blobs: list[bytes]) -> None:
         if not blobs:
             return
@@ -511,10 +561,14 @@ class _Channel:
             await w.drain()
 
     def attach(self, sub: _Sub) -> None:
+        """新订阅者从关键帧开始收。通道已出过关键帧 ⇒ 发 RESET_VIDEO 要个新的:缓存的 ``last_key`` 之后
+        可能已有 delta,拿它当起点会花屏;还在等首关键帧 ⇒ 不用发,首关键帧就是它的起点。"""
         if self._idle_task is not None:
             self._idle_task.cancel()
             self._idle_task = None
         self.subs.add(sub)
+        if self.last_key is not None:
+            self.request_keyframe("attach")
 
     def detach(self, sub: _Sub) -> None:
         self.subs.discard(sub)
@@ -574,15 +628,14 @@ class ScrcpySession:
         if kind == "pong":
             return
         if kind == "pause":
+            # A.2 待裁决口径:只停转发,两条 socket 都不动(4.1 断视频 ⇒ server 退出、控制也断)
             self._sub.paused = True
-            if ch.subs and all(s.paused for s in ch.subs):
-                await ch.pause_video()
             return
         if kind == "resume":
-            self._sub.paused = False
-            self._sub.waiting_key = True
-            if ch.video_paused and not ch.closed:
-                await ch.restart(notify=False, why="resume")
+            if self._sub.paused:
+                self._sub.paused = False
+                self._sub.waiting_key = True
+                ch.request_keyframe("resume")             # 画面立刻刷新,不等下一次重绘
             return
         if kind == "profile":
             new = str(msg.get("profile") or "")
@@ -612,14 +665,16 @@ class ScrcpyBackend:
     def __init__(self, target_of: Callable[[str], Target], *, adb: Optional[Any] = None,
                  server_jar: str = "/opt/qtrade/scrcpy/scrcpy-server", server_version: str = "4.1",
                  profiles: Optional[dict[str, str]] = None, frame_timeout_s: float = 10.0,
-                 idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0, connect_retry_s: float = 0.1,
+                 key_wait_s: float = 3.0, idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0,
+                 connect_retry_s: float = 0.1,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._target_of = target_of
         self.adb = adb if adb is not None else AsyncAdb()
         self.server_jar = server_jar
         self.server_version = server_version
         self.profiles = dict(profiles or DEFAULT_STREAM_PROFILES)
-        self.frame_timeout_s = float(frame_timeout_s)
+        self.frame_timeout_s = float(frame_timeout_s)      # 只管开流后等首关键帧(「无帧」不是故障)
+        self.key_wait_s = float(key_wait_s)                # RESET_VIDEO 之后等关键帧,超时重拉 server
         self.idle_stop_s = float(idle_stop_s)
         self.connect_timeout_s = float(connect_timeout_s)
         self.connect_retry_s = float(connect_retry_s)
@@ -645,9 +700,6 @@ class ScrcpyBackend:
             elif self._rank(self.profiles[profile]) > self._rank(self.profiles[ch.profile]):
                 if not await ch.restart(notify=True, profile=profile, why="upgrade"):
                     raise ScrcpyError("画面流按新档位重拉失败")
-            elif ch.video_paused:
-                if not await ch.restart(notify=False, why="attach"):
-                    raise ScrcpyError("画面流重拉失败")
             sub = _Sub()
             ch.attach(sub)
             return ScrcpySession(self, ch, sub)
