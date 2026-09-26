@@ -101,6 +101,8 @@ export const useEnvStore = defineStore('env', () => {
   }
 
   async function runSelftest(): Promise<void> {
+    // 开跑前清掉上一轮的错误,免得这轮成功了页面还挂着旧的「还没写完」
+    error.value = null
     const started = await systemApi.selftestRun()
     const runId = started.run_id
     const deadline = Date.now() + 45_000

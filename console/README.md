@@ -31,6 +31,18 @@ npm install
 
 非 Windows 上开发时,主进程取不到命名管道令牌,用 `QT_DEV_TOKEN=xxx` 走 mock 令牌。
 
+### 浏览器调试
+
+```bash
+QT_DEV_TOKEN=<管理员令牌> npm run dev      # 然后浏览器打开 http://127.0.0.1:5273
+```
+
+- `QT_DEV_TOKEN` 由 `vite.config.ts` 的 dev server 代理层给 `/api/v1`(含画面流 WS)补 `Authorization: Bearer …`。
+  **仅本机浏览器调试用,构建产物不含这一层**;正式运行时令牌只由 Electron 主进程注入,渲染进程不持有。
+- ⚠️ `npm run dev` / `dev:web` 会同时起 mock(占 `127.0.0.1:17600`)。对着**真 Agent**(已占 17600)调试时,
+  mock 起不来会连带 `concurrently -k` 把 vite 一起停掉 —— 这时只起 vite:`QT_DEV_TOKEN=<管理员令牌> npx vite`。
+- 管理员令牌等同最高权限,别写进脚本、别提交、别贴进聊天。
+
 ## 目录
 
 | 路径 | 说明 |
@@ -51,6 +63,9 @@ npm install
 - `ws-client.spec.ts` —— 首帧订阅、`seq` 去重与乱序不丢、重连 `since_seq`、`replay:"truncated"` 才全量拉、20s ping / 40s 判死、退避 1→2→4→…→30s
 - `stores.spec.ts` —— `account_state` 归约、`error_since_ms` 算「已故障 N 分钟」、`login_required` 的可用操作集、`late`/`origin` 三字段只挂事件行且重拉即消失、槽位**非空串**判据、告警 `(code,subject)` 去重、二维码不进环形缓冲
 - `codes-coverage.spec.ts` —— 从 `docs/02 §3.7` 解析告警码全表,断言 `codes.ts` **逐条登记且 severity 一致、不多不少**;再对 00 §8.3 结果码、01 §2.10 `state_code`、06 §2.3.5 邮件状态、00 §8.5 探测结论、02 §3.10 danger 十项逐一对账
+- `screen-stream.spec.ts` —— Annex-B 拆分(3/4 字节起始码、防竞争字节)/ avcC / 长度前缀;降档链硬解 → 软解(强制 thumb)→ 静态预览、不自动升;`decodeQueueSize > 6` 丢非关键帧到下一个关键帧;SPS 变化重新 configure;开流前隐藏补发 pause
+- `pointer-relay.spec.ts` —— 画布指针 → `touch{action,x,y,pointer}` 序列:点击、长按(按住期间零帧)、滑动 ≤ 60 Hz 且终点不丢、多点、cancel、黑边、首帧前不发;滚轮 → `scroll`;静态预览的 #35 tap/swipe 换算
+- `screen-page.spec.ts` —— 画面页:任何进页路径都注册可见性监听(隐藏 pause / 恢复 resume,浏览器退回 `visibilitychange`);无 WebCodecs 真去轮询 #33;可打印字符攒进输入框回车整段发 `text`;无「旋转」
 - `testids-coverage.spec.ts` —— 从 `docs/01 §4` 解析 **475 条元素条目**,断言源码里都出现;并断言作废 id(C-45/R-11/R-12)不再出现
 
 改文档后这两个 coverage 测试会立刻变红,这是刻意的:**它们是文档与代码的对账闸**。

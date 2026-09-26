@@ -2,8 +2,9 @@
 /**
  * `P-SCREEN` 画面(01 §2.7.4):企点 WebCodecs 内嵌流 + 事件回注;微信窗口截图预览(只看不点);QQ 无画面。
  * `login_required` 下画面注入照常可用(R-06),但发消息类不在画面里。
+ * 降档:硬解 → 软解(thumb)→ 静态预览(每 2 s #33 截图 + #35 REST 注入);自动降、不自动升。
  */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { screen as T, SCREEN_PERF_ITEMS, SCREEN_TOOLS } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
@@ -12,7 +13,7 @@ import { accountsApi } from '@/api/client'
 import { ScreenStream, type DecodePath, type StreamClosed, type StreamProfile } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
-import { normInContain } from './pointer'
+import { normInContain, PointerRelay, restGesture } from './pointer'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,6 +34,8 @@ const staticSrc = ref('')
 let stream: ScreenStream | null = null
 let previewTimer: ReturnType<typeof setInterval> | null = null
 let visibilityOff: (() => void) | undefined
+/** 窗口当前是否被最小化/隐藏(§2.7.4:隐藏时全部 pause,轮询也停) */
+let hidden = false
 
 const streamable = computed(() => accounts.items.filter((a) => a.channel !== 'qq'))
 const qqAccounts = computed(() => accounts.items.filter((a) => a.channel === 'qq'))
@@ -43,21 +46,31 @@ const notRunning = computed(() =>
   !!focus.value && ['stopped', 'disabled', 'created'].includes(focus.value.state))
 const starting = computed(() =>
   !!focus.value && ['starting', 'provisioning', 'logging_in'].includes(focus.value.state))
+const isStatic = computed(() => stats.value.decoder === 'static')
 
 const PROFILE_OF: Record<string, StreamProfile> = { focus30: 'focus', focus15: 'focus15', thumb10: 'thumb10' }
+
+/** 画布指针 → #34 控制帧(首帧前不发、move ≤ 60 Hz、长按期间不发任何东西) */
+const relay = new PointerRelay((f) => { stream?.send(f) })
 
 function draw(frame: VideoFrame): void {
   const c = canvas.value
   if (!c) { frame.close(); return }
   const ctx = c.getContext('2d')
   if (!ctx) { frame.close(); return }
-  if (c.width !== frame.displayWidth) c.width = frame.displayWidth
-  if (c.height !== frame.displayHeight) c.height = frame.displayHeight
+  if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
+    c.width = frame.displayWidth
+    c.height = frame.displayHeight
+    // 切档改了分辨率:以真正解出来的帧尺寸为准
+    relay.setMedia(frame.displayWidth, frame.displayHeight)
+  }
   ctx.drawImage(frame, 0, 0)
   frame.close()
 }
 
 function stopAll(): void {
+  relay.releaseAll()
+  relay.setMedia(0, 0)
   stream?.stop()
   stream = null
   if (previewTimer) clearInterval(previewTimer)
@@ -67,6 +80,7 @@ function stopAll(): void {
 async function startFocus(): Promise<void> {
   stopAll()
   degradeMsg.value = ''
+  closeIme()
   const a = focus.value
   if (!a) return
   if (a.channel === 'wechat') {
@@ -77,9 +91,9 @@ async function startFocus(): Promise<void> {
   }
   if (!['running', 'degraded', 'login_required', 'starting'].includes(a.state)) return
   streamClosed.value = null
-  stream = new ScreenStream(a.id, PROFILE_OF[ui.perfProfile] ?? 'focus', {
-    onHeader: () => undefined,
-    onStats: (s) => { stats.value = { ...stats.value, ...s } },
+  const s = new ScreenStream(a.id, PROFILE_OF[ui.perfProfile] ?? 'focus', {
+    onHeader: (h) => relay.setMedia(h.width, h.height),
+    onStats: (st) => { stats.value = { ...stats.value, ...st } },
     onFrame: draw,
     onFatal: (why) => {
       degradeMsg.value = why
@@ -90,17 +104,25 @@ async function startFocus(): Promise<void> {
       // 4401 由 App.vue 的事件流横幅统一引导「重取令牌」;4409/4400 重试无意义,都停手。
       if (!info.retryable) stopAll()
     },
+    // 第三档:流已关,改走 #33 截图轮询,点击改走 #35 REST
+    onStatic: () => {
+      relay.releaseAll()
+      startStaticPreview()
+    },
   })
-  await stream.start()
+  stream = s
+  if (hidden) s.pause()
+  await s.start()
 }
 
 function startStaticPreview(): void {
   if (previewTimer) clearInterval(previewTimer)
   previewTimer = setInterval(() => void pollStatic(), 2000)
+  void pollStatic()
 }
 
 async function pollStatic(): Promise<void> {
-  if (!focus.value) return
+  if (!focus.value || hidden) return
   try {
     const shot = await accountsApi.screenshot(focus.value.id)
     if (!shot.blob) return
@@ -110,7 +132,7 @@ async function pollStatic(): Promise<void> {
 }
 
 async function pollWechat(): Promise<void> {
-  if (!focus.value) return
+  if (!focus.value || hidden) return
   try {
     const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
     if (v && v.visible === false) { wechatNotReady.value = true; return }
@@ -124,67 +146,173 @@ async function pollWechat(): Promise<void> {
   }
 }
 
-/** 归一化坐标 (x/w, y/h) → 控制帧 touch;无 WS 时走 REST 兜底 */
-const zoom = ref(100)
-/** 按下时落在画面内的坐标。松手若在黑边上,仍用这个点收尾,避免划到屏幕边缘触发系统返回。 */
-let pointerDown: { x: number; y: number } | null = null
-
-function mediaSize(el: HTMLElement): { w: number; h: number } {
-  if (el instanceof HTMLCanvasElement) return { w: el.width, h: el.height }
-  if (el instanceof HTMLImageElement) return { w: el.naturalWidth, h: el.naturalHeight }
-  return { w: 0, h: 0 }
+/** 窗口可见性:隐藏 → pause,恢复 → resume(§2.7.4 规格策略) */
+function applyVisibility(visible: boolean): void {
+  hidden = !visible
+  if (visible) {
+    stream?.resume()
+    if (isWechat.value) void pollWechat()
+    else if (isStatic.value) void pollStatic()
+  } else {
+    relay.releaseAll()
+    stream?.pause()
+  }
 }
 
-function onPointer(e: PointerEvent, action: 'down' | 'move' | 'up'): void {
+function watchVisibility(): (() => void) | undefined {
+  if (window.qt?.window?.onVisibility) return window.qt.window.onVisibility(applyVisibility)
+  // 纯浏览器调试(没有 preload):退回页面可见性
+  if (typeof document === 'undefined') return undefined
+  const onChange = (): void => applyVisibility(document.visibilityState !== 'hidden')
+  document.addEventListener('visibilitychange', onChange)
+  return () => document.removeEventListener('visibilitychange', onChange)
+}
+
+const zoom = ref(100)
+
+/** 流模式:canvas 指针事件原样透传(down / move / up / cancel),前端不合成 tap / longpress */
+function onCanvasPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel'): void {
+  if (isWechat.value || !stream) return
   const el = e.currentTarget as HTMLElement | null
-  if (!el || isWechat.value) return
-  const r = el.getBoundingClientRect()
-  const { w, h } = mediaSize(el)
-  const inside = normInContain(e.clientX, e.clientY, r, w, h)
-  if (action === 'down') {
-    pointerDown = inside
-    if (!inside) return
-  } else if (!pointerDown) {
+  if (!el) return
+  const box = el.getBoundingClientRect()
+  if (kind === 'down') {
+    if (relay.down(e, box)) {
+      e.preventDefault()
+      el.focus?.()
+      try { el.setPointerCapture(e.pointerId) } catch { /* 指针已失效 */ }
+    }
+  } else if (kind === 'move') {
+    relay.move(e, box)
+  } else if (kind === 'up') {
+    relay.up(e, box)
+    try { el.releasePointerCapture(e.pointerId) } catch { /* 已释放 */ }
+  } else {
+    relay.cancel(e.pointerId)
+  }
+}
+
+function onWheel(e: WheelEvent): void {
+  if (isWechat.value || !stream) return
+  const el = e.currentTarget as HTMLElement | null
+  if (el) relay.wheel(e, e.deltaX, e.deltaY, el.getBoundingClientRect())
+}
+
+/**
+ * 静态预览模式:#35 只有 tap/swipe,没有 down/move/up,
+ * 所以按下记起点、松手时把整段手势换成一条 REST(长按 = 原地 swipe)。
+ */
+let staticDown: { x: number; y: number; t: number; last: { x: number; y: number }; pointerId: number } | null = null
+
+function staticPoint(e: PointerEvent): { x: number; y: number } | null {
+  const el = e.currentTarget as HTMLImageElement | null
+  if (!el || !el.naturalWidth || !el.naturalHeight) return null
+  return normInContain(e.clientX, e.clientY, el.getBoundingClientRect(), el.naturalWidth, el.naturalHeight)
+}
+
+function onStaticPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel'): void {
+  if (isWechat.value || !focus.value) return
+  const el = e.currentTarget as HTMLElement | null
+  if (kind === 'down') {
+    const p = staticPoint(e)
+    if (!p) return
+    e.preventDefault()
+    el?.focus?.()
+    staticDown = { ...p, t: Date.now(), last: p, pointerId: e.pointerId }
+    try { el?.setPointerCapture(e.pointerId) } catch { /* 指针已失效 */ }
     return
   }
-  const point = inside ?? pointerDown
-  if (!point) return
-  if (action === 'up') pointerDown = null
-  if (stream && stats.value.connected) stream.send({ type: 'touch', action, x: point.x, y: point.y, pointer: e.pointerId })
-  else if (focus.value && action === 'up') void accountsApi.streamInput(focus.value.id, { type: 'tap', x: point.x, y: point.y })
+  if (!staticDown || staticDown.pointerId !== e.pointerId) return
+  if (kind === 'move') {
+    const p = staticPoint(e)
+    if (p) staticDown.last = p
+    return
+  }
+  const start = staticDown
+  staticDown = null
+  if (kind === 'cancel') return
+  const end = staticPoint(e) ?? start.last
+  void accountsApi.streamInput(focus.value.id, restGesture(start, end, Date.now() - start.t)).catch(() => undefined)
+}
+
+/** 控制键 → `key`(按下 + 抬起各一帧);静态预览走 #35 */
+function sendKey(keycode: string): void {
+  if (isStatic.value) {
+    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'key', keycode }).catch(() => undefined)
+    return
+  }
+  if (!stream) return
+  stream.send({ type: 'key', keycode, action: 'down' })
+  stream.send({ type: 'key', keycode, action: 'up' })
+}
+
+function sendText(text: string): void {
+  if (!text) return
+  if (isStatic.value) {
+    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'text', text }).catch(() => undefined)
+    return
+  }
+  stream?.send({ type: 'text', text })
 }
 
 const KEYCODE_OF: Record<string, string> = {
-  Enter: 'ENTER', Backspace: 'DEL', Escape: 'ESCAPE',
+  Enter: 'ENTER', Backspace: 'DEL', Escape: 'ESCAPE', Tab: 'TAB', Delete: 'FORWARD_DEL',
+  ArrowUp: 'DPAD_UP', ArrowDown: 'DPAD_DOWN', ArrowLeft: 'DPAD_LEFT', ArrowRight: 'DPAD_RIGHT',
+  Home: 'MOVE_HOME', End: 'MOVE_END', PageUp: 'PAGE_UP', PageDown: 'PAGE_DOWN',
+}
+
+/**
+ * 输入框攒字:可打印字符不逐个当 `text` 发(一次按键一条注入,又慢又会被输入法拆碎),
+ * 而是攒进输入框(中文输入法也在这里上屏),回车一次发整段 `text`。
+ * 登录态下(可能是密码/短信码)输入框按密码框显示,不回显(§2.7.4 / §6)。
+ */
+const imeOpen = ref(false)
+const imeText = ref('')
+const imeInput = ref<HTMLInputElement | null>(null)
+
+function openIme(initial = ''): void {
+  imeOpen.value = true
+  imeText.value += initial
+  void nextTick(() => imeInput.value?.focus())
+}
+
+function closeIme(): void {
+  imeOpen.value = false
+  imeText.value = ''
+}
+
+function submitIme(): void {
+  const text = imeText.value
+  closeIme()
+  sendText(text)
+  canvas.value?.focus()
+}
+
+function onImeKey(e: KeyboardEvent): void {
+  // 输入法组字中(拼音候选)的回车 / Esc 归输入法,不算提交
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter') { e.preventDefault(); submitIme() }
+  else if (e.key === 'Escape') { e.preventDefault(); closeIme(); canvas.value?.focus() }
 }
 
 function onKey(e: KeyboardEvent): void {
-  if (isWechat.value || !stream) return
-  if (e.key.length === 1) {
+  if (isWechat.value || (!stream && !isStatic.value) || e.isComposing) return
+  if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault()
-    stream.send({ type: 'text', text: e.key })
+    openIme(e.key)
     return
   }
   const keycode = KEYCODE_OF[e.key]
   if (!keycode) return
   e.preventDefault()
-  stream.send({ type: 'key', keycode, action: 'down' })
-}
-
-function onWheel(e: WheelEvent): void {
-  if (isWechat.value || !stream) return
-  stream.send({ type: 'scroll', x: 0.5, y: 0.5, dx: e.deltaX, dy: e.deltaY })
+  sendKey(keycode)
 }
 
 function tool(t: string): void {
-  if (!stream) return
-  if (t === 'back') stream.send({ type: 'key', keycode: 'BACK', action: 'down' })
-  else if (t === 'home') stream.send({ type: 'key', keycode: 'HOME', action: 'down' })
-  // 不发 keycode ROTATE:正在跑的 Agent 把它收成返回键,点一次就退一层。
-  // 新进程认 type=rotate,但旧进程会把未知类型当成坏帧并断开画面,所以这里先不发。
-  else if (t === 'rotate') return
+  if (t === 'back') sendKey('BACK')
+  else if (t === 'home') sendKey('HOME')
   else if (t === 'shot') void takeShot()
-  else if (t === 'keyboard') canvas.value?.focus()
+  else if (t === 'keyboard') openIme()
 }
 
 /** #33:二进制 + `X-QT-Media-Id`/`X-QT-Sha256` 头 —— 存档时把这两个值一起显示,便于对账 */
@@ -207,7 +335,14 @@ async function saveShot(): Promise<void> {
 }
 
 function setPerf(p: string): void {
-  if (p === 'retry-hw') { stream?.retryHardware(); return }
+  if (p === 'retry-hw') {
+    // 静态预览档流已关:整条重开(start 会重新探测);其余档在原流上升回硬解
+    if (isStatic.value || !stream) {
+      stats.value = { ...stats.value, decoder: 'hardware' }
+      void startFocus()
+    } else stream.retryHardware()
+    return
+  }
   ui.perfProfile = p as typeof ui.perfProfile
   stream?.setProfile(PROFILE_OF[p] ?? 'focus')
 }
@@ -222,6 +357,8 @@ watch(focusId, () => void startFocus())
 watch(() => route.params.id, (v) => { if (v) focusId.value = String(v) })
 
 onMounted(async () => {
+  // 🔴 先注册可见性监听,再走任何可能提前 return 的分支(B5:以前首次自动选账号后 return,监听没注册)
+  visibilityOff = watchVisibility()
   if (!accounts.items.length) await accounts.load()
   // 这里再调一次 startFocus 会和上面的 watch 各开一条 focus 流。
   // 后到的那条被服务端拒绝(同时只允许 1 个),页面就停在空白画布上。
@@ -230,16 +367,12 @@ onMounted(async () => {
     return
   }
   await startFocus()
-  // 窗口最小化/隐藏 → 全部 pause(§2.7.4 规格策略)
-  visibilityOff = window.qt?.window.onVisibility((visible) => {
-    if (visible) stream?.resume()
-    else stream?.pause()
-  })
 })
 
 onUnmounted(() => {
   stopAll()
   visibilityOff?.()
+  visibilityOff = undefined
   if (shotUrl.value) URL.revokeObjectURL(shotUrl.value)
   if (wechatSrc.value) URL.revokeObjectURL(wechatSrc.value)
   if (staticSrc.value) URL.revokeObjectURL(staticSrc.value)
@@ -336,16 +469,24 @@ onUnmounted(() => {
             <a-button size="small" @click="startFocus">再试一次</a-button>
           </div>
 
-          <img
-            v-if="stats.decoder === 'static' && staticSrc"
-            class="wxpreview"
-            :src="staticSrc"
-            alt="静态预览"
-            :style="{ width: zoom + '%' }"
-            @pointerdown="(e) => onPointer(e, 'down')"
-            @pointermove="(e) => onPointer(e, 'move')"
-            @pointerup="(e) => onPointer(e, 'up')"
-          />
+          <!-- 第三档:静态预览(#33 每 2 s 一帧),点击/拖动松手时经 #35 REST 注入 -->
+          <template v-if="isStatic">
+            <img
+              v-if="staticSrc"
+              class="wxpreview static-preview"
+              :src="staticSrc"
+              alt="静态预览"
+              tabindex="0"
+              draggable="false"
+              :style="{ width: zoom + '%' }"
+              @pointerdown="(e) => onStaticPointer(e, 'down')"
+              @pointermove="(e) => onStaticPointer(e, 'move')"
+              @pointerup="(e) => onStaticPointer(e, 'up')"
+              @pointercancel="(e) => onStaticPointer(e, 'cancel')"
+              @keydown="onKey"
+            />
+            <p v-else class="qt-small qt-muted">静态预览:正在取第一张截图…</p>
+          </template>
           <canvas
             v-else
             ref="canvas"
@@ -353,15 +494,32 @@ onUnmounted(() => {
             tabindex="0"
             :data-testid="T.canvas"
             :style="{ width: zoom + '%' }"
-            @pointerdown="(e) => onPointer(e, 'down')"
-            @pointermove="(e) => onPointer(e, 'move')"
-            @pointerup="(e) => onPointer(e, 'up')"
+            @pointerdown="(e) => onCanvasPointer(e, 'down')"
+            @pointermove="(e) => onCanvasPointer(e, 'move')"
+            @pointerup="(e) => onCanvasPointer(e, 'up')"
+            @pointercancel="(e) => onCanvasPointer(e, 'cancel')"
+            @lostpointercapture="(e) => onCanvasPointer(e, 'cancel')"
             @keydown="onKey"
             @wheel.prevent="onWheel"
           />
+          <!-- 键盘输入:可打印字符攒在这里,回车整段发 text;控制键仍在画面上直接发 key -->
+          <div v-if="imeOpen" class="qt-row ime">
+            <input
+              ref="imeInput"
+              v-model="imeText"
+              class="ime-input"
+              :type="loginPhase ? 'password' : 'text'"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="输入文字,回车发送到画面;Esc 取消"
+              @keydown="onImeKey"
+            />
+            <a-button size="small" type="primary" @click="submitIme">发送</a-button>
+            <a-button size="small" @click="closeIme">取消</a-button>
+          </div>
           <div class="qt-row tools">
             <a-button v-for="t in SCREEN_TOOLS" :key="t" size="small" :data-testid="T.tool(t)" @click="tool(t)">
-              {{ ({ back: '返回', home: '主页', rotate: '旋转', shot: '截图', keyboard: '键盘输入' } as Record<string, string>)[t] }}
+              {{ ({ back: '返回', home: '主页', shot: '截图', keyboard: '键盘输入' } as Record<string, string>)[t] }}
             </a-button>
             <a-dropdown>
               <a-button size="small" :data-testid="T.perfMenu">性能 ▾</a-button>
@@ -420,6 +578,10 @@ onUnmounted(() => {
   width: 100%; max-width: 720px; max-height: 70vh; object-fit: contain;
   background: #000; display: block; outline: none; cursor: pointer;
 }
+/* 触屏/笔:不让浏览器把拖动当成页面滚动或缩放吞掉 */
+.canvas, .static-preview { touch-action: none; user-select: none; }
+.ime { margin-top: var(--qt-space-2); gap: var(--qt-space-2); }
+.ime-input { flex: 1 1 auto; max-width: 480px; padding: 2px 8px; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-sm); }
 .zoom { display: inline-flex; align-items: center; gap: 6px; }
 .tools { margin-top: var(--qt-space-2); flex-wrap: wrap; }
 .status { margin-top: var(--qt-space-2); gap: var(--qt-space-3); }

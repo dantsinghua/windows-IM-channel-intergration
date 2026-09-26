@@ -275,7 +275,8 @@ export const screen = {
   thumbStart: (id: string) => `qt-screen-thumb-${id}-start`,
   qqHint: (id: string) => `qt-screen-qq-hint-${id}`,
   canvas: 'qt-screen-canvas',
-  tool: (t: 'back' | 'home' | 'rotate' | 'shot' | 'keyboard') => `qt-screen-tool-${t}`,
+  // 02 #34 控制帧没有旋转:01 §4 工具条枚举里的「旋转」按钮已不渲染(待文档方出裁决删条)
+  tool: (t: 'back' | 'home' | 'shot' | 'keyboard') => `qt-screen-tool-${t}`,
   perfMenu: 'qt-screen-perf-menu',
   perf: (p: 'focus30' | 'focus15' | 'thumb10' | 'retry-hw') => `qt-screen-perf-${p}`,
   statusDecoder: 'qt-screen-status-decoder',
@@ -290,7 +291,7 @@ export const screen = {
   loginHint: 'qt-screen-login-hint',
 } as const
 
-export const SCREEN_TOOLS = ['back', 'home', 'rotate', 'shot', 'keyboard'] as const
+export const SCREEN_TOOLS = ['back', 'home', 'shot', 'keyboard'] as const
 export const SCREEN_PERF_ITEMS = ['focus30', 'focus15', 'thumb10', 'retry-hw'] as const
 
 /* ─────────────── P-CMD ─────────────── */
