@@ -57,12 +57,20 @@ def test_bind_failure_closes_socket_and_raises():
     assert made[0].closed
 
 
-def test_posix_bind_does_not_allow_second_active_listener():
-    a = bind_listener("127.0.0.1", 0, windows=False)
+def test_posix_bind_uses_reuseaddr_only():
+    # 只断言分支选择、不依赖宿主 OS 语义:Windows 的 SO_REUSEADDR 允许重复绑定,真绑在 Windows 上不成立
+    made: list[FakeSock] = []
+    bind_listener("127.0.0.1", 17610, windows=False, sock_factory=lambda *a: made.append(FakeSock()) or made[-1])
+    assert made[0].opts == [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)]
+
+
+def test_native_bind_does_not_allow_second_active_listener():
+    # 走本机默认分支(Windows=SO_EXCLUSIVEADDRUSE / POSIX=SO_REUSEADDR),两种语义下第二个活跃监听都应绑不上
+    a = bind_listener("127.0.0.1", 0)
     try:
         port = a.getsockname()[1]
         with pytest.raises(OSError):
-            bind_listener("127.0.0.1", port, windows=False)
+            bind_listener("127.0.0.1", port)
     finally:
         a.close()
 
