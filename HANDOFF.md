@@ -113,6 +113,20 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 **2026-09-26 深夜补记(九项裁决落地 + H07 告警,已推送)**:安琳当晚定了 **R6-69~R6-77**(A.2 暂停 = 只停转发不断 socket/resume 发 RESET_VIDEO;01 §2.7.4 丢帧阈值 6;#101 真重建覆盖 R6-58(ai);#34 注入提到 **W** 级(R 令牌注入 ⇒ 审计 `ws_rejected` ⇒ 关闭码 **4403**,控制台转只读不自动重连);安装取消退出码 **11 `E_INSTALL_CANCELLED`**;发帧超时关闭码 **4408**;#35 `duration_ms`;`[adapters.qidian]` 六个 scrcpy_* 键与 `GET /accounts/{id}/contacts`(#3b)登记;01 元素表删 rotate、加只读横幅/按钮),文档方回写 00/01/02/03/04/07/README/验收手册,对账脚本新增 ⑮ CROSS 8 条 + 「画面流健康旧判据」FORBIDDEN(改前备份全红);代码方落地三条 + 控制台 4403;随后按安琳裁决**补上 H07 告警接线**(`H07_SCRCPY_STALLED` warn/resolve,`/system/health` H07 三态;真机:杀 server 同刻 firing、+0.30 s resolve)。三轮独立验收(裁决批 ACCEPT;H07 批 REVISE×2 → ACCEPT:两次都是文档半改——引用了 worktree 内 SHA `870bdb4`、04 H07 行与 F-07 口径打架——**其中一次是总控代改文档所致,已记入记忆**)。数字:pytest 2556 / vitest 296 + tsc 0 / Pester 658 / ISCC 编过 / 对账 exit 0。真机另证:`forward --remove` 不打断已建立的流(A5-06 造故障改为杀 server)。遗留:G1 `main._attach_screen` 的 `alerts=` 接线无用例守护;00 R6-69 引 02 行号已偏(历史描述);SKILL §5 那条 NEGATION 收紧待办仍开着。**正式包仍未重出**。
 
+## 3d. 🔴 2026-09-27 01:30 交接快照(**1.0.1 带签名正式包已出、独立校验两轮 → ACCEPT**;版本对齐本机)
+
+**包身份**:`installer/out/QTrade-Setup-1.0.1.exe`(git 忽略,只在原机)—— **2,250,367,904 B**,sha256 **`4c93508df200c27396f5e24be2f318a0c954a0d74f057aa31f460c603a39326a`**,外壳签名指纹 `E36AFD96…D60E`(DigiCert 时间戳 2026-09-26T17:05:02Z),源码 **`0f7a7fb`**;包内引擎 1.0.1(VersionInfo/AppVersion/`package_version` 三处均 1.0.1);manifest 14 条、`lightweight=false`、`missing` 空。同目录旧件:`1.0.0.exe`(9/21,**作废**:引擎自报 1.0.0 + WinAgent exe 启动即崩)、`1.0.0.exe.void-20260921-0306`、`1.0.1.exe.void-20260927-r1`(第一轮,引擎版本错)——分发只认 `4c93508d…`。
+
+**安琳定的对齐口径(2026-09-27)**:WSL 本体 MSI = **本机 2.5.9.0**(`C:\Windows\Installer\98b31.msi`,与 GitHub 官方 `wsl.2.5.9.0.x64.msi` sha256 逐字节相同 `ffc88065…`;替换 9/21 的 2.7.14);内核 `bzImage-6.6` `35a985bc…` = 本机现役 `bzImage.v4`;redroid `d1ca0815…`、napcat `2cc70b45…` = 本机 docker;scrcpy-server 4.1、platform-tools 37.0.1、发行版内 `docker.io` **不对齐本机**(Agent 按 4.1 协议实现且真机全绿;规格 §2.7.3 定 docker.io);包版本 1.0.1。
+
+**载荷溯源(独立校验方逐项重算)**:rootfs.tar 2,171,279,360 B `7dc85006…`(ubuntu:22.04 基础镜像 digest `b8b6ee6a…` 与 9/21 相同;`--require-hashes`/`--only-binary`/wheel 逐包断言照常;基础镜像因代理 7890 失效由构建方直连拉取后 `docker load`,docker 配置未改)| Agent wheel `8c1532d3…`(HEAD `src/`,含 `screen_scrcpy.py`)| WinAgent svc/user 剥签名 `b2762218…`/`a27e5dad…`(**第三轮**才过:第一轮被平台用例挡、第二轮 exe 启动即崩)| 控制台 app.asar `5db066df…`、主 exe 剥签名 `14935289…`(含 4408/4403/只读模式)| 引擎 19 脚本剥签名 = HEAD。
+
+**本轮揪出的三条潜伏缺陷(9/21 包也有,都已修入 `dda050e`~`0f7a7fb`)**:①WinAgent 两个 PyInstaller exe **启动即崩**(spec 把包内 `main_*.py` 当入口,相对导入失败;user 的 spec 还排除了 fastapi;venv 缺 `websockets`)→ 包外薄入口 `entry_*.py` + `--selfcheck` + build.ps1 冒烟门 [5/6] + pyproject 补 websockets + 守卫用例;②`.iss` `#define EngineVersion "1.0.0"` 无条件覆盖 `/D` 传入值 → `#ifndef` + 用例;③winagent 一条用例假定 POSIX socket 语义,真 Windows 上红 → 改平台无关。**教训(已进记忆 `exe-smoke-gate`)**:pytest/签名/sha 全绿都不证明产物能起,打包线必须对产物做最小执行。
+
+**独立校验 11 项(`.omc/handoffs/verify-package-1.0.1-r2.md`)**:大小/sha/签名、三段切段 + `7z t`、全表零杂物、manifest 7 条 sha、版本对齐逐项对本机、引擎 20 文件零间隙、三 exe 剥签名、**从包内解出的 svc/user 真跑 `--help`/`--selfcheck` 退出码 0**、rootfs 抽件 sha、SHA256SUMS 17/17、B1 专项。遗留(非阻塞):通配条目无单文件 sha(老问题);svc `--help` GBK 输出;升级路径是否真走 upgrade、目标机导入证书后签名 Valid、安装器运行期行为 —— **全部要真机**。
+
+**接下来**:①清理中间产物(安琳 2026-09-27 指令,清单先过目);②真机验收:先按验收手册 §1.4 导入证书,再按 §1.1 核 `4c93508d…`,本机 Hyper-V 虚拟机只能验到 KERNEL_SWITCH 之前(WSL2 在嵌套里起不来),内核切换及之后要物理机;③浏览器联调(拉 Agent + `QT_DEV_TOKEN=… npx vite`)前先只读核 Agent 启动对企点账号的副作用。
+
 ## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。
