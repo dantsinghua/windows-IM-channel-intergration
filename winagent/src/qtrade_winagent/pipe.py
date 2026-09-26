@@ -293,7 +293,7 @@ class UserAgentLink:
 
     async def connect(self) -> dict[str, Any]:
         """返回 ``WELCOME`` 结果;被拒时抛 ``WaError``(``FORBIDDEN``/``BUSY``/``VERSION_MISMATCH``)。"""
-        conn = await self._backend.connect(self._pipe_name, peer_sid=self.user_sid)     # type: ignore[call-arg]
+        conn = await self._backend.connect(self._pipe_name, peer_sid=self.user_sid)
         self.conn = conn
         await conn.send(PipeFrame(id=1, method=HELLO, params={
             "session_id": self.session_id, "user_sid": self.user_sid, "version": self.version,

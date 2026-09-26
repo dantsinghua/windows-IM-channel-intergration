@@ -357,11 +357,13 @@ class FakePipeBackend:
     def __init__(self, *, max_frame_kb: int = 1024):
         self._pending: dict[str, asyncio.Queue] = {}
         self._max_frame_kb = max_frame_kb
+        self.served_allow_sid: Optional[str] = None
 
     def _q(self, name: str) -> asyncio.Queue:
         return self._pending.setdefault(name, asyncio.Queue())
 
-    async def serve(self, name: str) -> FakePipeConn:
+    async def serve(self, name: str, *, allow_sid: Optional[str] = None) -> FakePipeConn:
+        self.served_allow_sid = allow_sid                  # 记下来便于断言「服务确实把安装用户 SID 交给了 ACL」
         return await self._q(name).get()
 
     async def connect(self, name: str, *, peer_sid: Optional[str] = None) -> FakePipeConn:
@@ -421,6 +423,9 @@ class FakeWsl:
         if "binderfs" in joined or "mount" in joined:
             return (0, "binder\nbinder_ctl\nbinderfs_features\n") if self.binderfs_mountable else (32, "mount: 失败")
         return 0, ""
+
+    async def version(self) -> str:
+        return self.wsl_version
 
     def wslconfig_path(self) -> str:
         return self.wslconfig_file

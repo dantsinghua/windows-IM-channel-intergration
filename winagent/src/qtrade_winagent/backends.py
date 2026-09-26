@@ -202,8 +202,10 @@ class PipeConn(Protocol):
 
 @runtime_checkable
 class PipeBackend(Protocol):
-    async def serve(self, name: str) -> PipeConn: ...          # 服务端:等一个客户端接入
-    async def connect(self, name: str) -> PipeConn: ...        # 客户端(会话代理)
+    # 服务端:等一个客户端接入;``allow_sid`` = 追加进管道 ACL 的安装用户 SID(02 §2.4.1)
+    async def serve(self, name: str, *, allow_sid: Optional[str] = None) -> PipeConn: ...
+    # 客户端(会话代理);``peer_sid`` 只有假后端用得上(真后端对端 SID 由服务侧取)
+    async def connect(self, name: str, *, peer_sid: Optional[str] = None) -> PipeConn: ...
 
 
 @runtime_checkable
