@@ -1,8 +1,35 @@
 """画面流执行体 ``screen_scrcpy.ScrcpyBackend`` 与 ``screen_adb`` 的开发者测试。
 
-全部用假件:假 adb(只记命令、不起真进程)+ 假 scrcpy-server(``asyncio.start_server``,跑在独立线程的事件循环里,
-发 dummy 字节 / codec meta / 帧包,收控制消息)。**不碰真 docker / adb / 任何设备。**
-断言落在协议字节上:首帧 JSON、PTS 与标志位、配置包缓存补发、控制消息的逐字节布局、断线/无帧重建。
+全部用假件:假 adb(只记命令、不起真进程)+ 假 scrcpy-server 4.1(``asyncio.start_server``,跑在独立线程的事件循环里,
+按 4.1 顺序:accept 视频 → 写 dummy → accept 控制 → 写 codec id / session 包 / 帧包,收控制消息)。
+**不碰真 docker / adb / 任何设备。**
+断言落在协议字节上:首帧 JSON、PTS 与标志位、session 包换尺寸、配置包缓存补发、控制消息的逐字节布局、断线/无帧重建。
+
+协议依据 = scrcpy **v4.1** 官方源码(随包 ``installer/out/payload/pkg/scrcpy/scrcpy-server`` 的 dex 里
+版本串 ``4.1``、有 ``send_stream_meta``、无 ``send_codec_meta``,与下列源码一致):
+
+- ``server/.../device/DesktopConnection.java`` ``open()`` 56-116:``tunnel_forward`` 下
+  ``LocalServerSocket("scrcpy")`` 依次 ``accept`` video → audio → control(关掉的跳过),dummy 字节在**第一条
+  accept 后立即**写;三条都 accept 完 ``open()`` 才返回。
+- ``server/.../Server.java`` 105:先 ``DesktopConnection.open(...)``,之后才建 ``Streamer`` / 起编码器。
+- ``server/.../video/SurfaceEncoder.java`` 102 ``streamer.writeVideoHeader()``;146 每次编码会话开始
+  ``streamer.writeSessionMeta(w, h, isClientResize)``(分辨率变化 / 重配会再来一次)。
+- ``server/.../device/Streamer.java``:
+  17-19 ``PACKET_FLAG_SESSION = 1L << 63``、``PACKET_FLAG_CONFIG = 1L << 62``、``PACKET_FLAG_KEY_FRAME = 1L << 61``;
+  48-55 ``writeVideoHeader``:只写 4 字节 ``codec.getId()``(需 ``send_stream_meta``);
+  57-66 ``writeDisableStream``:codec id 位置写 0(流被关)/ 1(配置错误);
+  91-105 ``writeSessionMeta``:12 字节 ``int flags = (int)(PACKET_FLAG_SESSION >> 32) | (clientResize ? 1 : 0)``
+  + ``int width`` + ``int height``,**没有数据段**;
+  107-124 ``writeFrameMeta``:``long ptsAndFlags``(配置包 = ``PACKET_FLAG_CONFIG``,否则 pts | KEY_FRAME)+ ``int size``。
+- ``server/.../Options.java`` 559-561 认 ``send_stream_meta``;571-572 不认识的键只 ``Ln.w("Unknown server option")``。
+- ``app/src/demuxer.c`` 14-17、127-137:客户端同样按 MSB 判 session 包,``width = read32be(&header[4])``、
+  ``height = read32be(&header[8])``;230-254 头之后第一包必须是 session 包。
+- ``server/.../control/ControlMessageReader.java`` 121-128 ``parseInjectScrollEvent``:
+  ``Binary.i16FixedPointToFloat(readShort()) * 16``(注释:实际范围 [-16, 16]);``util/Binary.java`` 34-37
+  ``i16FixedPointToFloat(v) = v == 0x7fff ? 1f : v / 0x1p15f``;``app/src/control_msg.c`` 130-137 客户端先 ``/ 16``
+  再 ``sc_float_to_i16fp``(``app/src/util/binary.h`` 84-93:``(int32_t)(f * 0x1p15f)`` 向零截断,0x8000 钳成 0x7fff)。
+- ``ControlMessageReader`` 72-78 keycode 14 B、106-109 text ``>BI``+UTF-8(``INJECT_TEXT_MAX_LENGTH = 300``)、
+  111-119 touch 32 B;``control/ControlMessage.java`` 10-13 类型号 0/1/2/3。
 """
 from __future__ import annotations
 
@@ -18,8 +45,8 @@ import pytest
 
 from qtrade_agent import screen_adb
 from qtrade_agent.screen_scrcpy import (
-    CODEC_H264, FLAG_CONFIG, FLAG_KEY, REMOTE_JAR, SERVER_CLASS, ScrcpyBackend, ScrcpyError, control_bytes,
-    encode_text, profile_params, store_target_resolver,
+    CODEC_H264, FLAG_CONFIG, FLAG_KEY, FLAG_SESSION, REMOTE_JAR, SERVER_CLASS, ScrcpyBackend, ScrcpyError,
+    control_bytes, encode_text, profile_params, store_target_resolver,
 )
 
 JAR = "/opt/qtrade/scrcpy/scrcpy-server"
@@ -29,19 +56,32 @@ SPS_PPS = b"\x00\x00\x00\x01\x67SPS\x00\x00\x00\x01\x68PPS"
 
 # ══════════════════════════════════════════════════ 假件
 def pkt(pts_flags: int, data: bytes) -> bytes:
+    """4.1 ``writeFrameMeta``:8 字节 ``pts_flags`` + 4 字节长度 + 数据。"""
     return struct.pack(">QI", pts_flags, len(data)) + data
 
 
+def session(width: int, height: int, client_resize: bool = False) -> bytes:
+    """4.1 ``writeSessionMeta``:``int flags(bit31=1, bit0=client resize) + int w + int h``,无数据段。"""
+    return struct.pack(">III", 0x80000000 | (1 if client_resize else 0), width, height)
+
+
 class FakeScrcpyServer:
-    """假 scrcpy-server:偶数号连接 = 视频(dummy + codec meta + 脚本包),奇数号 = 控制(全收下)。"""
+    """假 scrcpy-server 4.1(``tunnel_forward=true video=true audio=false control=true``)。
+
+    连接按「一次 server 会话 = 视频 + 控制两条」成对:偶数号 = 视频,accept 后立刻写 dummy,然后**等控制那条
+    accept 完**才写 4 字节 codec id + session 包 + 脚本包;奇数号 = 控制(全收下)。
+    ``events`` 记下事件顺序,用来断言「头在控制连上之后才出」。
+    """
 
     def __init__(self, width: int = 540, height: int = 960, codec: int = CODEC_H264) -> None:
         self.width, self.height, self.codec = width, height, codec
-        self.script: list[bytes] = []                 # 每条视频连接一建立就发的包
+        self.script: list[bytes] = []                 # 每次会话出完头就发的包
         self.conns = 0
         self.ctrl = bytearray()
         self.video_eof = 0                            # 视频连接被对端(Agent)关掉的次数
+        self.events: list[str] = []
         self._video_w: Optional[asyncio.StreamWriter] = None
+        self._ctrl_up: Optional[asyncio.Event] = None
         self.loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -60,11 +100,25 @@ class FakeScrcpyServer:
         self.conns += 1
         if idx % 2 == 0:
             self._video_w = w
-            w.write(b"\x00" + struct.pack(">III", self.codec, self.width, self.height) + b"".join(self.script))
+            self._ctrl_up = ctrl_up = asyncio.Event()
+            self.events.append("accept_video")
+            w.write(b"\x00")                           # DesktopConnection.open:accept 视频后立刻写 dummy
             await w.drain()
-            await r.read()                             # 等 Agent 关视频 socket(暂停 / 收尾)
+            waiter = asyncio.ensure_future(ctrl_up.wait())
+            eof = asyncio.ensure_future(r.read())
+            await asyncio.wait({waiter, eof}, return_when=asyncio.FIRST_COMPLETED)
+            if waiter.done():                          # open() 返回 ⇒ 编码器起来 ⇒ 头 + session + 帧
+                self.events.append("header")
+                w.write(struct.pack(">I", self.codec) + session(self.width, self.height) + b"".join(self.script))
+                await w.drain()
+            else:
+                waiter.cancel()
+            await eof                                  # 等 Agent 关视频 socket(暂停 / 收尾)
             self.video_eof += 1
         else:
+            self.events.append("accept_control")
+            if self._ctrl_up is not None:
+                self._ctrl_up.set()
             while True:
                 b = await r.read(4096)
                 if not b:
@@ -204,14 +258,24 @@ def test_touch_rejects_unknown_action_and_clamps_coords():
     assert struct.unpack(">ii", b[10:18]) == (539, 0)            # 右边界钳到 w-1
 
 
+def _server_scroll(v: int) -> float:
+    """4.1 服务端解码:``Binary.i16FixedPointToFloat(v) * 16``。"""
+    return (1.0 if v == 0x7FFF else v / 0x8000) * 16
+
+
 def test_scroll_bytes():
+    """wheel 一格(100 px)= scrcpy 滚动量 1.0;编码前先 /16(4.1 服务端再 ×16),设备上正好滚 1 格。"""
     b = control_bytes({"type": "scroll", "x": 0.5, "y": 0.5, "dx": 0, "dy": 100}, 540, 960)
     assert b == [bytes([3]) + (270).to_bytes(4, "big") + (480).to_bytes(4, "big") + (540).to_bytes(2, "big")
                  + (960).to_bytes(2, "big") + (0).to_bytes(2, "big", signed=True)
-                 + (-0x8000).to_bytes(2, "big", signed=True) + bytes(4)]
+                 + (-0x0800).to_bytes(2, "big", signed=True) + bytes(4)]
     assert len(b[0]) == 21
+    assert _server_scroll(-0x0800) == -1.0                        # 往下一格(Android vscroll 取反)
     up = control_bytes({"type": "scroll", "x": 0.5, "y": 0.5, "dx": -50, "dy": -300}, 540, 960)[0]
-    assert struct.unpack(">hh", up[13:17]) == (0x4000, 0x7FFF)  # 左滑半格、往上满值(钳到 0x7FFF)
+    h, v = struct.unpack(">hh", up[13:17])
+    assert (h, v) == (0x0400, 0x1800) and (_server_scroll(h), _server_scroll(v)) == (0.5, 3.0)
+    big = control_bytes({"type": "scroll", "x": 0.5, "y": 0.5, "dx": 5000, "dy": -5000}, 540, 960)[0]
+    assert struct.unpack(">hh", big[13:17]) == (-0x8000, 0x7FFF)  # 超过 ±16 格钳到定点满值
 
 
 def test_console_key_names_map_to_keycodes():
@@ -263,11 +327,13 @@ async def test_open_runs_push_forward_server_and_meta(srv):
         opts = argv[6:]
         assert opts[0] == "4.1"
         for want in ("tunnel_forward=true", "video=true", "audio=false", "control=true", "video_codec=h264",
-                     "max_size=960", "max_fps=5", "send_frame_meta=true", "send_codec_meta=true",
+                     "max_size=960", "max_fps=5", "send_frame_meta=true", "send_stream_meta=true",
                      "send_device_meta=false", "send_dummy_byte=true"):
             assert want in opts
+        assert not any(o.startswith("send_codec_meta") for o in opts)   # 4.1 不认旧名,只会 warn
         assert not any(c[1:3] == ("shell", "am") or "am start" in " ".join(c) for c in adb.calls)   # 开流不拉企点
         await wait_for(lambda: srv.conns == 2)                     # 视频 + 控制两条
+        assert srv.events == ["accept_video", "accept_control", "header"]   # 4.1:控制连上后才出头
     finally:
         await s.close()
         await be.aclose()
@@ -279,6 +345,58 @@ async def test_open_rejects_non_h264(srv):
     with pytest.raises(ScrcpyError):
         await be.open("qd01", profile="thumb")
     assert be.channels == {}
+
+
+async def test_open_fails_when_server_disables_stream(srv):
+    """4.1 ``writeDisableStream``:codec id 位置写 1 = server 配置出错 ⇒ 如实报错、不留通道。"""
+    srv.codec = 1
+    be = make_backend(srv, FakeAdbRunner())
+    with pytest.raises(ScrcpyError, match="关了视频流"):
+        await be.open("qd01", profile="thumb")
+    assert be.channels == {}
+
+
+def test_flag_bits_match_scrcpy_41():
+    assert (FLAG_SESSION, FLAG_CONFIG, FLAG_KEY) == (1 << 63, 1 << 62, 1 << 61)
+
+
+async def test_header_only_after_control_connected(srv):
+    """4.1 假 server 自检:只连视频不连控制 ⇒ 只有 dummy、等不到头(旧实现「拿到头再连控制」会在此死锁)。"""
+    r, w = await asyncio.open_connection("127.0.0.1", srv.port)
+    try:
+        assert await asyncio.wait_for(r.readexactly(1), 2) == b"\x00"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(r.readexactly(4), 0.3)
+        r2, w2 = await asyncio.open_connection("127.0.0.1", srv.port)
+        hdr = await asyncio.wait_for(r.readexactly(16), 2)
+        assert struct.unpack(">I", hdr[:4])[0] == CODEC_H264 and hdr[4:] == session(540, 960)
+        w2.close()
+    finally:
+        w.close()
+
+
+async def test_session_packet_midstream_resends_meta_with_new_size(srv):
+    """分辨率变化:4.1 再发 session 包 + 新配置包 + 关键帧 ⇒ 已连 WS 先收新首帧 JSON,再从新关键帧开始。"""
+    srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 1_000_000, b"K1")]
+    be = make_backend(srv, FakeAdbRunner())
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert s.meta["width"] == 540 and s.meta["height"] == 960
+        assert await next_item(s) == (1000, SPS_PPS + b"K1")
+        new_cfg = b"\x00\x00\x00\x01\x67NEW"
+        srv.push(session(720, 1280), pkt(2_000_000, b"P-old-session"), pkt(FLAG_CONFIG, new_cfg),
+                 pkt(FLAG_KEY | 2_100_000, b"K2"))
+        meta = await next_item(s)
+        assert meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "focus", "fps": 30, "seq0": 0}
+        assert await next_item(s) == (2100, new_cfg + b"K2")          # 换尺寸后的 P 帧不送、旧 SPS 不拼
+        await s.control({"type": "touch", "action": "down", "x": 1.0, "y": 1.0, "pointer": 0})
+        await wait_for(lambda: len(srv.ctrl) == 32)
+        assert struct.unpack(">iiHH", bytes(srv.ctrl[10:22])) == (719, 1279, 720, 1280)   # 坐标按新尺寸
+        srv.push(session(720, 1280), pkt(FLAG_CONFIG, new_cfg), pkt(FLAG_KEY | 3_000_000, b"K3"))
+        assert await next_item(s) == (3000, new_cfg + b"K3")          # 尺寸没变的 session 不重发首帧
+    finally:
+        await s.close()
+        await be.aclose()
 
 
 async def test_packets_pts_flags_and_config_prepended_to_keyframe(srv):
@@ -313,6 +431,40 @@ async def test_second_subscriber_shares_server_and_starts_at_next_keyframe(srv):
     finally:
         await s1.close()
         await be.aclose()
+
+
+async def test_end_to_end_41_open_meta_frames_and_control_bytes():
+    """端到端(4.1 顺序):假 server 先 accept 两条再出头 → ``open`` → 首帧 JSON 宽高来自 session 包 →
+    配置包 + 关键帧 → touch / scroll / key / text 落到控制 socket 的逐字节内容。"""
+    srv = FakeScrcpyServer(width=576, height=1024)
+    srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 42_000_777, b"\x00\x00\x00\x01\x65IDR")]
+    be = make_backend(srv, FakeAdbRunner())
+    try:
+        s = await be.open("qd01", profile="focus")
+        try:
+            assert srv.events == ["accept_video", "accept_control", "header"]
+            assert s.meta == {"codec": "h264", "width": 576, "height": 1024, "profile": "focus", "fps": 30, "seq0": 0}
+            assert await next_item(s) == (42000, SPS_PPS + b"\x00\x00\x00\x01\x65IDR")
+            for m in ({"type": "touch", "action": "down", "x": 0.25, "y": 0.5, "pointer": 3},
+                      {"type": "touch", "action": "up", "x": 0.25, "y": 0.5, "pointer": 3},
+                      {"type": "scroll", "x": 0.5, "y": 0.5, "dx": 0, "dy": -200},
+                      {"type": "key", "keycode": "ENTER", "action": "down"},
+                      {"type": "text", "text": "你好"}):
+                await s.control(m)
+            want = (
+                struct.pack(">BBqiiHHHII", 2, 0, 3, 144, 512, 576, 1024, 0xFFFF, 1, 1)
+                + struct.pack(">BBqiiHHHII", 2, 1, 3, 144, 512, 576, 1024, 0, 1, 0)
+                + struct.pack(">BiiHHhhI", 3, 288, 512, 576, 1024, 0, 0x1000, 0)   # 上滚 2 格:2/16*32768
+                + struct.pack(">BBIII", 0, 0, 66, 0, 0)
+                + struct.pack(">BI", 1, 6) + "你好".encode("utf-8"))
+            await wait_for(lambda: len(srv.ctrl) >= len(want))
+            assert bytes(srv.ctrl) == want
+            assert _server_scroll(0x1000) == 2.0
+        finally:
+            await s.close()
+    finally:
+        await be.aclose()
+        srv.close()
 
 
 # ══════════════════════════════════════════════════ 控制 socket

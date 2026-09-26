@@ -3,11 +3,16 @@
 拉起(每账号一个 server,端口 = 00 §3 ``16500 + NN``):
 ``adb push <jar> /data/local/tmp/scrcpy-server.jar`` → ``adb forward tcp:165NN localabstract:scrcpy`` →
 ``adb shell CLASSPATH=… app_process / com.genymobile.scrcpy.Server 4.1 tunnel_forward=true …`` →
-依次连两条 TCP 到 ``127.0.0.1:165NN``:第一条视频、第二条控制。
+依次连两条 TCP 到 ``127.0.0.1:165NN``:第一条视频、第二条控制。**两条都连上之后** server 才开始出流头
+(4.1 ``DesktopConnection.open``:``tunnel_forward`` 下按 video→audio→control 顺序 accept 完才返回,
+dummy 字节在 accept 视频后立刻写;``SurfaceEncoder`` 之后才写流头)⇒ 读 dummy → 连控制 → 再读头。
 
-视频 socket(big-endian):1 字节 dummy → 12 字节 codec meta(codec id / 宽 / 高)→ 每包 8 字节 ``pts_flags``
-(bit63 配置包 SPS/PPS、bit62 关键帧、低 62 位 PTS 微秒)+ 4 字节包长 + Annex-B。转给 #34 时去掉包长、
-PTS 转毫秒;配置包缓存下来,拼在每个关键帧前面发(02 #34「SPS/PPS 随每个 IDR 重发」),
+视频 socket(big-endian,4.1 ``device/Streamer.java``):1 字节 dummy → 4 字节 codec id(``send_stream_meta``)
+→ 包序列,每包 12 字节头 + 数据:
+- ``pts_flags``(8 字节)bit63 置位 = **session 包**:头 12 字节就是 ``int flags(bit31=1, bit0=client resize)
+  + int 宽 + int 高``,没有数据段;每次编码会话(重)开都会来一个,分辨率变了 ⇒ 重发首帧 JSON。
+- 否则 ``pts_flags`` + 4 字节包长 + Annex-B;bit62 = 配置包(SPS/PPS)、bit61 = 关键帧、低 61 位 PTS 微秒。
+转给 #34 时去掉包长、PTS 转毫秒;配置包缓存下来,拼在每个关键帧前面发(02 #34「SPS/PPS 随每个 IDR 重发」),
 新连上的 WS 从下一个关键帧开始送(首个二进制帧就是 SPS/PPS + IDR)。
 
 控制 socket:``touch/scroll/key/text`` 编成 scrcpy 控制消息写进去,**不经任何 shell**。
@@ -32,9 +37,14 @@ log = logging.getLogger("qtrade.screen.scrcpy")
 REMOTE_JAR = "/data/local/tmp/scrcpy-server.jar"
 SERVER_CLASS = "com.genymobile.scrcpy.Server"
 CODEC_H264 = 0x68323634                  # "h264"
-FLAG_CONFIG = 1 << 63
-FLAG_KEY = 1 << 62
+# 4.1 device/Streamer.java:PACKET_FLAG_SESSION / CONFIG / KEY_FRAME
+FLAG_SESSION = 1 << 63
+FLAG_CONFIG = 1 << 62
+FLAG_KEY = 1 << 61
 PTS_MASK = FLAG_KEY - 1
+# 4.1 Streamer.writeDisableStream:codec id 位置写 0 = 流被关、1 = server 配置出错
+CODEC_DISABLED = 0
+CODEC_ERROR = 1
 
 # 控制消息类型(scrcpy ControlMessage)
 MSG_INJECT_KEYCODE = 0
@@ -45,7 +55,10 @@ KEY_ACTIONS = {"down": 0, "up": 1}                       # KeyEvent.ACTION_*
 TOUCH_ACTIONS = {"down": 0, "up": 1, "move": 2}          # MotionEvent.ACTION_*
 BUTTON_PRIMARY = 1
 TEXT_CHUNK_MAX = 300                                     # scrcpy 单条 INJECT_TEXT 上限(字节)
-SCROLL_FULL_PX = 100.0                                   # 浏览器 wheel 一格 ≈ 100 px ⇒ 满值 1.0
+SCROLL_NOTCH_PX = 100.0                                  # 浏览器 wheel 一格 ≈ 100 px ⇒ scrcpy 滚动量 1.0
+# 4.1 ControlMessageReader.parseInjectScrollEvent:i16FixedPointToFloat(v) * 16,实际范围 [-16, 16];
+# 官方客户端 control_msg.c 编码前先 /16 ⇒ 这里同样先 /16 再编定点
+SCROLL_RANGE = 16.0
 
 #: 02 §7.1 ``[adapters.qidian] stream_profiles`` 缺省四档
 DEFAULT_STREAM_PROFILES = {"thumb": "540p@5", "thumb10": "540p@10", "focus": "720p@30", "focus15": "720p@15"}
@@ -82,7 +95,7 @@ def server_args(version: str, spec: str) -> list[str]:
         version, "tunnel_forward=true", "video=true", "audio=false", "control=true", "video_codec=h264",
         f"max_size={p['max_size']}", f"max_fps={p['max_fps']}", f"video_bit_rate={p['video_bit_rate']}",
         f"video_codec_options=i-frame-interval={I_FRAME_INTERVAL_S}",
-        "send_frame_meta=true", "send_codec_meta=true", "send_device_meta=false", "send_dummy_byte=true",
+        "send_frame_meta=true", "send_stream_meta=true", "send_device_meta=false", "send_dummy_byte=true",
     ]
 
 
@@ -94,9 +107,9 @@ def _coord(v: Any, size: int) -> int:
 
 
 def _i16fp(v: float) -> int:
-    """scrcpy ``sc_float_to_i16fp``:[-1, 1] → 定点 i16,满值 0x7FFF。"""
+    """scrcpy ``sc_float_to_i16fp``:[-1, 1] → 定点 i16(向零截断),满值 0x7FFF。"""
     v = max(-1.0, min(1.0, v))
-    return max(-0x8000, min(0x7FFF, int(round(v * 0x8000))))
+    return max(-0x8000, min(0x7FFF, int(v * 0x8000)))
 
 
 def encode_touch(action: str, pointer: int, x: int, y: int, w: int, h: int) -> bytes:
@@ -108,7 +121,9 @@ def encode_touch(action: str, pointer: int, x: int, y: int, w: int, h: int) -> b
 
 
 def encode_scroll(x: int, y: int, w: int, h: int, hscroll: float, vscroll: float) -> bytes:
-    return struct.pack(">BiiHHhhI", MSG_INJECT_SCROLL, x, y, w, h, _i16fp(hscroll), _i16fp(vscroll), 0)
+    """``hscroll`` / ``vscroll`` 是 scrcpy 滚动量(格,[-16, 16]);先 /16 归一化再编定点(服务端再 ×16)。"""
+    return struct.pack(">BiiHHhhI", MSG_INJECT_SCROLL, x, y, w, h,
+                       _i16fp(hscroll / SCROLL_RANGE), _i16fp(vscroll / SCROLL_RANGE), 0)
 
 
 def encode_key(action: str, keycode: int) -> bytes:
@@ -144,8 +159,8 @@ def control_bytes(msg: dict[str, Any], width: int, height: int) -> list[bytes]:
     if kind == "scroll":
         x = _coord(msg.get("x", 0.5), width)
         y = _coord(msg.get("y", 0.5), height)
-        dx = float(msg.get("dx") or 0) / SCROLL_FULL_PX
-        dy = float(msg.get("dy") or 0) / SCROLL_FULL_PX
+        dx = float(msg.get("dx") or 0) / SCROLL_NOTCH_PX
+        dy = float(msg.get("dy") or 0) / SCROLL_NOTCH_PX
         # 浏览器 deltaY>0 = 往下翻(内容上移);Android AXIS_VSCROLL>0 = 往上 ⇒ 取反;水平同理
         return [encode_scroll(x, y, width, height, -dx, -dy)]
     if kind == "key":
@@ -160,9 +175,20 @@ def control_bytes(msg: dict[str, Any], width: int, height: int) -> list[bytes]:
     return []
 
 
+def parse_session(hdr: bytes) -> Optional[tuple[int, int]]:
+    """12 字节包头若是 session 包(bit63)⇒ ``(宽, 高)``;否则 None(4.1 客户端 ``sc_demuxer_parse_session``)。"""
+    flags, w, h = struct.unpack(">III", hdr)
+    if not flags & 0x80000000:
+        return None
+    return w, h
+
+
 async def read_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    """读一包:session 包返回 ``(pts_flags, 12 字节头)``(无数据段);其余返回 ``(pts_flags, 数据)``。"""
     hdr = await reader.readexactly(12)
     pts_flags, size = struct.unpack(">QI", hdr)
+    if pts_flags & FLAG_SESSION:
+        return pts_flags, hdr
     return pts_flags, await reader.readexactly(size)
 
 
@@ -202,6 +228,13 @@ class _Sub:
         if key:
             self.waiting_key = False
         self.queue.put_nowait((pts_ms, data))
+
+    def renew(self, meta: dict[str, Any]) -> None:
+        """新 session:发新首帧 JSON,之后从下一个关键帧开始送。"""
+        if self.detached:
+            return
+        self.waiting_key = True
+        self.queue.put_nowait(meta)
 
     def end(self, last: Optional[dict[str, Any]] = None) -> None:
         if self.detached:
@@ -262,12 +295,22 @@ class _Channel:
                                      SERVER_CLASS, *server_args(self.b.server_version, self.b.profiles[self.profile]))
         self._tasks.append(asyncio.create_task(self._drain_proc(), name=f"scrcpy-log:{self.account_id}"))
         self._vr, self._vw = await self._connect_video()
-        codec, w, h = struct.unpack(">III", await asyncio.wait_for(self._vr.readexactly(12), self.b.connect_timeout_s))
-        if codec != CODEC_H264:
-            raise ScrcpyError(f"scrcpy 回的编码不是 h264(codec_id=0x{codec:08x})")
-        self.width, self.height = w, h
+        # 4.1:server 要把控制 socket 也 accept 完才出流头 ⇒ 必须先连控制,再读头(X1)
         self._cr, self._cw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", self.port),
                                                     self.b.connect_timeout_s)
+        tmo = self.b.connect_timeout_s
+        (codec,) = struct.unpack(">I", await asyncio.wait_for(self._vr.readexactly(4), tmo))
+        if codec in (CODEC_DISABLED, CODEC_ERROR):
+            raise ScrcpyError(f"scrcpy-server 关了视频流(codec_id={codec}): {' | '.join(self._proc_tail[-5:])}")
+        if codec != CODEC_H264:
+            raise ScrcpyError(f"scrcpy 回的编码不是 h264(codec_id=0x{codec:08x})")
+        size = parse_session(await asyncio.wait_for(self._vr.readexactly(12), tmo))
+        if size is None:
+            raise ScrcpyError("scrcpy 视频流头之后第一包不是 session 包")
+        w, h = size
+        if not w or not h:
+            raise ScrcpyError(f"scrcpy session 包尺寸无效 {w}x{h}")
+        self.width, self.height = w, h
         self.config = b""
         self.alive = True
         self.video_paused = False
@@ -360,6 +403,9 @@ class _Channel:
             while True:
                 pts_flags, data = await read_packet(reader)
                 self.last_pkt = self.b.clock()
+                if pts_flags & FLAG_SESSION:
+                    self._on_session(data)
+                    continue
                 if pts_flags & FLAG_CONFIG:
                     self.config = data
                     continue
@@ -373,6 +419,19 @@ class _Channel:
                 return
             log.warning("画面流视频 socket 断了 account=%s: %r ⇒ 重建(H07)", self.account_id, e)
             self._spawn_heal("video_eof")
+
+    def _on_session(self, hdr: bytes) -> None:
+        """编码会话重开(4.1 每次 ``SurfaceEncoder`` 重配都发):尺寸变了 ⇒ 更新宽高、清配置缓存,
+        给已连 WS 重发首帧 JSON 并从下一个关键帧重新对齐;尺寸没变只清缓存(新 SPS/PPS 会紧跟着来)。"""
+        size = parse_session(hdr)
+        self.config = b""
+        if size is None or not size[0] or not size[1] or size == (self.width, self.height):
+            return
+        self.width, self.height = size
+        log.info("画面流分辨率变化 account=%s ⇒ %dx%d", self.account_id, *size)
+        meta = self.meta()
+        for sub in list(self.subs):
+            sub.renew(meta)
 
     async def _watchdog(self) -> None:
         """04 H07:有前台(未暂停)订阅者时 ``scrcpy_frame_timeout_s`` 内没收到包 ⇒ 重建 forward + server。"""
