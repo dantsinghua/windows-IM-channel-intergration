@@ -24,6 +24,7 @@ class WinPipeConn:
         self._peer_sid = peer_sid
         self._max = max_frame_kb * 1024
         self._buf = b""
+        self._broken = False                      # Peek 探到句柄已断 ⇒ recv 直接回 None(= 断开)
 
     @property
     def peer_sid(self) -> Optional[str]:
@@ -37,6 +38,8 @@ class WinPipeConn:
         await asyncio.to_thread(win32file.WriteFile, self._h, raw)
 
     async def recv(self) -> Optional[PipeFrame]:
+        if self._broken:
+            return None
         import win32file
         while b"\n" not in self._buf:
             try:
@@ -54,9 +57,17 @@ class WinPipeConn:
         return PipeFrame.from_wire(json.loads(line.decode("utf-8")))
 
     def inbound_ready(self) -> bool:
-        """有没有一帧在等读。用 Peek,避免同步 ReadFile 占住句柄、把心跳 WriteFile 卡住。"""
+        """有没有一帧在等读。用 Peek,避免同步 ReadFile 占住句柄、把心跳 WriteFile 卡住。
+
+        对端断开时 ``PeekNamedPipe`` 抛 ``pywintypes.error``(ERROR_BROKEN_PIPE 等):按断开处理——
+        回 ``True`` 让调用方去 ``recv``,``recv`` 见 ``_broken`` 回 ``None``,``run()`` 走正常退出路径。
+        """
         import win32pipe
-        _data, avail, _left = win32pipe.PeekNamedPipe(self._h, 0)
+        try:
+            _data, avail, _left = win32pipe.PeekNamedPipe(self._h, 0)
+        except Exception:
+            self._broken = True
+            return True
         return int(avail or 0) > 0
 
     async def close(self) -> None:

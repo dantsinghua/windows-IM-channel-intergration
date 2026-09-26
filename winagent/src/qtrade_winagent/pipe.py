@@ -286,7 +286,7 @@ class UserAgentLink:
         self.handlers: dict[str, Handler] = {}
         self.conn: Optional[PipeConn] = None
         self.welcome: Optional[dict[str, Any]] = None
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: set[asyncio.Task] = set()                 # 在途 _dispatch;留引用防被 GC,stop() 时取消
 
     def on(self, method: str, handler: Handler) -> None:
         self.handlers[method] = handler
@@ -312,65 +312,59 @@ class UserAgentLink:
         Windows 命名管道的同步句柄不能同时 ReadFile 和 WriteFile:心跳线程一写就被
         正在读的那个调用堵住,服务 15 秒收不到心跳就把会话代理判离线。
         没有入站帧时才写心跳。
+
+        ``stop()`` 把 ``conn`` 置 ``None`` ⇒ 本循环在下一轮检查时退出;对端断开(``recv`` 回 ``None``)
+        或探测入站本身抛错(句柄已断)一律按断开处理,正常返回。
         """
-        assert self.conn is not None
         next_hb = self._clock()
-        while self.conn is not None:
-            if self.conn.inbound_ready():
-                frame = await self.conn.recv()
+        while (conn := self.conn) is not None:
+            try:
+                ready = conn.inbound_ready()
+            except Exception:                                     # 句柄已断(真后端 Peek 抛 pywintypes.error)
+                log.warning("管道入站探测失败,按断开处理", extra={"op": "pipe.run", "code": "DISCONNECTED"})
+                return
+            if ready:
+                frame = await conn.recv()
                 if frame is None:
                     return
-                if frame.id != HEARTBEAT_ID:
-                    asyncio.create_task(self._dispatch(frame))
+                if frame.id != HEARTBEAT_ID:                      # 服务对心跳的回应忽略
+                    t = asyncio.create_task(self._dispatch(conn, frame), name=f"ua-dispatch-{frame.id}")
+                    self._tasks.add(t)
+                    t.add_done_callback(self._tasks.discard)
                 continue
             now = self._clock()
             if now >= next_hb:
-                await self.conn.send(PipeFrame(id=HEARTBEAT_ID, method=PING))
+                await conn.send(PipeFrame(id=HEARTBEAT_ID, method=PING))
                 next_hb = now + self._cfg.heartbeat_s * 1000
             await asyncio.sleep(0.05)
 
     async def stop(self) -> None:
-        for t in self._tasks:
+        """取消在途请求、关连接并置 ``conn=None``,``run()`` 随之退出。"""
+        for t in list(self._tasks):
             t.cancel()
-        if self.conn:
-            await self.conn.close()
+        self._tasks.clear()
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            await conn.close()
 
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self._cfg.heartbeat_s)
-            if self.conn is None:
-                return
-            await self.conn.send(PipeFrame(id=HEARTBEAT_ID, method=PING))
-
-    async def _serve_loop(self) -> None:
-        assert self.conn is not None
-        while True:
-            frame = await self.conn.recv()
-            if frame is None:
-                return
-            if frame.id == HEARTBEAT_ID:                          # 服务对心跳的回应,忽略
-                continue
-            asyncio.create_task(self._dispatch(frame))
-
-    async def _dispatch(self, frame: PipeFrame) -> None:
-        assert self.conn is not None
+    async def _dispatch(self, conn: PipeConn, frame: PipeFrame) -> None:
         h = self.handlers.get(frame.method or "")
         if h is None:
-            await self.conn.send(PipeFrame(id=frame.id, ok=False,
-                                           error={"code": "TARGET_NOT_FOUND", "message": f"未知方法 {frame.method}"}))
+            await conn.send(PipeFrame(id=frame.id, ok=False,
+                                      error={"code": "TARGET_NOT_FOUND", "message": f"未知方法 {frame.method}"}))
             return
         budget = (frame.deadline_ms or 30000) / 1000
         try:
             result = await asyncio.wait_for(h(frame.params), timeout=budget)
         except asyncio.TimeoutError:
-            await self.conn.send(PipeFrame(id=frame.id, ok=False,
-                                           error={"code": TIMEOUT, "message": f"会话代理超过 deadline_ms={frame.deadline_ms}"}))
+            await conn.send(PipeFrame(id=frame.id, ok=False,
+                                      error={"code": TIMEOUT, "message": f"会话代理超过 deadline_ms={frame.deadline_ms}"}))
             return
         except WaError as e:
-            await self.conn.send(PipeFrame(id=frame.id, ok=False,
-                                           error={"code": e.code, "message": e.message, "reason": e.reason}))
+            await conn.send(PipeFrame(id=frame.id, ok=False,
+                                      error={"code": e.code, "message": e.message, "reason": e.reason}))
             return
         except Exception as e:                                    # 任何未预期异常都要变成一帧,不能把管道读死
-            await self.conn.send(PipeFrame(id=frame.id, ok=False, error={"code": INTERNAL, "message": repr(e)}))
+            await conn.send(PipeFrame(id=frame.id, ok=False, error={"code": INTERNAL, "message": repr(e)}))
             return
-        await self.conn.send(PipeFrame(id=frame.id, ok=True, result=result))
+        await conn.send(PipeFrame(id=frame.id, ok=True, result=result))
