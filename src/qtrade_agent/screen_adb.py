@@ -21,7 +21,7 @@ KEYCODES: dict[str, int] = {
     "ESCAPE": 111, "FORWARD_DEL": 112, "MOVE_HOME": 122, "MOVE_END": 123, "APP_SWITCH": 187,
 }
 KEYCODE_MAX = 400                       # Android 11 的 KEYCODE_* 最大值在 300 出头;越界一律拒绝
-#: #35 ``swipe.duration_ms``(规格外字段,控制台静态预览档靠「同点 swipe + 时长」做长按;待 02 #35 登记)
+#: #35 ``swipe.duration_ms``(控制台静态预览档靠「同点 swipe + 时长」做长按;R6-75,02 #35 已登记)
 SWIPE_DURATION_DEFAULT_MS = 120
 SWIPE_DURATION_MAX_MS = 5000
 

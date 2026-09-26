@@ -289,7 +289,7 @@ export const screen = {
   wechatPreview: 'qt-screen-wechat-preview',
   wechatNotready: 'qt-screen-wechat-notready',
   loginHint: 'qt-screen-login-hint',
-  // R6-72 只读提示(R 令牌 4403 / 403);01 §4 尚未登记,已列给文档方
+  // R6-72 只读提示(R 令牌 4403 / 403);01 §4 P-SCREEN 已登记
   readonlyBanner: 'qt-screen-readonly-banner',
   readonlyReconnect: 'qt-screen-readonly-reconnect',
 } as const

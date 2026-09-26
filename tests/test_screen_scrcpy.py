@@ -778,6 +778,51 @@ async def test_reset_throttle_does_not_delay_first_attach_and_merges_later_ones(
         await be.aclose()
 
 
+async def test_reset_throttle_deferred_reset_skipped_when_nobody_waits_at_deadline(srv):
+    """第四轮验收 G-a / P3:间隔内来的接入被延后;到点前它走了(没人在等关键帧)⇒ 到点**不发** RESET。"""
+    be = make_backend(srv, FakeAdbRunner(), reset_min_interval_s=0.8)
+    s1 = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s1) == (270, REAL_CONFIG + REAL_KEY)
+        s2 = await be.open("qd01", profile="thumb")
+        assert await next_item(s2) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert await next_item(s1) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.resets == 1
+        s3 = await be.open("qd01", profile="thumb")               # 间隔内:延后
+        await asyncio.sleep(0.2)
+        assert srv.resets == 1
+        await s3.close()                                          # 到点前走了
+        await asyncio.sleep(1.0)                                  # 越过节流到点时刻
+        assert srv.resets == 1                                    # 没人等 ⇒ 不发
+        await s2.close()
+    finally:
+        await s1.close()
+        await be.aclose()
+
+
+async def test_reset_throttle_new_server_first_reset_not_delayed_by_old_throttle(srv):
+    """第四轮验收 G-a / P4:#101 重拉后的新 server,首次 RESET 立即发,不被旧 server 的节流时刻延后。"""
+    be = make_backend(srv, FakeAdbRunner(), reset_min_interval_s=5.0, idle_stop_s=5)
+    s1 = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s1) == (270, REAL_CONFIG + REAL_KEY)
+        s2 = await be.open("qd01", profile="thumb")
+        assert await next_item(s2) == (6000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.resets == 1                                    # 旧 server 的节流时刻 = 刚才
+        assert (await be.restart("qd01"))["stream_restarted"] is True
+        ch = be.channels["qd01"]
+        await wait_for(lambda: ch.last_key is not None and not ch._key_pending())   # 新 server 首关键帧已到
+        t0 = time.monotonic()
+        s3 = await be.open("qd01", profile="thumb")
+        assert await next_item(s3, timeout=2) == (7000, REAL_CONFIG + b"\x00\x00\x00\x01\x65RESET")
+        assert srv.resets == 2 and time.monotonic() - t0 < 1.0    # 立即,不等旧节流的 5 s
+        await s3.close()
+        await s2.close()
+    finally:
+        await s1.close()
+        await be.aclose()
+
+
 async def test_end_to_end_41_open_meta_frames_and_control_bytes():
     """端到端(4.1 顺序):假 server 首连关、再 accept 两条才出头 → ``open`` → 首帧 JSON 宽高来自 session 包 →
     配置包 + 关键帧 → touch / scroll / key / text 落到控制 socket 的逐字节内容。"""
@@ -846,11 +891,14 @@ async def test_static_screen_15s_without_frames_is_healthy(srv):
     """编号 2:静止画面 0 帧是常态。首关键帧之后 15 s 一帧不出(> 缺省 scrcpy_frame_timeout_s=10),
     server / 两条 socket 都在 ⇒ 不重建、不给 WS 发 restart。"""
     adb = FakeAdbRunner()
-    be = make_backend(srv, adb, frame_timeout_s=10.0, idle_stop_s=30)
+    alerts, ev = recording_alerts()
+    be = make_backend(srv, adb, frame_timeout_s=10.0, idle_stop_s=30, alerts=alerts)
     s = await be.open("qd01", profile="focus")
     try:
         assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
         await asyncio.sleep(15.0)
+        assert ev == [] and not alerts.active                     # 静止 15 s:不产生 H07 告警
+        assert be.channels["qd01"].h07_ok()                       # H07 口径:前台 + 进程在 + 两条 socket 未 EOF ⇒ ok
         assert len(adb.spawned) == 1 and len(adb.cmds("push")) == 1
         assert s._sub.queue.qsize() == 0 and not s._sub.detached  # 没收到 restart
         assert srv.video_eof == 0 and srv.exits == 0 and srv.conns == 3
@@ -927,6 +975,139 @@ async def test_server_process_exit_rebuilds(srv):
     finally:
         await s.close()
         await be.aclose()
+
+
+# ══════════════════════════════════════════════════ H07 告警(02 §3.7 H07_SCRCPY_STALLED;04 H07 / A5-06)
+def recording_alerts():
+    """真 ``Alerts`` + 只记事件的假 events:``ev`` = ``(state, code, subject, severity, evidence)`` 序列。"""
+    from qtrade_agent.alerts import Alerts
+
+    ev: list[tuple[str, str, str, str, dict[str, Any]]] = []
+
+    class Events:
+        def emit(self, family, *, payload, account_id=None, now_ms=None):
+            assert family == "alert" and account_id == "qd01"
+            ev.append((payload["state"], payload["code"], payload["subject"], payload["severity"], dict(payload["evidence"])))
+
+    return Alerts(Events(), clock=lambda: int(time.time() * 1000)), ev
+
+
+@pytest.mark.parametrize("kill,reason", [("proc", "server_exit"), ("video", "video_eof"), ("control", "control_eof")])
+async def test_h07_kill_server_warns_once_then_resolves_after_rebuild(srv, kill, reason):
+    """A5-06:前台账号 server 退出 / 视频或控制 socket EOF ⇒ H07 warn **一条**(subject=account:qd01);
+    重建成功(新 server 两条 socket 连上、流头读到)⇒ resolved,active 清空。"""
+    adb = FakeAdbRunner()
+    alerts, ev = recording_alerts()
+    be = make_backend(srv, adb, idle_stop_s=5, alerts=alerts)
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        assert ev == []
+        {"proc": lambda: adb.procs[0].exit(), "video": srv.drop_video, "control": srv.drop_control}[kill]()
+        assert await next_item(s) == {"type": "restart"}
+        await wait_for(lambda: len(ev) == 2)
+        assert ev[0] == ("firing", "H07_SCRCPY_STALLED", "account:qd01", "warn", {"reason": reason})
+        assert ev[1][:4] == ("resolved", "H07_SCRCPY_STALLED", "account:qd01", "warn")
+        assert len(adb.spawned) == 2 and not alerts.active
+        await asyncio.sleep(0.2)
+        assert len(ev) == 2                                        # 同一次故障只一条 firing
+    finally:
+        await s.close()
+        await be.aclose()
+
+
+async def test_h07_rebuild_failure_keeps_warn_with_reason(srv):
+    """重建失败 ⇒ 不 resolve,保持 warn,evidence 带失败原因。"""
+    adb = FakeAdbRunner()
+    alerts, ev = recording_alerts()
+    be = make_backend(srv, adb, idle_stop_s=5, alerts=alerts)
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        adb.fail.add("push")
+        adb.procs[0].exit()
+        assert await next_item(s) == {"type": "restart"}
+        await wait_for(lambda: "qd01" not in be.channels)
+        await asyncio.sleep(0.1)
+        assert [e[0] for e in ev] == ["firing"]                    # 只一条 firing、没有 resolved
+        a = alerts.active[("H07_SCRCPY_STALLED", "account:qd01")]
+        assert a.severity == "warn" and a.evidence["reason"] == "server_exit" and a.evidence["rebuild"] == "failed"
+        assert "push" in a.evidence["error"]
+    finally:
+        await s.close()
+        await be.aclose()
+
+
+async def test_h07_background_or_unwatched_account_does_not_alert(srv):
+    """04 H07「后台账号不检查」:只剩 pause 的订阅者(后台)或没人在看 ⇒ server 退出照常重建,但不产生告警。"""
+    adb = FakeAdbRunner()
+    alerts, ev = recording_alerts()
+    be = make_backend(srv, adb, idle_stop_s=5, alerts=alerts)
+    s = await be.open("qd01", profile="thumb")
+    try:
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        await s.control({"type": "pause"})
+        assert not be.channels["qd01"].h07_ok()                    # 后台:H07 不检查(unknown,不给 ok)
+        adb.procs[0].exit()
+        assert await next_item(s) == {"type": "restart"}
+        await wait_for(lambda: len(adb.spawned) == 2)
+        await asyncio.sleep(0.1)
+        assert ev == [] and not alerts.active
+        s2 = await be.open("qd01", profile="thumb")                # 再接一个,然后走掉 ⇒ 没人在看
+        await s2.close()
+        adb.procs[1].exit()
+        await wait_for(lambda: len(adb.spawned) == 3)
+        await asyncio.sleep(0.1)
+        assert ev == [] and not alerts.active
+    finally:
+        await s.close()
+        await be.aclose()
+
+
+@pytest.mark.parametrize("broken", ["video", "control", "proc"])
+async def test_h07_ok_false_once_socket_eof_or_server_gone(srv, broken):
+    """``h07_ok``(#72 的 ok 判据)逐项看:视频 / 控制 socket 一 EOF、或 server 进程一退,当场就不再是 ok。"""
+    be = make_backend(srv, FakeAdbRunner(), idle_stop_s=5)
+    s = await be.open("qd01", profile="focus")
+    try:
+        assert await next_item(s) == (270, REAL_CONFIG + REAL_KEY)
+        ch = be.channels["qd01"]
+        assert ch.h07_ok()
+        if broken == "proc":
+            ch._proc.returncode = 0                               # 只改返回码,不让看门狗先跑
+        else:
+            (ch._vr if broken == "video" else ch._cr).feed_eof()
+        assert not ch.h07_ok()                                    # 同步判,重建还没来得及跑
+    finally:
+        await s.close()
+        await be.aclose()
+
+
+def test_h07_health_check_per_account_follows_channel(rig):
+    """#72 ``checks.accounts.<id>.H07``:前台且健康 ⇒ ok;firing ⇒ firing;没有通道 / 后台 ⇒ unknown。"""
+    from tests.test_api_ext2 import H, P, TOK_R
+    from qtrade_agent.alerts import H07_SCRCPY_STALLED
+
+    class Ch:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def h07_ok(self):
+            return self.ok
+
+    class Be:
+        channels = {"qd01": Ch(True), "qd02": Ch(False)}
+
+    rig.agent.stream_backend = Be()
+
+    def h07():
+        r = rig.client.get(f"{P}/system/health", headers=H(TOK_R))
+        return {aid: v["H07"] for aid, v in r.json()["checks"]["accounts"].items()}
+
+    got = h07()
+    assert got["qd01"] == "ok" and got.get("qd02", "unknown") == "unknown"
+    rig.agent.alerts.firing(H07_SCRCPY_STALLED, subject="account:qd01", account_id="qd01", evidence={"reason": "server_exit"})
+    assert h07()["qd01"] == "firing"
 
 
 async def test_pause_keeps_both_sockets_and_resume_sends_reset_video(srv):

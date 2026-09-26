@@ -286,7 +286,7 @@ def test_health_checks_has_per_account_subkey(rig):
     checks = r.json()["checks"]
     assert {"H02", "H03", "H13", "H24"} <= set(checks)                 # 02 原有的全局键都还在
     assert set(checks["accounts"]["qd01"]) == {"H04", "H05", "H06", "H07", "H08"}
-    assert checks["accounts"]["qd01"]["H07"] == "unknown"              # H07 本期无执行体:不假装 ok
+    assert checks["accounts"]["qd01"]["H07"] == "unknown"              # 没有前台画面流(执行体未装配):不检查,不假装 ok
 
 
 def test_health_per_account_reports_firing(rig):

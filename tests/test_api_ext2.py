@@ -373,6 +373,23 @@ def test_stream_ws_with_fake_backend_frames_and_input(rig):
     assert any(a["kind"] == "stream_input" and a["action"] == "stream.touch" for a in rig.store.list_audit())
 
 
+def _close_code_within(ws, timeout: float = 5.0) -> int:
+    """一直收到服务端关闭帧为止,返回关闭码;``timeout`` 秒内没关 ⇒ 断言失败(回归时是红,不是挂死,验收 N3)。"""
+    import anyio
+
+    async def go() -> int:
+        with anyio.fail_after(timeout):
+            while True:
+                msg = await ws._send_rx.receive()
+                if msg["type"] == "websocket.close":
+                    return int(msg.get("code", 1000))
+
+    try:
+        return ws.portal.call(go)
+    except TimeoutError:
+        raise AssertionError(f"{timeout}s 内服务端没关 WS") from None
+
+
 def test_stream_ws_read_token_can_watch_but_inject_closes_4403(rig):
     """R6-72:R 令牌看流、pause/resume/profile/pong 都照常;一发 touch ⇒ 留痕(不下发)并关 4403。"""
     be = FakeStreamBackend()
@@ -388,10 +405,7 @@ def test_stream_ws_read_token_can_watch_but_inject_closes_4403(rig):
             rig.tick(1)
         assert [c["type"] for c in be.sessions[0].controls] == ["pause", "resume", "profile", "pong"]
         ws.send_json({"type": "touch", "action": "down", "x": 10, "y": 20})
-        with pytest.raises(WebSocketDisconnect) as ei:
-            for _ in range(20):
-                ws.receive_bytes()
-    assert ei.value.code == 4403
+        assert _close_code_within(ws) == 4403
     assert all(c["type"] != "touch" for c in be.sessions[0].controls)
     assert any(a["kind"] == "stream_input" and a["action"] == "stream.touch"
                and "ws_rejected" in str(a)
@@ -411,10 +425,7 @@ def test_stream_ws_inject_types_need_write(rig, kind):
     with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=thumb") as ws:
         ws.receive_json()
         ws.send_json(kind)
-        with pytest.raises(WebSocketDisconnect) as ei:
-            for _ in range(20):
-                ws.receive_bytes()
-    assert ei.value.code == 4403
+        assert _close_code_within(ws) == 4403
     with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_W}&profile=thumb") as ws:
         ws.receive_json()
         ws.send_json(kind)

@@ -27,6 +27,7 @@ H06_ADB_OFFLINE = "H06_ADB_OFFLINE"
 CONTAINER_OOM_KILLED = "CONTAINER_OOM_KILLED"
 ACCOUNT_OFFLINE = "ACCOUNT_OFFLINE"
 AUTO_RESTART_EXHAUSTED = "AUTO_RESTART_EXHAUSTED"
+H07_SCRCPY_STALLED = "H07_SCRCPY_STALLED"
 H08_NAPCAT_HEARTBEAT_LOST = "H08_NAPCAT_HEARTBEAT_LOST"
 H12_DISK_LOW = "H12_DISK_LOW"
 H21_WECHAT_HOSTS_BLOCK_FAILED = "H21_WECHAT_HOSTS_BLOCK_FAILED"
@@ -57,6 +58,7 @@ REGISTERED = {
     CONTAINER_OOM_KILLED: "warn",
     ACCOUNT_OFFLINE: "warn",
     AUTO_RESTART_EXHAUSTED: "crit",             # 02 §3.7:每小时自动重启 ≥ container_restart_max 次停止自愈(§5)
+    H07_SCRCPY_STALLED: "warn",                 # 02 §3.7:前台画面流 server 退出或视频/控制 socket EOF(04 H07,R6-69)
     H08_NAPCAT_HEARTBEAT_LOST: "warn",          # 02 §3.7:OneBot 30 s 无心跳(2 min 离线升 crit + login_required)
     H12_DISK_LOW: "warn",                       # 02 §3.7:三级水位(high 起由调用方传 crit)
     H21_WECHAT_HOSTS_BLOCK_FAILED: "warn",      # 02 §3.7:WinAgent 侧产生,Agent 只转发

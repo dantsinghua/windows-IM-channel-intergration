@@ -55,14 +55,13 @@ MESSAGES_PURGE_MODES = ("all", "text_only")
 #: #82 等在途指令的默认上限(02 #82:「等在跑指令 ≤30s」)
 DRAIN_WAIT_S = 30.0
 
-#: WS 关闭码(02 §3.4.7 只定义 4401 / 4400;本模块对「通道不适用 / 已有 focus 连接 / 无执行体」另给三个码,
-#: 见模块尾「留给文档方」一节 —— **不是** §3.4.7 已有的码,须补登)
+#: WS 关闭码(owner = 02 §3.4.7:4401 / 4400 / 4409 / 4410 / 4503 / 4403 / 4408 均已登记;客户端分诊见 01 §5.1)
 WS_CLOSE_UNAUTHORIZED = 4401
 WS_CLOSE_BAD_FRAME = 4400
 WS_CLOSE_NOT_APPLICABLE = 4409          # 通道不支持画面流(QQ 拒绝 / 微信 NOT_APPLICABLE)
 WS_CLOSE_CONFLICT = 4410                # 同账号已有 focus* 连接(02 #34「后来者 409」的 WS 落点)
-WS_CLOSE_NOT_READY = 4503               # 画面流执行体未装配(本期没有 scrcpy-server)
-WS_CLOSE_FORBIDDEN = 4403               # R6-72:注入类控制帧须 W 级,令牌级别不够(02 §3.4.7 待登记)
+WS_CLOSE_NOT_READY = 4503               # 画面流执行体未装配(随包 scrcpy-server 或 adb 不在)
+WS_CLOSE_FORBIDDEN = 4403               # R6-72:注入类控制帧须 W 级,令牌级别不够(02 §3.4.7 已登记)
 #: #34 单帧发送超时:客户端卡住(TCP 窗口满)⇒ 按掉线处理,摘下订阅并关 WS(第三轮验收 B1)
 STREAM_SEND_TIMEOUT_S = 5.0
 WS_CLOSE_RECV_TIMEOUT = 4408            # R6-74:客户端接收超时(网络或解码太慢,可重试;替代原 1011)
@@ -635,7 +634,7 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
                            extra={"details": [{"pointer": "/keycode"}]})
         dur = body.get("duration_ms")
         if kind == "swipe" and dur is not None and (isinstance(dur, bool) or not isinstance(dur, (int, float)) or dur < 0):
-            # 规格外字段(控制台长按兜底用;待 02 #35 登记):缺省 120 ms、上限 5000 ms,由执行体钳
+            # 控制台长按兜底用(R6-75,02 #35 已登记):缺省 120 ms、上限 5000 ms,由执行体钳
             raise ApiError(400, "INVALID_ARGS", "duration_ms 须为非负数字", reason="bad_duration",
                            extra={"details": [{"pointer": "/duration_ms"}]})
         if kind == "text" and not isinstance(body.get("text"), str):

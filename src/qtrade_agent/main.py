@@ -176,7 +176,8 @@ def _attach_screen(agent, cfg: AgentConfig) -> None:
                             key_wait_s=cfg.qidian.scrcpy_key_wait_s,
                             reset_min_interval_s=cfg.qidian.scrcpy_reset_min_interval_s,
                             lag_evict_count=cfg.qidian.scrcpy_lag_evict_count,
-                            lag_evict_window_s=cfg.qidian.scrcpy_lag_evict_window_s)
+                            lag_evict_window_s=cfg.qidian.scrcpy_lag_evict_window_s,
+                            alerts=agent.alerts)
     agent.stream_backend = backend
     qidian = agent.adapters.get("qidian")
     if qidian is not None:

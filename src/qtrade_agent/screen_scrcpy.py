@@ -31,6 +31,9 @@ RESET 节流与掉队(第三轮验收 B1):每次 RESET 都让**所有**观看者
 
 健康(04 H07):server 进程在 + 视频 socket 未 EOF + 控制 socket 未 EOF ⇒ 健康;任一断 ⇒ 重建。
 「没有帧」**不是**故障(静止画面本来就 0 帧);``scrcpy_frame_timeout_s`` 只管「开流后等首个关键帧」。
+告警(02 §3.7 ``H07_SCRCPY_STALLED`` warn,``subject=account:<id>``):进程退出 / 任一 socket EOF 触发重建时,
+该通道有**前台**订阅者(未 pause、未摘下)才 firing(后台 / 无人观看不产生);重建成功(两条 socket 连上、读到流头)
+⇒ resolved;重建失败 ⇒ 保持 warn、evidence 带失败 reason。
 
 控制 socket:``touch/scroll/key/text`` 编成 scrcpy 控制消息写进去,**不经任何 shell**。
 
@@ -50,6 +53,7 @@ import time
 from typing import Any, AsyncIterator, Callable, Optional, Union
 
 from . import screen_adb
+from .alerts import H07_SCRCPY_STALLED
 from .screen_adb import AsyncAdb, keycode_of
 
 log = logging.getLogger("qtrade.screen.scrcpy")
@@ -88,6 +92,9 @@ DEFAULT_STREAM_PROFILES = {"thumb": "540p@5", "thumb10": "540p@10", "focus": "72
 #: 仍按 1 s 传给编码器(无害,server 接受),但真机软件编码器 ``OMX.google.h264.encoder`` 不按它出周期关键帧——
 #: **不能依赖**;要关键帧一律发 RESET_VIDEO(见模块说明)。
 I_FRAME_INTERVAL_S = 1
+
+#: 触发 H07 告警的重建原因(04 H07 触发列:进程退出或任一 socket EOF)
+H07_REASONS = ("server_exit", "video_eof", "control_eof")
 
 Target = tuple[str, int]                                 # (adb serial, 165NN)
 FrameItem = Union[tuple[int, bytes], dict[str, Any]]
@@ -365,6 +372,7 @@ class _Channel:
                         asyncio.create_task(self._watch_proc(), name=f"scrcpy-proc:{self.account_id}")]
         # 新 server 自己会出首关键帧(真机 0.27 s);scrcpy_frame_timeout_s 内没来才算 H07
         self._want_key(reset=False, timeout=self.b.frame_timeout_s, why="first_keyframe")
+        self._h07_resolve()                                # 两条 socket 连上、流头已读 ⇒ 重建成功
         log.info("画面流已拉起 account=%s serial=%s port=%d %dx%d profile=%s",
                  self.account_id, self.serial, self.port, w, h, self.profile)
 
@@ -575,9 +583,37 @@ class _Channel:
         # 首关键帧没来 = 开流失败(H07,通知客户端重连);RESET_VIDEO 没回 = 退回重拉,已连 WS 留着收新首帧 JSON
         self._spawn_heal(f"no_keyframe:{why}", notify=first)
 
+    # ---------------------------------------------------------------- H07 告警
+    def _subject(self) -> str:
+        return f"account:{self.account_id}"
+
+    def foreground(self) -> bool:
+        """有前台订阅者(未 pause、未摘下);只 pause 着的 = 后台,H07 不检查(04 H07)。"""
+        return any(not s.paused and not s.detached for s in self.subs)
+
+    def h07_ok(self) -> bool:
+        """04 H07 口径:前台 + server 进程存活 + 视频 / 控制两条 socket 未 EOF。"""
+        proc = self._proc
+        return (self.alive and not self.closed and self.foreground()
+                and proc is not None and getattr(proc, "returncode", None) is None
+                and self._vr is not None and not self._vr.at_eof()
+                and self._cr is not None and not self._cr.at_eof())
+
+    def _h07_firing(self, evidence: dict[str, Any]) -> None:
+        alerts = self.b.alerts
+        if alerts is not None:
+            alerts.firing(H07_SCRCPY_STALLED, subject=self._subject(), account_id=self.account_id, evidence=evidence)
+
+    def _h07_resolve(self) -> None:
+        alerts = self.b.alerts
+        if alerts is not None:
+            alerts.resolve(H07_SCRCPY_STALLED, subject=self._subject(), account_id=self.account_id)
+
     def _spawn_heal(self, why: str, *, notify: bool = True) -> None:
         if self._heal_task is not None and not self._heal_task.done():
             return
+        if why in H07_REASONS and self.foreground():
+            self._h07_firing({"reason": why})
         self._heal_task = asyncio.create_task(self.restart(notify=notify, why=why),
                                               name=f"scrcpy-heal:{self.account_id}")
 
@@ -606,6 +642,8 @@ class _Channel:
                 await self._start_io()
             except Exception as e:
                 log.warning("画面流重建失败 account=%s why=%s: %s", self.account_id, why, e)
+                if self.b.alerts is not None and self.b.alerts.is_firing(H07_SCRCPY_STALLED, self._subject()):
+                    self._h07_firing({"reason": why, "rebuild": "failed", "error": str(e)[-200:]})
                 await self._stop_io(remove_forward=False)
                 for s in list(self.subs):                   # 留着的订阅者也摘下:让客户端重连,重连时如实拿 4503
                     s.end({"type": "restart"})
@@ -739,7 +777,7 @@ class ScrcpyBackend:
                  profiles: Optional[dict[str, str]] = None, frame_timeout_s: float = 10.0,
                  key_wait_s: float = 3.0, reset_min_interval_s: float = 2.0, lag_evict_count: int = 3,
                  lag_evict_window_s: float = 10.0, idle_stop_s: float = 5.0, connect_timeout_s: float = 5.0,
-                 connect_retry_s: float = 0.1,
+                 connect_retry_s: float = 0.1, alerts: Optional[Any] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._target_of = target_of
         self.adb = adb if adb is not None else AsyncAdb()
@@ -755,6 +793,7 @@ class ScrcpyBackend:
         self.connect_timeout_s = float(connect_timeout_s)
         self.connect_retry_s = float(connect_retry_s)
         self.clock = clock
+        self.alerts = alerts                               # agent.alerts:H07_SCRCPY_STALLED 的产生 / 解除(None = 不告警)
         self.channels: dict[str, _Channel] = {}
         self._open_locks: dict[str, asyncio.Lock] = {}
 

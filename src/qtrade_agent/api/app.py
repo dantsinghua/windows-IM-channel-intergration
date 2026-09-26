@@ -377,11 +377,14 @@ def create_api(agent) -> FastAPI:
 
         判据与全局 ``checks`` 同源:该码在 ``alerts.active`` 里对 ``subject='account:<id>'`` 有行 ⇒ ``firing``;
         该健康项**跑过**(健康循环的 ``last[…]`` 里有这个账号)⇒ ``ok``;否则 ``unknown``。
-        H07(前台流 10 s 无帧)本期没有执行体 ⇒ 恒 ``unknown``,**不假装 ok**。
+        H07(04 H07 / R6-69:前台账号 scrcpy-server 进程存活 + 视频 / 控制两条 socket 未 EOF;「没有帧」不算故障)
+        按画面流执行体的通道现状给:前台且健康 ⇒ ``ok``;后台 / 没人在看 / 执行体未装配 ⇒ 不检查 ⇒ ``unknown``。
         """
         firing = {(code, subject) for code, subject in agent.alerts.active}
+        channels = getattr(getattr(agent, "stream_backend", None), "channels", None) or {}
         ran = {"H04": set(agent.healthloop.last["H04"]), "H05": set(agent.healthloop.last["H05"]),
-               "H06": set(agent.healthloop.last["H06"]), "H07": set(),
+               "H06": set(agent.healthloop.last["H06"]),
+               "H07": {aid for aid, ch in channels.items() if getattr(ch, "h07_ok", lambda: False)()},
                "H08": set(getattr(agent, "qqhealth", None).last) if getattr(agent, "qqhealth", None) else set()}
         out: dict[str, dict[str, str]] = {}
         for row in agent.store.list_accounts():

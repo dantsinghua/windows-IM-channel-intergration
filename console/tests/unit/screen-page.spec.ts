@@ -9,6 +9,7 @@ import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import ScreenPage from '@/pages/screen/ScreenPage.vue'
 import { useAccountsStore } from '@/stores/accounts'
+import { useSessionStore } from '@/stores/session'
 import type { Account } from '@/api/types'
 
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string> }))
@@ -287,6 +288,29 @@ describe('4403 / 403 ⇒ 只读模式(R6-72)', () => {
     expect(w.find('[data-testid="qt-screen-readonly-banner"]').exists()).toBe(true)
     // 连上以后不再显示重连按钮
     expect(w.find('[data-testid="qt-screen-readonly-reconnect"]').exists()).toBe(false)
+  })
+
+  it('只读跨账号保持;令牌变化(authState 离开 ok 再回到 ok)才解除(验收 N4)', async () => {
+    const w = await mountPage([acct('qd01', 'qidian'), acct('qd02', 'qidian')])
+    await openCanvas(w)
+    ws().onclose?.({ code: 4403 })
+    await flushPromises()
+    const banner = () => w.find('[data-testid="qt-screen-readonly-banner"]').exists()
+    expect(banner()).toBe(true)
+    await w.find('[data-testid="qt-screen-thumb-qd02"]').trigger('click')
+    for (let i = 0; i < 6; i++) await flushPromises()
+    expect(ws().url).toContain('/accounts/qd02/')
+    expect(banner()).toBe(true)                              // 换账号不解除:令牌还是那一张
+    const session = useSessionStore()
+    session.authState = 'ok'
+    await flushPromises()
+    expect(banner()).toBe(true)                              // ok → ok 不算令牌变化
+    session.authState = 'no_token'
+    await flushPromises()
+    expect(banner()).toBe(true)                              // 令牌失效期间仍只读
+    session.authState = 'ok'
+    await flushPromises()
+    expect(banner()).toBe(false)                             // 重新取过令牌 ⇒ 解除
   })
 
   it('没收到 4403 时照常注入(对照)', async () => {
