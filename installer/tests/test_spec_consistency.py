@@ -157,7 +157,9 @@ def test_spec_exit_table_parsed(doc03: str) -> None:
 #
 # 历史:`E_INSTALL_ACL_HARDEN_FAILED = 31` 曾登记于此,
 #       docs-scribe 已按 R6-58 (cy) 回写 docs/03 §3.4,故已清空。
-PENDING_DOC_EXIT_ROWS: dict[str, int] = {}
+#
+# R6-73(安琳 2026-09-26):`E_INSTALL_CANCELLED = 11` 用户在向导中取消 —— 实现先落,等文档方回写 03 §3.4。
+PENDING_DOC_EXIT_ROWS: dict[str, int] = {"E_INSTALL_CANCELLED": 11}
 
 
 def test_pending_exit_rows_are_tracked(doc03: str) -> None:

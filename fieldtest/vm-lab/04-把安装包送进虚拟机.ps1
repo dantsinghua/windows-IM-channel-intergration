@@ -80,6 +80,7 @@ function Write-Info([string] $t)  { Write-Host ("      · {0}" -f $t) -Foregroun
 $ExitCodeTable = @{
     0   = 'OK —— DONE,安装完成'
     10  = 'E_INSTALL_WAIT_USER —— 停车等用户确认(等 shutdown 确认 / 等用户关微信 / 等 UAC)'
+    11  = 'E_INSTALL_CANCELLED —— 用户在向导中取消'
     20  = 'E_INSTALL_WIN_TOO_OLD —— Windows 版本太旧(< 19044)'
     21  = 'E_INSTALL_NOT_X64 —— 不是 x64'
     22  = 'E_INSTALL_NOT_ADMIN —— 没有管理员权限'

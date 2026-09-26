@@ -8,7 +8,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildAvcC, lengthPrefixed, MAX_DECODE_QUEUE, ScreenStream, splitAnnexB, type StreamHooks,
+  buildAvcC, classifyClose, lengthPrefixed, MAX_DECODE_QUEUE, ScreenStream, splitAnnexB, STREAM_CLOSE_CODES,
+  type StreamHooks,
 } from '@/codec/stream'
 
 /* ────────── ① 纯函数 ────────── */
@@ -392,5 +393,18 @@ describe('控制帧', () => {
     const { s, h } = await openStream()
     s.stop()
     expect(h.onClosed).not.toHaveBeenCalled()
+  })
+})
+
+describe('关闭码 4408 = 客户端接收超时(R6-74)', () => {
+  it('登记在 STREAM_CLOSE_CODES,分诊为 client_too_slow 且可重试', () => {
+    expect(STREAM_CLOSE_CODES[4408]).toEqual({
+      reason: 'client_too_slow', text: '接收超时:网络或解码太慢,正在重连', retryable: true,
+    })
+    const c = classifyClose(4408, true)
+    expect(c.reason).toBe('client_too_slow')
+    expect(c.retryable).toBe(true)
+    expect(c.everOpened).toBe(true)
+    expect(classifyClose(1011, true).reason, '1011 已不再是发帧超时的码,只按通用断线处理').toBe('transport')
   })
 })

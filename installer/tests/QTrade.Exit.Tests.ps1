@@ -22,6 +22,7 @@ Describe 'QTrade.Exit —— 退出码表' {
     It 'docs/03 §3.4 的关键码逐条对齐' -ForEach @(
         @{ Name = 'OK'; Code = 0 }
         @{ Name = 'E_INSTALL_WAIT_USER'; Code = 10 }
+        @{ Name = 'E_INSTALL_CANCELLED'; Code = 11 }
         @{ Name = 'E_INSTALL_REBOOT_REQUIRED'; Code = 3010 }
         @{ Name = 'E_INSTALL_DISK_LOW'; Code = 26 }
         @{ Name = 'E_INSTALL_ALREADY_RUNNING'; Code = 29 }
@@ -51,6 +52,23 @@ Describe 'QTrade.Exit —— 退出码表' {
 
     It '未知名抛错,不静默回 0' {
         { Get-QtExitCode -Name 'E_INSTALL_NOT_A_REAL_CODE' } | Should -Throw
+    }
+
+    It 'R6-73:表含 11 = E_INSTALL_CANCELLED,且与 10 WAIT_USER 是两个码' {
+        (Get-QtExitTable)['E_INSTALL_CANCELLED'] | Should -Be 11
+        Get-QtReasonCode -Name 'E_INSTALL_CANCELLED' | Should -Be 'CANCELLED'
+        (Get-QtExitCode -Name 'CANCELLED') | Should -Not -Be (Get-QtExitCode -Name 'WAIT_USER')
+    }
+
+    It 'R6-73:.iss 的【取消】路径(RunStep 里 if Cancelled 分支)退 11,不再借 10' {
+        $iss = Get-Content -Raw -Encoding UTF8 (Join-Path (Split-Path -Parent $PSScriptRoot) 'engine\qtrade-setup-engine.iss')
+        $iss | Should -Match '(?m)^\s*E_INSTALL_CANCELLED\s*=\s*11;'
+        $i = $iss.IndexOf('if Cancelled then')
+        $i | Should -BeGreaterThan 0
+        $branch = $iss.Substring($i, $iss.IndexOf('Exit;', $i) - $i)
+        $branch | Should -Match 'LastStepExit := E_INSTALL_CANCELLED;'
+        $branch | Should -Match 'FailWith\(LastStepExit'
+        $branch | Should -Not -Match 'LastStepExit := E_INSTALL_WAIT_USER'
     }
 
     It '🔴 26 DISK_LOW 与 123 DISK_FULL 是两个量,不得互相顶替(§3.4 第 123 行)' {

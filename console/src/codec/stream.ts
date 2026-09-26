@@ -160,6 +160,8 @@ export const STREAM_CLOSE_CODES: Record<number, { reason: string; text: string; 
   4400: { reason: 'bad_request', text: '画面流参数或控制帧格式不对', retryable: false },
   4409: { reason: 'channel_no_stream', text: '该通道不提供画面流(微信请改用截图预览)', retryable: false },
   4410: { reason: 'focus_taken', text: '该账号已有 focus 连接(同时只允许 1 个)', retryable: true },
+  /** R6-74:服务端单帧发送超 5 s(客户端接收/解码跟不上)⇒ 4408,可重试 */
+  4408: { reason: 'client_too_slow', text: '接收超时:网络或解码太慢,正在重连', retryable: true },
   4503: { reason: 'stream_backend_missing', text: '画面流后端未就绪(本期未装配执行体)', retryable: false },
 }
 
@@ -169,7 +171,7 @@ export interface StreamClosed {
   text: string
   /** 本次连接曾经 open 过没有 —— 区分「握手就被拒」与「看着看着断了」 */
   everOpened: boolean
-  /** 重试有没有意义(4503/4409/4401/4400 都没有) */
+  /** 重试有没有意义(4503/4409/4401/4400 都没有;4410/4408 有) */
   retryable: boolean
 }
 

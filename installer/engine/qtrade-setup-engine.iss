@@ -90,6 +90,7 @@ Filename: "{app}\install\engine\{#EngineExeName}.exe"; Parameters: "/QT_MODE=uni
 const
   OK                                      = 0;
   E_INSTALL_WAIT_USER                     = 10;
+  E_INSTALL_CANCELLED                     = 11;   // R6-73:用户在向导中取消
   E_INSTALL_REBOOT_REQUIRED               = 3010;
   E_INSTALL_WIN_TOO_OLD                   = 20;
   E_INSTALL_NOT_X64                       = 21;
@@ -730,11 +731,11 @@ begin
   end;
   if Cancelled then
   begin
-    // 按现有失败路径退出。§3.4 没有「用户取消」专用码 → 用 10 E_INSTALL_WAIT_USER(停下等用户),
+    // 按现有失败路径退出,退出码 = 11 E_INSTALL_CANCELLED(R6-73;10 WAIT_USER 专指停车等用户)。
     // 状态机里的步骤都幂等可重入(§2.12),重新运行即从中断处继续。
     CancelMsg := '已按你的要求中止「' + StepName + '」这一步。重新运行安装程序会从中断处继续。';
-    LastStepExit := E_INSTALL_WAIT_USER;
-    LastStepJson := '{"ok":false,"state":"","reason":"USER_CANCELLED","exit":' + IntToStr(E_INSTALL_WAIT_USER) +
+    LastStepExit := E_INSTALL_CANCELLED;
+    LastStepJson := '{"ok":false,"state":"","reason":"USER_CANCELLED","exit":' + IntToStr(E_INSTALL_CANCELLED) +
       ',"message":"' + CancelMsg + '"}';
     Result := False;
     // 'diag' 是在 FailWith 里被调的,再 FailWith 会递归 —— 交回调用方(它随后就 ExitProcess)

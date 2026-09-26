@@ -355,10 +355,10 @@ def test_stream_ws_without_backend_closes_4503(rig):
 
 
 def test_stream_ws_with_fake_backend_frames_and_input(rig):
-    """假后端下跑通「订阅 → 首帧 meta → 收到帧(8 字节 PTS + NAL)→ 回注一次输入」。"""
+    """假后端下跑通「订阅 → 首帧 meta → 收到帧(8 字节 PTS + NAL)→ 回注一次输入」(注入须 W 级,R6-72)。"""
     be = FakeStreamBackend()
     rig.agent.stream_backend = be
-    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=focus") as ws:
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_W}&profile=focus") as ws:
         meta = ws.receive_json()
         assert meta["codec"] == "h264" and meta["profile"] == "focus"
         frame = ws.receive_bytes()
@@ -371,6 +371,59 @@ def test_stream_ws_with_fake_backend_frames_and_input(rig):
     assert be.opened == [("qd01", "focus")]
     assert be.sessions[0].controls[0]["type"] == "touch"
     assert any(a["kind"] == "stream_input" and a["action"] == "stream.touch" for a in rig.store.list_audit())
+
+
+def test_stream_ws_read_token_can_watch_but_inject_closes_4403(rig):
+    """R6-72:R 令牌看流、pause/resume/profile/pong 都照常;一发 touch ⇒ 留痕(不下发)并关 4403。"""
+    be = FakeStreamBackend()
+    rig.agent.stream_backend = be
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=focus") as ws:
+        assert ws.receive_json()["codec"] == "h264"
+        assert struct.unpack(">Q", ws.receive_bytes()[:8])[0] == 1234
+        for m in ({"type": "pause"}, {"type": "resume"}, {"type": "profile", "profile": "thumb"}, {"type": "pong"}):
+            ws.send_json(m)
+        for _ in range(50):
+            if len(be.sessions[0].controls) >= 4:
+                break
+            rig.tick(1)
+        assert [c["type"] for c in be.sessions[0].controls] == ["pause", "resume", "profile", "pong"]
+        ws.send_json({"type": "touch", "action": "down", "x": 10, "y": 20})
+        with pytest.raises(WebSocketDisconnect) as ei:
+            for _ in range(20):
+                ws.receive_bytes()
+    assert ei.value.code == 4403
+    assert all(c["type"] != "touch" for c in be.sessions[0].controls)
+    assert any(a["kind"] == "stream_input" and a["action"] == "stream.touch"
+               and "ws_rejected" in str(a)
+               for a in rig.store.list_audit())
+
+
+@pytest.mark.parametrize("kind", [
+    {"type": "touch", "action": "down", "x": 1, "y": 2, "pointer": 0},
+    {"type": "key", "keycode": 4, "action": "down"},
+    {"type": "scroll", "x": 1, "y": 2, "dx": 0, "dy": -1},
+    {"type": "text", "text": "abc"},
+])
+def test_stream_ws_inject_types_need_write(rig, kind):
+    """R6-72:四类注入帧 R 令牌一律 4403;W 令牌全通(下发到执行体)。"""
+    be = FakeStreamBackend()
+    rig.agent.stream_backend = be
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=thumb") as ws:
+        ws.receive_json()
+        ws.send_json(kind)
+        with pytest.raises(WebSocketDisconnect) as ei:
+            for _ in range(20):
+                ws.receive_bytes()
+    assert ei.value.code == 4403
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_W}&profile=thumb") as ws:
+        ws.receive_json()
+        ws.send_json(kind)
+        ws.send_json({"type": "pause"})
+        for _ in range(50):
+            if len(be.sessions[-1].controls) >= 2:
+                break
+            rig.tick(1)
+    assert [c["type"] for c in be.sessions[-1].controls] == [kind["type"], "pause"]
 
 
 def test_stream_ws_second_focus_is_rejected(rig):

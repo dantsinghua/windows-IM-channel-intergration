@@ -9,6 +9,8 @@ Set-StrictMode -Version Latest
 $script:QtExitTable = [ordered]@{
     'OK'                                    = 0
     'E_INSTALL_WAIT_USER'                   = 10
+    # R6-73(安琳 2026-09-26):用户在向导里点【取消】⇒ 结束子进程树后退 11;10 仍专指「停车等用户、可续跑」
+    'E_INSTALL_CANCELLED'                   = 11
     'E_INSTALL_REBOOT_REQUIRED'             = 3010
     'E_INSTALL_WIN_TOO_OLD'                 = 20
     'E_INSTALL_NOT_X64'                     = 21

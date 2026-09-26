@@ -1097,10 +1097,10 @@ def rig(tmp_path):
 
 def test_ws_route_end_to_end_with_scrcpy_backend(rig, srv):
     """#34 全链:WS 首帧 JSON = codec meta;二进制帧 = 8 字节 PTS(ms)+ SPS/PPS + IDR;控制帧落到控制 socket。"""
-    from tests.test_api_ext2 import P, TOK_R
+    from tests.test_api_ext2 import P, TOK_W
     srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 7_000_123, b"\x00\x00\x00\x01\x65IDR")]
     rig.agent.stream_backend = make_backend(srv, FakeAdbRunner())
-    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_R}&profile=thumb",
+    with rig.client.websocket_connect(f"{P}/accounts/qd01/stream?token={TOK_W}&profile=thumb",
                                       subprotocols=["qtrade-scrcpy-v1"]) as ws:
         meta = ws.receive_json()
         assert meta == {"codec": "h264", "width": 720, "height": 1280, "profile": "thumb", "fps": 5, "seq0": 0}
@@ -1116,7 +1116,7 @@ def test_ws_route_end_to_end_with_scrcpy_backend(rig, srv):
 
 
 def test_ws_send_timeout_closes_ws_and_session(rig, monkeypatch):
-    """#34 单帧 send 卡住超过 STREAM_SEND_TIMEOUT_S ⇒ 按掉线处理:摘订阅(session.close)、以 1011 关 WS。"""
+    """#34 单帧 send 卡住超过 STREAM_SEND_TIMEOUT_S ⇒ 按掉线处理:摘订阅(session.close)、以 4408(客户端接收超时,R6-74)关 WS。"""
     from starlette.websockets import WebSocket, WebSocketDisconnect
 
     from qtrade_agent.api import routes_ext2
@@ -1133,7 +1133,7 @@ def test_ws_send_timeout_closes_ws_and_session(rig, monkeypatch):
         assert ws.receive_json()["codec"] == "h264"
         with pytest.raises(WebSocketDisconnect) as ei:
             ws.receive_bytes()
-        assert ei.value.code == 1011
+        assert ei.value.code == 4408 == routes_ext2.WS_CLOSE_RECV_TIMEOUT
     assert be.sessions[0].closed
 
 

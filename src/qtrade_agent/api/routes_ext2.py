@@ -62,9 +62,12 @@ WS_CLOSE_BAD_FRAME = 4400
 WS_CLOSE_NOT_APPLICABLE = 4409          # 通道不支持画面流(QQ 拒绝 / 微信 NOT_APPLICABLE)
 WS_CLOSE_CONFLICT = 4410                # 同账号已有 focus* 连接(02 #34「后来者 409」的 WS 落点)
 WS_CLOSE_NOT_READY = 4503               # 画面流执行体未装配(本期没有 scrcpy-server)
-#: #34 单帧发送超时:客户端卡住(TCP 窗口满)⇒ 按掉线处理,摘下订阅并以 1011 关 WS(第三轮验收 B1)
+WS_CLOSE_FORBIDDEN = 4403               # R6-72:注入类控制帧须 W 级,令牌级别不够(02 §3.4.7 待登记)
+#: #34 单帧发送超时:客户端卡住(TCP 窗口满)⇒ 按掉线处理,摘下订阅并关 WS(第三轮验收 B1)
 STREAM_SEND_TIMEOUT_S = 5.0
-WS_CLOSE_SEND_TIMEOUT = 1011
+WS_CLOSE_RECV_TIMEOUT = 4408            # R6-74:客户端接收超时(网络或解码太慢,可重试;替代原 1011)
+#: R6-72:#34 控制帧中属「画面注入」的类型 —— 须 W 级(与 #35 REST 兜底对齐);其余(pause/resume/profile/pong)随连接级别
+STREAM_INJECT_TYPES = ("touch", "key", "scroll", "text")
 
 
 @contextmanager
@@ -482,7 +485,7 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
 
     @app.websocket(f"{P}/accounts/{{account_id}}/stream")
     async def account_stream(ws: WebSocket, account_id: str):
-        """#34,级别 R(WS 升级,子协议 ``qtrade-scrcpy-v1``)。
+        """#34,级别 R(WS 升级,子协议 ``qtrade-scrcpy-v1``);注入类控制帧 ``touch/key/scroll/text`` 须 W(R6-72)。
 
         首帧由服务端发 JSON ``{codec,width,height,profile,fps,seq0}``;此后二进制帧 =
         **8 字节 PTS(毫秒,big-endian uint64)+ Annex-B NAL**;控制帧由客户端发 JSON。
@@ -557,7 +560,7 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
                         except Exception:
                             pass
                         try:
-                            await ws.close(code=WS_CLOSE_SEND_TIMEOUT, reason="画面帧发送超时")
+                            await ws.close(code=WS_CLOSE_RECV_TIMEOUT, reason="client_too_slow:画面帧发送超时")
                         except Exception:
                             pass
                         return
@@ -577,6 +580,11 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
                     if msg.get("profile") not in STREAM_PROFILES:
                         await ws.close(code=WS_CLOSE_BAD_FRAME, reason="profile 取值非法")
                         return
+                if msg["type"] in STREAM_INJECT_TYPES and not p.can("write"):
+                    # R6-72:观看是 R,注入须 W;不够级别 ⇒ 先留痕(不下发)再关 WS
+                    _audit_stream_input(p, account_id, msg, via="ws_rejected")
+                    await ws.close(code=WS_CLOSE_FORBIDDEN, reason="forbidden:画面注入须 W 级令牌")
+                    return
                 _audit_stream_input(p, account_id, msg, via="ws")
                 await session.control(msg)
         except WebSocketDisconnect:
