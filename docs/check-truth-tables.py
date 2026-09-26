@@ -1370,6 +1370,203 @@ def check_norm_definition():
     return red
 
 
+# ---------------------------------------------------------------- ⑮ CROSS(R6-69~R6-77,2026-09-26)
+# 安琳 2026-09-26 晚九项裁决的守卫。R6-37 的明文规矩:**改对一个语义,同一次就给脚本加规则**,
+# 否则下一轮回潮时既无人也无脚本发现。本族与 ⑩ VALUE 同型(按值判、不走行级 NEGATION),
+# 其中 ① ⑥ 两条**跨出 docs/** 读实物(installer 的退出码模块、Agent 的 config.py)——
+# 03 §3.4 是退出码唯一出处、02 §7.1 是配置键唯一出处,但「文档写了、实现里不存在 / 值不同」
+# 这一类缺陷只比 docs 内部 token 是看不见的(R6-62 (h) 已点名过第三次)。
+# ⚠️ 保守设计同 ⑤ MIRROR:实物文件缺失 / 实物里还没这个名字 ⇒ 只报 ⚠️ 不判红(实现方在途时文档先行是常态);
+#    **两边都有而值不同** 才判红 —— 那才是真分叉。
+# 每条都在 docs-before-R6-69 备份上实测能红(见 .omc/handoffs/docs-rulings-2026-09-26.md)。
+ROOT = os.path.dirname(HERE)
+EXIT_PSM1 = os.path.join(ROOT, "installer", "engine", "modules", "QTrade.Exit.psm1")
+AGENT_CONFIG_PY = os.path.join(ROOT, "src", "qtrade_agent", "config.py")
+
+
+def _load_glob(pat):
+    p = next(iter(sorted(glob.glob(os.path.join(HERE, pat)))), None)
+    return io.open(p, encoding="utf-8").read() if p else None
+
+
+def _slice_between(text, start_pat, end_pat):
+    """从 start_pat 首次命中处切到其后 end_pat 首次命中处;start 找不到回 None。"""
+    m = re.search(start_pat, text, re.M)
+    if not m:
+        return None
+    rest = text[m.start():]
+    nl = rest.find("\n")
+    if nl < 0:
+        return rest
+    e = re.search(end_pat, rest[nl + 1:], re.M)       # 从起始行的下一行起找终点,别让起始行自己命中
+    return rest if not e else rest[: nl + 1 + e.start()]
+
+
+def _parse_03_exit_table(t03):
+    """03 §3.4「退出码」表 → {名: 码}。解析法与 installer/tests/test_spec_consistency.py 同源(按「码 + 反引号名」逐组抓)。"""
+    block = _slice_between(t03, r"^\*\*退出码\*\*", r"^---\s*$|^#{2,4} ")
+    codes = {}
+    if block is None:
+        return codes
+    for ln in block.splitlines():
+        if not ln.lstrip().startswith("|"):
+            continue
+        for code, name in re.findall(r"(\d+)\s*\|?\s*`(E_INSTALL_[A-Z0-9_]+)`", ln):
+            codes[name] = int(code)
+    return codes
+
+
+def _endpoint_level(t02, num, path_pat):
+    """02 端点表里 `| num | `path…` | 级 |` 行的「级」列原文;找不到回 None。"""
+    # 路径列在反引号里、可能自带 `|`(#34 的 `?profile=thumb|focus|…`)⇒ 先吃完整对反引号再数列
+    m = re.search(r"^\|\s*" + re.escape(num) + r"\s*\|\s*`" + path_pat + r"[^`\n]*`[^|\n]*\|\s*([^|\n]+)\|", t02, re.M)
+    return m.group(1).strip() if m else None
+
+
+def check_rulings_0926():
+    red, warn = [], 0
+    print()
+    print("=" * 78)
+    print("⑮ CROSS —— R6-69~R6-77 守卫(跨册同现 / 跨出 docs 读实物比值)")
+    print("=" * 78)
+    t00 = _load_glob("00-*.md") or ""
+    t01 = _load_glob("01-*.md") or ""
+    t02 = _load_glob("02-*.md") or ""
+    t03 = _load_glob("03-*.md") or ""
+    t07 = _load_glob("07-*.md") or ""
+
+    # ① R6-73:退出码 11 E_INSTALL_CANCELLED 在 03 §3.4;03 表与 QTrade.Exit.psm1 逐名同值
+    spec = _parse_03_exit_table(t03)
+    if spec.get("E_INSTALL_CANCELLED") != 11:
+        red.append("R6-73 退出码 11")
+        print(f"\n  ❌ R6-73:03 §3.4 退出码表须有 `11 E_INSTALL_CANCELLED`(现读到 {spec.get('E_INSTALL_CANCELLED')!r})")
+        print("     理由:用户取消与「停车等用户(10)」是两件事;03 §3.4 是唯一出处,Exit.psm1 / .iss / 验收手册都从它抄。")
+    else:
+        print("  ✅ R6-73:03 §3.4 有 `11 E_INSTALL_CANCELLED`")
+    if not os.path.isfile(EXIT_PSM1):
+        warn += 1
+        print(f"  ⚠️  R6-73:找不到 {os.path.relpath(EXIT_PSM1, ROOT)},跨文件比值跳过")
+    else:
+        impl = {k: int(v) for k, v in re.findall(r"^\s*'(OK|E_INSTALL_[A-Z0-9_]+)'\s*=\s*(\d+)",
+                                                    io.open(EXIT_PSM1, encoding="utf-8-sig").read(), re.M)}
+        diff = [f"{k}: 03={spec[k]} / psm1={impl[k]}" for k in sorted(set(spec) & set(impl)) if spec[k] != impl[k]]
+        if diff:
+            red.append("03 §3.4 ↔ Exit.psm1 退出码值")
+            print("\n  ❌ 03 §3.4 ↔ QTrade.Exit.psm1 同名退出码**值不同**(以 03 为准):")
+            for x in diff[:8]:
+                print(f"       {x}")
+        else:
+            print(f"  ✅ 03 §3.4 ↔ QTrade.Exit.psm1:{len(set(spec) & set(impl))} 个同名退出码值一致")
+        only_doc = sorted(set(spec) - set(impl))
+        if only_doc:
+            warn += 1
+            print(f"  ⚠️  03 有、Exit.psm1 还没有:{', '.join(only_doc)}(实现方在途时属正常;合流后应消失)")
+
+    # ② R6-74 / R6-72:#34 关闭码 4408(客户端接收超时)与 4403(无权限,令牌级别不足)在 02 §3.4.7 与 01 §5.1 同现;
+    #    且 02 §3.4.7 不得再有「没有 `4403`」一句(总控 2026-09-26 补充:该句已删,回潮 = 两句自相矛盾)。
+    s02 = _slice_between(t02, r"^#### 3\.4\.7 ", r"^#{2,4} ") or ""
+    s01 = _slice_between(t01, r"^### 5\.1 ", r"^#{2,4} ") or ""
+    for code, rid in (("4408", "R6-74"), ("4403", "R6-72")):
+        # 只认**登记形态**(加粗的码 `**`4408`**…`):节首指针句「再补 `4403`/`4408`」这种顺带提及不算登记,
+        # 否则删掉真正的登记行、留着指针句照样绿(反向验证首跑实测抓到的空规则)。
+        miss = [n for n, s in (("02 §3.4.7", s02), ("01 §5.1", s01)) if f"**`{code}`" not in s]
+        if miss:
+            red.append(f"{rid} 关闭码 {code}")
+            print(f"\n  ❌ {rid}:#34 关闭码 `{code}` 须在 02 §3.4.7 与 01 §5.1 同现 —— 缺:{', '.join(miss)}")
+            print("     理由:服务端发了一个客户端码表里没有的码 ⇒ 控制台只能当未知错误,不知道该不该重试。")
+        else:
+            print(f"  ✅ {rid}:`{code}` 在 02 §3.4.7 与 01 §5.1 同现")
+    # ②b R6-72 承接(总控 2026-09-26 补充):01 §5.1 登记了 4403 ⇒ §4 P-SCREEN 元素表必须有只读模式两元素
+    #     (否则分诊句说「挂横幅 / 点按钮重连」,元素表里却没有 testid ⇒ 验收脚本无从断言)。
+    s4 = _slice_between(t01, r"^## 4\. ", r"^## 5\. ") or ""
+    if "**`4403`**" in s01:
+        # 只认**表行首列**(别的行里顺带引用一句「与 `qt-screen-readonly-banner` 同时显示」不算有这个元素)
+        lack = [e for e in ("qt-screen-readonly-banner", "qt-screen-readonly-reconnect")
+                if not re.search(r"^\|\s*`" + re.escape(e) + r"`\s*\|", s4, re.M)]
+        if lack:
+            red.append("R6-72 只读模式元素")
+            print(f"\n  ❌ R6-72:01 §5.1 有 `4403` 分诊,但 §4 元素表缺:{', '.join(lack)}")
+        else:
+            print("  ✅ R6-72:01 §4 有只读模式两元素(承接 `4403`)")
+    if re.search(r"没有\s*\**`4403`", s02):
+        red.append("R6-72 §3.4.7 残留「没有 4403」")
+        print("\n  ❌ R6-72:02 §3.4.7 仍写「没有 `4403`」—— 与同节登记的 #34 `4403` 自相矛盾")
+    else:
+        print("  ✅ R6-72:02 §3.4.7 无「没有 `4403`」残句")
+
+    # ③ R6-72:#34 级别列含 W(注入)且与 #35 一致
+    lv34 = _endpoint_level(t02, "34", r"GET /accounts/\{id\}/stream")
+    lv35 = _endpoint_level(t02, "35", r"POST /accounts/\{id\}/stream/input")
+    if lv34 is None or lv35 is None:
+        red.append("R6-72 #34/#35 行")
+        print(f"\n  ❌ R6-72:02 端点表找不到 #34 或 #35 行(#34={lv34!r} #35={lv35!r})—— 措辞变了请同步本规则")
+    elif not re.search(r"\bW\b", lv34) or lv35 != "W":
+        red.append("R6-72 #34 注入级别")
+        print(f"\n  ❌ R6-72:#34 级别列须标注入类为 W、且 #35 为 W —— 现 #34={lv34!r} / #35={lv35!r}")
+        print("     理由:#34 整条 R ⇒ 只读令牌开 WS 就能点屏幕、打字,绕过 #35 的 W 级。")
+    else:
+        print(f"  ✅ R6-72:#34 级别列 {lv34!r} 含 W,#35 = W")
+
+    # ④ R6-77 ②:01 不再有画面工具条的 rotate testid
+    hits = [i for i, ln in enumerate(lines_of(t01), 1)
+            if re.search(r"qt-screen-tool-(?:rotate\b|\{[^}]*\brotate\b)", ln)]
+    if hits:
+        red.append("R6-77 rotate testid")
+        print(f"\n  ❌ R6-77:01 仍列画面工具条的 rotate testid —— 行 {hits[:8]}")
+        print("     理由:控制台没有这个按钮;元素表是 testid 唯一出处,列着 = 验收脚本去点一个不存在的元素。")
+    else:
+        print("  ✅ R6-77:01 无画面工具条 rotate testid")
+
+    # ⑤ R6-71:00 的 R6-58 (ai) 标「被 R6-71 覆盖」;02 #101 行承接 R6-71
+    # 只在 R6-58 那一行里找(00 头部增补行也写着「(ai) 就地标『已被 R6-71 覆盖』」,全文搜会被它顺带满足)
+    row58 = re.search(r"^\| \*\*R6-58\*\* \|[^\n]*", t00, re.M)
+    if not row58 or not re.search(r"\*\*\(ai\)\*\*[^;]{0,40}被 R6-71 覆盖", row58.group(0)):
+        red.append("R6-58 (ai) 覆盖标注")
+        print("\n  ❌ R6-71:00 §15g R6-58 **(ai)** 须就地标「已被 R6-71 覆盖」")
+        print("     理由:(ai)「stream_restarted 恒 false」照字面实现 = 有人在看也不真重建。")
+    else:
+        print("  ✅ R6-71:R6-58 (ai) 已标被 R6-71 覆盖")
+    row101 = re.search(r"^\|\s*101\s*\|[^\n]*", t02, re.M)
+    if not row101 or "R6-71" not in row101.group(0) or "`stream_restarted:true`" not in row101.group(0):
+        red.append("R6-71 #101 行")
+        print("\n  ❌ R6-71:02 #101 行未承接 R6-71(有画面流在跑 ⇒ 真重建、stream_restarted:true)")
+    else:
+        print("  ✅ R6-71:02 #101 行已承接")
+
+    # ⑥ R6-76:config.py 的 [adapters.qidian] scrcpy_* 键逐个登记在 02 §7.1 与 07
+    if not os.path.isfile(AGENT_CONFIG_PY):
+        warn += 1
+        print(f"  ⚠️  R6-76:找不到 {os.path.relpath(AGENT_CONFIG_PY, ROOT)},跳过")
+    else:
+        src = io.open(AGENT_CONFIG_PY, encoding="utf-8").read()
+        cls = _slice_between(src, r"^class QidianAdapterConfig\b", r"^(?:class |@dataclass)") or ""
+        keys = re.findall(r"^\s+(scrcpy_[a-z0-9_]+)\s*:", cls, re.M)
+        if not keys:
+            warn += 1
+            print("  ⚠️  R6-76:config.py QidianAdapterConfig 里没读到 scrcpy_* 键(措辞变了?),跳过")
+        else:
+            s71 = _slice_between(t02, r"^### 7\.1 ", r"^### 7\.2 ") or ""
+            lack = [f"{k}({w})" for k in keys for w, s in (("02 §7.1", s71), ("07", t07)) if f"`{k}" not in s and f"{k}=" not in s]
+            if lack:
+                red.append("R6-76 scrcpy_* 键登记")
+                print(f"\n  ❌ R6-76:config.py 已落键但未登记:{', '.join(lack)}")
+                print("     理由:02 §7.1 是配置键唯一出处、07 是全表镜像;实现有键、文档没有 = 现场改不了也查不到。")
+            else:
+                print(f"  ✅ R6-76:config.py 的 {len(keys)} 个 scrcpy_* 键在 02 §7.1 与 07 均已登记")
+
+    # ⑦ R6-70:解码背压阈值不得回到 3 帧
+    hits = [i for i, ln in enumerate(lines_of(t01), 1) if re.search(r"队列\s*>\s*3\s*帧", ln)]
+    if hits:
+        red.append("R6-70 背压阈值")
+        print(f"\n  ❌ R6-70:01 仍写「队列 > 3 帧」—— 行 {hits}(裁决为 6 帧)")
+    else:
+        print("  ✅ R6-70:01 背压阈值不再是 3 帧")
+
+    if warn:
+        print(f"\n  (⚠️ {warn} 项跳过/在途——保守起见不判红,请人工核)")
+    return red
+
+
 def main():
     red = []
     red += check_copyable()
@@ -1385,6 +1582,7 @@ def main():
     red += check_merge_window_literal()
     red += check_literals()
     red += check_result_codes_to_01()
+    red += check_rulings_0926()
     red += check_versions()
     print()
     print("=" * 78)
