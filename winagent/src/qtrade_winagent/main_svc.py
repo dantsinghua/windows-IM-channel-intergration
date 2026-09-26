@@ -17,7 +17,7 @@ import os
 import socket
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import __version__
 from .alerts import AlertBuffer
@@ -36,6 +36,144 @@ from .wechat import WeChatHostsBlock, WeChatStore
 
 log = get_logger("svc")
 DEFAULT_ROOT = os.path.expandvars(r"%ProgramData%\QTrade\winagent")
+LOOPBACK = "127.0.0.1"
+
+
+def bind_listener(host: str, port: int, *, windows: bool = sys.platform == "win32",
+                  sock_factory: Callable[..., socket.socket] = socket.socket) -> socket.socket:
+    """绑一个 TCP 监听 socket(评审 B2)。
+
+    🔴 Windows 上**必须** ``SO_EXCLUSIVEADDRUSE``、**绝不** ``SO_REUSEADDR``:后者在 Windows 上允许别的进程
+    对同一 ``地址:端口`` 再绑一次并抢走连接(端口劫持)——而 17610 上跑的是带令牌的控制面。
+    非 Windows(仅开发/测试)保持 ``SO_REUSEADDR``:POSIX 语义下它只放过 TIME_WAIT,不允许两个活跃监听共端口。
+    绑定失败抛 ``OSError``(地址还不存在 = ``WSAEADDRNOTAVAIL`` / ``EADDRNOTAVAIL``),socket 不泄漏。
+    """
+    sock = sock_factory(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if windows:
+            # Python 在 Windows 上本就导出该常量;回退值 -5 = winsock.h 的 (int)(~SO_REUSEADDR),其中 Windows
+            # SO_REUSEADDR=4(不能用本机 socket.SO_REUSEADDR 现算:Linux 上它是 2)
+            sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.setblocking(False)
+        sock.listen(2048)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class Listeners:
+    """WinAgent HTTP 监听集合 ``{127.0.0.1} ∪ vEthernet (WSL) IPv4``(评审 B2)。
+
+    - 启动期:回环**必须**绑上(绑不上服务无意义,照常抛);vEthernet 地址此刻可能还不存在(WSL 未起)——
+      **跳过 + 记 warn**,不让服务起不来。
+    - 运行期(``sync``,由周期任务在期望集合与实际不一致时调):补绑缺的地址、挂到正在跑的 uvicorn 上;
+      子网变了则关掉旧地址的监听(回环永不关)。uvicorn 还没完成 startup 时本轮不补绑,下一轮再试。
+    - 挂载用的是 uvicorn ``Server.startup`` 里同一套协议工厂(``config.http_protocol_class`` + ``server_state``
+      + ``lifespan.state``;uvicorn 0.53 实测),新 asyncio server 追加进 ``server.servers``,关机时由 uvicorn 一并关。
+    """
+
+    def __init__(self, port: int, *, bind: Callable[[str, int], socket.socket] = bind_listener):
+        self.port = port
+        self._bind = bind
+        self.sockets: dict[str, socket.socket] = {}
+        self.server: Any = None                                    # uvicorn.Server;main() 里挂上
+
+    def actual(self) -> tuple[str, ...]:
+        return tuple(self.sockets)
+
+    def _try_bind(self, host: str, *, required: bool = False) -> Optional[socket.socket]:
+        try:
+            s = self._bind(host, self.port)
+        except OSError as e:
+            if required:
+                raise
+            log.warning("监听地址绑定失败,先跳过、由周期任务补绑", extra={
+                "op": "svc.bind", "code": "BIND_FAILED", "kv": {"host": host, "port": self.port, "err": str(e)}})
+            return None
+        self.sockets[host] = s
+        return s
+
+    def open(self, hosts: tuple[str, ...]) -> tuple[str, ...]:
+        for h in hosts:
+            self._try_bind(h, required=(h == LOOPBACK))
+        return self.actual()
+
+    def _running(self) -> bool:
+        return self.server is not None and bool(getattr(self.server, "started", False))
+
+    async def _attach(self, sock: socket.socket) -> None:
+        srv = self.server
+        cfg = srv.config
+
+        def create_protocol(_loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Protocol:
+            return cfg.http_protocol_class(config=cfg, server_state=srv.server_state,
+                                           app_state=srv.lifespan.state, _loop=_loop)
+        aserver = await asyncio.get_running_loop().create_server(create_protocol, sock=sock, backlog=cfg.backlog)
+        srv.servers.append(aserver)
+
+    def _detach(self, host: str) -> None:
+        sock = self.sockets.pop(host)
+        name = sock.getsockname()
+        for a in list(getattr(self.server, "servers", None) or []):
+            if any(s.getsockname() == name for s in (a.sockets or ())):
+                a.close()                                          # 连同底层 socket 一起关
+                self.server.servers.remove(a)
+                break
+        else:
+            sock.close()
+        log.info("关闭已失效的监听地址", extra={"op": "svc.bind", "code": "UNBOUND", "kv": {"host": host}})
+
+    async def sync(self, want: tuple[str, ...]) -> tuple[str, ...]:
+        """把实际监听对齐到 ``want``;返回对齐后的实际集合(可能仍缺地址——绑不上就等下一轮)。"""
+        if not self._running():                                    # uvicorn 还没把启动期 socket 接过去:本轮不动
+            return self.actual()
+        for h in [h for h in self.sockets if h not in want and h != LOOPBACK]:
+            self._detach(h)
+        for h in want:
+            if h in self.sockets:
+                continue
+            s = self._try_bind(h)
+            if s is None:
+                continue
+            try:
+                await self._attach(s)
+            except Exception:
+                log.exception("新监听挂载到 uvicorn 失败", extra={"op": "svc.bind", "code": "ATTACH_FAILED",
+                                                                "kv": {"host": h}})
+                self.sockets.pop(h, None)
+                s.close()
+            else:
+                log.info("补绑监听地址", extra={"op": "svc.bind", "code": "OK", "kv": {"host": h, "port": self.port}})
+        return self.actual()
+
+
+async def align_listen(d: SvcDeps, listeners: Optional[Listeners],
+                       reported: Optional[frozenset[str]]) -> Optional[frozenset[str]]:
+    """周期任务里的 H16 一段:期望监听集合 vs 实际。返回「已上报过的期望集合」(下一轮传回来)。
+
+    - 同一个期望集合只走一次 ``reconcile_listen`` 的告警/刷防火墙/``WSL_SUBNET_CHANGED``,绑不上就每轮静默重试;
+    - 对齐之后再调一次 ``reconcile_listen``(此时一致)⇒ 解除 H16;
+    - ``listeners=None``(``--dev``)保持旧语义:只告警,把期望集合当实际集合记下。
+    """
+    want = await asyncio.to_thread(d.netprobe.desired_listen)
+    if set(want) == set(d.listen):
+        return reported
+    if listeners is None:
+        await asyncio.to_thread(d.netprobe.reconcile_listen, actual=d.listen)
+        d.listen = want
+        return reported
+    if frozenset(want) != reported:
+        await asyncio.to_thread(d.netprobe.reconcile_listen, actual=d.listen)     # H16 + 刷防火墙 + WSL_SUBNET_CHANGED
+        reported = frozenset(want)
+    d.listen = await listeners.sync(want)
+    if set(d.listen) == set(want):
+        await asyncio.to_thread(d.netprobe.reconcile_listen, actual=d.listen)     # 一致 ⇒ 解除 H16
+        reported = None
+    return reported
 
 
 def setup_logging(level: str, log_dir: Optional[str]) -> None:
@@ -158,19 +296,17 @@ async def load_tokens(d: SvcDeps) -> None:
         setattr(d.tokens, attr, val)
 
 
-async def periodic(d: SvcDeps) -> None:
+async def periodic(d: SvcDeps, listeners: Optional[Listeners] = None) -> None:
     """后台周期任务(04 §2.2 周期表 + R3-20 每日 03:00 清理)。任一轮抛异常只记日志,不让循环停。"""
     cfg = d.cfg
     next_slow = next_sweep = 0
+    reported: Optional[frozenset[str]] = None
     while True:
         now = int(time.time() * 1000)
         try:
             await asyncio.to_thread(d.monitor.sample_fast)
             await asyncio.to_thread(d.monitor.check_session_locked)
-            listen = await asyncio.to_thread(d.netprobe.desired_listen)
-            if set(listen) != set(d.listen):
-                await asyncio.to_thread(d.netprobe.reconcile_listen, actual=d.listen)
-                d.listen = listen
+            reported = await align_listen(d, listeners, reported)       # H16 自愈:真的补绑/解绑(评审 B2)
             if now >= next_slow:
                 await asyncio.to_thread(d.monitor.sample_slow)
                 await asyncio.to_thread(d.monitor.check_disks)
@@ -208,6 +344,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg = load_cfg(read_toml(args.config or os.path.join(root, "winagent.toml")))
     setup_logging(cfg.log.level, None if args.dev else os.path.join(root, "logs"))
     d = build_real_deps(cfg, root=root, install_user_sid=args.install_user_sid, fake=args.dev)
+    listeners = Listeners(cfg.api.port)
+    tasks: set[asyncio.Task] = set()                                   # 留住后台任务引用,防被 GC
 
     async def boot() -> None:
         await load_tokens(d)
@@ -217,9 +355,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                             evidence=alert["evidence"])
         await d.hub.start()
         await d.netprobe.refresh()
-        d.listen = d.netprobe.desired_listen()
+        # 真机:d.listen = **真正绑上的**集合(vEthernet 没绑上时与期望不一致 ⇒ 周期任务报 H16 并补绑)
+        d.listen = d.netprobe.desired_listen() if args.dev else listeners.actual()
         d.netprobe.firewall_ensure()
-        asyncio.create_task(periodic(d), name="wa-periodic")
+        tasks.add(asyncio.create_task(periodic(d, None if args.dev else listeners), name="wa-periodic"))
 
     app = build_app(d)
 
@@ -229,20 +368,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     import uvicorn
     # 规格要求同时听 127.0.0.1 和 vEthernet (WSL)。uvicorn 单 host 只会绑 desired_listen()[0],
-    # WSL 里的 Agent 打到网关地址会连不上。这里把期望集合里的每个地址都绑上。
-    hosts = ("127.0.0.1",) if args.dev else d.netprobe.desired_listen()
-    sockets: list[socket.socket] = []
-    for host in hosts:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, cfg.api.port))
-        sock.setblocking(False)
-        sock.listen(2048)
-        sockets.append(sock)
+    # WSL 里的 Agent 打到网关地址会连不上。这里把期望集合里的每个地址都绑上;
+    # vEthernet 此刻不存在就跳过(Listeners.open 记 warn),由周期任务补绑。
+    listeners.open((LOOPBACK,) if args.dev else d.netprobe.desired_listen())
     log.info("WinAgent 服务启动", extra={"op": "svc.start", "code": "OK",
-                                        "kv": {"listen": ",".join(hosts), "port": cfg.api.port}})
-    config = uvicorn.Config(app, ws="websockets", log_config=None)
-    uvicorn.Server(config).run(sockets=sockets)
+                                        "kv": {"listen": ",".join(listeners.actual()), "port": cfg.api.port}})
+    server = uvicorn.Server(uvicorn.Config(app, ws="websockets", log_config=None))
+    listeners.server = server
+    server.run(sockets=list(listeners.sockets.values()))
     return 0
 
 
