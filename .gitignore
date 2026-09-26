@@ -20,3 +20,6 @@ console/tests/e2e-pw/.pw-results/
 
 # 与本项目无关的个人脚本(羿珩 DM 行情旁路),误入过一次
 qb_tap.user.js
+
+# Claude Code 子 agent 的 worktree 目录,不入库
+.claude/worktrees/
