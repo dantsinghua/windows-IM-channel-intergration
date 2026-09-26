@@ -175,22 +175,37 @@ function New-QtDiagBundle {
             $included += $c.Name
         }
         if ($IncludeDmesg) {
+            # 预演 #16:kcheck 在失败路径上会被注销,那之前 Save-QtKCheckDmesg 已把 dmesg 落进日志目录
+            #          (kcheck-dmesg-<ts>.txt)。这里全部带上,并把最新一份并进 kcheck-dmesg.txt,不再只留占位句。
+            $saved = @()
+            if (Test-QtPath -Path $paths.Logs) {
+                $saved = @(Get-ChildItem -LiteralPath $paths.Logs -Filter 'kcheck-dmesg-*.txt' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+            }
+            if ($saved.Count -gt 0) {
+                $savedDir = Join-Path $staging 'logs'
+                New-QtDirectory -Path $savedDir | Out-Null
+                foreach ($sf in $saved) {
+                    if (Copy-QtDiagFile -StagingDir $savedDir -Source $sf.FullName) { $included += ('logs/' + $sf.Name) }
+                }
+            }
             $kname = Get-QtKCheckDistroName
             $listed = Invoke-QtWsl -WslArgs @('--list', '--quiet') -TimeoutSec 30
             $present = (-not $listed.TimedOut) -and ($listed.ExitCode -eq 0) -and ($listed.StdOut -match [regex]::Escape($kname))
-            if (-not $present) {
-                Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text '采集时发行版已注销' | Out-Null
-                $included += 'kcheck-dmesg'
-            } else {
+            $live = ''
+            if ($present) {
                 $r = Invoke-QtWsl -WslArgs @('-d', $kname, '--user', 'root', '--exec', 'sh', '-c', 'dmesg | tail -200') -TimeoutSec 60
-                if (-not $r.TimedOut -and $r.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.StdOut)) {
-                    Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text $r.StdOut | Out-Null
-                    $included += 'kcheck-dmesg'
-                } else {
-                    Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text '采集时发行版已注销' | Out-Null
-                    $included += 'kcheck-dmesg'
-                }
+                if (-not $r.TimedOut -and $r.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.StdOut)) { $live = $r.StdOut }
             }
+            if ($live) {
+                $dmesgText = $live
+            } elseif ($saved.Count -gt 0) {
+                $latest = $saved[$saved.Count - 1]
+                $dmesgText = ('采集时发行版已注销;以下为注销前抓取的 logs/{0}:' -f $latest.Name) + "`n" + (Read-QtTextFile -Path $latest.FullName)
+            } else {
+                $dmesgText = '采集时发行版已注销,且日志目录里没有注销前抓取的 kcheck-dmesg-*.txt'
+            }
+            Add-QtDiagText -StagingDir $staging -Name 'kcheck-dmesg' -Text $dmesgText | Out-Null
+            $included += 'kcheck-dmesg'
         } else { $skipped += 'kcheck-dmesg(diag_include_dmesg=false)' }
 
         $dl = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'sh', '-c',

@@ -10,7 +10,7 @@ BeforeAll {
 
 Describe '预演:uname 不是版本串' {
 
-    It 'HCS 超时文案、退出码 0 → KERNEL_BOOT_FAILED,且说明本机 WSL2 无法启动' {
+    It 'HCS 超时文案、退出码 0 → KERNEL_BOOT_FAILED,且验证段此刻不下「与 QTrade 内核无关」的结论(B6)' {
         Mock -ModuleName QTrade.Kernel Invoke-QtWsl {
             if ($WslArgs -contains '--shutdown') { return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
             return [pscustomobject]@{ ExitCode = 0; StdOut = $script:Hcs; StdErr = ''; TimedOut = $false; DurationMs = 1 }
@@ -18,7 +18,9 @@ Describe '预演:uname 不是版本串' {
         $r = Invoke-QtKernelVerify -ManifestVersion $script:Ver -ShutdownConfirmed $true -SkipShutdown
         $r.Reason | Should -Not -Be 'KERNEL_NO_BINDER'
         $r.Reason | Should -Be 'KERNEL_BOOT_FAILED'
-        $r.Message | Should -Match '本机 WSL2 无法启动'
+        $r.Message | Should -Match 'QTrade 内核下 WSL2 未能正常启动'
+        # B6:原装内核好不好要等回滚复验才知道,验证段不得先把锅甩给「本机 WSL2」
+        $r.Message | Should -Not -Match '与 QTrade 内核无关'
     }
 
     It '回滚时超时文案不得当成 OfficialKernel' {

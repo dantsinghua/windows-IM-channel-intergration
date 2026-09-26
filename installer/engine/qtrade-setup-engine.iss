@@ -193,6 +193,79 @@ function GetLastError(): Cardinal;
 const
   ERROR_ALREADY_EXISTS = 183;
 
+// ── 评审 C / 预演 #3②:长步骤不能用 Exec(..., ewWaitUntilTerminated) 同步阻塞 ────────
+// Inno 的 Exec 拿不到子进程句柄,只好自己 CreateProcessW 拿句柄,再 WaitForSingleObject(h, 0) 轮询,
+// 轮询间隙泵消息,界面能重绘、【取消】能点。
+// ⚠️ Setup 本体恒为 32 位 x86(Inno 6.7 whatsnew:"Setup itself is currently always built as a 32-bit x86 binary"),
+//    下面的记录按 x86 布局写:指针/句柄一律 4 字节 Cardinal,STARTUPINFOW = 68 字节、无填充。
+// ⚠️ EnableFsRedirection 对 external 调用**无效**(Inno 帮助原话),32 位进程直接 CreateProcess
+//    System32\cmd.exe 会被重定向到 SysWOW64 —— 所以用 Sysnative\cmd.exe(见 RunStep)。
+type
+  TQtStartupInfo = record
+    cb: Cardinal;
+    lpReserved: Cardinal;
+    lpDesktop: Cardinal;
+    lpTitle: Cardinal;
+    dwX: Cardinal;
+    dwY: Cardinal;
+    dwXSize: Cardinal;
+    dwYSize: Cardinal;
+    dwXCountChars: Cardinal;
+    dwYCountChars: Cardinal;
+    dwFillAttribute: Cardinal;
+    dwFlags: Cardinal;
+    wShowWindow: Word;
+    cbReserved2: Word;
+    lpReserved2: Cardinal;
+    hStdInput: Cardinal;
+    hStdOutput: Cardinal;
+    hStdError: Cardinal;
+  end;
+  TQtProcessInfo = record
+    hProcess: Cardinal;
+    hThread: Cardinal;
+    dwProcessId: Cardinal;
+    dwThreadId: Cardinal;
+  end;
+  TQtMsg = record
+    hwnd: Cardinal;
+    message: Cardinal;
+    wParam: Cardinal;
+    lParam: Cardinal;
+    time: Cardinal;
+    ptX: Integer;
+    ptY: Integer;
+  end;
+
+// BOOL 形参一律按 Cardinal 传 0/1,返回值按 Cardinal 收、与 0 比(不赌 Boolean 的 4 字节扩展)
+function CreateProcessW(lpApplicationName: Cardinal; lpCommandLine: String;
+  lpProcessAttributes, lpThreadAttributes: Cardinal; bInheritHandles: Cardinal;
+  dwCreationFlags: Cardinal; lpEnvironment: Cardinal; lpCurrentDirectory: Cardinal;
+  var lpStartupInfo: TQtStartupInfo; var lpProcessInformation: TQtProcessInfo): Cardinal;
+  external 'CreateProcessW@kernel32.dll stdcall';
+function WaitForSingleObject(hHandle: Cardinal; dwMilliseconds: Cardinal): Cardinal;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function GetExitCodeProcess(hProcess: Cardinal; var lpExitCode: Cardinal): Cardinal;
+  external 'GetExitCodeProcess@kernel32.dll stdcall';
+function TerminateProcess(hProcess: Cardinal; uExitCode: Cardinal): Cardinal;
+  external 'TerminateProcess@kernel32.dll stdcall';
+function CloseHandle(hObject: Cardinal): Cardinal;
+  external 'CloseHandle@kernel32.dll stdcall';
+function PeekMessageW(var lpMsg: TQtMsg; hWnd: Cardinal; wMsgFilterMin, wMsgFilterMax, wRemoveMsg: Cardinal): Cardinal;
+  external 'PeekMessageW@user32.dll stdcall';
+function TranslateMessage(var lpMsg: TQtMsg): Cardinal;
+  external 'TranslateMessage@user32.dll stdcall';
+function DispatchMessageW(var lpMsg: TQtMsg): Cardinal;
+  external 'DispatchMessageW@user32.dll stdcall';
+
+const
+  QT_WAIT_TIMEOUT        = 258;         // WaitForSingleObject 返回 WAIT_TIMEOUT
+  QT_STARTF_USESHOWWINDOW = 1;
+  QT_PM_REMOVE           = 1;
+  QT_POLL_MS             = 200;         // 轮询间隔
+  // §2.6.3 确认页的「正在运行的发行版」检测上限 3000 毫秒(界面线程不得无界等待)
+  RUNNING_DISTROS_TIMEOUT_MS = 3000;
+
 var
   OptMode: String;
   OptAcceptShutdown: Boolean;
@@ -229,6 +302,9 @@ var
   WeChatBackupModeSel: String;     // auto | copy | rename | skip
   AcceptSchemaBreaking: Boolean;
   EngineScriptsReady: Boolean;
+  EngineScriptsBroken: Boolean;    // 释放引擎脚本失败:此后 FailWith 不再提供诊断包(诊断包本身也要跑脚本)
+  StepRunning: Boolean;            // RunStep 正在轮询子进程(CancelButtonClick 据此接管【取消】)
+  StepCancelRequested: Boolean;
 
 // ── 命令行解析 ─────────────────────────────────────────────────────────────
 function GetSwitchValue(const Prefix: String; const Default: String): String;
@@ -307,17 +383,23 @@ end;
 function JsonStr(const Json, Key: String): String;
 var
   P, Q, I: Integer;
-  Pat, Raw, Out: String;
+  Pat, Raw, Out, HexStr: String;
   C: Char;
 begin
-  // JSON unescape \\ \" \n \r \t \/ —— 路径里的反斜杠不能原样显示成 \\
+  // JSON unescape \\ \" \n \r \t \/ \uXXXX —— 路径里的反斜杠不能原样显示成 \\;
+  // PowerShell 5.1 的 ConvertTo-Json 会把 < > ' & 等写成 \u003c 这类,不反转义就原样漏到界面上
   Result := '';
   Pat := '"' + Key + '":"';
   P := Pos(Pat, Json);
   if P = 0 then Exit;
   P := P + Length(Pat);
   Q := P;
-  while (Q <= Length(Json)) and (Json[Q] <> '"') do Q := Q + 1;
+  // 找值的结束引号:跳过被反斜杠转义的字符(否则值里的 \" 会把字符串截断)
+  while (Q <= Length(Json)) and (Json[Q] <> '"') do
+  begin
+    if Json[Q] = '\' then Q := Q + 2 else Q := Q + 1;
+  end;
+  if Q > Length(Json) + 1 then Q := Length(Json) + 1;
   Raw := Copy(Json, P, Q - P);
   Out := '';
   I := 1;
@@ -332,6 +414,22 @@ begin
       else if C = '\' then Out := Out + '\'
       else if C = '"' then Out := Out + '"'
       else if C = '/' then Out := Out + '/'
+      else if C = 'b' then Out := Out + #8
+      else if C = 'f' then Out := Out + #12
+      else if (C = 'u') and (I + 5 <= Length(Raw)) then
+      begin
+        // \uXXXX:PowerShell 5.1 ConvertTo-Json 只把 < > ' & 与控制字符写成 \u00XX(中文原样输出),
+        // 都 ≤ $FF,用 Chr 还原。⚠️ Inno 文档里 Chr 的签名是 Chr(B: Byte),> $FF 会被截断,
+        // 所以 > $FF 的(本引擎的输出里不会出现)保留原文 \uXXXX,宁可难看也不显示错字。
+        HexStr := Copy(Raw, I + 2, 4);
+        if (StrToIntDef('$' + HexStr, -1) >= 0) and (StrToIntDef('$' + HexStr, 256) <= 255) then
+        begin
+          Out := Out + Chr(StrToIntDef('$' + HexStr, 63));
+          I := I + 6;
+          Continue;
+        end;
+        Out := Out + '\' + C;
+      end
       else Out := Out + C;
       I := I + 2;
     end
@@ -424,40 +522,185 @@ begin
     end;
 end;
 
+// FailWith 在后面定义(它要调 RunStep('diag')),这里先前向声明,供 EnsureEngineScripts / RunStep 用
+procedure FailWith(const Code: Integer; const Msg: String); forward;
+
 // 向导阶段 {app} 尚未初始化,[Files] 拷贝也在 ssInstall 之后。脚本先从 dontcopy 释放到 {tmp}\qte。
+// 评审 C:原先空的 try/except 把释放失败吞掉,后面每一步都会以「找不到脚本」的形式莫名失败 ——
+//        现在任何一处失败即 FailWith(E_INSTALL_INTERNAL, …)。
 procedure EnsureEngineScripts();
 var
   FindRec: TFindRec;
-  Tmp, Qte, ModDir: String;
+  Tmp, Qte, ModDir, Err: String;
+  Copied: Integer;
 begin
   if EngineScriptsReady then Exit;
+  Err := '';
+  Copied := 0;
   Tmp := ExpandConstant('{tmp}');
   Qte := Tmp + '\qte';
   ModDir := Qte + '\modules';
-  ForceDirectories(ModDir);
-  ExtractTemporaryFile('run-step.ps1');
-  FileCopy(Tmp + '\run-step.ps1', Qte + '\run-step.ps1', False);
   try
-    ExtractTemporaryFiles('*.psm1');
+    if not ForceDirectories(ModDir) then Err := '无法创建目录 ' + ModDir;
+    if Err = '' then
+    begin
+      ExtractTemporaryFile('run-step.ps1');
+      if not FileCopy(Tmp + '\run-step.ps1', Qte + '\run-step.ps1', False) then
+        Err := '无法复制 run-step.ps1 到 ' + Qte;
+    end;
+    if Err = '' then
+    begin
+      ExtractTemporaryFiles('*.psm1');
+      if FindFirst(Tmp + '\*.psm1', FindRec) then
+      try
+        repeat
+          if FileCopy(Tmp + '\' + FindRec.Name, ModDir + '\' + FindRec.Name, False) then
+            Copied := Copied + 1
+          else
+            Err := '无法复制 ' + FindRec.Name + ' 到 ' + ModDir;
+        until (Err <> '') or (not FindNext(FindRec));
+      finally
+        FindClose(FindRec);
+      end;
+      if (Err = '') and (Copied = 0) then Err := '安装包里没有找到任何引擎模块(*.psm1)';
+    end;
   except
+    Err := GetExceptionMessage();
   end;
-  if FindFirst(Tmp + '\*.psm1', FindRec) then
-  try
-    repeat
-      FileCopy(Tmp + '\' + FindRec.Name, ModDir + '\' + FindRec.Name, False);
-    until not FindNext(FindRec);
-  finally
-    FindClose(FindRec);
+  if Err <> '' then
+  begin
+    EngineScriptsBroken := True;
+    FailWith(E_INSTALL_INTERNAL, '释放安装引擎脚本失败:' + Err);
   end;
   EngineScriptsReady := True;
+end;
+
+// 泵一轮消息:界面重绘、按钮(含【取消】)可点。Inno 的 [Code] 不暴露 Application.ProcessMessages。
+procedure PumpMessages();
+var
+  Msg: TQtMsg;
+begin
+  while PeekMessageW(Msg, 0, 0, 0, QT_PM_REMOVE) <> 0 do
+  begin
+    TranslateMessage(Msg);
+    DispatchMessageW(Msg);
+  end;
+end;
+
+// 用户在步骤进行中点【取消】/关窗:结束整棵子进程树(cmd → powershell → wsl …)
+procedure KillStepProcess(const PI: TQtProcessInfo);
+var
+  R: Integer;
+begin
+  // taskkill /T 靠父子关系找子孙,须在 cmd 还活着时先调;再 TerminateProcess 兜底
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/T /F /PID ' + IntToStr(PI.dwProcessId), '', SW_HIDE, ewWaitUntilTerminated, R);
+  TerminateProcess(PI.hProcess, 1);
+  WaitForSingleObject(PI.hProcess, 5000);
+end;
+
+// 启动 CmdLine 并**不阻塞界面**地等它结束。返回 True = 启动成功;OutCode 带回退出码;
+// Cancelled = 用户中途取消(子进程树已被结束)。CreateProcessW 失败时回退到阻塞的 Exec(正确但会卡界面)。
+function RunHiddenPolling(const CmdParams, Caption: String; var OutCode: Integer; var Cancelled: Boolean): Boolean;
+var
+  SI: TQtStartupInfo;
+  PI: TQtProcessInfo;
+  CmdLine: String;
+  Code: Cardinal;
+  Ticks: Integer;
+  NextWas, BackWas, CancelWas: Boolean;
+begin
+  Result := False;
+  Cancelled := False;
+  OutCode := E_INSTALL_INTERNAL;
+  // 显式清零指针/保留字段(不赌脚本引擎对局部记录的初始化)
+  SI.cb := 68;
+  SI.lpReserved := 0;
+  SI.lpDesktop := 0;
+  SI.lpTitle := 0;
+  SI.dwX := 0;
+  SI.dwY := 0;
+  SI.dwXSize := 0;
+  SI.dwYSize := 0;
+  SI.dwXCountChars := 0;
+  SI.dwYCountChars := 0;
+  SI.dwFillAttribute := 0;
+  SI.dwFlags := QT_STARTF_USESHOWWINDOW;
+  SI.wShowWindow := SW_HIDE;
+  SI.cbReserved2 := 0;
+  SI.lpReserved2 := 0;
+  SI.hStdInput := 0;
+  SI.hStdOutput := 0;
+  SI.hStdError := 0;
+  // 32 位 Setup 经 Sysnative 拿到 64 位 cmd;其后的 {sys}\...\powershell.exe 由 64 位 cmd 解析,不再被重定向
+  CmdLine := '"' + ExpandConstant('{win}') + '\Sysnative\cmd.exe" ' + CmdParams;
+  if CreateProcessW(0, CmdLine, 0, 0, 0, 0, 0, 0, SI, PI) = 0 then
+  begin
+    Log('CreateProcessW 失败,回退到阻塞的 Exec:' + SysErrorMessage(DLLGetLastError()));
+    Result := Exec(ExpandConstant('{cmd}'), CmdParams, '', SW_HIDE, ewWaitUntilTerminated, OutCode);
+    if not Result then OutCode := E_INSTALL_INTERNAL;
+    Exit;
+  end;
+  CloseHandle(PI.hThread);
+  Result := True;
+  StepRunning := True;
+  StepCancelRequested := False;
+  if not WizardSilent() then
+  begin
+    // 轮询期间消息照常派发:防止用户再点【下一步】/【上一步】重入 NextButtonClick;【取消】保持可点
+    NextWas := WizardForm.NextButton.Enabled;
+    BackWas := WizardForm.BackButton.Enabled;
+    CancelWas := WizardForm.CancelButton.Enabled;
+    WizardForm.NextButton.Enabled := False;
+    WizardForm.BackButton.Enabled := False;
+    WizardForm.CancelButton.Enabled := True;
+  end;
+  try
+    Ticks := 0;
+    while WaitForSingleObject(PI.hProcess, 0) = QT_WAIT_TIMEOUT do
+    begin
+      if StepCancelRequested then
+      begin
+        KillStepProcess(PI);
+        Cancelled := True;
+        Break;
+      end;
+      PumpMessages();
+      Sleep(QT_POLL_MS);
+      Ticks := Ticks + 1;
+      if (not WizardSilent()) and (Ticks mod 25 = 0) then
+      begin
+        // 预演 #3②:长步骤不能几分钟一个字不出
+        WizardForm.StatusLabel.Caption := Caption + '(已用 ' + IntToStr(Ticks * QT_POLL_MS div 1000) + ' 秒,可点【取消】中止)';
+        WizardForm.Update;
+      end;
+    end;
+    if not Cancelled then
+    begin
+      Code := 0;
+      if GetExitCodeProcess(PI.hProcess, Code) <> 0 then
+        OutCode := Code
+      else
+        OutCode := E_INSTALL_INTERNAL;
+    end;
+  finally
+    CloseHandle(PI.hProcess);
+    StepRunning := False;
+    if not WizardSilent() then
+    begin
+      WizardForm.NextButton.Enabled := NextWas;
+      WizardForm.BackButton.Enabled := BackWas;
+      WizardForm.CancelButton.Enabled := CancelWas;
+    end;
+  end;
 end;
 
 // 跑一个步骤。返回 True = ok;LastStepExit 带回 §3.4 的退出码,LastStepJson 带回整行结果。
 function RunStep(const StepName: String): Boolean;
 var
-  OutFile, OptFile, Cmd, Params: String;
+  OutFile, OptFile, Cmd, Params, CancelMsg: String;
   OptLines: TArrayOfString;
   Code: Integer;
+  Cancelled: Boolean;
 begin
   EnsureEngineScripts();
   OutFile := ExpandConstant('{tmp}\qt-step-') + StepName + '.json';
@@ -477,12 +720,25 @@ begin
     WizardForm.StatusLabel.Caption := StepName + '，可能需要几分钟';
     WizardForm.Update;
   end;
-  // 经 cmd /c 重定向 stdout,免得 Inno 拿不到输出
-  if not Exec(ExpandConstant('{cmd}'), '/c ""' + Cmd + '" ' + Params + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  // 经 cmd /c 重定向 stdout,免得拿不到输出;评审 C:不再 ewWaitUntilTerminated 同步阻塞,改轮询
+  if not RunHiddenPolling('/c ""' + Cmd + '" ' + Params + '"', StepName, Code, Cancelled) then
   begin
     LastStepExit := E_INSTALL_INTERNAL;
     LastStepJson := '';
     Result := False;
+    Exit;
+  end;
+  if Cancelled then
+  begin
+    // 按现有失败路径退出。§3.4 没有「用户取消」专用码 → 用 10 E_INSTALL_WAIT_USER(停下等用户),
+    // 状态机里的步骤都幂等可重入(§2.12),重新运行即从中断处继续。
+    CancelMsg := '已按你的要求中止「' + StepName + '」这一步。重新运行安装程序会从中断处继续。';
+    LastStepExit := E_INSTALL_WAIT_USER;
+    LastStepJson := '{"ok":false,"state":"","reason":"USER_CANCELLED","exit":' + IntToStr(E_INSTALL_WAIT_USER) +
+      ',"message":"' + CancelMsg + '"}';
+    Result := False;
+    // 'diag' 是在 FailWith 里被调的,再 FailWith 会递归 —— 交回调用方(它随后就 ExitProcess)
+    if StepName <> 'diag' then FailWith(LastStepExit, CancelMsg);
     Exit;
   end;
   LastStepExit := Code;
@@ -493,16 +749,31 @@ end;
 // §2.6.3 的确认页要列出「当前检测到正在运行的发行版」与 Docker Desktop 状态。
 function GetRunningDistros(): String;
 var
-  OutFile, Cmd: String;
+  OutFile, PsExe, WslExe, PsScript, PsParams: String;
   Code: Integer;
   Lines: TArrayOfString;
   I: Integer;
 begin
   Result := '';
   OutFile := ExpandConstant('{tmp}\qt-running.txt');
-  // 超时上限 3000 毫秒:界面线程不得无界等待 wsl --list --running
-  Cmd := '/c "' + ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe') + ' -NoProfile -NonInteractive -Command ""$p = Start-Process -FilePath ''' + ExpandConstant('{sys}\wsl.exe') + ''' -ArgumentList ''--list'',''--running'',''--quiet'' -RedirectStandardOutput ''' + OutFile + ''' -WindowStyle Hidden -PassThru; if (-not $p.WaitForExit(3000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 1 }""';
-  if not Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  WslExe := ExpandConstant('{sys}\wsl.exe');
+  // 超时上限 RUNNING_DISTROS_TIMEOUT_MS(3000 毫秒):界面线程不得无界等待 wsl --list --running。
+  // 评审 B7:wsl.exe 输出被重定向时默认是 UTF-16LE,LoadStringsFromFile 读成乱码 ⇒ 先 $env:WSL_UTF8='1'
+  //          再 Start-Process(子进程继承环境,wsl 改出 UTF-8;LoadStringsFromFile 支持无 BOM 的 UTF-8)。
+  // 原先是 cmd /c + powershell -Command + 单引号三层嵌套,拆成下面两段:
+  //   PsScript = 纯 PowerShell 文本,只用单引号(Pascal 里写成 ''),不含双引号;
+  //   PsParams = powershell.exe 的参数,Exec 直接起 powershell,不再套 cmd。
+  // ⚠️ installer/tests/QTrade.RunningDistros.Tests.ps1 会从本文件解析这两段赋值并在本机实跑,改动时保持
+  //    「每段一条 := 赋值、只由 '字面量'、变量名、IntToStr(常量) 用 + 拼成」这一形状。
+  PsScript :=
+    '$env:WSL_UTF8=''1''; ' +
+    '$p = Start-Process -FilePath ''' + WslExe + ''' -ArgumentList ''--list'',''--running'',''--quiet''' +
+    ' -RedirectStandardOutput ''' + OutFile + ''' -WindowStyle Hidden -PassThru; ' +
+    'if (-not $p.WaitForExit(' + IntToStr(RUNNING_DISTROS_TIMEOUT_MS) + ')) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 1 }';
+  PsParams := '-NoProfile -NonInteractive -Command "' + PsScript + '"';
+  DeleteFile(OutFile);   // 不让上一次的结果冒充这一次
+  if not Exec(PsExe, PsParams, '', SW_HIDE, ewWaitUntilTerminated, Code) then
   begin
     Result := '(检测超时)';
     Exit;
@@ -527,6 +798,12 @@ var
   Answer: Integer;
   DiagMsg: String;
 begin
+  if EngineScriptsBroken then
+  begin
+    // 脚本都没释放出来,诊断包(也是跑 run-step.ps1)无从谈起;不提供,免得递归
+    if not IsSilentRun() then MsgBox(Msg, mbCriticalError, MB_OK);
+    ExitProcess(Code);
+  end;
   if not IsSilentRun() then
   begin
     // §5.3:每个失败页带日志路径与【导出诊断包】。诊断包**不含** vault / 密码 / 微信数据 / 消息正文(红线 2)。
@@ -549,6 +826,19 @@ begin
     end;
   end;
   ExitProcess(Code);
+end;
+
+// 评审 C:步骤进行中点【取消】/关窗 —— 不走 Inno 自带的取消(它不认识我们的子进程),
+// 由 RunHiddenPolling 结束子进程树后按现有失败路径(FailWith)退出。
+procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
+begin
+  if StepRunning then
+  begin
+    Cancel := False;
+    if MsgBox('当前步骤仍在进行。确定要中止安装吗?' + #13#10#13#10 +
+      '中止后可重新运行安装程序,会从中断处继续。', mbConfirmation, MB_YESNO) = IDYES then
+      StepCancelRequested := True;
+  end;
 end;
 
 // ── 向导页(§4;🔴 C-39:安装器向导是 Inno 自己的页面,不是控制台的 P-SETUP)──

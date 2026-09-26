@@ -291,7 +291,9 @@ function Invoke-QtKernelVerify {
         return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = ''; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
     }
     if (-not (Test-QtUnameLooksLikeVersion -Text $u.StdOut)) {
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = '本机 WSL2 无法启动,与 QTrade 内核无关'; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
+        # B6:此刻只知道「QTrade 内核下 WSL2 没起来」,**不能**下「与 QTrade 内核无关」的结论 ——
+        #     要等回滚后原装内核的复验结果才分得清(见 Resolve-QtKernelSwitchFailure)
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = 'QTrade 内核下 WSL2 未能正常启动(uname 输出不是版本串)'; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
     }
     if (-not (Test-QtKernelVersionExact -UnameOutput $u.StdOut -ManifestVersion $ManifestVersion)) {
         # W12:不等且策略键存在 → 原因码改 POLICY_BLOCKED(否则排查方向全错)
@@ -341,7 +343,10 @@ function Invoke-QtKernelRollback {
         用户发行版起不来(第 8 步)**不触发**,只给按钮(B-4)。
         回滚基线 = 当前文件去掉所有 `kernel=` 行(W4),**不是旧备份文件**。
     .OUTPUTS
-        {Ok, Reason, OfficialKernel}
+        {Ok, Reason, OfficialKernel, Stage}
+        Stage(B6):'' = 成功;'shutdown' = 回滚那次 shutdown 挂住(分不清原装内核好坏);
+                   'verify' = 已回到原装内核、但原装内核下 kcheck 也起不来(uname 超时 / 非 0 / 不像版本串)
+                   ——只有这一种才能说「与 QTrade 内核无关」。
     #>
     [CmdletBinding()]
     param(
@@ -361,7 +366,7 @@ function Invoke-QtKernelRollback {
     if (-not $sd.Ok) {
         # 🔴 §2.6.6 不变量②:任何路径结束时 kcheck 都被注销 —— 提前 return 也不能漏
         Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = '' }
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'shutdown' }
     }
 
     # 3. kcheck uname -r 应为官方版本串
@@ -372,10 +377,88 @@ function Invoke-QtKernelRollback {
     Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
 
     if (-not $ok) {
-        # .wslconfig 已是无 kernel= 的基线 —— WSL 起不来就与我们无关了(文案给手工步骤)
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = '' }
+        # .wslconfig 已是无 kernel= 的基线 —— 原装内核下也起不来,才与我们无关(文案给手工步骤)
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'verify' }
     }
-    return [pscustomobject]@{ Ok = $true; Reason = ''; OfficialKernel = $u.StdOut.Trim() }
+    return [pscustomobject]@{ Ok = $true; Reason = ''; OfficialKernel = $u.StdOut.Trim(); Stage = '' }
+}
+
+function Resolve-QtKernelSwitchFailure {
+    <#
+    .SYNOPSIS
+        B6:KERNEL_SWITCH 内核自身验证失败、回滚之后,给用户看的原因码与文案。纯函数。
+        🔴「与 QTrade 内核无关」**只**在回滚后原装内核也起不来(Rollback.Stage = 'verify')时才说;
+           回滚成功 = 原装内核好好的 ⇒ 问题就在 QTrade 内核上,文案必须这么说、并保留原因码,
+           否则排查方向会被带反(评审 B6)。
+    .PARAMETER Verify
+        Invoke-QtKernelVerify 的结果({Reason, Message, ...})。
+    .PARAMETER Rollback
+        Invoke-QtKernelRollback 的结果({Ok, Reason, OfficialKernel, Stage})。
+    .OUTPUTS
+        {Reason, ExitName, Message}
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Verify,
+        [Parameter(Mandatory)] $Rollback
+    )
+    $vr = [string]$Verify.Reason
+    $detail = ''
+    if ((Test-QtHasProperty -Object $Verify -Name 'Message') -and $Verify.Message) { $detail = [string]$Verify.Message }
+    $stage = ''
+    if (Test-QtHasProperty -Object $Rollback -Name 'Stage') { $stage = [string]$Rollback.Stage }
+
+    if ([bool]$Rollback.Ok) {
+        $official = [string]$Rollback.OfficialKernel
+        if ($vr -eq 'KERNEL_BOOT_FAILED' -or $vr -eq 'KERNEL_BOOT_TIMEOUT') {
+            $msg = ('QTrade 内核未能启动,已恢复原内核{0}(原因码 {1})' -f $(if ($official) { ' ' + $official } else { '' }), $vr)
+        } else {
+            $msg = ('切换失败({0}),已恢复原内核' -f $vr)
+        }
+        if ($detail) { $msg = $msg + ':' + $detail }
+        return [pscustomobject]@{ Reason = $vr; ExitName = ('E_INSTALL_' + $vr); Message = $msg }
+    }
+
+    if ($stage -eq 'verify') {
+        $msg = ('已去掉 .wslconfig 里的 kernel= 行、回到原装内核,但原装内核下本机 WSL2 仍无法启动,与 QTrade 内核无关' +
+            '(QTrade 内核验证原因码 {0})。请先让 WSL2 本身恢复正常(可运行 wsl --status 查看),必要时重启电脑后再重试安装' -f $vr)
+    } else {
+        $msg = ('回滚失败(QTrade 内核验证原因码 {0}):请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑' -f $vr)
+    }
+    return [pscustomobject]@{ Reason = 'KERNEL_ROLLBACK_FAILED'; ExitName = 'E_INSTALL_KERNEL_ROLLBACK_FAILED'; Message = $msg }
+}
+
+function Save-QtKCheckDmesg {
+    <#
+    .SYNOPSIS
+        9/22 预演 #16 / 评审 C:**注销 kcheck 之前**把 `dmesg | tail -200` 落进日志目录,诊断包再带上。
+        采集晚了(kcheck 已注销)就只剩「发行版不存在」一句,正是预演里的情形。
+        只记不判;任何失败都不抛(诊断材料不能反过来把失败路径打断)。
+    .OUTPUTS
+        写成的文件路径;写不成回 ''。
+    #>
+    [CmdletBinding()][OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string] $Directory,
+        [string] $Phase = '',
+        [string] $Stamp = '',
+        [int] $TimeoutSec = 0
+    )
+    try {
+        if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtKernelTimeouts.record_timeout_s }
+        if (-not $Stamp) { $Stamp = Get-QtTimestamp }
+        $r = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--user', 'root', '--exec', 'sh', '-c', 'dmesg | tail -200') -TimeoutSec $TimeoutSec
+        $head = ('# {0} 的 dmesg(注销前抓取;阶段 {1};exit={2};timed_out={3})' -f $script:QtKCheckDistro, $Phase, $r.ExitCode, $r.TimedOut)
+        $body = [string]$r.StdOut
+        if ($r.TimedOut) { $body = ('(抓取超时 {0} s)' -f $TimeoutSec) }
+        elseif ([string]::IsNullOrWhiteSpace($body)) { $body = '(dmesg 无输出)' + "`n" + [string]$r.StdErr }
+        New-QtDirectory -Path $Directory | Out-Null
+        $path = Join-Path $Directory ('kcheck-dmesg-{0}.txt' -f $Stamp)
+        Write-QtUtf8NoBom -Path $path -Text (Protect-QtLogText -Text ($head + "`n" + $body)) | Out-Null
+        return $path
+    } catch {
+        return ''
+    }
 }
 
 function Test-QtKernelStaged {
@@ -429,5 +512,6 @@ Register-QtStepCheck -Step 'WSLCONFIG_WRITTEN' -Check { param($ctx) Test-QtWslCo
 Export-ModuleMember -Function Get-QtKernelTimeouts, Get-QtBinderCheckCommand, Get-QtKCheckDistroName,
 Get-QtKernelLine, Get-QtDmesgNoiseAllowlist, Test-QtBinderCheckOutput, Test-QtKernelVersionExact,
 Test-QtKernelPreconditions, Write-QtKernelPointer, Set-QtKernelAcl, Import-QtKCheck, Remove-QtKCheck,
-Invoke-QtWslShutdown, Invoke-QtKernelVerify, Invoke-QtKernelRollback, Test-QtUnameLooksLikeVersion, Test-QtKernelStaged,
+Invoke-QtWslShutdown, Invoke-QtKernelVerify, Invoke-QtKernelRollback, Resolve-QtKernelSwitchFailure, Save-QtKCheckDmesg,
+Test-QtUnameLooksLikeVersion, Test-QtKernelStaged,
 Test-QtWslConfigWritten, Test-QtDmesgNoiseOnly

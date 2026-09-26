@@ -357,29 +357,24 @@ try {
                     Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KERNEL_SHUTDOWN_TIMEOUT' -ExitName 'E_INSTALL_KERNEL_SHUTDOWN_TIMEOUT' `
                         -Message 'WSL 服务未响应,请重启电脑,登录后自动继续验证'
                 }
+                # 预演 #16:回滚会注销 kcheck ⇒ **先**把 QTrade 内核下的 dmesg 落进日志目录,诊断包再带上
+                $dmesgFile = Save-QtKCheckDmesg -Directory $paths.Logs -Phase ('KERNEL_SWITCH ' + $ver.Reason)
+                Write-QtLog -Message ('注销 kcheck 前的 dmesg:{0}' -f $(if ($dmesgFile) { $dmesgFile } else { '(未能写入)' }))
                 # 内核自身失败 → 自动回滚(§2.6.5)
                 $rb = Invoke-QtKernelRollback -WslConfigPath $wslConfig -ShutdownConfirmed $true -KCheckDirectory $paths.KCheck
                 Clear-QtRunOnce -State $state | Out-Null
                 $note = if ([string]::IsNullOrWhiteSpace([string]$rb.OfficialKernel)) {
-                    'rollback: 本机 WSL2 无法启动'
+                    'rollback: 原装内核复验未通过'
                 } else {
                     'rolled back to ' + $rb.OfficialKernel
                 }
-                $human = [string]$ver.Message
-                if (-not $human) { $human = ('切换失败({0}),已恢复原内核' -f $ver.Reason) }
-                if (-not $rb.Ok) {
-                    Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note $note | Out-Null
-                    Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason 'KERNEL_ROLLBACK_FAILED') | Out-Null
-                    Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                    $rbMsg = if ($ver.Reason -eq 'KERNEL_BOOT_FAILED' -and $human) { $human } else { '回滚失败:请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑' }
-                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KERNEL_ROLLBACK_FAILED' -ExitName 'E_INSTALL_KERNEL_ROLLBACK_FAILED' `
-                        -Message $rbMsg
-                }
+                # B6:文案看回滚结果定 —— 只有原装内核也起不来才说「与 QTrade 内核无关」
+                $fail = Resolve-QtKernelSwitchFailure -Verify $ver -Rollback $rb
                 Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note $note | Out-Null
-                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $ver.Reason) | Out-Null
+                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $fail.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $ver.Reason -ExitName ('E_INSTALL_' + $ver.Reason) `
-                    -Message $human -Data ([ordered]@{ official_kernel = $rb.OfficialKernel })
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $fail.Reason -ExitName $fail.ExitName `
+                    -Message $fail.Message -Data ([ordered]@{ official_kernel = $rb.OfficialKernel; verify_reason = $ver.Reason; dmesg = $dmesgFile })
             }
 
             Remove-QtKCheck -Directory $paths.KCheck | Out-Null
@@ -413,6 +408,8 @@ try {
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $true -State 'KERNEL_VERIFIED' -Message ('内核 {0} 已生效' -f $ver.Uname)
             }
+            # 同 KERNEL_SWITCH:回滚会注销 kcheck,先抓 dmesg
+            Save-QtKCheckDmesg -Directory $paths.Logs -Phase ('verify-kernel ' + $ver.Reason) | Out-Null
             $rb = Invoke-QtKernelRollback -WslConfigPath $wslConfig -ShutdownConfirmed $true -KCheckDirectory $paths.KCheck
             Clear-QtRunOnce -State $state | Out-Null
             $reason = if ($rb.Ok) { $ver.Reason } else { 'KERNEL_ROLLBACK_FAILED' }
