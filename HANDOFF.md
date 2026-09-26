@@ -90,6 +90,25 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 **新增工作纪律**(已入项目记忆):🔴 **绝不 `cd` 进会被打包收集的目录**(`installer/out/**`、`winagent/dist/**`、`console/release/**`、产物根)——本机 OMC 钩子会在当前目录写 `.omc/state/…`,被通配收集带进安装包(本段出包第一轮因此作废重跑);一律绝对路径,出包后的校验必须含「包内与 stage 零 `.omc`」。实现方的自检脚本不能当结论(第三批自检 `docker exec` 缺 `-i` ⇒ heredoc 检查空跑恒通过,靠独立复测兜住)⇒ 每条检查都要有「确实执行了」的证据。其余沿用:发给忙碌 agent 的消息要等它这轮结束才到;收尾只 `kill <自己 PID>`、禁 `pkill`/`killall`;删目录前 `git ls-files`;复跑用独占副本;只按精确路径 `git add`;打 wheel / 全量前 `rm -rf build/` + 清杂散 `.omc/`。安琳直接带的羿珩行情采集 + 企点只读监控两条线不在安装包关键路径、已收口。
 
+## 3c. 🔴 2026-09-26 15:30 交接快照(cursor 联调提交经评审+两轮返修+两轮独立验收后已推送;**正式包未重出**)
+
+**现状一句话**:开发分支 `claude/lucid-dijkstra-uu5max` 已推到 `47b16cb`(11 个提交:cursor 的联调提交 `c86a670` + 10 个修复/返修);第二轮独立验收 **ACCEPT**、五套检查全绿;**但 9/21 的正式包没有重出**——包里还是旧引擎/旧代码,真装验证要等重出重签。
+
+**这批改了什么(评审编号见 `.omc/handoffs/review-bcda8e6-2026-09-26.md`,原机 git 忽略)**:
+- 引擎(installer/engine):首个步骤前引擎脚本落盘(`dontcopy`+`ExtractTemporaryFile` 到 `{tmp}\qte`)、向导页不再展开 `{app}`、`RunStep` 不阻塞界面且可取消、告知页 `wsl --list` 3 s 超时 + `WSL_UTF8`、内核失败文案看回滚结果、dmesg 在注销 kcheck 前抓、`.cmd` 全 ASCII、`AppName=QTrade`、`JsonStr` 反转义;**新增 ISCC 编译门 + `[Code]` 保留字守卫**(`installer/tests/test_engine_iss_compile.py`)。
+- Agent(src/qtrade_agent):画面流执行体 = **scrcpy-server 4.1**(`screen_scrcpy.py`:先连视频/控制两条 socket 再读头、4 字节 codec id + 12 字节 session 包、SESSION/CONFIG/KEY = bit63/62/61、touch/scroll/key/text 直写控制 socket 不经 shell、scroll ÷16、断线/换档/#101 重建并发 `{type:'restart'}`);删 cursor 的企点登录假升级;`rotate` 控制帧删;#35 REST 兜底 `shlex.quote` + 规格外字段 `duration_ms`;contacts 端点异步化。
+- WinAgent:`serve(allow_sid=)` 三处签名同步(4 个测试文件挂死的根因)、磁盘检查走 `SysBackend.path_exists`、`host_snapshot` 首轮不回 0、Windows `SO_EXCLUSIVEADDRUSE` + WSL 地址缺失不阻断启动并周期补绑、`UserAgentLink` 可停。
+- 控制台:恢复硬解→软解→静态预览三档、最小化暂停、`setPointerCapture` + down/move/up 原样透传(长按 = 不发)、SPS 变化重配、解码背压、vue-tsc 归零、浏览器调试 README(`QT_DEV_TOKEN=… npx vite`)。
+- vm-lab 脚本:`$ProgressPreference`、`$PSScriptRoot` 兜底、文案/编号。
+
+**验收数字(第二轮,验收方副本实跑)**:Agent+installer pytest 2526 / winagent 515 / console vitest 289 + tsc 0 / Pester 655(4 跳 = SfxStub 缺二进制)/ ISCC `Successful compile`。
+
+**待安琳裁决(合成一批 R6-69~,文档方回写 + `check-truth-tables.py`)**:①N1:scrcpy 4.1 视频线程一结束整个 server 退出,A.2「暂停断视频留控制」做不到 → 改语义或接受断连自愈;②01 §2.7.4 丢帧阈值 3 vs 代码 6;③#101 真重建推翻 R6-58(ai);④#34 注入级别 R vs W;⑤安装取消退出码 10 撞「停车等用户」→ 新码;⑥补登:01 元素表删 rotate、#35 `duration_ms`、配置键 `scrcpy_server_path/_version`、`GET /accounts/{id}/contacts`;⑦可接受:微信盘不存在只 warn、删假升级后手动登完仍须走 #12。
+
+**真机才能验(全卡在 `qtrade-redroid` 未拉起,安琳自己 `up.sh` 后先 `scrcpy -s 127.0.0.1:5555 --max-size 720` 验编码器)**:两条 socket 实际顺序与 session 包、N1 实证、滚轮距离、触控坐标、中文输入(scrcpy text 打不出中文,走 ADBKeyboard)、静止画面 10 s 是否误触发 H07 重建、安装器运行期(取消/重绘/内核失败文案,内核切换只能物理机)、WinAgent 独占绑定与补绑。**本机 Hyper-V 虚拟机里 WSL2 起不来**(原装内核也超时,见 `.omc/handoffs/vm-rehearsal-2026-09-22.md`),只能验 KERNEL_SWITCH 之前的步骤。
+
+**编排纪律新增**:worktree 隔离派工的三个坑(起点是旧提交要 reset、写不了主树 `.omc`、跑不了 powershell/ISCC)见记忆 `agent-worktree-gotchas`;合并用 cherry-pick。`qb_tap.user.js`(与本项目无关)已从提交剔除并 gitignore。
+
 ## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。
