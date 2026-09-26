@@ -383,7 +383,7 @@ end;
 function JsonStr(const Json, Key: String): String;
 var
   P, Q, I: Integer;
-  Pat, Raw, Out, HexStr: String;
+  Pat, Raw, Decoded, HexStr: String;
   C: Char;
 begin
   // JSON unescape \\ \" \n \r \t \/ \uXXXX —— 路径里的反斜杠不能原样显示成 \\;
@@ -401,21 +401,21 @@ begin
   end;
   if Q > Length(Json) + 1 then Q := Length(Json) + 1;
   Raw := Copy(Json, P, Q - P);
-  Out := '';
+  Decoded := '';
   I := 1;
   while I <= Length(Raw) do
   begin
     if (Raw[I] = '\') and (I < Length(Raw)) then
     begin
       C := Raw[I + 1];
-      if C = 'n' then Out := Out + #10
-      else if C = 'r' then Out := Out + #13
-      else if C = 't' then Out := Out + #9
-      else if C = '\' then Out := Out + '\'
-      else if C = '"' then Out := Out + '"'
-      else if C = '/' then Out := Out + '/'
-      else if C = 'b' then Out := Out + #8
-      else if C = 'f' then Out := Out + #12
+      if C = 'n' then Decoded := Decoded + #10
+      else if C = 'r' then Decoded := Decoded + #13
+      else if C = 't' then Decoded := Decoded + #9
+      else if C = '\' then Decoded := Decoded + '\'
+      else if C = '"' then Decoded := Decoded + '"'
+      else if C = '/' then Decoded := Decoded + '/'
+      else if C = 'b' then Decoded := Decoded + #8
+      else if C = 'f' then Decoded := Decoded + #12
       else if (C = 'u') and (I + 5 <= Length(Raw)) then
       begin
         // \uXXXX:PowerShell 5.1 ConvertTo-Json 只把 < > ' & 与控制字符写成 \u00XX(中文原样输出),
@@ -424,22 +424,22 @@ begin
         HexStr := Copy(Raw, I + 2, 4);
         if (StrToIntDef('$' + HexStr, -1) >= 0) and (StrToIntDef('$' + HexStr, 256) <= 255) then
         begin
-          Out := Out + Chr(StrToIntDef('$' + HexStr, 63));
+          Decoded := Decoded + Chr(StrToIntDef('$' + HexStr, 63));
           I := I + 6;
           Continue;
         end;
-        Out := Out + '\' + C;
+        Decoded := Decoded + '\' + C;
       end
-      else Out := Out + C;
+      else Decoded := Decoded + C;
       I := I + 2;
     end
     else
     begin
-      Out := Out + Raw[I];
+      Decoded := Decoded + Raw[I];
       I := I + 1;
     end;
   end;
-  Result := Out;
+  Result := Decoded;
 end;
 
 function JsonInt(const Json, Key: String; const Default: Integer): Integer;

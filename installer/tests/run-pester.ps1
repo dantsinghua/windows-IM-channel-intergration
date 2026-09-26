@@ -55,6 +55,14 @@ Write-Host ('Pester {0}' -f $ver)
 
 $target = $Path
 if (-not $target) { $target = $PSScriptRoot }
+elseif (-not [IO.Path]::IsPathRooted($target)) {
+    # 相对路径:先按当前目录找,找不到再按本脚本目录找(用法里的 -Path .\QTrade.Wsl.Tests.ps1 是相对 tests 目录写的)
+    $cands = @((Join-Path (Get-Location).Path $target), (Join-Path $PSScriptRoot $target))
+    $hit = @($cands | Where-Object { Test-Path -LiteralPath $_ })
+    if ($hit.Count -eq 0) { throw ('-Path 找不到:{0}(已试 {1})' -f $Path, ($cands -join ' ; ')) }
+    $target = (Resolve-Path -LiteralPath $hit[0]).Path
+}
+elseif (-not (Test-Path -LiteralPath $target)) { throw ('-Path 找不到:{0}' -f $Path) }
 
 $cfg = New-PesterConfiguration
 $cfg.Run.Path = $target
@@ -64,6 +72,8 @@ $cfg.Output.Verbosity = $(if ($Detailed) { 'Detailed' } else { 'Normal' })
 $cfg.Should.ErrorAction = 'Stop'
 
 $result = Invoke-Pester -Configuration $cfg
+# Pester 5 没找到任何测试文件时只发警告并返回 $null;StrictMode 下直接取 .PassedCount 就报「属性不存在」
+if ($null -eq $result) { throw ('Pester 没有返回结果(没找到测试文件?):{0}' -f $target) }
 Write-Host ''
 Write-Host ('通过 {0} / 失败 {1} / 跳过 {2} / 用时 {3:N1}s' -f
     $result.PassedCount, $result.FailedCount, $result.SkippedCount, $result.Duration.TotalSeconds)
