@@ -1,0 +1,5 @@
+# Deploy on the machine receiving public traffic, with its real DNS name.
+# This is a template, not a provisioned domain or verified public ingress.
+{$QTRADE_API_DOMAIN} {
+    reverse_proxy 127.0.0.1:17622
+}
