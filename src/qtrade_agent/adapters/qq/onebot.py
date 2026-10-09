@@ -75,7 +75,10 @@ class WebsocketsTransport:
         except ImportError as e:                                # pragma: no cover - 开发容器不装
             raise OneBotClosed(f"未安装 websockets,无法连接 {url}: {e}") from e
         headers = {"Authorization": f"Bearer {access_token}"} if access_token else None
-        self._ws = await websockets.connect(url, additional_headers=headers)
+        try:
+            self._ws = await websockets.connect(url, additional_headers=headers, open_timeout=5, proxy=None)
+        except Exception:
+            raise OneBotClosed("OneBot 连接未就绪") from None
 
     async def send(self, payload: str) -> None:
         if self._ws is None:

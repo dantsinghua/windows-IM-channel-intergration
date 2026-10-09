@@ -9,14 +9,16 @@
  * 这里断的是**前端自己这一侧**:白名单里有没有野键、页面控件是不是真绑在白名单的键上。
  * 「白名单 ↔ 真实出参键集」那一半在 `mock-shape.spec.ts`(那里有跑着的 mock,按 GET 的真出参对账)。
  */
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
+import { message } from 'ant-design-vue'
+import SetPage from '@/pages/set/SetPage.vue'
+import { settingsApi, systemApi } from '@/api/client'
+import { useUiStore } from '@/stores/ui'
 import {
   API_KEYS, ASR_KEYS, ASR_SECRET_KEY, OCR_KEYS, POOL_KEYS, RETENTION_KEYS, pickKeys,
 } from '../../src/api/settingsKeys'
-
-const SET_PAGE_SRC = readFileSync(resolve(__dirname, '../../src/pages/set/SetPage.vue'), 'utf8')
 
 describe('各组白名单本身不含野键', () => {
   it('retention:是 `messages_days`/`raw_days`,不是 `text_days`/`raw_enabled`', () => {
@@ -60,41 +62,91 @@ function sorted(v: Iterable<string>): string[] {
   return [...v].sort()
 }
 
-describe('P-SET 的控件**真的**绑在白名单的键上(白名单对了、控件绑错一样是 P-2)', () => {
-  const retentionBlock = (() => {
-    const i = SET_PAGE_SRC.indexOf('<!-- 保留期 -->')
-    expect(i, 'SetPage.vue 里找不到保留期卡片').toBeGreaterThan(0)
-    return SET_PAGE_SRC.slice(i, SET_PAGE_SRC.indexOf('<!-- 保险库(WinAgent) -->', i))
-  })()
+/**
+ * R6-81 / 安琳 2026-10-08 最新指令：复杂保留期、配额和保险库控件退役。
+ * 上面的接口白名单守护原样保留；这里用日常偏好行为替代已移除控件的存在性断言。
+ */
+describe('P-SET 仅保留本地偏好与只读告知', () => {
+  const wrappers: VueWrapper[] = []
+  const configPatch = vi.fn()
+  const autoLaunch = vi.fn()
 
-  it('保留期四个控件读写的都是 07 `[retention]` 登记的键', () => {
-    const used = new Set([...retentionBlock.matchAll(/retention\.([a-z_0-9]+)/g)].map((m) => m[1]))
-    expect(used.size, '没扫到任何 retention.<key> 绑定').toBeGreaterThan(0)
-    for (const k of used) {
-      expect(RETENTION_KEYS as readonly string[], `控件绑了 07 没有的键 retention.${k}`).toContain(k)
-    }
-    // 01 §4 :1337 登记的四个控件(files|text|raw|audit)各自的落点
-    for (const k of ['files_days', 'messages_days', 'raw_days', 'audit_days']) {
-      expect(used, `保留期卡片少了 ${k} 的绑定`).toContain(k)
-    }
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    configPatch.mockReset().mockResolvedValue(undefined)
+    autoLaunch.mockReset().mockResolvedValue(false)
+    vi.stubGlobal('qt', { config: { patch: configPatch }, app: { setAutoLaunch: autoLaunch } })
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unexpected settings network call')))
+    vi.spyOn(systemApi, 'notice').mockResolvedValue({ notice_version: 'test-v1', text: '测试使用告知', acked_version: 'test-v1' })
+    vi.spyOn(systemApi, 'noticeAck').mockResolvedValue({ ok: true })
+    vi.spyOn(settingsApi, 'put').mockRejectedValue(new Error('Preferences must not replace Agent configuration'))
+    vi.spyOn(message, 'success').mockReturnValue((() => undefined) as never)
+    vi.spyOn(message, 'error').mockReturnValue((() => undefined) as never)
   })
 
-  it('E-18 的 30 天上限判在 `messages_days` 上(判错键 = 上限形同虚设)', () => {
-    expect(/const days = Number\(retention\.value\.messages_days \?\? 30\)/.test(SET_PAGE_SRC),
-      'saveRetention 的 30 天上限没有判 messages_days').toBe(true)
+  afterEach(() => {
+    for (const wrapper of wrappers.splice(0)) wrapper.unmount()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
-  it('资源池卡片按 #88 的 `{pools, quota_mb}` 两键取数,不再有 `qidian_mb` 这类顶层野键', () => {
-    for (const wild of ['resGroup.qidian_mb', 'resGroup.qq_mb', 'resGroup.wechat_mb', 'resGroup.base_mb']) {
-      expect(SET_PAGE_SRC, `资源池仍在读 ${wild}(#88 的 resources 组没有这个键)`).not.toContain(wild)
-    }
-    expect(SET_PAGE_SRC).toContain("setQuota('qidian'")
-    expect(SET_PAGE_SRC, 'WSL 基础占用 = pools.wsl.reserved_mb').toContain("setPoolReserved('wsl'")
+  function renderPreferences() {
+    const wrapper = shallowMount(SetPage, {
+      global: { stubs: { 'a-switch': true, 'a-button': true, 'a-modal': true }, renderStubDefaultSlot: true },
+    })
+    wrappers.push(wrapper)
+    return wrapper
+  }
+
+  it('只展示三项日常偏好，不再提供保留期、配额或保险库表单', () => {
+    const page = renderPreferences()
+    expect(page.findAll('a-switch-stub').map((item) => item.attributes('aria-label'))).toEqual([
+      '桌面提醒', '关闭窗口后继续运行', '登录后自动启动',
+    ])
+    expect(page.findAll('input,textarea,a-input-stub,a-input-number-stub')).toHaveLength(0)
+    expect(page.text()).not.toMatch(/保留期|保险库|资源配额/)
   })
 
-  it('合规块走 #86 `GET /system/notice`,不再调已废弃的 `/settings/compliance`(D-E)', () => {
-    expect(SET_PAGE_SRC, "SetPage 仍在 loadGroup('compliance') ⇒ 每次打开都白打一条 404")
-      .not.toContain("loadGroup('compliance')")
-    expect(SET_PAGE_SRC).toContain('systemApi.notice()')
+  it.each([
+    ['桌面提醒', { notify: { enabled: false } }],
+    ['关闭窗口后继续运行', { app: { minimize_to_tray_on_close: false } }],
+  ])('修改%s只补丁写本地键，不替换 Agent 设置组', async (label, expected) => {
+    const page = renderPreferences()
+    ;(page.getComponent(`[aria-label="${label}"]`) as VueWrapper).vm.$emit('change', false)
+    await flushPromises()
+    expect(configPatch).toHaveBeenCalledTimes(1)
+    expect(configPatch).toHaveBeenCalledWith(expected)
+    expect(settingsApi.put).not.toHaveBeenCalled()
+  })
+
+  it('自动启动以主进程实际应用结果回填，不能把请求值冒充结果', async () => {
+    const page = renderPreferences()
+    ;(page.getComponent('[aria-label="登录后自动启动"]') as VueWrapper).vm.$emit('change', true)
+    await flushPromises()
+    expect(autoLaunch).toHaveBeenCalledWith(true)
+    expect(configPatch).toHaveBeenCalledWith({ app: { auto_launch: false } })
+    expect(useUiStore().autoLaunch).toBe(false)
+    expect(settingsApi.put).not.toHaveBeenCalled()
+  })
+
+  it('告知仍读取 #86，查看不得自动确认告知或写配置', async () => {
+    const page = renderPreferences()
+    await flushPromises()
+    expect(systemApi.notice).toHaveBeenCalledTimes(1)
+    expect(page.text()).toContain('测试使用告知')
+    expect(systemApi.noticeAck).not.toHaveBeenCalled()
+    expect(settingsApi.put).not.toHaveBeenCalled()
+    expect(configPatch).not.toHaveBeenCalled()
+  })
+
+  it('保存失败保留原偏好并反馈失败，不假报保存成功', async () => {
+    configPatch.mockRejectedValue(new Error('fixture local save failed'))
+    const page = renderPreferences()
+    ;(page.getComponent('[aria-label="桌面提醒"]') as VueWrapper).vm.$emit('change', false)
+    await flushPromises()
+    expect(useUiStore().notifyEnabled).toBe(true)
+    expect(message.error).toHaveBeenCalledWith('fixture local save failed')
+    expect(message.success).not.toHaveBeenCalled()
+    expect(settingsApi.put).not.toHaveBeenCalled()
   })
 })

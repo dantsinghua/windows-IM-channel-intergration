@@ -11,6 +11,7 @@ export const useResourcesStore = defineStore('resources', () => {
   const metrics = ref<MetricsSnapshot | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const metricsError = ref<string | null>(null)
   const lastAt = ref<string | null>(null)
 
   const slots = computed(() => pool.value?.pools.windows.wechat_slots ?? null)
@@ -35,12 +36,12 @@ export const useResourcesStore = defineStore('resources', () => {
 
   async function loadMetrics(): Promise<void> {
     loading.value = true
-    error.value = null
     try {
       metrics.value = await resourcesApi.metrics()
+      metricsError.value = null
       lastAt.value = new Date().toISOString()
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      metricsError.value = e instanceof Error ? e.message : String(e)
     } finally {
       loading.value = false
     }
@@ -51,7 +52,10 @@ export const useResourcesStore = defineStore('resources', () => {
     const p = ev.payload
     if (p && typeof p === 'object' && 'code' in p && p.code) return
     if (p?.pools) pool.value = p as unknown as ResourcePool
-    if (p?.metrics_snapshot) metrics.value = p.metrics_snapshot as MetricsSnapshot
+    if (p?.metrics_snapshot) {
+      metrics.value = p.metrics_snapshot as MetricsSnapshot
+      metricsError.value = null
+    }
     lastAt.value = new Date().toISOString()
   }
 
@@ -60,7 +64,7 @@ export const useResourcesStore = defineStore('resources', () => {
   }
 
   return {
-    pool, metrics, loading, error, lastAt,
+    pool, metrics, loading, error, metricsError, lastAt,
     slots, hasPending, pendingLoginSessionId, canCancelPending, canAdd,
     load, loadMetrics, applyResource, bindEvents,
   }

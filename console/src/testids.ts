@@ -66,6 +66,7 @@ export const dash = {
   alertItemAction: (n: number | string, act: string) => `qt-dash-alert-item-${n}-action-${act}`,
   resMem: 'qt-dash-res-mem',
   resDisk: 'qt-dash-res-disk',
+  cleanup: 'qt-dash-cleanup',
   mailHealth: 'qt-dash-mail-health',
   sys: (what: string) => `qt-dash-sys-${what}`,
   emptyAdd: (channel: string) => `qt-dash-empty-add-${channel}`,
@@ -185,7 +186,7 @@ export const acctNew = {
   qrRefresh: 'qt-acct-new-qr-refresh',
   qrOpenWebui: 'qt-acct-new-qr-open-webui',
   wxModuleStatus: 'qt-acct-new-wx-module-status',
-  wxGotoSettings: 'qt-acct-new-wx-goto-settings',
+  wxEnableModule: 'qt-acct-new-wx-enable-module',
   wxUserAgentHint: 'qt-acct-new-wx-user-agent-hint',
   wxHolderHint: 'qt-acct-new-wx-holder-hint',
   wxSwitchConfirm: 'qt-acct-new-wx-switch-confirm',
@@ -602,7 +603,7 @@ export const set = {
 /* ─────────────── P-LOG ─────────────── */
 
 export const log = {
-  tab: (k: 'command' | 'api' | 'system') => `qt-log-tab-${k}`,
+  tab: (k: 'command' | 'api' | 'system' | 'alerts') => `qt-log-tab-${k}`,
   filter: (k: 'account' | 'op' | 'code' | 'actor' | 'since' | 'until') => `qt-log-filter-${k}`,
   search: 'qt-log-search',
   loadMore: 'qt-log-load-more',

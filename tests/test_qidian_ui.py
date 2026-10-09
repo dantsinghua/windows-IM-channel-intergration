@@ -57,6 +57,22 @@ class UiFakeAdb:
             return self.databases_ls
         return ""
 
+    async def shell_result(self, serial: str, cmd: str, *, timeout_s: float):
+        from qtrade_agent.runtime.backends import AdbShellResult
+
+        if "stat " in cmd:
+            self.cmds.append(cmd)
+            metadata = []
+            for line in self.databases_ls.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                timestamps = [p for p in parts[:-1] if p.isdigit() and len(p) >= 9]
+                if timestamps:
+                    metadata.append(f"{timestamps[-1]} /data/data/{PKG}/databases/{parts[-1]}")
+            return AdbShellResult(0, "\n".join(metadata))
+        return AdbShellResult(0, await self.shell(serial, cmd))
+
     # 协议其余方法:本层用不到,给全以免误用真后端
     async def connect(self, serial: str) -> bool: return True
     async def disconnect(self, serial: str) -> None: return None
@@ -209,7 +225,7 @@ async def test_免登命中_直接running且不填账密(rig):
 
 async def test_密码登录_填账密点登录后_running(rig):
     ui, adb, _ = rig
-    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, MAIN_TREE]
+    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, MAIN_TREE]
     out = await ui.login(acct(), "13800000000", "pw123")
     assert out.result == "running"
     assert adb.typed == ["13800000000", "pw123"]
@@ -219,21 +235,21 @@ async def test_密码登录_填账密点登录后_running(rig):
 @pytest.mark.parametrize("marker,code", [("短信验证", "WAIT_SMS"), ("拖动滑块", "WAIT_CAPTCHA"), ("设备锁", "WAIT_DEVICE_CONFIRM")])
 async def test_验证页转对应WAIT码_交人处理不硬闯(rig, marker, code):
     ui, adb, _ = rig
-    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text=marker, bounds="[0,300][720,400]"))]
+    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text=marker, bounds="[0,300][720,400]"))]
     out = await ui.login(acct(), "13800000000", "pw")
     assert out.result == code and out.reason.startswith("marker:")
 
 
 async def test_错误toast转bad_credential(rig):
     ui, adb, _ = rig
-    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text="账号或密码错误", bounds="[0,300][720,400]"))]
+    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text="账号或密码错误", bounds="[0,300][720,400]"))]
     out = await ui.login(acct(), "13800000000", "bad")
     assert out.result == "bad_credential"
 
 
 async def test_登录超时回None_不冒充成功(rig):
     ui, adb, clk = rig
-    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text="正在登录", bounds="[0,300][720,400]"))]
+    adb.dumps = [LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, tree(node(text="正在登录", bounds="[0,300][720,400]"))]
     t0 = clk.ms
     out = await ui.login(acct(), "13800000000", "pw")
     assert out.result is None and out.reason == "login_timeout"
@@ -244,7 +260,7 @@ async def test_被踢后先点重新登录再填(rig):
     ui, adb, _ = rig
     kicked = tree(node(text="重新登录", bounds="[200,700][520,760]"))
     adb.dumps = [tree(node(text="您的账号在别处登录", bounds="[0,300][720,400]")),
-                 tree(node(text="您的账号在别处登录", bounds="[0,300][720,400]")), kicked, LOGIN_TREE, MAIN_TREE]
+                 tree(node(text="您的账号在别处登录", bounds="[0,300][720,400]")), kicked, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, LOGIN_TREE, MAIN_TREE]
     out = await ui.login(acct(), "13800000000", "pw")
     assert out.result == "running"
     assert "input tap 360 730" in adb.taps                        # 点过「重新登录」

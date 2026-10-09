@@ -22,6 +22,7 @@ import asyncio
 import base64
 import logging
 import re
+import shlex
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -248,6 +249,66 @@ def serial_of(account_id: str) -> str:
     return f"127.0.0.1:{ADB_PORT_BASE + int(m.group(1))}"
 
 
+def _postlogin_activity_visible(raw: str, component: str, p: Profile) -> bool:
+    """真机结构判据：前台 Activity 内，同一可见 QQTabHost 下的会话列表、标题和 tabs。
+
+    只解析类名、资源 ID、可见 flags/层级，不从“消息”等文本推断登录，也不跨 Activity 拼节点。
+    """
+    headers = list(re.finditer(r"(?m)^[ \t]*ACTIVITY[ \t]+(\S+)[^\n]*$", raw))
+    required = {
+        ("android.widget.RelativeLayout", "app:id/conversation_activity_title"): "title",
+        ("com.tencent.widget.OlympicListView", "app:id/recent_chat_list"): "list",
+        ("com.tencent.mobileqq.widget.QQTabWidget", "android:id/tabs"): "tabs",
+    }
+    blocked_ids = {str(p.anchor(key).get("id", "")).replace(p.package + ":id/", "app:id/")
+                   for key in ("agree_button", "login_account", "login_password", "relogin_button")}
+    blocked_ids.discard("")
+    for index, header in enumerate(headers):
+        if header[1] != component:
+            continue
+        section = raw[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(raw)]
+        if re.search(r"\bmResumed=false\b|\bmStopped=true\b|\bmFinished=true\b", section):
+            continue
+        hierarchy_indent: Optional[int] = None
+        ancestors: list[tuple[int, bool, Optional[set[str]]]] = []
+        hosts: list[set[str]] = []
+        login_visible = False
+        for line in section.splitlines():
+            indent = len(line) - len(line.lstrip())
+            if line.strip() == "View Hierarchy:":
+                hierarchy_indent = indent
+                ancestors = []
+                continue
+            if hierarchy_indent is None:
+                continue
+            if line.strip() and indent <= hierarchy_indent:
+                hierarchy_indent = None
+                ancestors = []
+                continue
+            node = re.match(r"\s*([A-Za-z0-9_.$]+)\{\S+\s+([VIG][A-Za-z.]{8})\s", line)
+            if node is None:
+                continue
+            while ancestors and ancestors[-1][0] >= indent:
+                ancestors.pop()
+            visible = node[2][0] == "V" and (not ancestors or ancestors[-1][1])
+            host = ancestors[-1][2] if ancestors and visible else None
+            ids = set(re.findall(r"\b(?:app|android|" + re.escape(p.package) + r"):id/[A-Za-z0-9_]+", line))
+            ids = {rid.replace(p.package + ":id/", "app:id/") for rid in ids}
+            if visible:
+                login_visible |= bool(ids & blocked_ids)
+                if node[1] == "com.tencent.mobileqq.widget.QQTabHost" and "android:id/tabhost" in ids:
+                    host = set()
+                    hosts.append(host)
+                if host is not None:
+                    for (cls, rid), key in required.items():
+                        if node[1] == cls and rid in ids:
+                            host.add(key)
+            ancestors.append((indent, visible, host))
+        if not login_visible and any(host == {"title", "list", "tabs"} for host in hosts):
+            return True
+    return False
+
+
 class QidianUi:
     """企点控件层。构造只建对象,**不连任何设备**;每个方法自己带超时与可观察的失败原因。"""
 
@@ -264,6 +325,7 @@ class QidianUi:
         #: 落到 ``default.yaml`` 时通知装配方(02 §2.2.3 要求账号 ``degraded(UI_UNEXPECTED)``;
         #: 状态迁移是 ``AccountService.transition`` 的职责,本层只报事实、不自己迁移)。
         self._on_default_profile = on_default_profile
+        self._prepared_login: dict[str, bool] = {}
 
     # ------------------------------------------------------------------ profile
     def profile_for(self, acct: Account) -> Profile:
@@ -358,6 +420,55 @@ class QidianUi:
         await self._sleep(p.timeout("ui_settle_s", 0.5))
 
     # ------------------------------------------------------------------ 登录(05 §2.1.1 ⑥~⑪)
+    async def prepare_login(self, acct: Account) -> bool:
+        """无凭据执行 ⑥~⑧；协议处理和重启后的界面读回都通过才缓存就绪。"""
+        self._prepared_login.pop(acct.id, None)
+        p = self.profile_for(acct)
+        timeout_s = max(0.1, p.timeout("login_s", 90.0))
+        deadline_ms = self._clock() + int(timeout_s * 1000)
+        try:
+            async with asyncio.timeout(timeout_s):
+                if not await self.ensure_ime(acct, p):
+                    return False
+                await self._launch(acct, p)
+                if not await self._wait_login_ready(acct, p, deadline_ms=deadline_ms, allow_consent=True):
+                    return False
+                # 首启 MSF 必须在协议已消失之后重新初始化(05 §2.1.1 ⑧)。
+                await self._shell(acct, f"am force-stop {p.package}")
+                await self._launch(acct, p)
+                if not await self._wait_login_ready(acct, p, deadline_ms=deadline_ms, allow_consent=False):
+                    return False
+        except asyncio.TimeoutError:
+            return False
+        self._prepared_login[acct.id] = True
+        return True
+
+    async def _wait_login_ready(self, acct: Account, p: Profile, *, deadline_ms: int, allow_consent: bool) -> bool:
+        """只从控件树确认协议消失及真实表单/主界面；最多点击一次协议和重新登录入口。"""
+        consent_clicked = relogin_clicked = False
+        while self._clock() < deadline_ms:
+            try:
+                nodes = await self._dump(acct, p)
+            except ValueError:
+                nodes = []
+            if find_node(nodes, p.anchor("agree_button")) is not None:
+                if not allow_consent:
+                    return False                         # 重启后仍有协议，不能继续点或假报就绪。
+                if not consent_clicked:
+                    if not await self._tap_anchor(acct, p, "agree_button", nodes):
+                        return False
+                    consent_clicked = True
+            elif (find_node(nodes, p.anchor("main_marker")) is not None
+                  or all(find_node(nodes, p.anchor(key)) is not None
+                         for key in ("login_account", "login_password", "login_submit"))):
+                return True
+            elif not relogin_clicked and find_node(nodes, p.anchor("relogin_button")) is not None:
+                if not await self._tap_anchor(acct, p, "relogin_button", nodes):
+                    return False
+                relogin_clicked = True
+            await self._sleep(max(0.1, p.timeout("poll_interval_s", 1.0)))
+        return False
+
     async def login(self, acct: Account, login_account: Optional[str], secret: Optional[str]) -> LoginOutcome:
         """⑥ 设 IME → ⑦ 首拉起 + 同意协议 → ⑧ force-stop + 再拉起 → ⑩ 填账密点登录 → ⑪ 轮询判定。
 
@@ -368,11 +479,14 @@ class QidianUi:
             p = self.profile_for(acct)
         except ProfileError as e:
             return LoginOutcome(None, reason=f"profile_unavailable:{e}")
-        ime_ok = await self.ensure_ime(acct, p)                                   # ⑥
-        await self._launch(acct, p)                                               # ⑦
-        await self._tap_anchor(acct, p, "agree_button")                           # ⑦ 协议弹窗:没有就是没有,不算失败
-        await self._shell(acct, f"am force-stop {p.package}")                     # ⑧ 首启 MSF 初始化不全,必须重启一次
-        await self._launch(acct, p)
+        if acct.id not in self._prepared_login:
+            if not await self.prepare_login(acct):
+                return LoginOutcome(None, reason="login_form_not_found")
+            ime_ok = self._prepared_login.pop(acct.id)
+        else:
+            self._prepared_login.pop(acct.id)
+            # WAIT_PASSWORD 可能停留很久；填凭据前重新读回 IME，不重复拉起/强停。
+            ime_ok = await self.ensure_ime(acct, p)
         verdict = await self._login_verdict(acct, p, once=True)
         if verdict is not None and verdict.result == "running":
             return verdict                                                        # 免登命中
@@ -402,6 +516,8 @@ class QidianUi:
                 nodes = await self._dump(acct, p)
             except ValueError:
                 return False
+        if find_node(nodes, p.anchor("agree_button")) is not None:
+            return False                                   # 等密码期间协议重新覆盖表单，也不能向底层控件填密。
         if find_node(nodes, p.anchor("login_account")) is None or find_node(nodes, p.anchor("login_password")) is None:
             return False
         if login_account:
@@ -442,30 +558,85 @@ class QidianUi:
         (取错一次的代价是 06 §2.9.5 ③ 把该账号全部水位删掉重建)。
         """
         pkg = (p or self.profile_for(acct)).package
-        out = await self._shell(acct, f"ls -l --time-style=+%s /data/data/{pkg}/databases/ 2>/dev/null")
+        directory = f"/data/data/{pkg}/databases"
+        # Android Toybox 没有 GNU ls --time-style；只取文件名及 Unix mtime，不读库内容。
+        cmd = f"find {shlex.quote(directory)} -maxdepth 1 -type f -name '*.db*' -exec stat -c '%Y %n' {{}} +"
+        try:
+            out = await self._read_shell(acct, cmd)
+        except Exception:
+            return None
         db: dict[str, int] = {}
         wal: dict[str, int] = {}
         for line in out.replace("\r", "").splitlines():
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            name, stamp = parts[-1], 0
-            for tok in parts[:-1]:
-                if tok.isdigit() and len(tok) >= 9:          # --time-style=+%s 的那一列(秒级 epoch)
-                    stamp = int(tok)
-            m = re.fullmatch(r"([0-9]+)\.db(-wal)?", name)
+            m = re.fullmatch(rf"([0-9]+) {re.escape(directory)}/([0-9]+)\.db(-wal)?", line)
             if not m:
                 continue
-            (wal if m.group(2) else db)[m.group(1)] = stamp
-        pool = wal or db
+            (wal if m.group(3) else db)[m.group(2)] = int(m.group(1))
+        pool = {uid: stamp for uid, stamp in wal.items() if uid in db} or db
         if not pool:
             return None
         best = max(pool.values())
         winners = [uin for uin, ts in pool.items() if ts == best]
         if len(winners) != 1:
-            log.warning("self_uid 并列(account=%s 候选=%s),按 R6-40 留空、不猜", acct.id, sorted(winners))
+            log.warning("self_uid 并列(account=%s 候选数=%s),按 R6-40 留空、不猜", acct.id, len(winners))
             return None
         return winners[0]
+
+    async def _read_shell(self, acct: Account, cmd: str) -> str:
+        """只读观察使用可取消 CLI，并检查 Android 命令退出码。"""
+        result = await asyncio.wait_for(self._adb.shell_result(serial_of(acct.id), cmd, timeout_s=5), 5)
+        if result.returncode != 0:
+            raise RuntimeError("Android 只读命令未完成")
+        return result.output
+
+    async def probe_login(self, acct: Account) -> LoginOutcome:
+        """只读观察手工登录；不启动应用、切 IME、填框或调用密码登录。"""
+        p, selection = pick_profile(self.profiles, acct.app_version)
+        if p is None:
+            return LoginOutcome(None, reason="profile_unavailable", evidence={"stage": "profile"})
+        stage = "foreground"
+        try:
+            async with asyncio.timeout(15):
+                focus = _FOCUS_RE.search(await self._read_shell(acct, "dumpsys window"))
+                if not focus or focus[1] != p.package or not re.search(p.activities.get("main", r"(?!)"), focus[2]):
+                    return LoginOutcome(None, reason="foreground_not_main")
+                stage = "ui"
+                try:
+                    nodes = parse_ui_xml(await self._read_shell(acct, "uiautomator dump /dev/tty 2>/dev/null"))
+                except Exception:
+                    nodes = None
+                if nodes is None:
+                    stage = "activity_structure"
+                    top = await self._read_shell(acct, "dumpsys activity top")
+                    if not _postlogin_activity_visible(top, f"{focus[1]}/{focus[2]}", p):
+                        return LoginOutcome(None, reason="main_ui_unverified")
+                else:
+                    marker_id = p.anchor("main_marker").get("id")
+                    # 已取得 XML 时，以它为准，绝不拿 fallback 覆盖明确的登录/验证页。
+                    if not marker_id or not marker_id.startswith(p.package + ":id/") or not any(n.rid == marker_id for n in nodes):
+                        return LoginOutcome(None, reason="main_ui_unverified")
+                    if any(find_node(nodes, p.anchor(key)) is not None
+                           for key in ("agree_button", "login_account", "login_password", "relogin_button")):
+                        return LoginOutcome(None, reason="login_ui_visible")
+                    blob = "\n".join(n.text + "\u0000" + n.desc for n in nodes)
+                    if any(word in blob for key in ("sms", "captcha", "device_confirm", "bad_credential")
+                           for word in p.markers.get(key, [])):
+                        return LoginOutcome(None, reason="verification_ui_visible")
+                stage = "identity"
+                uid = await self.discover_self_uid(acct, p)
+                if uid is None:
+                    return LoginOutcome(None, reason="self_uid_unavailable", evidence={"stage": stage})
+                # 读取元数据期间若切到其它窗口，旧画面不能用于宣布当前已登录。
+                stage = "foreground_recheck"
+                final_focus = _FOCUS_RE.search(await self._read_shell(acct, "dumpsys window"))
+                if not final_focus or final_focus.groups() != focus.groups():
+                    return LoginOutcome(None, reason="foreground_changed")
+                return LoginOutcome("running", self_uid=uid, evidence={
+                    "source": "readonly_ui",
+                    "profile": {"selection": selection, "version": p.version, "app_version": acct.app_version},
+                })
+        except Exception:
+            return LoginOutcome(None, reason="login_probe_unavailable", evidence={"stage": stage})
 
     # ------------------------------------------------------------------ 发送(06 §2.9.5 / 02 §2.2.3)
     async def send(self, acct: Account, native_id: str, text: str) -> SendOutcome:
@@ -587,6 +758,25 @@ class QidianUi:
         return n.text if n is not None else None
 
     # ------------------------------------------------------------------ 装配适配
+    def login_probe_fn(self):
+        """只读观察回调，与会输入凭据的 login_fn 分开装配。"""
+        async def fn(row: dict[str, Any]) -> dict[str, Any]:
+            acct = Account(id=row["id"], channel="qidian", state=row["state"], self_uid=row.get("self_uid"),
+                           app_version=row.get("app_version") or row.get("runtime_app_version"))
+            out = await self.probe_login(acct)
+            return {"ready": out.result == "running", "self_uid": out.self_uid, "reason": out.reason,
+                    "profile": out.evidence.get("profile"), "stage": out.evidence.get("stage")}
+        return fn
+
+    def prepare_login_fn(self):
+        """包成 AccountService 的无凭据准备回调；不填账号密码、不点登录。"""
+        async def fn(row: dict[str, Any]) -> None:
+            acct = Account(id=row["id"], channel="qidian", state=row.get("state") or "starting",
+                           self_uid=row.get("self_uid"), app_version=row.get("app_version"))
+            if not await self.prepare_login(acct):
+                raise RuntimeError("企点协议、登录界面或输入法尚未就绪")
+        return fn
+
     def login_fn(self, on_self_uid: Optional[Callable[[str, str], None]] = None):
         """包成 ``accounts.LoginFn``:``(row, account, secret) -> 'running'|'bad_credential'|'WAIT_*'|None``。"""
         async def fn(row: dict[str, Any], account: Optional[str], secret: Optional[str]) -> Optional[str]:

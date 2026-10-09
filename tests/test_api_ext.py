@@ -304,7 +304,38 @@ def test_wsl_restart_requires_confirm_and_goes_through_winagent(rig):
         if rig.wa.wsl_restarts:
             break
         rig.client.get(f"{P}/system/version", headers=H())
-    assert rig.wa.wsl_restarts and rig.wa.wsl_restarts[-1] == {"mode": "shutdown", "run_id": run_id}
+    assert rig.wa.wsl_restarts and rig.wa.wsl_restarts[-1] == {
+        "mode": "shutdown", "run_id": run_id, "confirm": True,
+    }
+
+
+@pytest.mark.parametrize("confirm", [False, None, 1, "true"])
+def test_wsl_restart_shutdown_rejects_non_true_before_drain(rig, monkeypatch, confirm):
+    """仅 JSON 布尔 true 有效；拒绝时既不排空账号，也不转发假 WinAgent。"""
+    from unittest.mock import AsyncMock
+
+    rig.store.ensure_account("qd01", "qidian", state="running")
+    stop = AsyncMock()
+    monkeypatch.setattr(rig.agent.accounts, "stop", stop)
+    response = rig.client.post(f"{P}/system/wsl-restart", headers=H(),
+                               json={"mode": "shutdown", "confirm": confirm})
+    assert response.status_code == 400
+    assert response.json()["error"]["reason"] == "confirm_required"
+    rig.client.get(f"{P}/system/version", headers=H())
+    stop.assert_not_awaited()
+    assert rig.wa.wsl_restarts == []
+
+
+def test_wsl_restart_terminate_forwards_false_confirmation(rig):
+    """terminate 保持原契约可无确认，但不能凭空升级成已确认 shutdown。"""
+    response = rig.client.post(f"{P}/system/wsl-restart", headers=H(), json={"mode": "terminate"})
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    for _ in range(50):
+        if rig.wa.wsl_restarts:
+            break
+        rig.client.get(f"{P}/system/version", headers=H())
+    assert rig.wa.wsl_restarts == [{"mode": "terminate", "run_id": run_id, "confirm": False}]
 
 
 def test_wsl_restart_rejects_bad_mode_and_non_admin(rig):
@@ -511,8 +542,13 @@ def test_job_view_uses_iso_at_keys(rig):
 
 def test_metrics_has_hardware_and_ours_groups(rig):
     """S-07:#77 快照分 ``hardware`` / ``ours`` 两组并排;没有采集方的项一律 null,不编造。"""
+    assert rig.agent.deployment_disks is None
     m = rig.client.get(f"{P}/system/metrics", headers=H(TOK_R)).json()
-    assert set(m["hardware"]) == {"mem", "cpu", "disks"}
+    assert set(m["hardware"]) == {"mem", "cpu", "disks", "disk_source_error"}
+    assert m["hardware"]["disks"] == []
+    assert m["hardware"]["disk_source_error"]
+    assert m["disk_watermark"]["level"] == "unknown"
+    assert m["disk_watermark"]["free_mb"] is None
     assert set(m["hardware"]["mem"]) == {"total_mb", "used_mb", "avail_mb", "vmmem_mb"}
     assert m["hardware"]["mem"]["vmmem_mb"] is None and m["hardware"]["cpu"]["logical_cores"]
     assert set(m["ours"]) == {"procs", "procs_detail", "accounts", "wechat", "storage"}

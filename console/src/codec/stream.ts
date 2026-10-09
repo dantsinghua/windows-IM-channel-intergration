@@ -25,7 +25,7 @@ export interface StreamHeader {
 
 export interface StreamStats {
   fps: number
-  latencyMs: number
+  latencyMs: number | null
   decoder: DecodePath
   codec: string
   connected: boolean
@@ -268,7 +268,7 @@ export class ScreenStream {
     // 不自动升:已经降过的档不因为重新 start 就回去(升档只走 retryHardware)
     if (RANK[probed] > RANK[this.path]) this.path = probed
     if (this.path === 'software') this.profile = 'thumb'
-    this.hooks.onStats({ decoder: this.path })
+    this.hooks.onStats({ decoder: this.path, latencyMs: null })
     if (this.path === 'static') {
       this.enterStatic('本机没有可用的 WebCodecs 解码器')
       return
@@ -424,7 +424,7 @@ export class ScreenStream {
 
   private handleBinary(buf: ArrayBuffer): void {
     if (this.path === 'static') return
-    const { ptsMs, nal } = parseFrame(buf)
+    const { nal } = parseFrame(buf)
     const parts = splitAnnexB(nal)
     const vcl: Uint8Array[] = []
     let key = false
@@ -436,7 +436,8 @@ export class ScreenStream {
     }
     if (!vcl.length) return
     const access = lengthPrefixed(key && this.sps && this.pps ? [this.sps, this.pps, ...vcl] : vcl)
-    this.hooks.onStats({ latencyMs: Math.max(0, Date.now() - ptsMs) })
+    // scrcpy PTS 是媒体时间，不是 Unix 时间；未同步时钟时单向延迟未知。
+    this.hooks.onStats({ latencyMs: null })
     if (this.configuring) return
     const paramsChanged = key && !!this.sps && !!this.pps && this.decoder?.state === 'configured'
       && (!sameBytes(this.configuredSps, this.sps) || !sameBytes(this.configuredPps, this.pps))

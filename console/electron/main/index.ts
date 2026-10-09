@@ -4,7 +4,7 @@
  * 不解析业务数据、不缓存消息、不存令牌到磁盘。
  */
 import { app, BrowserWindow, dialog, ipcMain, Notification, shell } from 'electron'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { patchConfig, readConfig } from './config'
 import { installNetGuard, openExternalAllowed } from './netguard'
 import { TokenHolder } from './token'
@@ -12,6 +12,7 @@ import { TrayController } from './tray'
 import { openLogsDir, pickFile, saveAs } from './files'
 import { loadWindowState, recordCrash, saveWindowState, clearCrashes } from './window-state'
 import { resolvePath, WA_WHITELIST } from './wa-whitelist'
+import { createLocalMetricsReader } from './local-metrics'
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL
 const tokens = new TokenHolder()
@@ -157,6 +158,9 @@ function loadRenderer(win: BrowserWindow): void {
 }
 
 function registerIpc(): void {
+  // Fixed local scope: packaged executable folder, or the development application folder.
+  const readLocalMetrics = createLocalMetricsReader(app.isPackaged ? dirname(process.execPath) : app.getAppPath())
+  ipcMain.handle('qt:app.localMetrics', () => readLocalMetrics())
   ipcMain.handle('qt:app.version', () => ({ console: app.getVersion(), electron: process.versions.electron }))
   ipcMain.handle('qt:app.minimizeToTray', () => {
     mainWindow?.hide()

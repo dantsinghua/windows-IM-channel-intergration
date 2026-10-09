@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -41,6 +43,8 @@ def rig(tmp_path):
                       api=ApiConfig(http_sync_max_wait_ms=25000))
     sender = FakeSender(maindb, clock)
     agent = AgentApp(cfg, db_path=str(tmp_path / "agent.db"), clock=clock, sender=sender,
+                     wsl_env_reader=SimpleNamespace(versions=AsyncMock(return_value={})),
+                     deployment_disks=SimpleNamespace(snapshot=AsyncMock(return_value={"disks": [], "error": "test_host_unknown"})),
                      maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path)).open()
     st = agent.store
     st.ensure_account("qd01", "qidian", state="running", self_uid="3007373675", label="张三-固收")

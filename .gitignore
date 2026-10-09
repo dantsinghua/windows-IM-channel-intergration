@@ -23,3 +23,7 @@ qb_tap.user.js
 
 # Claude Code 子 agent 的 worktree 目录,不入库
 .claude/worktrees/
+
+# Codex/OMX 本机运行态；项目规范、skills 和迁移说明仍可入库。
+.omx/
+.codex/handoffs/

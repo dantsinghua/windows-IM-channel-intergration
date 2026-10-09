@@ -10,14 +10,14 @@ const routes: RouteRecordRaw[] = [
   { path: '/acct/new', name: 'P-ACCT-NEW', component: () => import('@/pages/acct/AcctNewPage.vue') },
   { path: '/acct/:id', name: 'P-ACCT-DETAIL', component: () => import('@/pages/acct/AcctDetailPage.vue'), props: true },
   { path: '/screen/:id?', name: 'P-SCREEN', component: () => import('@/pages/screen/ScreenPage.vue'), props: true },
-  { path: '/cmd', name: 'P-CMD', component: () => import('@/pages/cmd/CmdPage.vue') },
-  { path: '/flow', name: 'P-FLOW', component: () => import('@/pages/flow/FlowPage.vue') },
+  { path: '/cmd', name: 'P-CMD', redirect: '/dash' },
+  { path: '/flow', name: 'P-FLOW', redirect: '/dash' },
   { path: '/msg', name: 'P-MSG', component: () => import('@/pages/msg/MsgPage.vue') },
   { path: '/mail', name: 'P-MAIL', component: () => import('@/pages/mail/MailPage.vue') },
   { path: '/env', name: 'P-ENV', component: () => import('@/pages/env/EnvPage.vue') },
   { path: '/set', name: 'P-SET', component: () => import('@/pages/set/SetPage.vue') },
   // E-4 子页,仍属 P-SET
-  { path: '/set/mail-templates', name: 'P-SET-MAILTPL', component: () => import('@/pages/set/MailTemplatesPage.vue') },
+  { path: '/set/mail-templates', name: 'P-SET-MAILTPL', redirect: '/set' },
   { path: '/log', name: 'P-LOG', component: () => import('@/pages/log/LogPage.vue') },
 ]
 

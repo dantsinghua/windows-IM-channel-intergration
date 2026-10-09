@@ -64,6 +64,7 @@ function Get-QtOpt {
 
 Initialize-QtLog -Directory $paths.Logs -Prefix 'install' -Stamp $LogStamp | Out-Null
 Set-QtLogStep -Step $Step
+Set-QtWslLogContext -Path (Get-QtSubLogPath -Name 'wsl') -Step $Step
 
 # ── 载入或新建 install_state ────────────────────────────────────────────────
 $state = Read-QtInstallState -Path $paths.StateFile
@@ -267,13 +268,22 @@ try {
                     -Message ('内核文件权限收紧失败,安装已中止。请确认以管理员身份运行,且该文件未被安全软件锁定:{0}' -f $kernelPath) `
                     -Data ([ordered]@{ acl_problems = @($kAcl.Problems); path = $kernelPath })
             }
-            Write-QtKernelPointer -Path $paths.KernelPtr -KernelPath $kernelPath -Sha256 ([string]$k.sha256) -Version ([string]$k.version) -Line (Get-QtKernelLine) | Out-Null
             $imp = Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar')
             if (-not $imp.Ok) {
+                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason 'KCHECK_IMPORT_FAILED') | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KCHECK_IMPORT_FAILED' -ExitName 'E_INSTALL_KCHECK_IMPORT_FAILED' -Message '内核验证用微型发行版导入失败'
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KCHECK_IMPORT_FAILED' -ExitName 'E_INSTALL_KCHECK_IMPORT_FAILED' -Message 'qtrade-kcheck import failed; the kernel configuration was not changed.' -Data $imp.Records
             }
+            $baseline = Test-QtKCheckBaseline
+            if (-not $baseline.Ok) {
+                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason $baseline.Reason) | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $baseline.Reason -ExitName ('E_INSTALL_' + $baseline.Reason) `
+                    -Message 'qtrade-kcheck could not start under the current kernel; kernel configuration and WSL shutdown were not changed.' -Data $baseline.Records
+            }
+            Write-QtKernelPointer -Path $paths.KernelPtr -KernelPath $kernelPath -Sha256 ([string]$k.sha256) -Version ([string]$k.version) -Line (Get-QtKernelLine) | Out-Null
             Set-QtState -State $state -To 'KERNEL_STAGED' -Note ('kernel ' + $k.version) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
             Write-QtStepResult -Ok $true -State 'KERNEL_STAGED' -Message ('内核已就位:{0}' -f $k.version) -Data ([ordered]@{ kernel_path = $kernelPath; version = [string]$k.version; sha256 = [string]$k.sha256 })
@@ -307,7 +317,17 @@ try {
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $pre.Reason -ExitName ('E_INSTALL_' + $pre.Reason) -Message '写入 .wslconfig 的前置校验未通过,未做任何改动'
             }
 
-            # 断电保险(§2.6.3):写入前先置 substate 并把 RunOnce 指向 verify-kernel
+            # R6-82: recheck a resumed stage before changing the kernel configuration.
+            $baseline = Test-QtKCheckBaseline
+            if (-not $baseline.Ok) {
+                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason $baseline.Reason) | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $baseline.Reason -ExitName ('E_INSTALL_' + $baseline.Reason) `
+                    -Message 'qtrade-kcheck startup preflight failed; kernel configuration and WSL shutdown were not changed.' -Data $baseline.Records
+            }
+
+            # Set the resume marker before writing the configuration.
             Set-QtSubstate -State $state -Substate 'wslconfig_writing' | Out-Null
             Set-QtRunOnce -State $state -EnginePath $paths.EngineExe -Mode 'verify-kernel' | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
@@ -350,12 +370,12 @@ try {
                 -UserDistros $userDistros -CustomKernelPolicyPresent $policy.CustomKernelForbidden
 
             if (-not $ver.Ok) {
-                if ($ver.Reason -eq 'KERNEL_SHUTDOWN_TIMEOUT') {
+                if ($ver.Reason -in @('KERNEL_SHUTDOWN_TIMEOUT', 'KERNEL_SHUTDOWN_FAILED')) {
                     # 🔴 不回滚(回滚也要 shutdown,同样会挂);配置已写、RunOnce 已指 verify-kernel
-                    Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason 'KERNEL_SHUTDOWN_TIMEOUT') | Out-Null
+                    Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $ver.Reason) | Out-Null
                     Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KERNEL_SHUTDOWN_TIMEOUT' -ExitName 'E_INSTALL_KERNEL_SHUTDOWN_TIMEOUT' `
-                        -Message 'WSL 服务未响应,请重启电脑,登录后自动继续验证'
+                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $ver.Reason -ExitName ('E_INSTALL_' + $ver.Reason) `
+                        -Message ('WSL shutdown did not succeed ({0}); verification is parked for resume after a restart.' -f $ver.Reason) -Data $ver.Records
                 }
                 # 预演 #16:回滚会注销 kcheck ⇒ **先**把 QTrade 内核下的 dmesg 落进日志目录,诊断包再带上
                 $dmesgFile = Save-QtKCheckDmesg -Directory $paths.Logs -Phase ('KERNEL_SWITCH ' + $ver.Reason)
@@ -368,13 +388,13 @@ try {
                 } else {
                     'rolled back to ' + $rb.OfficialKernel
                 }
-                # B6:文案看回滚结果定 —— 只有原装内核也起不来才说「与 QTrade 内核无关」
+                # Normal and resume failures use the same evidence-based classification.
                 $fail = Resolve-QtKernelSwitchFailure -Verify $ver -Rollback $rb
                 Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note $note | Out-Null
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $fail.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $fail.Reason -ExitName $fail.ExitName `
-                    -Message $fail.Message -Data ([ordered]@{ official_kernel = $rb.OfficialKernel; verify_reason = $ver.Reason; dmesg = $dmesgFile })
+                    -Message $fail.Message -Data ([ordered]@{ official_kernel = $rb.OfficialKernel; verify_reason = $ver.Reason; dmesg = $dmesgFile; records = $ver.Records; rollback_records = $rb.Records })
             }
 
             Remove-QtKCheck -Directory $paths.KCheck | Out-Null
@@ -398,7 +418,14 @@ try {
             $wslConfig = [string]$state.env.wslconfig_path
             $policy = Get-QtWslPolicyFacts
             # 断电保险后续跑:kcheck 可能已被清,先在当前内核上补导一次
-            Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar') | Out-Null
+            $imp = Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar')
+            if (-not $imp.Ok) {
+                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $imp.Reason) | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $imp.Reason -ExitName ('E_INSTALL_' + $imp.Reason) `
+                    -Message 'qtrade-kcheck import failed during resume; kernel verification did not run.' -Data $imp.Records
+            }
             $ver = Invoke-QtKernelVerify -ManifestVersion ([string]$k.version) -ShutdownConfirmed $true `
                 -CustomKernelPolicyPresent $policy.CustomKernelForbidden -SkipShutdown
             if ($ver.Ok) {
@@ -409,14 +436,15 @@ try {
                 Write-QtStepResult -Ok $true -State 'KERNEL_VERIFIED' -Message ('内核 {0} 已生效' -f $ver.Uname)
             }
             # 同 KERNEL_SWITCH:回滚会注销 kcheck,先抓 dmesg
-            Save-QtKCheckDmesg -Directory $paths.Logs -Phase ('verify-kernel ' + $ver.Reason) | Out-Null
+            $dmesgFile = Save-QtKCheckDmesg -Directory $paths.Logs -Phase ('verify-kernel ' + $ver.Reason)
             $rb = Invoke-QtKernelRollback -WslConfigPath $wslConfig -ShutdownConfirmed $true -KCheckDirectory $paths.KCheck
             Clear-QtRunOnce -State $state | Out-Null
-            $reason = if ($rb.Ok) { $ver.Reason } else { 'KERNEL_ROLLBACK_FAILED' }
+            $fail = Resolve-QtKernelSwitchFailure -Verify $ver -Rollback $rb
             Set-QtState -State $state -To 'KERNEL_ROLLED_BACK' -Note 'verify-kernel resume' | Out-Null
-            Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $reason) | Out-Null
+            Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $fail.Reason) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $reason -ExitName ('E_INSTALL_' + $reason) -Message '内核验证未通过,已按基线恢复'
+            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $fail.Reason -ExitName $fail.ExitName -Message $fail.Message `
+                -Data ([ordered]@{ official_kernel = $rb.OfficialKernel; verify_reason = $ver.Reason; dmesg = $dmesgFile; records = $ver.Records; rollback_records = $rb.Records })
         }
 
         # ── DISTRO_IMPORTED(§2.7)────────────────────────────────────────────

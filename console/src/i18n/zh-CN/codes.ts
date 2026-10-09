@@ -208,6 +208,7 @@ export const STATE_CODES: Record<string, StateCodeMeta> = {
   LOGIN_TIMEOUT: { group: 'offline', zh: '登录超时,已回到登录阶段,请重新发起登录', actions: ['login'] },
 
   BOOT_TIMEOUT: { group: 'fail', zh: '容器启动超时', actions: ['restart', 'open-env'] },
+  NETWORK_UNAVAILABLE: { group: 'fail', zh: 'Android 网络检查未通过，请检查后重试启动', actions: ['open-env'] },
   APK_UNAVAILABLE: { group: 'fail', zh: '企点安装包不可用', actions: ['open-env'] },
   INSTALL_FAILED: { group: 'fail', zh: '企点安装失败', actions: ['restart', 'open-env'] },
   BAD_CREDENTIAL: { group: 'fail', zh: '账号或密码错误', actions: ['cred-update'] },

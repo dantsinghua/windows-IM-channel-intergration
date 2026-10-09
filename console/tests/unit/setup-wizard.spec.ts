@@ -153,13 +153,13 @@ describe('向导步骤存 store(D-B)', () => {
     store.step = 3
     const first = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
-    expect(first.text()).toContain('添加第一个账号')
+    expect(first.find('[data-testid="qt-setup-login-qidian-add"]').exists()).toBe(true)
 
     first.unmount()
     const again = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
     expect(store.step).toBe(3)
-    expect(again.text()).toContain('添加第一个账号')
+    expect(again.find('[data-testid="qt-setup-login-qidian-add"]').exists()).toBe(true)
     again.unmount()
   })
 

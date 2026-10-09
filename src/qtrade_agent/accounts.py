@@ -4,7 +4,7 @@
   (payload = Account 序列化 + ``state_before/login_session_id/prompt/error_since_ms``,与 #1/#3 同一份,02 §3.4.1「三处必须同值」)。
 - 序列不跳段(00 §8.1):``created → provisioning → starting → login_required → logging_in → running``;免验证时中间态停留 0 秒仍发事件(05-P5)。
 - 企点冷启动(05 §2.1.1):④ ``provisioning`` 起容器 → ``starting`` → ⑤ 等 ``boot_completed``(超时 ``error(BOOT_TIMEOUT)``)→ ⑤b ``ensure_root``(失败不阻断、只 warn)
-  → ⑥⑦⑧ 装/拉起(UI 执行层未接:本期以可注入的 ``login_fn`` 代替,缺省未接)→ ``login_required(WAIT_PASSWORD)`` → ⑨ 取凭据(Vault 离线 → ``error(VAULT_UNAVAILABLE)``,
+  → ⑥ 安装缺失包 → ⑦⑧ 无凭据准备登录界面 → ``login_required(WAIT_PASSWORD)`` → ⑨ 取凭据(Vault 离线 → ``error(VAULT_UNAVAILABLE)``,
   不回退成让人输入)→ ⑩ ``logging_in`` → ⑪ 由 ``login_fn`` 判定;未接 ⇒ 回 ``login_required`` 等人。
 - ``stop``:``stopping``(容器 stop)→ ``stopped`` **之后**、释放额度**之前** ``runtime._purge_ephemeral``(05 §2.5.7 / 02 §2.2.4)。
 - ``start`` 前过 ``pool.can_add``(``stopped`` 不占额度但 start 要再过一次);全局启动串行在 ``runtime.start_lock``。
@@ -13,23 +13,28 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from typing import Any, Awaitable, Callable, Optional
 
 from .adapters.base import Account
-from .alerts import ACCOUNT_OFFLINE
+from .adapters.qq.login import QR_LIFETIME_MS, QR_REFRESH_MS, valid_png
+from .alerts import ACCOUNT_OFFLINE, QIDIAN_PROFILE_FALLBACK
 from .api.auth import ApiError
 from .api.serialize import account_view
 from .config import AgentConfig
 from .events import iso8601
 from .ids import login_session_id as new_login_session_id, ulid
+from .runtime.apk import ApkPreparationError
 from .vault_client import VaultUnavailable, credential_ref, vault_name
 
 log = logging.getLogger("qtrade.accounts")
 
 LoginFn = Callable[[dict[str, Any], Optional[str], Optional[str]], Awaitable[Optional[str]]]   # (row, account, secret) -> 'running'|'login_required'|None(未接)
+PrepareLoginFn = Callable[[dict[str, Any]], Awaitable[Optional[bool]]]
+LoginProbeFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 STOPPABLE = ("provisioning", "starting", "login_required", "logging_in", "running", "degraded", "error")
 STARTABLE = ("created", "stopped", "error")
@@ -48,7 +53,9 @@ async def _login_not_wired(row: dict[str, Any], account: Optional[str], secret: 
 class AccountService:
     def __init__(self, *, store, events, pool, runtime, vault, cfg: AgentConfig, adapters: dict[str, Any], health,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000), login_fn: Optional[LoginFn] = None,
-                 caps_by_op: Optional[dict[str, dict[str, Any]]] = None, pressure=None):
+                 caps_by_op: Optional[dict[str, dict[str, Any]]] = None, pressure=None,
+                 prepare_login_fn: Optional[PrepareLoginFn] = None, login_probe_fn: Optional[LoginProbeFn] = None,
+                 qq_login_backend=None):
         self._store = store
         self._events = events
         self._pool = pool
@@ -59,6 +66,12 @@ class AccountService:
         self._health = health
         self._clock = clock
         self._login_fn: LoginFn = login_fn or _login_not_wired
+        self._prepare_login_fn = prepare_login_fn
+        self._login_probe_fn = login_probe_fn
+        self._qq_login_backend = qq_login_backend
+        self._qq_attempts: dict[str, dict[str, Any]] = {}
+        self._manual_login_probes: set[str] = set()
+        self._manual_login_probe_failures: dict[str, tuple[str, str]] = {}
         self._caps_by_op = caps_by_op or {}
         self.pressure = pressure                                # pressure.MemoryWatermark(装配后注入);None = 不判水位
         self._wechat_slot = None                                # wechat_slot.WechatSlot(装配后注入);None = 微信分支退回「本期未接」
@@ -241,68 +254,203 @@ class AccountService:
                 await self._wechat_start(id)
                 return
             await self._runtime.start(row)                                       # ④ docker run/start(全局串行)
-            row = self.transition(id, "starting")
+            row = self.transition(id, "starting", state_reason=(
+                "正在启动 Android，随后检查 DNS/TCP 并完成企点协议与登录界面初始化"
+                if row["channel"] == "qidian" else ""))
             if row["channel"] == "qidian":
                 if not await self._runtime.wait_boot(row):                        # ⑤ 等 boot_completed
                     self.transition(id, "error", state_code="BOOT_TIMEOUT", state_reason=f"boot_completed 超时 {self.cfg.runtime.boot_timeout_s}s")
                     return
                 await self._runtime.ensure_root(row)                             # ⑤b 提权;失败只 warn,不阻断
+                report = await self._runtime.check_qidian_network(row)
+                if not report["ok"]:
+                    prefix = "Android 网络探测未完成" if report["result"] == "SKIPPED" else "Android 网络预检失败"
+                    details = "; ".join(f"{item.get('host') or 'target'}:{item.get('port') or '-'} "
+                                        f"{item['stage']}/{item['result']}({item['detail']})"
+                                        for item in report["targets"][:3])
+                    self.transition(id, "error", state_code="NETWORK_UNAVAILABLE",
+                                    state_reason=f"{prefix}: {report['result']} {details}；检查后重试启动")
+                    return
+                await self._runtime.prepare_qidian(row)                          # ⑥ 缺包安装并复查
+                if self._prepare_login_fn is not None:
+                    try:
+                        if await self._prepare_login_fn(row) is False:          # ⑦⑧ 无凭据准备，完成后才发布 WAIT_PASSWORD
+                            raise RuntimeError("企点登录界面尚未就绪")
+                    except Exception:
+                        log.warning("企点登录界面准备失败 account=%s", id)
+                        self.transition(id, "error", state_code="UI_UNEXPECTED", state_reason="企点登录界面准备失败")
+                        return
                 await self._login_phase(id, row)
             else:
                 await self._qq_start(id, row)
         except asyncio.CancelledError:
             raise
+        except ApkPreparationError as e:
+            self.transition(id, "error", state_code=e.code, state_reason=str(e))
         except Exception as e:
             log.exception("start 序列失败 account=%s: %s", id, e)
             self.transition(id, "error", state_code="CONTAINER_EXIT", state_reason=f"启动失败:{e}")
 
     # ------------------------------------------------------------------ 05 §2.3 QQ 首登序列 ⑤/⑦
-    async def _qq_start(self, id: str, row: dict[str, Any]) -> None:
-        """05 §2.3.1 ⑤:建 OneBot 连接(不阻塞到登录)→ ``qq_quick_login_wait_s`` 内轮询 ``get_state``。
-
-        ⑤a ``qq_data`` 免扫命中 ⇒ ``get_login_info`` 有 ``user_id``,回填 ``self_uid``/``self_nick`` 并转 ``running``;
-        ⑤b 窗内没登上 ⇒ ``login_required(WAIT_QRCODE)`` 等人(**不自动重登**,D-2;二维码转发的接口路径 05 §10 待定 3,未接)。"""
+    async def _qq_start(self, id: str, row: dict[str, Any], ls: Optional[str] = None) -> None:
+        """人发起的启动/登录；免扫失败后继续同一次扫码会话，不靠运行期自恢复触发。"""
         ad = self._adapters.get("qq")
         if ad is None:
-            self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="QQ 适配器未装配")
+            self.transition(id, "error", state_code="ONEBOT_UNREACHABLE", state_reason="QQ 适配器未装配")
             return
         acct = Account(id=id, channel="qq", state=row["state"], self_uid=row.get("self_uid"), self_nick=row.get("self_nick"),
-                       state_code=row.get("state_code"))
-        await ad.start(acct)                                                     # ⑤ 建连,不阻塞到登录
-        # 00 §8.1 / 05-P5 **序列不跳段**:免扫命中时 `login_required`/`logging_in` 各停留 0 秒,但**两个事件都要发**
-        # (控制台与审计据此还原时间线);与企点 `_login_phase` 同款。
-        ls = new_login_session_id()
+                       state_code=row.get("state_code"), extra={"login_pending": True})
+        ls = ls or new_login_session_id()
         self.transition(id, "login_required", state_code="WAIT_QRCODE", login_session_id=ls,
                         prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
-        self.transition(id, "logging_in", login_session_id=ls)
-        deadline = self._clock() + self.cfg.accounts.qq_quick_login_wait_s * 1000
-        while self._clock() < deadline:
-            if await ad.get_state(acct) == "running":                            # ⑤a 免扫命中
-                info = await self._qq_login_info(ad, id)
-                if info:
-                    # ⑦ 身份列:`self_nick` 不在 transition/patch_account 的白名单里(它不是人能改的设置项),直接写同一张表
-                    self._store.con.execute("UPDATE accounts SET self_nick=?, updated_ms=? WHERE id=?",
-                                            (str(info.get("nickname") or ""), self._clock(), id))
-                self.transition(id, "running", state_code=None, login_session_id=ls,
-                                **({"self_uid": str(info["user_id"])} if info else {}))
+        attempt = {"session": ls, "deadline": self._clock() + self.cfg.accounts.qr_max_wait_s * 1000,
+                   "refresh_due": self._clock(), "lock": asyncio.Lock()}
+        self._qq_attempts[id] = attempt
+        if ad.session_of(id) is not None:
+            await ad.stop(acct, graceful=True)
+        await ad.start(acct)
+        deadline = time.monotonic() + self.cfg.accounts.qq_quick_login_wait_s
+        while True:
+            info = await self._qq_login_info(ad, id)
+            if not self._qq_attempt_current(id, attempt):
                 return
-            await asyncio.sleep(1)
-        # ⑤b 窗内没登上:回 `login_required(WAIT_QRCODE)` 等人扫码(**不自动重登**,D-2;二维码转发 05 §10 待定 3)
-        self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason="免扫码登录未命中,请在 NapCat WebUI 扫码",
-                        login_session_id=ls, prompt={"kind": "WAIT_QRCODE", "text": "请扫码登录 QQ"})
+            if info:
+                await self._qq_complete(id, attempt, info)
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+        # 同一卷可能保留上次 PNG，首张也要求 NapCat 新生成，避免旧文件抢读。
+        await self._qq_refresh(id, attempt, refresh=True)
+
+    def qq_login_pending(self, id: str) -> bool:
+        attempt = self._qq_attempts.get(id)
+        return attempt is not None and self._qq_attempt_current(id, attempt)
+
+    def _qq_attempt_current(self, id: str, attempt: dict[str, Any]) -> bool:
+        row = self._store.get_account_full(id)
+        return bool(self._qq_attempts.get(id) is attempt and self._current_ls.get(id) == attempt["session"]
+                    and row and row.get("enabled") and not row.get("deleted_ms") and row["state"] in LOGIN_PHASE
+                    and self._clock() < attempt["deadline"])
+
+    async def _qq_refresh(self, id: str, attempt: dict[str, Any], *, refresh: bool) -> None:
+        async with attempt["lock"]:
+            if not self._qq_attempt_current(id, attempt) or self.get(id)["state"] != "login_required":
+                return
+            prompt = {"kind": "WAIT_QRCODE", "text": "请用手机 QQ 扫码并确认登录"}
+            reason = ""
+            try:
+                if self._qq_login_backend is None:
+                    raise RuntimeError("not_wired")
+                png = await asyncio.wait_for(self._qq_login_backend.qrcode(self.get(id), refresh=refresh), 26)
+                if not valid_png(png):
+                    raise ValueError("invalid_png")
+                encoded = base64.b64encode(png).decode("ascii")
+                previous = (self._prompts.get(id) or {}).get("prompt", {}).get("qrcode_png_b64")
+                if refresh and encoded == previous:
+                    raise ValueError("stale_qrcode")
+                prompt.update(qrcode_png_b64=encoded, expires_at=iso8601(self._clock() + QR_LIFETIME_MS))
+            except Exception:
+                # 上游错误正文可能含二维码/凭据，只向人显示固定可重试说明。
+                reason = "二维码获取暂不可用，请重试；若持续失败请检查 NapCat 登录初始化"
+                prompt["text"] = reason
+            if not self._qq_attempt_current(id, attempt) or self.get(id)["state"] != "login_required":
+                return
+            attempt["refresh_due"] = self._clock() + QR_REFRESH_MS
+            self.transition(id, "login_required", state_code="WAIT_QRCODE", state_reason=reason,
+                            login_session_id=attempt["session"], prompt=prompt)
+
+    async def poll_qq_logins(self) -> None:
+        """仅观察明确由人开始且仍有效的 QQ 登录尝试；运行期掉线不创建尝试。"""
+        for id, attempt in list(self._qq_attempts.items()):
+            if self._clock() >= attempt["deadline"] and self._current_ls.get(id) == attempt["session"]:
+                self._qq_attempts.pop(id, None)
+                await self.stop(id, graceful=True, actor="system:qq_login_timeout")
+                await self.wait_idle(id)
+                if self.get(id)["state"] == "stopped":
+                    self.transition(id, "stopped", state_reason="扫码超时,已停止", desired_state="stopped")
+                continue
+            if not self._qq_attempt_current(id, attempt):
+                if self._qq_attempts.get(id) is attempt:
+                    self._qq_attempts.pop(id, None)
+                continue
+            if self.busy(id) or attempt["lock"].locked():
+                continue
+            async with attempt["lock"]:
+                info = await self._qq_login_info(self._adapters["qq"], id)
+                if self._qq_attempt_current(id, attempt) and info:
+                    await self._qq_complete(id, attempt, info)
+            if self._qq_attempt_current(id, attempt) and self._clock() >= attempt["refresh_due"]:
+                await self._qq_refresh(id, attempt, refresh=True)
+
+    async def _qq_complete(self, id: str, attempt: dict[str, Any], info: dict[str, Any]) -> None:
+        if not self._qq_attempt_current(id, attempt):
+            return
+        row = self.get(id)
+        expected = str(json.loads(row.get("identity_json") or "{}").get("qq_uin") or "")
+        uid = str(info["user_id"])
+        if expected and expected != uid:
+            self._qq_attempts.pop(id, None)
+            self.transition(id, "error", state_code="BAD_CREDENTIAL", state_reason="扫码登录的 QQ 号与指定账号不一致")
+            return
+        ls = attempt["session"]
+        self._prompts.pop(id, None)
+        self.transition(id, "logging_in", login_session_id=ls)
+        try:
+            restarted = await self._runtime.set_napcat_webui(
+                row | {"qq_confirmed_uid": uid, "qq_login_current": lambda: self._qq_attempt_current(id, attempt)}, False)
+            if not self._qq_attempt_current(id, attempt):
+                return
+            if restarted:
+                ad = self._adapters["qq"]
+                acct = Account(id=id, channel="qq", state="logging_in", self_uid=uid, extra={"login_pending": True})
+                await ad.stop(acct, graceful=True)
+                await ad.start(acct)
+                deadline = time.monotonic() + self.cfg.accounts.qq_quick_login_wait_s
+                while True:
+                    verified = await self._qq_login_info(ad, id)
+                    if not self._qq_attempt_current(id, attempt):
+                        return
+                    if verified and str(verified["user_id"]) == uid:
+                        info = verified
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("onebot_unavailable")
+                    await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+            if not self._qq_attempt_current(id, attempt):
+                return
+            self._store.con.execute("UPDATE accounts SET self_nick=?, updated_ms=? WHERE id=?",
+                                    (str(info.get("nickname") or ""), self._clock(), id))
+            self.transition(id, "running", state_code=None, login_session_id=ls, self_uid=uid)
+            session = self._adapters["qq"].session_of(id)
+            if session is not None:
+                session.acct.self_uid = uid
+                session.acct.self_nick = str(info.get("nickname") or "")
+                session.acct.state = "running"
+                session.acct.extra.pop("login_pending", None)
+            self._store.upsert_runtime(id, kind="napcat", webui_published_until_ms=None, now_ms=self._clock())
+            self._qq_attempts.pop(id, None)
+        except Exception:
+            if self._qq_attempt_current(id, attempt):
+                self._qq_attempts.pop(id, None)
+                self.transition(id, "error", state_code="ONEBOT_UNREACHABLE", state_reason="QQ 登录后关闭管理界面或连接验证失败，请重试启动")
 
     @staticmethod
     async def _qq_login_info(ad: Any, account_id: str) -> Optional[dict[str, Any]]:
-        """⑦ 判定:``get_login_info`` 有 ``user_id`` ⇒ 写 ``self_uid``/``self_nick``;取不到就只转状态、不写身份列。"""
+        """只接受 OneBot 确认的数字 UID；缺身份时不能进入 running。"""
         sess = ad.session_of(account_id)
         if sess is None:
             return None
         try:
-            info = await sess.client.call_action("get_login_info")
-        except Exception as e:                                                   # 连接抖动:状态已判 running,身份下轮再补
-            log.info("QQ get_login_info 未取到 account=%s: %s", account_id, e)
+            status = await asyncio.wait_for(sess.client.call_action("get_status"), 5)
+            if not isinstance(status, dict) or status.get("online") is not True:
+                return None
+            info = await asyncio.wait_for(sess.client.call_action("get_login_info"), 5)
+        except Exception:
             return None
-        return info if isinstance(info, dict) and info.get("user_id") else None
+        uid = info.get("user_id") if isinstance(info, dict) else None
+        return info if (not isinstance(uid, bool) and isinstance(uid, (int, str))
+                        and str(uid).isascii() and str(uid).isdigit() and int(uid) > 0) else None
 
     # ------------------------------------------------------------------ 05 §2.4 微信登录流
     async def _wechat_start(self, id: str) -> None:
@@ -321,31 +469,41 @@ class AccountService:
 
     # ------------------------------------------------------------------ #97 / #98 QQ WebUI 临时开关(C-35)
     async def set_webui(self, id: str, enable: bool, *, until_ms: Optional[int] = None, actor: str) -> dict[str, Any]:
-        """改 napcat 的 ``webui.enable`` 并重启容器;``account_runtime.webui_published_until_ms`` 记到期时刻。
-
-        ``running`` 态下改必须重启容器才生效(C-35 / 02 #97),响应里如实带 ``restart``;
-        已是目标状态 ⇒ no-op(``changed:false``),不白重启一次容器。
-        """
+        """配置和执行结果为准；到期登记不能被误当作管理面已关闭。"""
         row = self.get(id)
+        if row["channel"] != "qq":
+            raise ApiError(400, "NOT_APPLICABLE", "只有 QQ 支持 NapCat WebUI", reason="channel_not_qq")
         rt = self._store.get_runtime(id) or {}
         now = self._clock()
-        currently_on = bool(rt.get("webui_published_until_ms") and int(rt["webui_published_until_ms"]) > now)
-        if currently_on == enable:
-            return {"changed": False, "restart": False, "until_ms": rt.get("webui_published_until_ms")}
+        registered_until = rt.get("webui_published_until_ms")
+        try:
+            currently_on = self._runtime.napcat_webui_enabled(row)
+            target_until = until_ms if enable else None
+            if currently_on == enable and registered_until == target_until:
+                return {"changed": False, "restart": False, "until_ms": registered_until}
+            # 失败重试时配置可能已写成关闭，但上一进程尚未退出；登记保留即仍要核实重启。
+            force_restart = not enable and registered_until is not None
+            restarted = await self._runtime.set_napcat_webui(row | {"napcat_restart_required": force_restart}, enable)
+        except Exception:
+            raise ApiError(503, "NOT_READY", "NapCat 管理界面配置或重启失败，请重试", reason="napcat_webui_unavailable", retryable=True) from None
         self._store.upsert_runtime(id, kind=self._store.RUNTIME_KIND[row["channel"]],
-                                   webui_published_until_ms=(until_ms if enable else None), now_ms=now)
-        restarted = False
-        if row["state"] in ("running", "degraded", "login_required", "logging_in"):
-            try:
-                await self._runtime.set_napcat_webui(row, enable)          # 改配置 + 重启容器(runtime 的事)
-                restarted = True
-            except AttributeError:
-                # runtime 侧的「改 napcat 配置 + 重启」尚未实现(C-35,见 rulings R6-58 (cx)):
-                # 登记照写、如实回 restart=false,**不假装重启过**
-                log.warning("runtime 未实现 set_napcat_webui:account=%s 的 WebUI 开关只落了登记", id)
+                                   webui_published_until_ms=target_until, now_ms=now)
         self._store.insert_audit(kind="system", transport="system", actor=actor, action="settings.update", account_id=id,
                                  result_code="OK", detail={"webui": enable, "until_ms": until_ms}, now_ms=now)
-        return {"changed": True, "restart": restarted, "until_ms": until_ms if enable else None}
+        return {"changed": True, "restart": restarted, "until_ms": target_until}
+
+    async def expire_qq_webui(self) -> None:
+        """只处理我方明确登记的临时窗口；失败保留登记，下轮重试，不发起登录。"""
+        now = self._clock()
+        for row in self._store.list_accounts(channel="qq"):
+            runtime = self._store.get_runtime(row["id"]) or {}
+            until = runtime.get("webui_published_until_ms")
+            if until is None or until > now or self.busy(row["id"]) or self.qq_login_pending(row["id"]):
+                continue
+            try:
+                await self.set_webui(row["id"], False, actor="system:qq_webui_expiry")
+            except ApiError:
+                log.warning("QQ 临时管理界面到期关闭失败 account=%s", row["id"])
 
     async def _drain_account(self, account_id: str, timeout_s: float) -> bool:
         """#17 切换第 ① 步:等该账号的总线队列跑完(上限 ``[adapters.wechat] switch_drain_timeout_s``)。
@@ -466,11 +624,7 @@ class AccountService:
             secret = None                                                       # 密码用完置零
         if result == "running":
             uid = self._pending_self_uid.pop(id, None)
-            self.transition(id, "running", state_code=None, login_session_id=ls, **({"self_uid": uid} if uid else {}))
-            if id in self._pending_ui_degraded:                                  # 02 §2.2.3:落 default profile ⇒ degraded(UI_UNEXPECTED)
-                ver = self._pending_ui_degraded.pop(id)
-                self.transition(id, "degraded", state_code="UI_UNEXPECTED",
-                                state_reason=f"企点定位表无 {ver or '本'} 版本的 profile,已退到 default.yaml")
+            self._login_succeeded(id, ls, uid)
         elif result == "bad_credential":
             if row.get("credential_ref"):
                 try:
@@ -488,6 +642,72 @@ class AccountService:
             self._pending_self_uid.pop(id, None)
             self._pending_ui_degraded.pop(id, None)
 
+    def _login_succeeded(self, id: str, ls: str, uid: Optional[str]) -> None:
+        self.transition(id, "running", state_code=None, login_session_id=ls, **({"self_uid": uid} if uid else {}))
+        if id in self._pending_ui_degraded:                                  # 02 §2.2.3:落 default profile ⇒ degraded(UI_UNEXPECTED)
+            ver = self._pending_ui_degraded.pop(id)
+            self.transition(id, "degraded", state_code="UI_UNEXPECTED",
+                            state_reason=f"企点定位表无 {ver or '本'} 版本的 profile,已退到 default.yaml")
+
+    def _note_login_probe_health(self, id: str, reason: str, stage: str, *, recovered: bool = False) -> None:
+        """只记录固定失败类别/阶段；相同故障去重，完整身份观察成功才记录恢复。"""
+        if reason in ("login_probe_unavailable", "profile_unavailable", "self_uid_unavailable"):
+            if stage not in ("profile", "foreground", "ui", "activity_structure", "identity", "foreground_recheck"):
+                stage = "observation"
+            failure = (reason, stage)
+            if self._manual_login_probe_failures.get(id) != failure:
+                self._manual_login_probe_failures[id] = failure
+                log.warning("企点手工登录只读观察失败 account=%s reason=%s stage=%s", id, reason, stage)
+        elif recovered and self._manual_login_probe_failures.pop(id, None) is not None:
+            log.info("企点手工登录只读观察恢复 account=%s status=recovered", id)
+
+    async def probe_manual_logins(self) -> None:
+        """观察手工完成登录/验证的企点；不取凭据、不重登，旧观察不能覆盖新登录会话。"""
+        if self._login_probe_fn is None:
+            return
+        waiting = ("WAIT_PASSWORD", "WAIT_SMS", "WAIT_CAPTCHA")
+        for row in self._store.list_accounts(channel="qidian", state="login_required"):
+            aid = row["id"]
+            expected_uid = self._login_account(row)
+            if (not row.get("enabled") or row.get("state_code") not in waiting or self.busy(aid)
+                    or aid in self._manual_login_probes or not isinstance(expected_uid, str)
+                    or not expected_uid.isascii() or not expected_uid.isdigit()):
+                continue
+            session = self._current_ls.get(aid)
+            updated_ms = row["updated_ms"]
+            self._manual_login_probes.add(aid)
+            try:
+                report = await asyncio.wait_for(self._login_probe_fn(row), 15)
+                fresh = self._store.get_account_full(aid)
+                if (not fresh or fresh.get("deleted_ms") or not fresh.get("enabled")
+                        or fresh["state"] != "login_required" or fresh.get("state_code") not in waiting
+                        or self.busy(aid) or self._current_ls.get(aid) != session
+                        or fresh["updated_ms"] != updated_ms or self._login_account(fresh) != expected_uid):
+                    continue
+                matched = report.get("ready") is True and report.get("self_uid") == expected_uid
+                self._note_login_probe_health(aid, report.get("reason"), report.get("stage"), recovered=matched)
+                if not matched:
+                    continue
+                # self_uid 来自实际观察，不用登录名、手机号、邮箱作缺省 UID。
+                profile = report.get("profile") or {}
+                if profile.get("selection") == "default" and profile.get("app_version"):
+                    self.note_default_profile(aid, profile["app_version"])
+                ls = session or new_login_session_id()
+                self.transition(aid, "logging_in", login_session_id=ls)
+                self._pending_self_uid.pop(aid, None)
+                self._login_succeeded(aid, ls, expected_uid)
+                if profile.get("selection") == "fallback":
+                    self._alerts_firing(QIDIAN_PROFILE_FALLBACK, aid, severity="info",
+                                        evidence={"app_version": profile.get("app_version"), "profile": profile.get("version")})
+                self._store.insert_audit(
+                    kind="system", transport="system", actor="system:accounts", action="account.manual_login_observed",
+                    account_id=aid, result_code="OK", detail={"source": "readonly_ui", "identity_match": True}, now_ms=self._clock(),
+                )
+            except Exception:
+                self._note_login_probe_health(aid, "login_probe_unavailable", "observation")
+            finally:
+                self._manual_login_probes.discard(aid)
+
     # ------------------------------------------------------------------ #12 人发起登录 / #13 #14 凭据 / #15 prompt / #16b 取消
     async def login(self, id: str, body: dict[str, Any], *, actor: str) -> dict[str, Any]:
         """#12:人发起登录(D-2:唯一的重登入口;05 §2.2.7 「不保存」路径提交密码);``202 {state:'logging_in', login_session_id}``。"""
@@ -498,6 +718,17 @@ class AccountService:
             raise ApiError(409, "NOT_APPLICABLE", "账号已登录", reason="already_running")
         if row["state"] != "login_required":
             raise ApiError(409, "NOT_APPLICABLE", f"当前状态 {row['state']} 不可登录,请先 start", reason="bad_state")
+        if row["channel"] == "qq":
+            if body.get("mode", "qrcode") != "qrcode":
+                raise ApiError(400, "INVALID_ARGS", "QQ 仅支持扫码登录", reason="bad_login_mode")
+            ls = new_login_session_id()
+            self._qq_attempts.pop(id, None)
+            self._prompts.pop(id, None)
+            self.transition(id, "logging_in", login_session_id=ls)
+            self._spawn(id, self._qq_relogin(id, ls))
+            self._store.insert_audit(kind="system", transport="system", actor=actor, action="account.login", account_id=id,
+                                     result_code="OK", detail={"mode": "qrcode", "login_session_id": ls}, now_ms=self._clock())
+            return {"state": "logging_in", "login_session_id": ls}
         mode = body.get("mode") or row["login_mode"]
         if mode not in LOGIN_MODES:
             raise ApiError(400, "INVALID_ARGS", "mode 须为 password|qrcode|manual", reason="bad_login_mode", extra={"details": [{"pointer": "/mode"}]})
@@ -542,6 +773,20 @@ class AccountService:
                                  detail={"mode": mode, "remember": remember, "login_session_id": ls}, now_ms=self._clock())
         return {"state": "logging_in", "login_session_id": ls}
 
+    async def _qq_relogin(self, id: str, ls: str) -> None:
+        try:
+            row = self.get(id)
+            await self._runtime.set_napcat_webui(row, True)
+            if self._current_ls.get(id) != ls or self.get(id)["state"] != "logging_in":
+                return
+            ad = self._adapters.get("qq")
+            if ad is not None:
+                await ad.stop(Account(id=id, channel="qq", state=row["state"]), graceful=True)
+            await self._qq_start(id, self.get(id), ls)
+        except Exception:
+            if self._current_ls.get(id) == ls:
+                self.transition(id, "error", state_code="ONEBOT_UNREACHABLE", state_reason="QQ 登录准备失败，请重试启动")
+
     async def set_credential(self, id: str, body: dict[str, Any], *, actor: str) -> dict[str, Any]:
         """#13:只写 Vault 与 credential_ref,不登录;响应不回显。"""
         row = self.get(id)
@@ -585,6 +830,19 @@ class AccountService:
         out["login_session_id"] = p["login_session_id"]
         return out
 
+    async def refresh_prompt(self, id: str, login_session_id: Optional[str] = None) -> dict[str, Any]:
+        row = self.get(id)
+        if row["channel"] != "qq":
+            return self.prompt(id, login_session_id)
+        attempt = self._qq_attempts.get(id)
+        if (attempt is None or (login_session_id and login_session_id != attempt["session"])
+                or not self._qq_attempt_current(id, attempt) or row["state"] != "login_required"):
+            return {"kind": None}
+        await self._qq_refresh(id, attempt, refresh=True)
+        if not self._qq_attempt_current(id, attempt):
+            return {"kind": None}
+        return self.prompt(id, attempt["session"])
+
     async def login_cancel(self, id: str, login_session_id: Optional[str] = None, *, actor: str) -> dict[str, Any]:
         """#16b:取消一次登录尝试 / 释放微信槽位 pending;带 id 只取消指定那次,不等 ⇒ 幂等 no-op ``{cancelled:false, stale:true, current_login_session_id}``。"""
         row = self.get(id)
@@ -616,6 +874,9 @@ class AccountService:
             raise ApiError(409, "NOT_APPLICABLE", "当前没有进行中的登录尝试", reason="no_login_in_progress")
         if login_session_id is not None and login_session_id != cur:
             return {"cancelled": False, "stale": True, "current_login_session_id": cur}
+        if row["channel"] == "qq":
+            self._qq_attempts.pop(id, None)                            # 先使所有在途 QR/身份观察失效
+            self._current_ls.pop(id, None)
         t = self.tasks.get(id)
         if t is not None and not t.done():
             t.cancel()
@@ -623,8 +884,9 @@ class AccountService:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        self.transition(id, "login_required", state_code="WAIT_PASSWORD", state_reason="登录尝试已取消", login_session_id=cur,
-                        prompt={"kind": "WAIT_PASSWORD", "text": "请点「登录」重新登录"})
+        code = "WAIT_QRCODE" if row["channel"] == "qq" else "WAIT_PASSWORD"
+        self.transition(id, "login_required", state_code=code, state_reason="登录尝试已取消", login_session_id=cur,
+                        prompt={"kind": code, "text": "请点「登录」重新登录"})
         self._current_ls.pop(id, None)                                          # 那一次尝试结束;下次 login 是新的 id
         self._prompts[id]["login_session_id"] = ""
         self._store.insert_audit(kind="system", transport="system", actor=actor, action="account.login_cancel", account_id=id, result_code="OK",
@@ -817,6 +1079,11 @@ class AccountService:
     async def _stop_sequence(self, id: str, *, graceful: bool) -> None:
         row = self._store.get_account_full(id)
         try:
+            if row["channel"] == "qq":
+                self._qq_attempts.pop(id, None)
+                ad = self._adapters.get("qq")
+                if ad is not None:
+                    await ad.stop(Account(id=id, channel="qq", state=row["state"]), graceful=graceful)
             if row["channel"] != "wechat":
                 await self._runtime.stop(row, graceful=graceful)
             row = self.transition(id, "stopped", desired_state="stopped")          # 账号已置 stopped 之后……

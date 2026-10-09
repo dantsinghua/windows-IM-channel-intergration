@@ -1,422 +1,80 @@
 <script setup lang="ts">
-/**
- * `P-MSG` 消息(01 §2.7.7)。
- * 左会话列表 + 筛选 + 虚拟列表 + 详情面板;导出走 JobProgress 异步。
- * 🔴 事件专属三字段 `late`/`lag_s`/`origin` 只标经事件前插的行,重拉即消失(R6-49)。
- */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { msg as T } from '@/testids'
 import { useMessagesStore } from '@/stores/messages'
 import { useAccountsStore } from '@/stores/accounts'
 import { useEventsStore } from '@/stores/events'
 import { messagesApi } from '@/api/client'
-import { ApiFailure } from '@/api/http'
 import PageState from '@/components/PageState.vue'
 import ChannelTag from '@/components/ChannelTag.vue'
-import JsonViewer from '@/components/JsonViewer.vue'
 import JobProgress from '@/components/JobProgress.vue'
-import { OCR_REVIEW_TEXT, SOURCE_TEXT } from '@/i18n/zh-CN/codes'
+import QtIcon from '@/components/QtIcon.vue'
+import { localDateTimeToIso, isoToLocalDateTime } from '@/utils/datetime'
+import { SOURCE_TEXT } from '@/i18n/zh-CN/codes'
 import type { Job, Message } from '@/api/types'
-
 const store = useMessagesStore()
 const accounts = useAccountsStore()
 const events = useEventsStore()
-
+const route = useRoute()
+const detailOpen = ref(false)
+const datesOpen = ref(false)
 const exportJob = ref<string | null>(null)
-const includeMedia = ref(false)
-const rawOpen = ref(false)
 const mediaUrl = ref('')
-/** #54 消息清除:danger,须手输账号 id 确认 */
-const purgeModal = ref(false)
-const purgeInput = ref('')
-const purgeMode = ref<'all' | 'text_only'>('text_only')
-const purgeBefore = ref('')
-const purgeJob = ref<string | null>(null)
-const purgeTarget = computed(() => String(store.filter.account_id ?? ''))
-const purgeMismatch = computed(() => !purgeTarget.value || purgeInput.value !== purgeTarget.value)
-
-const TYPES = ['text', 'image', 'voice', 'file', 'video', 'system']
+const mediaKind = ref('')
 const selected = computed(() => store.selected)
-
-async function search(): Promise<void> {
-  await store.search(true)
+const types = [{value:'text',label:'文字'},{value:'image',label:'图片'},{value:'voice',label:'语音'},{value:'file',label:'文件'},{value:'video',label:'视频'},{value:'system',label:'系统通知'}]
+const selectedAccount = computed(() => accounts.items.find(a => a.id === store.filter.account_id))
+function accountName(id: string): string { const a=accounts.byId[id]; return a?.self_nick || a?.label || id }
+function time(ts: string): string { return new Date(ts).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) }
+async function search(): Promise<void> { if(store.qTooShort) return; await store.search(true) }
+function openDetail(m: Message): void { store.selectedId = m.id; detailOpen.value = true; clearMedia() }
+function clearMedia(): void { if(mediaUrl.value) URL.revokeObjectURL(mediaUrl.value); mediaUrl.value = '' }
+async function selectSession(id: string | null): Promise<void> { store.selectedSessionId = id; await search() }
+async function changeAccount(id?: string): Promise<void> { store.filter.account_id=id; store.selectedSessionId=null; await Promise.all([store.loadSessions(),search()]) }
+async function startExport(): Promise<void> {
+  try { const r=await messagesApi.export({fmt:'csv',with_media:'none',filter:{...store.filter,...(store.selectedSessionId ? {session_id:store.selectedSessionId} : {})}}); exportJob.value=r.job_id }
+  catch(e) { message.error(e instanceof Error ? e.message : String(e)) }
 }
-
-function selectSession(sid: string | null): void {
-  store.selectedSessionId = sid
-  void store.search(true)
-}
-
-function rowLate(m: Message): string { return store.lateText(m.id) }
-function rowExternal(m: Message): boolean { return store.isExternal(m.id) }
-
-/** 悬停原文(R6-49) */
-function lateTitle(m: Message): string {
-  const f = store.flagsOf(m.id)
-  return `消息发出时刻与入库时刻相差 ${f.lag_s ?? 0} 秒,多为掉线/重登后补同步`
-}
-
-/**
- * #55 取媒体:二进制 + `X-QT-Media-Id`/`X-QT-Sha256` 头。
- * 懒下载还没完时后端回 `202`(`pending`)—— 这**不是错误**,提示「仍在下载」让用户稍后再点。
- */
-async function openMedia(sha: string): Promise<void> {
-  const r = await messagesApi.media(sha)
-  if (!r.blob) { message.info('媒体仍在下载中,请稍后再试'); return }
-  if (mediaUrl.value) URL.revokeObjectURL(mediaUrl.value)
-  mediaUrl.value = URL.createObjectURL(r.blob)
-}
-
-async function downloadMedia(sha: string): Promise<void> {
-  const r = await messagesApi.media(sha)
-  if (!r.blob) { message.info('媒体仍在下载中,请稍后再试'); return }
-  const bytes = new Uint8Array(await r.blob.arrayBuffer())
-  // 文件名优先用后端响应头里的 sha256(与落库那份对得上),拿不到才用行里的 ref
-  const name = (r.sha256 ?? sha).slice(0, 12)
-  await window.qt?.files.saveAs(`${name}.bin`, r.blob.type || 'application/octet-stream', bytes)
-}
-
-/** #51 入参逐字:`{fmt:'jsonl|csv|eml', with_media:'none|zip', filter}`(不是 format/include_media) */
-async function startExport(fmt: 'csv' | 'jsonl' | 'eml'): Promise<void> {
-  const r = await messagesApi.export({
-    filter: store.filter,
-    fmt,
-    with_media: includeMedia.value ? 'zip' : 'none',
-  })
-  exportJob.value = r.job_id
-  store.exportJobId = r.job_id
-}
-
 async function onExportDone(job: Job): Promise<void> {
-  exportJob.value = null
-  if (job.state !== 'succeeded') { message.error('导出未完成'); return }
-  await window.qt?.files.saveAs(`messages-${Date.now()}.zip`, 'application/zip', String(job.result?.download_url ?? ''))
+  exportJob.value=null
+  if(job.state!=='succeeded'){message.error('导出未完成，请重试');return}
+  if(!window.qt){message.info('导出已完成，请在桌面控制台保存文件');return}
+  try { await window.qt.files.saveAs(`messages-${Date.now()}.zip`,'application/zip',String(job.result?.download_url ?? '')) }
+  catch (e) { message.error(e instanceof Error ? e.message : '文件保存未完成，请重新导出') }
 }
-
-/**
- * #53 语音转文字。🔴 回的 `trace_id` 是**作业 trace,不是指令 trace**
- * (backend-api-2 §7-8)—— **不要**拿它去查 `#31 /accounts/{id}/commands/{trace_id}`,那里查不到。
- * 结果由后端回写到本条消息的 `asr_text`/`asr_state`,等 `message` 事件刷新即可。
- */
-async function transcribe(m: Message): Promise<void> {
-  try {
-    const r = await messagesApi.asr(m.id)
-    message.success(`已提交转写作业(trace ${String(r.trace_id ?? '').slice(0, 8)});完成后回填到本条消息`)
-  } catch (e) {
-    if (!(e instanceof ApiFailure)) { message.error(String(e)); return }
-    if (e.reason === 'asr_backend_missing') {
-      message.warning('语音转文字的执行体本期未装配,暂时无法转写')
-    } else {
-      message.error(`${e.message}(trace ${e.traceShort})`)
-    }
-  }
+async function openMedia(sha: string,kind: string): Promise<void> {
+  try { const r=await messagesApi.media(sha); if(!r.blob){message.info('媒体正在下载，请稍后重试');return} clearMedia(); mediaUrl.value=URL.createObjectURL(r.blob);mediaKind.value=kind }
+  catch(e){message.error(e instanceof Error?e.message:String(e))}
 }
-
-/**
- * #54 消息清除(danger)。🔴 须 `confirm:true`(客户端恒带)**且**界面手输账号 id 二次确认;
- * 回 `202 {job_id}`,进不可逆阶段后取消按钮由 `JobProgress` 自动置灰。
- */
-async function doPurgeMessages(): Promise<void> {
-  if (purgeMismatch.value) return
-  try {
-    const r = await messagesApi.purge({
-      account_id: purgeTarget.value,
-      before: purgeBefore.value || undefined,
-      mode: purgeMode.value,
-    })
-    purgeJob.value = r.job_id
-    purgeModal.value = false
-    purgeInput.value = ''
-  } catch (e) {
-    if (e instanceof ApiFailure) message.error(`${e.message}(trace ${e.traceShort})`)
-    else message.error(String(e))
-  }
+async function downloadMedia(sha: string): Promise<void> {
+  try{const r=await messagesApi.media(sha);if(!r.blob){message.info('媒体正在下载');return}if(window.qt){await window.qt.files.saveAs(`${(r.sha256??sha).slice(0,12)}.bin`,r.blob.type,new Uint8Array(await r.blob.arrayBuffer()))}else{message.info('请在桌面控制台保存附件')}}
+  catch(e){message.error(e instanceof Error?e.message:String(e))}
 }
-
-function onPurgeMessagesDone(job: Job): void {
-  purgeJob.value = null
-  if (job.state !== 'succeeded') { message.error(`清除未完成:${job.error?.message ?? job.state}`); return }
-  message.success('消息清除完成')
-  void store.search(true)
-}
-
-function scrollTop(): void {
-  document.querySelector('.msglist')?.scrollTo({ top: 0 })
-  store.newCount = 0
-}
-
-onMounted(async () => {
-  if (!accounts.items.length) await accounts.load()
-  await store.loadSessions().catch(() => undefined)
-  await store.search(true)
-})
-
-onUnmounted(() => {
-  // 离开 P-MSG 时把 message 订阅放宽回全部
-  events.narrowMessages([])
-  if (mediaUrl.value) URL.revokeObjectURL(mediaUrl.value)
-})
+function applyRoute(): void { if(typeof route.query.account_id==='string'){store.filter.account_id=route.query.account_id;store.selectedSessionId=null} }
+watch(()=>route.query.account_id,async()=>{applyRoute();await Promise.all([store.loadSessions(),search()])})
+onMounted(async()=>{applyRoute();if(!accounts.items.length)await accounts.load();await store.loadSessions().catch(()=>undefined);await store.search(true)})
+onUnmounted(()=>{events.narrowMessages([]);clearMedia()})
 </script>
-
 <template>
-  <div class="msg">
-    <aside class="sessions">
-      <a-input
-        v-model:value="store.sessionKeyword"
-        :data-testid="T.sessionSearch"
-        placeholder="搜会话"
-        allow-clear
-      />
-      <div :data-testid="T.sessionList" class="slist">
-        <div
-          class="sitem"
-          :class="{ active: !store.selectedSessionId }"
-          :data-testid="T.sessionAll"
-          @click="selectSession(null)"
-        >全部</div>
-        <div
-          v-for="s in store.filteredSessions"
-          :key="s.id"
-          class="sitem"
-          :class="{ active: store.selectedSessionId === s.id }"
-          :data-testid="T.session(s.id)"
-          @click="selectSession(s.id)"
-        >
-          <span class="qt-grow">{{ s.name }}</span>
-          <span class="qt-small qt-muted">{{ s.unread ?? 0 }}</span>
-        </div>
-        <!--
-          C-42「加载更多」:`GET /sessions` 已按游标翻页(后端 `last_msg_at` 降序)。
-          ⚠️ 左侧的关键字框是**本地筛**(`filteredSessions`),只筛已拉到的页 —— 翻到底再筛才是全量。
-          🔴 元素 id 未在 01 §4 登记 ⇒ 暂不加 `data-testid`,清单已转文档方。
-        -->
-        <div v-if="store.sessionsCursor" class="sitem more">
-          <a-button size="small" block @click="store.loadSessions(true)">加载更多</a-button>
-        </div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="filters qt-row">
-        <a-select
-          class="w140"
-          :data-testid="T.filter('account')"
-          :value="store.filter.account_id"
-          allow-clear
-          placeholder="账号:全部"
-          :options="accounts.items.map((a) => ({ value: a.id, label: a.id }))"
-          @change="(v: any) => store.filter.account_id = v"
-        />
-        <a-select
-          class="w100"
-          :data-testid="T.filter('dir')"
-          :value="store.filter.dir"
-          allow-clear
-          placeholder="方向"
-          :options="[{ value: 'in', label: '入' }, { value: 'out', label: '出' }]"
-          @change="(v: any) => store.filter.dir = v"
-        />
-        <a-select
-          class="w120"
-          :data-testid="T.filter('type')"
-          :value="store.filter.type"
-          allow-clear
-          placeholder="类型"
-          :options="TYPES.map((t) => ({ value: t, label: t }))"
-          @change="(v: any) => store.filter.type = v"
-        />
-        <a-input class="w160" :data-testid="T.filter('since')" :value="store.filter.since" placeholder="起(ISO)"
-                 @change="(e: any) => store.filter.since = e.target.value" />
-        <a-input class="w160" :data-testid="T.filter('until')" :value="store.filter.until" placeholder="止(ISO)"
-                 @change="(e: any) => store.filter.until = e.target.value" />
-        <a-input class="w160" :data-testid="T.filter('q')" :value="store.filter.q" placeholder="关键字"
-                 @change="(e: any) => store.filter.q = e.target.value" />
-        <a-checkbox
-          :data-testid="T.filterOcrReview"
-          :checked="!!store.filter.needs_review"
-          @change="(e: any) => store.filter.needs_review = e.target.checked || undefined"
-        >仅 OCR 需复核</a-checkbox>
-        <a-button type="primary" :data-testid="T.search" @click="search">搜索</a-button>
-        <a-dropdown>
-          <a-button :data-testid="T.export">导出 ▾</a-button>
-          <template #overlay>
-            <a-menu>
-              <a-menu-item @click="startExport('csv')">导出 CSV</a-menu-item>
-              <a-menu-item @click="startExport('jsonl')">导出 JSONL</a-menu-item>
-            </a-menu>
-          </template>
-        </a-dropdown>
-        <!--
-          🔴 02 #51 R6-62 (g):`with_media:'zip'` 与 `fmt:'eml'` 后端**明着 400**、不静默降级。
-          所以这个勾选框本期禁用 —— 勾了只会换来一个 400,不如把原因写在旁边。
-        -->
-        <a-checkbox v-model:checked="includeMedia" disabled :data-testid="T.exportWithMedia">
-          包含媒体(本期不支持,后端对 with_media=zip 直接 400)
-        </a-checkbox>
-        <!--
-          #54 消息清除(danger + admin)。⚠️ 01 §4 还没有这个按钮的元素 id,已列给文档方。
-        -->
-        <a-button
-          danger
-          :disabled="!store.filter.account_id"
-          :title="store.filter.account_id ? '清除该账号的消息' : '先在上面选定一个账号'"
-          @click="purgeModal = true"
-        >清除消息…</a-button>
-      </header>
-
-      <p v-if="store.qTooShort" class="qt-warn qt-small" :data-testid="T.qHint">关键字至少 3 个字</p>
-
-      <JobProgress
-        :job-id="exportJob"
-        :testid="T.exportProgress"
-        :cancel-testid="T.exportCancel"
-        @done="onExportDone"
-      />
-      <!-- #54 是 202 作业;进不可逆阶段后取消按钮自动置灰 -->
-      <JobProgress v-if="purgeJob" :job-id="purgeJob" @done="onPurgeMessagesDone" />
-      <a-button
-        v-if="store.exportJobId && !exportJob"
-        size="small"
-        :data-testid="T.exportDownload"
-        @click="onExportDone({ job_id: store.exportJobId, kind: 'export', state: 'succeeded', progress: 100 })"
-      >下载导出</a-button>
-
-      <a-button v-if="store.newCount" class="newbanner" :data-testid="T.newBanner" @click="scrollTop">
-        {{ store.newCount }} 条新消息
-      </a-button>
-
-      <PageState
-        :loading="store.loading && !store.items.length"
-        :error="store.error"
-        :empty="!store.loading && !store.items.length"
-        empty-text="暂无消息;账号在线后自动采集"
-        @retry="search"
-      >
-        <div class="msglist" :data-testid="T.list">
-          <div
-            v-for="m in store.items"
-            :key="m.id"
-            class="mrow"
-            :class="{ revoked: m.revoked, active: store.selectedId === m.id }"
-            :data-testid="T.row(m.id)"
-            @click="store.selectedId = m.id"
-          >
-            <span class="ts qt-mono qt-small">{{ m.ts.slice(11, 16) }}</span>
-            <ChannelTag :channel="m.channel" />
-            <span class="qt-small">{{ m.account_id }}</span>
-            <span class="sess qt-small">{{ m.session.name }}</span>
-            <span class="sender qt-small">{{ m.sender.name }}</span>
-            <span class="dir">{{ m.dir === 'in' ? '›' : '‹' }}</span>
-            <span class="text qt-grow">{{ m.text ?? `[${m.type}]` }}</span>
-            <span v-if="m.revoked" class="tag">已撤回</span>
-            <span v-if="rowLate(m)" class="tag amber" :data-testid="T.rowLate(m.id)" :title="lateTitle(m)">
-              {{ rowLate(m) }}
-            </span>
-            <span
-              v-if="rowExternal(m)"
-              class="tag"
-              :data-testid="T.rowOriginExternal(m.id)"
-              title="这条我方消息不是由本系统发出的(人在别的端接手),仅标记、不影响任何自动动作"
-            >外部来源</span>
-            <span v-if="m.needs_review" class="tag amber" :data-testid="T.rowOcrReview(m.id)">⚠需复核</span>
-            <span class="src qt-small qt-muted" :data-testid="T.rowSource(m.id)">
-              {{ SOURCE_TEXT[m.source] ?? m.source }}
-            </span>
-          </div>
-        </div>
-      </PageState>
-
-      <section v-if="selected" class="detail qt-card" :data-testid="T.detail">
-        <div class="qt-row">
-          <span class="qt-mono qt-small">消息 ID {{ selected.id }}</span>
-          <span class="qt-mono qt-small">ext {{ selected.ext_msg_id ?? '—' }}</span>
-          <span class="qt-small">来源 {{ SOURCE_TEXT[selected.source] ?? selected.source }}</span>
-          <span v-if="selected.needs_review" class="tag amber">{{ OCR_REVIEW_TEXT }}</span>
-          <span class="qt-small">撤回 {{ selected.revoked ? '是' : '否' }}</span>
-        </div>
-        <!-- 需要持久线索的看 ts 与 received_at 两列,差值即 lag_s -->
-        <div class="qt-row qt-small qt-muted">
-          <span>ts {{ selected.ts }}</span>
-          <span>received_at {{ selected.received_at }}</span>
-        </div>
-        <!-- #53:语音转文字的回写(asr_text 不覆盖原文,text_source='asr' 时才是转写结果) -->
-        <div v-if="selected.asr_text || selected.asr_state" class="qt-row qt-small">
-          <span class="qt-muted">语音转文字</span>
-          <b>{{ selected.asr_text ?? (selected.asr_state === 'pending' ? '转写中…' : '未转写') }}</b>
-          <span v-if="selected.asr_state === 'failed'" class="qt-danger">转写失败</span>
-        </div>
-        <div v-for="(md, i) in selected.media" :key="i" class="qt-row">
-          <span class="qt-small">{{ md.kind }} {{ md.mime }}</span>
-          <template v-if="md.state === 'ready' && md.sha256">
-            <a-button size="small" :data-testid="T.mediaPreview" @click="openMedia(md.sha256!)">预览</a-button>
-            <a-button size="small" :data-testid="T.mediaDownload" @click="downloadMedia(md.sha256!)">下载</a-button>
-            <!-- ⚠️ 01 §4 还没有这个按钮的元素 id,已列给文档方 -->
-            <a-button
-              v-if="md.kind === 'voice'"
-              size="small"
-              :disabled="selected.asr_state === 'pending'"
-              @click="transcribe(selected)"
-            >转文字</a-button>
-          </template>
-          <span v-else class="qt-muted qt-small" :data-testid="T.mediaPending">
-            {{ md.state === 'pending' ? '下载中' : '未下载' }}
-          </span>
-        </div>
-        <img v-if="mediaUrl" :src="mediaUrl" class="media" alt="媒体预览" />
-        <a-button v-if="selected.raw_ref" size="small" :data-testid="T.rawView" @click="rawOpen = true">查看原始载荷</a-button>
-      </section>
-    </main>
-
-    <a-modal v-model:open="rawOpen" title="原始载荷" :footer="null" width="680px">
-      <JsonViewer :value="{ raw_ref: selected?.raw_ref }" />
-    </a-modal>
-
-    <!-- #54 消息清除:danger,须手输账号 id 原文确认 -->
-    <a-modal v-model:open="purgeModal" title="清除消息" :footer="null">
-      <p class="qt-danger">
-        <b>不可恢复</b>:「只清正文」会把消息文本清空(全文索引一并更新);
-        「整行删除」还会删掉消息行并减少媒体引用计数。
-      </p>
-      <div class="qt-row">
-        <a-radio-group v-model:value="purgeMode">
-          <a-radio value="text_only">只清正文</a-radio>
-          <a-radio value="all">整行删除</a-radio>
-        </a-radio-group>
-      </div>
-      <div class="qt-row">
-        <span class="qt-small qt-muted">只清这个时刻之前的(留空 = 全部)</span>
-        <a-input v-model:value="purgeBefore" placeholder="2026-01-01T00:00:00+08:00" />
-      </div>
-      <p>请手动输入账号 ID 原文 <b class="qt-mono">{{ purgeTarget }}</b> 以确认:</p>
-      <a-input v-model:value="purgeInput" :status="purgeMismatch && purgeInput ? 'error' : undefined" />
-      <div class="qt-row mt">
-        <a-button @click="purgeModal = false">取消</a-button>
-        <a-button type="primary" danger :disabled="purgeMismatch" @click="doPurgeMessages">确认清除</a-button>
-      </div>
-    </a-modal>
+  <div class="qt-page messages-page">
+    <header class="qt-page-heading"><div><span class="qt-eyebrow">MESSAGE ARCHIVE</span><h1>历史消息</h1><p>{{ selectedAccount ? `${selectedAccount.self_nick || selectedAccount.label || selectedAccount.id} 的消息记录` : '按账号或关键词，找到每一段对话。' }}</p></div><a-button :data-testid="T.export" @click="startExport">导出查询结果</a-button></header>
+    <div class="message-workspace">
+      <aside class="sessions qt-glass"><div class="session-title">会话 <span>{{ store.sessions.length }}</span></div><a-input v-model:value="store.sessionKeyword" :data-testid="T.sessionSearch" placeholder="搜索已加载会话" allow-clear><template #prefix><QtIcon name="search" :size="15" /></template></a-input><div class="slist" :data-testid="T.sessionList"><button class="sitem all" :class="{active:!store.selectedSessionId}" :data-testid="T.sessionAll" @click="selectSession(null)"><QtIcon name="msg" :size="18" /><span>全部会话</span></button><button v-for="s in store.filteredSessions" :key="s.id" class="sitem" :class="{active:store.selectedSessionId===s.id}" :data-testid="T.session(s.id)" @click="selectSession(s.id)"><span class="session-avatar">{{ s.name.slice(0,1) }}</span><span class="session-info"><strong>{{ s.name }}</strong><small>{{ accountName(s.account_id) }}</small></span><span v-if="s.unread" class="unread">{{ s.unread }}</span></button></div><a-button v-if="store.sessionsCursor" block size="small" @click="store.loadSessions(true)">更多会话</a-button><span class="session-note">搜索范围为已加载的会话</span></aside>
+      <main class="message-main qt-surface">
+        <div class="search-row"><a-input v-model:value="store.filter.q" :data-testid="T.filter('q')" placeholder="搜索消息内容，至少 3 个字" allow-clear @press-enter="search"><template #prefix><QtIcon name="search" :size="17" /></template></a-input><a-button type="primary" :data-testid="T.search" :loading="store.loading" @click="search">查询</a-button></div>
+        <div class="filter-row"><a-select :value="store.filter.account_id" :data-testid="T.filter('account')" allow-clear placeholder="全部账号" :options="accounts.items.map(a=>({value:a.id,label:a.self_nick||a.label||a.id}))" @change="(v:any)=>changeAccount(v)"/><a-select v-model:value="store.filter.dir" :data-testid="T.filter('dir')" allow-clear placeholder="全部方向" :options="[{value:'in',label:'收到的消息'},{value:'out',label:'发出的消息'}]"/><a-select v-model:value="store.filter.type" :data-testid="T.filter('type')" allow-clear placeholder="全部类型" :options="types"/><button class="time-toggle" :aria-expanded="datesOpen" @click="datesOpen=!datesOpen"><QtIcon name="clock" :size="15" />时间范围</button></div>
+        <div v-if="datesOpen" class="date-row"><a-input :value="isoToLocalDateTime(store.filter.since)" @update:value="store.filter.since = localDateTimeToIso($event)" :data-testid="T.filter('since')" type="datetime-local" aria-label="开始时间"/><span>至</span><a-input :value="isoToLocalDateTime(store.filter.until)" @update:value="store.filter.until = localDateTimeToIso($event)" :data-testid="T.filter('until')" type="datetime-local" aria-label="结束时间"/></div>
+        <p v-if="store.qTooShort" class="qt-warn" :data-testid="T.qHint">请输入至少 3 个字后查询</p><JobProgress :job-id="exportJob" :testid="T.exportProgress" :cancel-testid="T.exportCancel" @done="onExportDone"/>
+        <div class="list-heading"><span>消息记录</span><span>已加载 {{ store.items.length }} 条{{ store.nextCursor ? ' · 还有更多' : '' }}</span></div>
+        <button v-if="store.newCount" class="new-messages" :data-testid="T.newBanner" @click="store.search(true)">{{ store.newCount }} 条新消息 · 刷新列表</button>
+        <PageState :loading="store.loading&&!store.items.length" :error="store.error" :empty="!store.loading&&!store.items.length" empty-text="没有找到消息，试试其他关键词或时间范围" @retry="search"><div class="msglist" :data-testid="T.list"><button v-for="m in store.items" :key="m.id" class="mrow" :class="{revoked:m.revoked,active:store.selectedId===m.id}" :data-testid="T.row(m.id)" @click="openDetail(m)"><span class="message-avatar" :class="m.channel">{{ (m.sender.name||'消').slice(0,1) }}</span><div class="message-body"><div class="message-title"><strong>{{ m.sender.name || '未知发送人' }}</strong><ChannelTag :channel="m.channel"/><span class="message-direction">{{ m.dir==='in' ? '接收' : '发送' }}</span><time>{{ time(m.ts) }}</time></div><p>{{ m.revoked ? '此消息已撤回' : m.text || `[${types.find(t=>t.value===m.type)?.label||m.type}]` }}</p><div class="message-meta"><span>{{ m.session.name }}</span><span>·</span><span>{{ accountName(m.account_id) }}</span><span v-if="store.lateText(m.id)" :data-testid="T.rowLate(m.id)" class="meta-warning">{{ store.lateText(m.id) }}</span><span v-if="store.isExternal(m.id)" :data-testid="T.rowOriginExternal(m.id)">外部来源</span><span v-if="m.needs_review" :data-testid="T.rowOcrReview(m.id)" class="meta-warning">需复核</span></div></div><QtIcon name="chevron" :size="15"/></button></div><div class="list-footer"><span>按消息时间排序</span><a-button v-if="store.nextCursor" :loading="store.loading" @click="store.search(false)">加载更多消息</a-button><span v-else>已显示全部查询结果</span></div></PageState>
+      </main>
+    </div>
+    <a-drawer v-model:open="detailOpen" title="消息详情" :width="520" :data-testid="T.detail"><template v-if="selected"><div class="detail-identity"><span class="message-avatar" :class="selected.channel">{{ (selected.sender.name||'消').slice(0,1) }}</span><div><h3>{{ selected.sender.name }}</h3><span>{{ time(selected.ts) }} · {{ selected.session.name }}</span></div></div><div class="detail-text">{{ selected.revoked?'此消息已撤回':selected.text||'媒体消息' }}</div><div class="detail-meta"><span>所属账号</span><a :href="`#/acct/${selected.account_id}`">{{ accountName(selected.account_id) }}</a><span>消息方向</span><b>{{ selected.dir==='in'?'接收':'发送' }}</b><span>采集来源</span><b>{{ SOURCE_TEXT[selected.source]??selected.source }}</b><span>入库时间</span><b>{{ time(selected.received_at) }}</b></div><div v-for="(md,i) in selected.media" :key="i" class="media-item"><span>{{ types.find(t=>t.value===md.kind)?.label||md.kind }}</span><template v-if="md.state==='ready'&&md.sha256"><a-button size="small" :data-testid="T.mediaPreview" @click="openMedia(md.sha256!,md.kind)">预览</a-button><a-button size="small" :data-testid="T.mediaDownload" @click="downloadMedia(md.sha256!)">保存</a-button></template><span v-else :data-testid="T.mediaPending">正在准备媒体</span></div><img v-if="mediaUrl&&mediaKind==='image'" :src="mediaUrl" class="media-preview" alt="消息图片"/><audio v-else-if="mediaUrl&&mediaKind==='voice'" :src="mediaUrl" controls/><video v-else-if="mediaUrl&&mediaKind==='video'" :src="mediaUrl" controls class="media-preview"/><p v-else-if="mediaUrl">此附件请保存后查看</p></template></a-drawer>
   </div>
 </template>
-
 <style scoped>
-.msg { display: flex; height: 100%; }
-.sessions { width: 240px; flex: 0 0 auto; padding: var(--qt-space-3); border-right: 1px solid var(--qt-border); overflow: auto; }
-.slist { margin-top: var(--qt-space-2); }
-.sitem { display: flex; padding: 5px 6px; cursor: pointer; border-radius: var(--qt-radius-sm); }
-.sitem:hover, .sitem.active { background: var(--qt-bg-elevated); }
-.main { flex: 1 1 auto; padding: var(--qt-space-3); overflow: auto; min-width: 0; }
-.filters { flex-wrap: wrap; gap: var(--qt-space-2); }
-.w100 { width: 100px; } .w120 { width: 120px; } .w140 { width: 140px; } .w160 { width: 160px; }
-.newbanner { margin: var(--qt-space-2) 0; }
-.msglist { max-height: 52vh; overflow: auto; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-sm); }
-.mrow { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--qt-border); cursor: pointer; }
-.mrow.active { background: var(--qt-bg-elevated); }
-.mrow.revoked { color: var(--qt-text-disabled); text-decoration: line-through; }
-.sess, .sender { min-width: 80px; }
-.sitem.more { justify-content: center; padding: var(--qt-space-2) 0; }
-.text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tag { font-size: var(--qt-font-xs); border: 1px solid currentColor; border-radius: 8px; padding: 0 5px; }
-.amber { color: var(--qt-sev-warn); }
-.detail { margin-top: var(--qt-space-3); padding: var(--qt-space-3); }
-.media { max-width: 320px; margin-top: var(--qt-space-2); }
+.message-workspace{display:grid;grid-template-columns:235px minmax(0,1fr);gap:24px;align-items:start}.sessions{padding:20px 14px;min-height:620px}.session-title{display:flex;justify-content:space-between;font-size:15px;font-weight:600;margin:4px 4px 20px}.session-title span{color:#a292b2;font-size:12px;font-weight:400}.slist{margin:18px 0}.sitem{width:100%;display:flex;align-items:center;gap:10px;padding:13px 10px;border:0;border-radius:12px;background:transparent;text-align:left;color:#7e708c;cursor:pointer;margin:4px 0}.sitem:hover{background:#ffffffa0}.sitem.active{background:#fff;box-shadow:0 3px 14px #64438509;color:#7547a8}.sitem.all{gap:12px;margin-bottom:15px}.session-avatar,.message-avatar{display:grid;place-items:center;flex-shrink:0;background:#ede5f6;border:1px solid #fff;color:#9370b2;border-radius:12px;width:36px;height:36px}.session-info{min-width:0;flex:1}.session-info strong{display:block;font-weight:500;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.session-info small{display:block;font-size:12px;color:#a195ad;margin-top:5px}.unread{font-size:12px;background:#7547a8;color:#fff;border-radius:10px;padding:2px 5px}.session-note{font-size:12px;color:#a294b1}.message-main{padding:24px 26px;min-width:0;min-height:660px}.search-row{display:flex;gap:10px}.filter-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}.filter-row .ant-select{min-width:130px;flex:1;max-width:190px}.time-toggle{display:flex;align-items:center;gap:6px;border:0;background:transparent;color:#8d7b9f;font-size:12px;cursor:pointer;padding:8px}.date-row{display:flex;align-items:center;gap:10px;margin-top:12px}.list-heading{display:flex;justify-content:space-between;font-size:12px;color:#a496ae;margin-top:26px;padding-bottom:14px;border-bottom:1px solid #eee8f4}.list-heading span:first-child{font-size:14px;color:#64566f;font-weight:600}.msglist{max-height:640px;overflow:auto}.mrow{display:flex;align-items:flex-start;gap:14px;width:100%;border:0;border-bottom:1px solid #f0edf4;background:white;padding:20px 0;cursor:pointer;text-align:left;color:var(--qt-text)}.mrow:hover,.mrow.active{background:#fcfaff}.message-avatar{width:40px;height:40px;border-radius:13px;font-size:14px;background:linear-gradient(145deg,#e8def5,#f6f0fc)}.message-avatar.wechat{background:linear-gradient(145deg,#f6e5ba,#fff5dd);color:#aa8433}.message-avatar.qq{background:linear-gradient(145deg,#ded8f2,#f0ecfb);color:#7d6da5}.message-body{flex:1;min-width:0}.message-title{display:flex;gap:10px;align-items:center;font-size:13px;flex-wrap:wrap}.message-title strong{font-weight:600}.message-title:deep(.tag){font-size:12px}.message-title time{margin-left:auto;color:#80718c;font-size:12px}.message-direction{font-size:12px;color:#80718c}.message-body p{margin:9px 0 8px;font-size:14px;line-height:1.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#5d5267}.message-meta{display:flex;gap:7px;flex-wrap:wrap;font-size:12px;color:#7e708a}.meta-warning{color:#9c6d17}.mrow>svg{margin-top:5px;color:#baaaca}.revoked .message-body p{color:#83708e}.list-footer{display:flex;justify-content:space-between;align-items:center;padding-top:20px;color:#81718d;font-size:12px}.new-messages{width:100%;border:0;padding:9px;background:#f1eaf8;color:#7547a8;cursor:pointer}.detail-identity{display:flex;align-items:center;gap:14px;margin:12px 0 24px}.detail-identity h3{margin:0 0 6px}.detail-identity span{font-size:12px;color:#a093ab}.detail-text{padding:22px;background:#f8f5fb;border-radius:16px;font-size:16px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere}.detail-meta{display:grid;grid-template-columns:95px 1fr;gap:18px;font-size:13px;padding:28px 0;color:#97889f}.detail-meta b{font-weight:400;color:#5c4e69}.media-item{display:flex;gap:10px;align-items:center;margin:15px 0}.media-preview{max-width:100%;border-radius:12px}@media(max-width:1000px){.message-workspace{grid-template-columns:180px minmax(0,1fr);gap:16px}.message-main{padding:20px}.message-title time{width:100%;margin-left:0}}@media(max-width:740px){.message-workspace{grid-template-columns:1fr}.sessions{min-height:0}.slist{display:flex;overflow:auto;max-height:160px;margin:10px 0}.sitem{min-width:160px}.session-note{display:none}.message-main{padding:16px}.date-row{flex-wrap:wrap}.message-title{gap:6px}}
 </style>

@@ -1,612 +1,234 @@
 <script setup lang="ts">
-/**
- * `P-ACCT-DETAIL` 账号详情(01 §2.7.3.4),八个 Tab。
- * 概览带 `state_code` 引导卡片(D-2 等人组标题恒「登录中·等待你操作」)与企点读取降级横幅;
- * 删除 = 软删无参,彻底删除数据 = purge 两步(R-11)。
- */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { acctDetail as T, ACCT_DETAIL_HEALTH_ITEMS, ACCT_DETAIL_TABS } from '@/testids'
+import { acctDetail as T } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
 import { useResourcesStore } from '@/stores/resources'
 import { useEventsStore } from '@/stores/events'
 import { useSessionStore } from '@/stores/session'
-import { accountsApi, auditApi } from '@/api/client'
+import { accountsApi } from '@/api/client'
 import { ApiFailure } from '@/api/http'
 import StateDot from '@/components/StateDot.vue'
 import PromptCard from '@/components/PromptCard.vue'
-import JobProgress from '@/components/JobProgress.vue'
-import {
-  ALERT_CODES, CAPABILITY_TEXT, LOGIN_PHASE_TITLE, QIDIAN_READ_DEGRADED_CODES,
-  STATE_CODES, capabilityText, stateCardSubtitle, stateCardTitle,
-} from '@/i18n/zh-CN/codes'
-import { auditDetail, auditTsText, type AuditRow, type Job } from '@/api/types'
+import { ACCOUNT_STATES, ALERT_CODES, CHANNEL_TEXT, LOGIN_PHASE_TITLE, QIDIAN_READ_DEGRADED_CODES, STATE_CODES, stateCardSubtitle, stateCardTitle } from '@/i18n/zh-CN/codes'
 
+const AccountScreen = defineAsyncComponent(() => import('@/pages/screen/ScreenPage.vue'))
 const route = useRoute()
 const router = useRouter()
 const accounts = useAccountsStore()
 const resources = useResourcesStore()
 const events = useEventsStore()
 const session = useSessionStore()
-
 const id = computed(() => String(route.params.id ?? ''))
-const tab = ref<string>('overview')
-const editingLabel = ref('')
-const editLabel = ref(false)
-const purgeModal = ref(false)
-const purgeInput = ref('')
-const pwModal = ref(false)
-const pwSecret = ref('')
-const pwRemember = ref(false)
-const credModal = ref(false)
-const credSecret = ref('')
-const exportJob = ref<string | null>(null)
-/** #8 彻底删除是 `202 {job_id}`:进度走 #107,不可逆阶段后取消按钮自动置灰(JobProgress 里判) */
-const purgeJob = ref<string | null>(null)
-const webuiUntil = ref<number | null>(null)
-const now = ref(Date.now())
-const recent = ref<AuditRow[]>([])
-const settingsForm = ref<Record<string, unknown>>({})
-const acctCaps = ref<{ capabilities: string[]; matrix: Record<string, string> } | null>(null)
-let tick: ReturnType<typeof setInterval> | null = null
-
 const a = computed(() => accounts.byId[id.value] ?? null)
 const prompt = computed(() => accounts.prompts[id.value] ?? null)
 const ops = computed(() => accounts.ops(a.value))
 const stateCode = computed(() => a.value?.state_code ?? '')
-const codeMeta = computed(() => (stateCode.value ? STATE_CODES[stateCode.value] : undefined))
-/** 卡片只在 login_required / degraded / error 出现;RATE_LIMITED 不进本卡片(R-12) */
-const showStateCard = computed(() =>
-  !!a.value && ['login_required', 'degraded', 'error'].includes(a.value.state) && stateCode.value !== 'RATE_LIMITED')
-const isWaitGroup = computed(() => codeMeta.value?.group === 'wait')
+const codeMeta = computed(() => STATE_CODES[stateCode.value])
+const stateActions = computed(() => (codeMeta.value?.actions ?? []).map((action) =>
+  a.value?.channel === 'qq' && action === 'goto-screen' ? 'refresh-qr' : action))
+const showStateCard = computed(() => !!a.value && ['login_required', 'degraded', 'error'].includes(a.value.state) && stateCode.value !== 'RATE_LIMITED')
+const readDegraded = computed(() => events.firing.find((alert) => (QIDIAN_READ_DEGRADED_CODES as readonly string[]).includes(alert.code) && alert.subject === 'account:' + id.value) ?? null)
+const resSnapshot = computed(() => resources.metrics?.ours.accounts.find((item) => item.id === id.value) ?? resources.pool?.accounts?.find((item) => item.id === id.value) ?? null)
+const memoryMb = computed(() => resSnapshot.value?.current_mb ?? (resSnapshot.value && 'rss_mb' in resSnapshot.value ? resSnapshot.value.rss_mb : null))
+const loadingAccount = ref(false)
+const accountError = ref('')
+const screenOpen = ref(false)
+const editLabel = ref(false)
+const editingLabel = ref('')
+const pwModal = ref(false)
+const pwSecret = ref('')
+const pwRemember = ref(false)
+const passwordPurpose = ref<'login' | 'credential'>('login')
+const busy = ref(false)
+const webuiUntil = ref<number | null>(null)
+const now = ref(Date.now())
+const webuiLeft = computed(() => webuiUntil.value ? Math.max(0, Math.round((webuiUntil.value - now.value) / 1000)) : 0)
+let tick: ReturnType<typeof setInterval> | null = null
 
-/** 企点读取降级横幅:只认 QIDIAN_NOT_ROOT / QIDIAN_DB_UNAVAILABLE 两码,且 subject=account:<本账号> */
-const readDegraded = computed(() =>
-  events.firing.find(
-    (al) =>
-      (QIDIAN_READ_DEGRADED_CODES as readonly string[]).includes(al.code) &&
-      al.subject === `account:${id.value}`,
-  ) ?? null)
-
-const purgeMismatch = computed(() => purgeInput.value !== id.value)
-const webuiLeft = computed(() => (webuiUntil.value ? Math.max(0, Math.round((webuiUntil.value - now.value) / 1000)) : 0))
-
-const resSnapshot = computed(() =>
-  resources.metrics?.ours.accounts.find((x) => x.id === id.value) ??
-  resources.pool?.accounts?.find((x) => x.id === id.value) ?? null)
-
-const healthChecks = computed(() => {
-  const c = (session.agentReachable ? undefined : undefined) as unknown
-  void c
-  return ACCT_DETAIL_HEALTH_ITEMS
-})
-
+function errorText(error: unknown): string {
+  return error instanceof ApiFailure ? error.message + '（trace ' + error.traceShort + '）' : error instanceof Error ? error.message : String(error)
+}
 async function reload(): Promise<void> {
-  if (!id.value) return
-  if (!accounts.items.length) await accounts.load()
-  try { acctCaps.value = await accountsApi.capabilities(id.value) } catch { acctCaps.value = null }
-  try { recent.value = (await auditApi.list({ kind: 'command', account_id: id.value, limit: 20 })).items } catch { recent.value = [] }
-  if (a.value) {
-    editingLabel.value = a.value.label
-    // 🔴 总控裁决④:Account 不带 `settings` 子对象。账号级设置只经 #22 写,
-    // 读侧目前只有 Account 顶层的这几项(其余键保存后立即生效,页面不假装回显服务端值)。
-    settingsForm.value = {
-      auto_recover: a.value.auto_recover,
-      quota_mb: a.value.quota_mb,
-    }
-  }
-  if (a.value && ['login_required', 'degraded', 'error'].includes(a.value.state)) {
-    await accounts.refreshPrompt(id.value).catch(() => undefined)
-  }
-}
-
-async function act(fn: () => Promise<unknown>, okText: string): Promise<void> {
+  const targetId = id.value
+  if (!targetId) return
+  loadingAccount.value = true
+  accountError.value = ''
   try {
-    await fn()
-    message.success(okText)
-    await accounts.load()
-  } catch (e) {
-    if (e instanceof ApiFailure) message.error(`${e.message}(trace ${e.traceShort})`)
-    else message.error(String(e))
-  }
+    if (!accounts.byId[targetId]) accounts.upsert(await accountsApi.get(targetId))
+    if (id.value !== targetId) return
+    editingLabel.value = a.value?.label ?? ''
+    if (a.value && ['login_required', 'degraded', 'error'].includes(a.value.state)) await accounts.refreshPrompt(targetId).catch(() => undefined)
+    if (!resources.metrics) await resources.loadMetrics().catch(() => undefined)
+  } catch (error) { if (id.value === targetId) accountError.value = errorText(error) }
+  finally { if (id.value === targetId) loadingAccount.value = false }
 }
-
-/** 引导卡片的默认动作按钮(act 名落 qt-acct-detail-state-card-action-{act}) */
-async function runStateAction(actName: string): Promise<void> {
-  switch (actName) {
+async function act(fn: () => Promise<unknown>, okText: string): Promise<boolean> {
+  if (busy.value) return false
+  busy.value = true
+  try { await fn(); message.success(okText); await accounts.load(); if (!accounts.byId[id.value]) await reload(); return true }
+  catch (error) { message.error(errorText(error)); return false }
+  finally { busy.value = false }
+}
+async function saveLabel(): Promise<void> {
+  if (await act(() => accountsApi.patch(id.value, { label: editingLabel.value }), '账号名称已更新')) editLabel.value = false
+}
+function closePassword(): void { pwSecret.value = ''; pwModal.value = false; passwordPurpose.value = 'login' }
+async function submitPassword(): Promise<void> {
+  if (!pwSecret.value || busy.value) return
+  const pendingSecret = pwSecret.value
+  pwSecret.value = ''
+  const updated = passwordPurpose.value === 'credential'
+    ? await act(() => accountsApi.putCredential(id.value, { secret: pendingSecret, remember: true }), '已更新保存的登录密码')
+    : await act(() => accountsApi.login(id.value, { secret: pendingSecret, remember: pwRemember.value }), '已提交登录')
+  if (updated) closePassword()
+}
+async function runStateAction(action: string): Promise<void> {
+  switch (action) {
     case 'login': await act(() => accountsApi.login(id.value, {}), '已重新发起登录'); break
-    case 'password': pwModal.value = true; break
-    case 'goto-screen': void router.push(`/screen/${id.value}`); break
-    case 'key-retry': await window.qt?.wa.invoke('wechat.key.retry', {}); message.info('已请求重新取钥'); break
+    case 'password': passwordPurpose.value = 'login'; pwModal.value = true; break
+    case 'goto-screen': screenOpen.value = true; break
+    case 'refresh-qr':
+      if (busy.value) return
+      busy.value = true
+      try { await accounts.refreshPrompt(id.value) }
+      catch (error) { message.error(errorText(error)) }
+      finally { busy.value = false }
+      break
+    case 'key-retry':
+      if (!window.qt?.wa) message.info('请在桌面控制台重新取钥')
+      else await act(() => window.qt!.wa.invoke('wechat.key.retry', {}), '已请求重新取钥')
+      break
     case 'reinstall': void router.push({ path: '/acct/new', query: { ch: 'wechat', step: 'reinstall' } }); break
     case 'unlock': message.info('请解锁 Windows 桌面后重试'); break
-    case 'cred-update': credModal.value = true; break
+    case 'cred-update': passwordPurpose.value = 'credential'; pwModal.value = true; pwRemember.value = true; break
     case 'restart': await act(() => accountsApi.restart(id.value), '已请求重启'); break
     case 'open-env': void router.push('/env'); break
-    case 'open-logs': await window.qt?.app.openLogsDir(); break
-    case 'narrator-redo': message.info('请重新做一次讲述人仪式'); break
+    case 'open-logs': void router.push({ path: '/log', query: { account_id: id.value } }); break
+    case 'narrator-redo': message.info('请按 Win + Ctrl + Enter 开启讲述人，再完成微信登录'); break
     default: break
   }
 }
-
-async function saveLabel(): Promise<void> {
-  await act(() => accountsApi.patch(id.value, { label: editingLabel.value }), '已改名')
-  editLabel.value = false
-}
-
-async function submitPassword(): Promise<void> {
-  await act(() => accountsApi.login(id.value, { secret: pwSecret.value, remember: pwRemember.value }), '已提交登录')
-  pwSecret.value = ''
-  pwModal.value = false
-}
-
-async function submitCredential(): Promise<void> {
-  await act(() => accountsApi.putCredential(id.value, { secret: credSecret.value, remember: true }), '已更新保险库密码')
-  credSecret.value = ''
-  credModal.value = false
-}
-
-/**
- * #8 账号彻底删除。🔴 回的是 **`202 {job_id}`**,不是同步删完 ——
- * 原先拿到就跳走,用户看不到进度、也看不到失败(比如 Vault 不可达时 `vault_removed:false`)。
- * 现在留在页面上跟 job:进度 + 结果;进不可逆阶段后取消按钮由 `JobProgress` 自动置灰。
- * 前置:须先 #7 软删,否则后端 `409 not_soft_deleted`。
- */
-async function doPurge(): Promise<void> {
-  if (purgeMismatch.value) return
+async function openWebui(): Promise<void> {
+  if (!window.qt?.app.openExternal) { message.info('请在桌面控制台打开 NapCat 工作台'); return }
+  if (busy.value) return
+  busy.value = true
   try {
-    const r = await accountsApi.purge(id.value)
-    purgeJob.value = r.job_id
-    purgeModal.value = false
-    message.success('已发起彻底删除,请等待作业完成')
-  } catch (e) {
-    if (e instanceof ApiFailure) message.error(`${e.message}(trace ${e.traceShort})`)
-    else message.error(String(e))
-  }
+    const result = await accountsApi.webuiOpen(id.value, 10)
+    webuiUntil.value = Date.parse(result.until)
+    const opened = await window.qt.app.openExternal(result.url)
+    if (opened === false) message.warning('临时入口已开启，但地址不在本机安全白名单内，无法打开')
+    else message.success('已打开 NapCat 工作台，入口将在 10 分钟后关闭')
+  } catch (error) { message.error(errorText(error)) }
+  finally { busy.value = false }
 }
-
-function onPurgeDone(job: Job): void {
-  purgeJob.value = null
-  if (job.state !== 'succeeded') {
-    message.error(`彻底删除未完成:${job.error?.message ?? job.state}`)
-    return
-  }
-  const r = (job.result ?? {}) as { vault_removed?: boolean; dir_removed?: boolean; freed_mb?: number }
-  // 🔴 Vault 不可达时后端如实回 `vault_removed:false` —— 界面也要如实说,不许一句「已删除」盖过去
-  if (r.vault_removed === false) {
-    message.warning('数据已删除,但保险库条目未能删除(Vault 不可达),请稍后在保险库里手工清理')
-  } else {
-    message.success(`彻底删除完成,释放 ${r.freed_mb ?? 0} MB`)
-  }
-  void router.push('/acct')
+async function closeWebui(): Promise<void> {
+  if (await act(() => accountsApi.webuiClose(id.value), '临时工作台入口已关闭')) webuiUntil.value = null
 }
-
-/**
- * #16 登出。🔴 **通道分界**(backend-api-2 §3):QQ 通道压根没有「登出」这个概念、
- * 企点有概念但本期没有执行体 —— 两者都要如实说清楚,不许一律「登出失败」。
- */
-async function doLogout(): Promise<void> {
-  try {
-    const r = await accountsApi.logout(id.value)
-    message.success(`已请求登出${r.via ? `(经 ${r.via})` : ''}`)
-    await accounts.load()
-  } catch (e) {
-    if (!(e instanceof ApiFailure)) { message.error(String(e)); return }
-    if (e.reason === 'channel_no_logout') {
-      message.info('QQ 通道没有「登出」这个概念:登录态在 qq_data 卷里,换号请走「导出身份 / 重装」')
-    } else if (e.reason === 'logout_backend_missing') {
-      message.warning('企点通道的登出执行体本期未装配,请在画面里手工退出登录')
-    } else {
-      message.error(`${e.message}(trace ${e.traceShort})`)
-    }
-  }
-}
-
 async function doSoftDelete(): Promise<void> {
   if (!a.value) return
-  await act(() => accountsApi.softDelete(id.value, a.value!.label), '已从列表移除(数据与登录态保留)')
-  void router.push('/acct')
+  if (await act(() => accountsApi.softDelete(id.value, a.value!.label), '账号已从列表移除，数据与登录态保留')) void router.push('/acct')
 }
-
-async function copyAdb(): Promise<void> {
-  await navigator.clipboard.writeText(`adb connect 127.0.0.1:${a.value?.runtime?.adb_port ?? ''}`)
-  message.success('已复制 adb 连接串')
+function openMessages(): void { void router.push({ path: '/msg', query: { account_id: id.value } }) }
+function startAccount(): void {
+  if (a.value?.channel === 'wechat') void router.push({ path: '/acct/new', query: { ch: 'wechat', wxnn: id.value } })
+  else void act(() => accountsApi.start(id.value), '已请求启动')
 }
-
-async function openWebui(): Promise<void> {
-  const r = await accountsApi.webuiOpen(id.value, 10)
-  webuiUntil.value = Date.parse(r.until)
-  message.success('已临时开启 WebUI(10 分钟)')
-}
-
-async function closeWebui(): Promise<void> {
-  await accountsApi.webuiClose(id.value)
-  webuiUntil.value = null
-}
-
-async function exportQqData(): Promise<void> {
-  const r = await accountsApi.exportIdentity(id.value)
-  exportJob.value = r.job_id
-}
-
-async function onExportDone(job: Job): Promise<void> {
-  exportJob.value = null
-  if (job.state !== 'succeeded') { message.error('导出失败'); return }
-  message.success('导出完成,请选择保存位置')
-  await window.qt?.files.saveAs(`${id.value}-qq_data.tar`, 'application/x-tar', String(job.result?.download_url ?? ''))
-}
-
-async function saveSettings(): Promise<void> {
-  await act(() => accountsApi.patchSettings(id.value, settingsForm.value), '账号级设置已保存')
-}
-
-async function toggleAutostop(on: boolean): Promise<void> {
-  settingsForm.value = { ...settingsForm.value, auto_stop_on_pressure: on }
-  await saveSettings()
-}
-
-function capTag(op: string): string {
-  const m = acctCaps.value?.matrix?.[op]
-  if (m === 'supported') return ''
-  if (m === 'not_applicable') return 'NOT_APPLICABLE'
-  return 'UNSUPPORTED'
-}
-
-watch(id, () => void reload())
-onMounted(() => {
-  void reload()
-  tick = setInterval(() => { now.value = Date.now() }, 1000)
-})
-onUnmounted(() => { if (tick) clearInterval(tick) })
+function memoryText(value?: number | null): string { return value == null ? '—' : (value / 1024).toFixed(2) + ' GB' }
+watch(id, () => { screenOpen.value = false; closePassword(); webuiUntil.value = null; void reload() })
+onMounted(() => { void reload(); tick = setInterval(() => { now.value = Date.now() }, 1000) })
+onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
 </script>
 
 <template>
-  <div class="qt-page" :data-testid="T.drawer">
-    <a-result v-if="!a" status="404" title="账号不存在或已删除">
-      <template #extra><a-button @click="router.push('/acct')">返回列表</a-button></template>
-    </a-result>
-
+  <div class="qt-page account-detail" :data-testid="T.drawer">
+    <a-skeleton v-if="loadingAccount && !a" active />
+    <a-result v-else-if="!a" status="404" title="暂时无法打开此账号" :sub-title="accountError || '账号可能已移除，请返回列表确认。'"><template #extra><a-button @click="reload">重试</a-button><a-button @click="router.push('/acct')">返回账号列表</a-button></template></a-result>
     <template v-else>
-      <header class="qt-row head">
-        <StateDot :state="a.state" :reason="a.state_reason" />
-        <template v-if="!editLabel">
-          <strong class="qt-grow">{{ a.label }}</strong>
-          <a-button size="small" :data-testid="T.labelEdit" @click="editLabel = true">改名</a-button>
-        </template>
-        <template v-else>
-          <a-input v-model:value="editingLabel" class="qt-grow" :maxlength="20" />
-          <a-button size="small" type="primary" :data-testid="T.labelSave" @click="saveLabel">保存</a-button>
-        </template>
-        <span class="qt-mono qt-small qt-muted">{{ a.id }}</span>
+      <header class="account-heading qt-glass">
+        <div class="account-avatar">{{ CHANNEL_TEXT[a.channel].slice(0, 1) }}</div>
+        <div class="account-title"><div class="qt-eyebrow">{{ CHANNEL_TEXT[a.channel] }} / 账号工作台</div>
+          <template v-if="!editLabel"><h1>{{ a.label || a.self_nick || a.id }}</h1><span class="qt-small qt-muted">{{ a.self_nick || '尚未取得昵称' }} · {{ a.wxid || a.self_uid || a.id }}</span></template>
+          <div v-else class="qt-row"><a-input v-model:value="editingLabel" :maxlength="20" /><a-button type="primary" :loading="busy" :data-testid="T.labelSave" @click="saveLabel">保存</a-button><a-button @click="editLabel = false">取消</a-button></div>
+        </div>
+        <a-button v-if="!editLabel" size="small" :data-testid="T.labelEdit" @click="editLabel = true">改名</a-button>
+        <span class="account-state-text"><StateDot :state="a.state" :reason="a.state_reason" />{{ ACCOUNT_STATES[a.state]?.zh || '状态未知' }}</span>
       </header>
 
-      <div class="qt-row ops">
-        <a-button v-if="ops.start" :data-testid="T.op('start')" @click="act(() => accountsApi.start(a!.id), '已请求启动')">启动</a-button>
-        <a-button v-if="ops.stop" :data-testid="T.op('stop')" @click="act(() => accountsApi.stop(a!.id), '已请求停止')">停止</a-button>
-        <a-button v-if="ops.restart" :data-testid="T.op('restart')" @click="act(() => accountsApi.restart(a!.id), '已请求重启')">重启</a-button>
-        <a-button v-if="ops.screen" :data-testid="T.op('screen')" @click="router.push(`/screen/${a!.id}`)">画面</a-button>
+      <div class="qt-toolbar account-toolbar">
+        <a-button type="primary" @click="openMessages">查询历史消息</a-button>
+        <a-button v-if="ops.start" :loading="busy" :disabled="a.channel === 'wechat' && resources.hasPending" :data-testid="T.op('start')" @click="startAccount">{{ a.channel === 'wechat' ? '登录此微信' : '启动账号' }}</a-button>
+        <a-popconfirm v-if="ops.stop" title="停止当前账号？消息采集与正在进行的任务会受影响。" @confirm="act(() => accountsApi.stop(a!.id), '已请求停止')"><a-button :disabled="busy" :data-testid="T.op('stop')">停止账号</a-button></a-popconfirm>
+        <a-popconfirm v-if="ops.restart" title="重启当前账号？连接和正在进行的任务会暂时中断。" @confirm="act(() => accountsApi.restart(a!.id), '已请求重启')"><a-button :disabled="busy" :data-testid="T.op('restart')">重启</a-button></a-popconfirm>
+        <a-button class="back-link" @click="router.push('/acct')">全部账号 ↗</a-button>
       </div>
 
-      <a-tabs v-model:activeKey="tab">
-        <a-tab-pane v-for="t in ACCT_DETAIL_TABS" :key="t">
-          <template #tab>
-            <span :data-testid="T.tab(t)">
-              {{ ({ overview: '概览', runtime: '运行时', identity: '身份档案', login: '登录',
-                    caps: '能力', settings: '账号级设置', recent: '最近指令', resource: '资源' } as Record<string, string>)[t] }}
-            </span>
+      <div v-if="readDegraded" class="warnbar" :data-testid="T.readDegraded">{{ ALERT_CODES[readDegraded.code]?.zh ?? readDegraded.message }}<small>系统每 5 分钟自动重试；也可按需重启当前账号。</small></div>
+      <section v-if="showStateCard" class="qt-card state-guide" :data-testid="T.stateCard">
+        <div class="qt-row"><strong>{{ stateCardTitle(stateCode) }}</strong><span v-if="codeMeta?.group === 'wait'" class="workspace-label" :data-testid="T.stateCardLoginPhase">{{ LOGIN_PHASE_TITLE }}</span></div>
+        <p v-if="stateCardSubtitle(stateCode)" class="qt-muted">{{ stateCardSubtitle(stateCode) }}</p><p>{{ prompt?.text || codeMeta?.zh || a.state_reason }}</p>
+        <PromptCard :prompt="prompt" :state-code="stateCode" />
+        <div class="qt-row wrap"><a-button v-for="action in stateActions" :key="action" type="primary" :disabled="busy" :data-testid="T.stateCardAction(action)" @click="runStateAction(action)">{{ ({ login: '重新登录', password: '输入密码登录', 'goto-screen': '查看账号画面', 'refresh-qr': '刷新二维码', 'key-retry': '重新取钥', reinstall: '修复微信', unlock: '解锁 Windows', 'cred-update': '更新登录密码', restart: '重试启动', 'open-env': '检查环境', 'open-logs': '查看日志', 'narrator-redo': '重新准备登录' } as Record<string,string>)[action] ?? action }}</a-button></div>
+      </section>
+
+      <div class="account-layout">
+        <section class="qt-glass account-workspace">
+          <header class="workspace-heading"><div><div class="qt-eyebrow">{{ a.channel === 'qq' ? 'NAPCAT / ONEBOT' : a.channel === 'wechat' ? 'WECHAT / WINDOWS' : 'QIDIAN / ANDROID' }}</div><h2>{{ a.channel === 'qq' ? 'QQ 工作台' : a.channel === 'wechat' ? '微信账号画面' : '企点操作画面' }}</h2></div><span class="workspace-label">{{ a.channel === 'qq' ? '本机受控入口' : a.channel === 'wechat' ? '只读预览' : '实时画面' }}</span></header>
+          <template v-if="a.channel === 'qq'">
+            <div class="channel-preview"><div class="preview-orbit">QQ</div><h3>{{ a.self_nick || a.label }}</h3><p>通过 NapCat 管理当前账号，收发记录可在消息中心查询。</p><a-popconfirm title="临时开放本机 NapCat 工作台 10 分钟并在浏览器打开？" @confirm="openWebui"><a-button type="primary" :disabled="session.draining || busy" :data-testid="T.webuiOpen">打开 NapCat 工作台</a-button></a-popconfirm><div v-if="webuiLeft" class="webui-timer"><span :data-testid="T.webuiCountdown">临时入口剩余 {{ webuiLeft }} 秒</span><a-button size="small" :data-testid="T.webuiClose" @click="closeWebui">提前关闭</a-button></div></div>
           </template>
-        </a-tab-pane>
-      </a-tabs>
-
-      <!-- 概览 -->
-      <section v-if="tab === 'overview'" class="qt-stack">
-        <!-- 企点读取降级横幅:warn、无操作按钮(R6-35 已删「重试提权」) -->
-        <div v-if="readDegraded" class="warnbar" :data-testid="T.readDegraded">
-          {{ ALERT_CODES[readDegraded.code]?.zh ?? readDegraded.message }}
-          <span class="qt-small qt-muted">Agent 每 5 分钟自动重试;要立刻重试用账号「重启」。</span>
-        </div>
-
-        <div v-if="showStateCard" class="qt-card box" :data-testid="T.stateCard">
-          <div class="qt-row">
-            <strong>{{ stateCardTitle(stateCode) }}</strong>
-            <span v-if="isWaitGroup" class="tag" :data-testid="T.stateCardLoginPhase">{{ LOGIN_PHASE_TITLE }}</span>
-          </div>
-          <div v-if="stateCardSubtitle(stateCode)" class="qt-muted">{{ stateCardSubtitle(stateCode) }}</div>
-          <p>{{ prompt?.text || codeMeta?.zh || a.state_reason }}</p>
-          <PromptCard :prompt="prompt" :state-code="stateCode" />
-          <div class="qt-row">
-            <a-button
-              v-for="actName in codeMeta?.actions ?? []"
-              :key="actName"
-              size="small"
-              type="primary"
-              :data-testid="T.stateCardAction(actName)"
-              @click="runStateAction(actName)"
-            >
-              {{ ({ login: '重新登录', password: '输入密码登录', 'goto-screen': '去画面',
-                    'key-retry': '重试取钥', reinstall: '重装微信', unlock: '请解锁 Windows',
-                    'cred-update': '更新保险库里的密码', restart: '重试(重新启动)',
-                    'open-env': '去环境页', 'open-logs': '打开日志目录',
-                    'narrator-redo': '重做仪式' } as Record<string, string>)[actName] ?? actName }}
-            </a-button>
-          </div>
-        </div>
-
-        <div class="qt-card box">
-          <div class="kv"><span>状态</span><b>{{ a.state }} {{ a.state_code }}</b></div>
-          <div class="kv"><span>原因</span><b>{{ a.state_reason || '—' }}</b></div>
-          <div class="kv"><span>昵称</span><b>{{ a.self_nick || '—' }}</b></div>
-          <div class="kv"><span>最近活动</span><b>{{ a.last_seen_at ?? '—' }}</b></div>
-        </div>
-
-        <div class="qt-row">
-          <a-popconfirm
-            title="从列表移除?数据卷与登录态保留,account_id 永不复用"
-            @confirm="doSoftDelete"
-          >
-            <a-button :disabled="!ops.del" :data-testid="T.delete">停用 / 删除</a-button>
-          </a-popconfirm>
-          <a-button danger :disabled="!ops.del" :data-testid="T.purge" @click="purgeModal = true">彻底删除数据</a-button>
-          <!--
-            #16 登出:三个通道语义不同(微信真登出 / QQ 无此概念 / 企点本期无执行体),
-            分诊在 doLogout 里。⚠️ 01 §4 还没有这个按钮的元素 id,已列给文档方。
-          -->
-          <a-popconfirm title="登出该账号?登录态会失效,下次要重新登录" @confirm="doLogout">
-            <a-button :disabled="session.draining">登出</a-button>
-          </a-popconfirm>
-        </div>
-        <!-- #8 是 202 作业:进度与结果留在页面上,不再「发起即跳走」 -->
-        <JobProgress v-if="purgeJob" :job-id="purgeJob" @done="onPurgeDone" />
-      </section>
-
-      <!-- 运行时 -->
-      <section v-else-if="tab === 'runtime'" class="qt-card box">
-        <div v-for="(v, k) in a.runtime ?? {}" :key="k" class="kv"><span>{{ k }}</span><b class="qt-mono">{{ v }}</b></div>
-        <div class="qt-row">
-          <a-button v-if="a.channel === 'qidian'" :data-testid="T.copyAdb" @click="copyAdb">复制 adb 连接串</a-button>
-          <a-button
-            v-if="a.channel === 'qidian'"
-            :disabled="!['running', 'degraded'].includes(a.state)"
-            :data-testid="T.adbReconnect"
-            @click="act(() => accountsApi.reconnectAdb(a!.id), '已重连 adb')"
-          >重连 adb</a-button>
-          <a-button
-            v-if="a.channel === 'qidian'"
-            :disabled="!['running', 'degraded'].includes(a.state)"
-            :data-testid="T.streamRebuild"
-            @click="act(() => accountsApi.restartStream(a!.id), '已重建画面流')"
-          >重建画面流</a-button>
-        </div>
-        <div v-if="a.channel !== 'wechat'" class="qt-row health">
-          <span class="qt-small qt-muted">健康项:</span>
-          <span v-for="h in healthChecks" :key="h" class="hdot" :data-testid="T.health(h)">
-            {{ h.toUpperCase() }}
-            <span class="dot" :style="{ background: 'var(--qt-state-running)' }" />
-          </span>
-        </div>
-        <div v-if="a.channel === 'qq'" class="qt-row">
-          <a-button v-if="!webuiLeft" :data-testid="T.webuiOpen" @click="openWebui">临时开 WebUI(10 分钟)</a-button>
-          <template v-else>
-            <span :data-testid="T.webuiCountdown" class="qt-mono">剩余 {{ webuiLeft }} 秒</span>
-            <a-button :data-testid="T.webuiClose" @click="closeWebui">提前关闭</a-button>
-          </template>
-        </div>
-      </section>
-
-      <!-- 身份档案 -->
-      <section v-else-if="tab === 'identity'" class="qt-card box">
-        <template v-if="a.channel === 'qidian'">
-          <div v-for="(v, k) in a.identity ?? {}" :key="k" class="kv"><span>{{ k }}</span><b class="qt-mono">{{ v }}</b></div>
-          <p class="qt-danger qt-small">机型/指纹/序列号一经生成永不改变。</p>
-        </template>
-        <template v-else-if="a.channel === 'qq'">
-          <div class="kv"><span>qq_data 卷</span><b class="qt-mono">accounts/{{ a.id }}/data</b></div>
-          <a-popconfirm
-            title="只用于同机重装后恢复;换机器恢复等于新设备,仍需扫码且可能触发风控"
-            @confirm="exportQqData"
-          >
-            <a-button :disabled="a.state !== 'stopped'" :data-testid="T.exportQqdata">导出 qq_data</a-button>
-          </a-popconfirm>
-          <JobProgress :job-id="exportJob" :testid="T.exportProgress" @done="onExportDone" />
-        </template>
-        <template v-else>
-          <div class="kv"><span>wxid</span><b class="qt-mono">{{ a.wxid ?? '—' }}</b></div>
-          <div class="kv"><span>昵称</span><b>{{ a.self_nick ?? '—' }}</b></div>
-          <p class="qt-small qt-muted">微信登录态**不备份、不恢复**。</p>
-        </template>
-      </section>
-
-      <!-- 登录 -->
-      <section v-else-if="tab === 'login'" class="qt-card box">
-        <div class="kv"><span>登录方式</span><b>{{ a.login?.mode ?? '—' }}</b></div>
-        <div class="kv"><span>记住密码</span><b>{{ a.login?.remember ? '是' : '否' }}</b></div>
-        <div class="kv">
-          <span>保险库</span>
-          <b :data-testid="T.credStatus">{{ a.login?.credential_ref ? '已保存' : '未保存' }}</b>
-        </div>
-        <p class="qt-small qt-muted">永不显示密码明文;控制台令牌对保险库只能写与删。</p>
-        <div class="qt-row">
-          <a-button
-            v-if="a.channel === 'qidian'"
-            :data-testid="T.loginPassword"
-            @click="pwModal = true"
-          >输入密码登录</a-button>
-          <a-button
-            v-if="a.channel === 'qidian'"
-            :disabled="!session.winagentOnline"
-            :data-testid="T.credUpdate"
-            @click="credModal = true"
-          >更新保险库里的密码</a-button>
-          <a-popconfirm title="清除保存的密码?下次启动需手输" @confirm="act(() => accountsApi.deleteCredential(a!.id), '已清除')">
-            <a-button :disabled="!session.winagentOnline" :data-testid="T.credClear">清除保存的密码</a-button>
-          </a-popconfirm>
-        </div>
-      </section>
-
-      <!-- 能力 -->
-      <section v-else-if="tab === 'caps'" class="qt-card box">
-        <p v-if="a.state === 'degraded' && a.state_code === 'KEY_FAIL'" class="qt-danger">
-          取钥失败,读写均不可用。
-        </p>
-        <div v-for="op in Object.keys(CAPABILITY_TEXT)" :key="op" class="kv" :data-testid="T.cap(op)">
-          <span :class="{ dim: !!capTag(op) }">{{ capabilityText(op) }} <span class="qt-mono qt-small">{{ op }}</span></span>
-          <b>{{ capTag(op) || '可用' }}</b>
-        </div>
-      </section>
-
-      <!-- 账号级设置 -->
-      <section v-else-if="tab === 'settings'" class="qt-card box">
-        <a-form layout="vertical">
-          <a-form-item label="发送最小间隔 ms">
-            <a-input-number
-              :data-testid="T.settings('send-interval')"
-              :value="(settingsForm['send.min_interval_ms'] as number)"
-              @change="(v: any) => settingsForm['send.min_interval_ms'] = v"
-            />
-          </a-form-item>
-          <a-form-item label="发送抖动 ms">
-            <a-input-number
-              :data-testid="T.settings('send-jitter')"
-              :value="(settingsForm['send.jitter_ms'] as number)"
-              @change="(v: any) => settingsForm['send.jitter_ms'] = v"
-            />
-          </a-form-item>
-          <a-form-item label="每分钟最多发送">
-            <a-input-number
-              :data-testid="T.settings('send-max')"
-              :value="(settingsForm['send.max_per_minute'] as number)"
-              @change="(v: any) => settingsForm['send.max_per_minute'] = v"
-            />
-          </a-form-item>
-          <a-form-item label="会话白名单(会话名或原生 ID,* 为全部)">
-            <a-textarea
-              :data-testid="T.settings('allowlist')"
-              :rows="2"
-              :value="(settingsForm['sessions.allowlist'] as string)"
-              @change="(e: any) => settingsForm['sessions.allowlist'] = e.target.value"
-            />
-          </a-form-item>
-          <a-form-item label="自定义闸">
-            <a-textarea
-              :data-testid="T.settings('gates')"
-              :rows="2"
-              :value="(settingsForm['gates.custom'] as string)"
-              @change="(e: any) => settingsForm['gates.custom'] = e.target.value"
-            />
-          </a-form-item>
-          <a-form-item label="记录正文">
-            <a-switch
-              :data-testid="T.settings('log-body')"
-              :checked="!!settingsForm['log.body']"
-              @change="(v: any) => settingsForm['log.body'] = !!v"
-            />
-          </a-form-item>
-          <a-form-item label="保留天数(空 = 继承全局;上限 30)">
-            <a-input-number
-              :data-testid="T.settings('retention')"
-              :max="30"
-              :value="(settingsForm['retention_days'] as number)"
-              @change="(v: any) => settingsForm['retention_days'] = v"
-            />
-          </a-form-item>
-          <a-form-item label="开机自恢复(仅拉起容器,不含登录)">
-            <a-switch
-              :data-testid="T.settings('auto-recover')"
-              :checked="!!settingsForm['auto_recover']"
-              @change="(v: any) => settingsForm['auto_recover'] = !!v"
-            />
-          </a-form-item>
-          <a-form-item label="内存吃紧时允许自动停用本账号">
-            <a-popconfirm
-              title="开启后内存吃紧时本账号可能被系统自动停用"
-              @confirm="toggleAutostop(!settingsForm['auto_stop_on_pressure'])"
-            >
-              <a-switch :data-testid="T.autostop" :checked="!!settingsForm['auto_stop_on_pressure']" />
-            </a-popconfirm>
-            <div class="qt-danger qt-small" :data-testid="T.autostopNote">
-              默认关;开启后内存 critical 时本账号可能被按 LRU 自动停用。
-            </div>
-          </a-form-item>
-          <a-button type="primary" :data-testid="T.settingsSave" @click="saveSettings">保存</a-button>
-        </a-form>
-      </section>
-
-      <!-- 最近指令 -->
-      <section v-else-if="tab === 'recent'" class="qt-card box">
-        <table class="tbl">
-          <thead><tr><th>时间</th><th>能力</th><th>结果码</th><th>耗时</th><th /></tr></thead>
-          <tbody>
-            <tr v-for="r in recent" :key="r.id" :data-testid="T.recent(r.trace_id ?? String(r.id))">
-              <td class="qt-small">{{ auditTsText(r) }}</td>
-              <td>{{ capabilityText(auditDetail(r).op ?? r.action ?? '') }}</td>
-              <td>{{ r.result_code ?? '—' }}</td>
-              <td>{{ auditDetail(r).cost_ms ?? '—' }} ms</td>
-              <td><a-button size="small" @click="router.push({ path: '/cmd', query: { replay: r.trace_id } })">重放</a-button></td>
-            </tr>
-            <tr v-if="!recent.length"><td colspan="5" class="qt-muted">暂无指令</td></tr>
-          </tbody>
-        </table>
-      </section>
-
-      <!-- 资源 -->
-      <section v-else class="qt-card box">
-        <div class="kv"><span>配额</span><b :data-testid="T.resField('quota')">{{ a.quota_mb }} MB</b></div>
-        <div class="kv"><span>anon</span><b :data-testid="T.resField('anon')">{{ resSnapshot?.anon_mb ?? '—' }} MB</b></div>
-        <div class="kv"><span>current</span><b :data-testid="T.resField('current')">{{ resSnapshot?.current_mb ?? '—' }} MB</b></div>
-        <div class="kv"><span>容器 max</span><b :data-testid="T.resField('max')">{{ a.quota_mb }} MB</b></div>
-        <div class="kv"><span>CPU</span><b :data-testid="T.resField('cpu')">{{ resSnapshot?.cpu_pct ?? '—' }}%</b></div>
-      </section>
+          <AccountScreen v-else-if="screenOpen" :key="a.id" embedded :account-id="a.id" />
+          <div v-else class="channel-preview"><div class="preview-orbit">{{ a.channel === 'wechat' ? '微' : '企' }}</div><h3>{{ a.channel === 'wechat' ? '查看当前微信窗口' : '打开专属账号画面' }}</h3><p>{{ a.channel === 'wechat' ? '窗口每 2 秒更新一次。操作请在 Windows 中的微信窗口完成。' : '按需连接实时画面，完成登录、验证码与日常操作。' }}</p><a-button type="primary" :data-testid="T.op('screen')" @click="screenOpen = true">{{ a.channel === 'wechat' ? '查看微信画面' : '连接企点画面' }}</a-button></div>
+        </section>
+        <aside class="account-sidebar">
+          <section class="qt-card facts-card"><div class="qt-eyebrow">ACCOUNT PROFILE</div><h2>账号信息</h2><div class="kv"><span>通道</span><b>{{ CHANNEL_TEXT[a.channel] }}</b></div><div class="kv"><span>标识</span><b>{{ a.wxid || a.self_uid || a.id }}</b></div><div class="kv"><span>最近活动</span><b>{{ a.last_seen_at?.slice(5,19).replace('T',' ') || '—' }}</b></div><p v-if="a.state_reason" class="qt-small qt-muted">{{ a.state_reason }}</p></section>
+          <section class="qt-card facts-card"><div class="qt-eyebrow">RESOURCE USAGE</div><h2>当前占用</h2><div class="resource-value" :data-testid="T.resField('current')">{{ memoryText(memoryMb) }}</div><div class="kv"><span>CPU</span><b :data-testid="T.resField('cpu')">{{ resSnapshot?.cpu_pct == null ? '—' : resSnapshot.cpu_pct + '%' }}</b></div><a-button block @click="router.push('/res')">查看资源监控 ↗</a-button></section>
+          <div class="remove-account"><a-popconfirm title="从列表移除该账号？账号将停用，数据与登录态保留。" @confirm="doSoftDelete"><a-button type="text" :disabled="!ops.del || busy" :data-testid="T.delete">移除账号</a-button></a-popconfirm></div>
+        </aside>
+      </div>
     </template>
 
-    <!-- 输入密码登录 -->
-    <a-modal v-model:open="pwModal" title="输入密码登录" :data-testid="T.loginPasswordModal" :footer="null">
-      <a-input v-model:value="pwSecret" type="password" autocomplete="new-password" placeholder="密码(不回显、不入 store)" />
-      <a-checkbox v-model:checked="pwRemember" :disabled="!session.winagentOnline" class="mt">这次保存到保险库</a-checkbox>
-      <div class="qt-row mt">
-        <a-button @click="pwModal = false">取消</a-button>
-        <a-button type="primary" :data-testid="T.loginPasswordSubmit" @click="submitPassword">登录</a-button>
-      </div>
-    </a-modal>
-
-    <!-- 更新保险库密码 -->
-    <a-modal v-model:open="credModal" title="更新保险库里的密码" :footer="null">
-      <a-input v-model:value="credSecret" type="password" autocomplete="new-password" placeholder="新密码(只写不读)" />
-      <div class="qt-row mt">
-        <a-button @click="credModal = false">取消</a-button>
-        <a-button type="primary" @click="submitCredential">保存</a-button>
-      </div>
-    </a-modal>
-
-    <!-- 彻底删除数据:须手输账号 ID 原文 -->
-    <a-modal v-model:open="purgeModal" title="彻底删除数据" :data-testid="T.purgeModal" :footer="null">
-      <p class="qt-danger">
-        将清空数据卷与登录态,<b>不可恢复</b>;重新登录等于新设备,可能触发风控。
-      </p>
-      <p>请手动输入账号 ID 原文 <b class="qt-mono">{{ id }}</b> 以确认:</p>
-      <a-input v-model:value="purgeInput" :data-testid="T.purgeInput" :status="purgeMismatch && purgeInput ? 'error' : undefined" />
-      <div class="qt-row mt">
-        <a-button @click="purgeModal = false">取消</a-button>
-        <a-button type="primary" danger :disabled="purgeMismatch" :data-testid="T.purgeConfirm" @click="doPurge">
-          确认彻底删除
-        </a-button>
-      </div>
+    <a-modal v-model:open="pwModal" :title="passwordPurpose === 'credential' ? '更新保存的登录密码' : '输入密码登录'" :data-testid="T.loginPasswordModal" :footer="null" @cancel="closePassword">
+      <a-input v-model:value="pwSecret" type="password" autocomplete="new-password" placeholder="输入登录密码" />
+      <a-checkbox v-if="passwordPurpose === 'login'" v-model:checked="pwRemember" :disabled="!session.winagentOnline" class="mt">这次保存到保险库</a-checkbox>
+      <div class="qt-row mt"><a-button @click="closePassword">取消</a-button><a-button type="primary" :loading="busy" :disabled="!pwSecret || (passwordPurpose === 'credential' && !session.winagentOnline)" :data-testid="T.loginPasswordSubmit" @click="submitPassword">{{ passwordPurpose === 'credential' ? '保存' : '登录' }}</a-button></div>
     </a-modal>
   </div>
 </template>
 
 <style scoped>
-.head { margin-bottom: var(--qt-space-2); }
-.ops { margin-bottom: var(--qt-space-2); gap: var(--qt-space-2); }
-.box { padding: var(--qt-space-4); }
-.kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed var(--qt-border); }
-.warnbar { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); border-radius: var(--qt-radius-sm); }
-.tag { border: 1px solid var(--qt-sev-warn); color: var(--qt-sev-warn); border-radius: 8px; padding: 0 6px; font-size: var(--qt-font-xs); }
-.tbl { width: 100%; border-collapse: collapse; }
-.tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--qt-border); }
-.dim { color: var(--qt-text-disabled); }
-.health { margin-top: var(--qt-space-2); }
-.hdot { display: inline-flex; align-items: center; gap: 4px; margin-right: var(--qt-space-3); font-size: var(--qt-font-xs); }
-.hdot .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.mt { margin-top: var(--qt-space-3); }
+.account-heading { display: flex; align-items: center; margin-bottom: 22px; padding: 28px; border: 1px solid rgba(117,71,168,.12); border-radius: 26px; gap: 18px; }
+.account-state-text { display: inline-flex; align-items: center; gap: 8px; color: var(--qt-text-secondary); font-size: 13px; }
+.account-title { flex: 1; min-width: 0; }
+.account-title h1 { margin: 4px 0; font-size: 28px; letter-spacing: -.8px; }
+.account-avatar { display: grid; place-items: center; flex-shrink: 0; width: 64px; height: 64px; border: 1px solid rgba(255,255,255,.8); border-radius: 22px; color: var(--qt-primary); background: linear-gradient(135deg,#eee5fa,#fff6de); font-size: 26px; }
+.account-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+.back-link { margin-left: auto; }
+.account-layout { display: grid; grid-template-columns: minmax(0,1fr) 285px; gap: 22px; }
+.account-workspace { border: 1px solid rgba(117,71,168,.12); border-radius: 26px; padding: 26px; min-width: 0; }
+.workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.workspace-heading h2, .facts-card h2 { margin: 5px 0 0; font-size: 20px; }
+.workspace-label { background: rgba(117,71,168,.08); color: var(--qt-primary); font-size: 11px; padding: 7px 12px; border-radius: 20px; white-space: nowrap; }
+.channel-preview { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 390px; padding: 28px 18px; text-align: center; background: radial-gradient(ellipse at 38% 60%,rgba(117,71,168,.11),transparent 52%),radial-gradient(ellipse at 66% 40%,rgba(242,173,56,.14),transparent 46%); }
+.preview-orbit { display: grid; place-items: center; width: 88px; height: 88px; border-radius: 28px; background: rgba(255,255,255,.75); border: 1px solid #fff; color: var(--qt-primary); box-shadow: 0 16px 45px rgba(117,71,168,.12); font-size: 30px; }
+.channel-preview h3 { margin: 24px 0 8px; font-size: 20px; }
+.channel-preview p { color: var(--qt-text-secondary); max-width: 420px; line-height: 1.8; font-size: 13px; margin-bottom: 24px; }
+.webui-timer { display: flex; align-items: center; gap: 10px; margin-top: 18px; color: var(--qt-text-secondary); font-size: 11px; }
+.account-sidebar { display: flex; flex-direction: column; gap: 20px; }
+.facts-card { padding: 24px; }
+.facts-card h2 { margin-bottom: 18px; font-size: 17px; }
+.kv { display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--qt-border); font-size: 12px; }
+.kv span { color: var(--qt-text-secondary); flex-shrink: 0; }
+.kv b { text-align: right; overflow-wrap: anywhere; font-weight: 500; }
+.resource-value { font-size: 31px; margin: 12px 0; letter-spacing: -1px; }
+.facts-card .ant-btn { margin-top: 18px; }
+.remove-account { text-align: center; }
+.state-guide { padding: 24px; margin-bottom: 22px; }
+.wrap { flex-wrap: wrap; gap: 8px; }
+.warnbar { background: #fff5df; color: var(--qt-sev-warn); padding: 18px 22px; border-radius: 16px; margin-bottom: 20px; }
+.warnbar small { display: block; margin-top: 6px; }
+.mt { margin-top: 18px; }
+@media(max-width: 1000px) { .account-layout { grid-template-columns: 1fr; } .account-sidebar { display: grid; grid-template-columns: 1fr 1fr; } }
+@media(max-width: 760px) { .account-heading { padding: 20px; flex-wrap: wrap; } .account-workspace { padding: 18px; } .account-avatar { width: 48px; height: 48px; } .account-sidebar { display: flex; } .account-title h1 { font-size: 23px; } .back-link { margin-left: 0; } }
 </style>

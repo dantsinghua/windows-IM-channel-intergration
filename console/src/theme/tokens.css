@@ -1,7 +1,11 @@
 /* 设计令牌全表(01 §2.9;基线 §9 给定的色值为准) */
 :root {
   /* 品牌与状态 */
-  --qt-primary: #2F54EB;
+  --qt-primary: #7547A8;
+  --qt-primary-strong: #583180;
+  --qt-primary-soft: #F0EAF8;
+  --qt-accent: #F2AD38;
+  --qt-accent-soft: #FFF4DC;
   --qt-state-running: #52C41A;  --qt-state-login_required: #FAAD14;
   --qt-state-starting: #1677FF; --qt-state-stopped: #8C8C8C;
   --qt-state-error: #F5222D;    --qt-state-degraded: #FA8C16;
@@ -14,18 +18,18 @@
   --qt-sev-info: var(--qt-state-starting);  --qt-sev-warn: var(--qt-state-login_required);
   --qt-sev-crit: var(--qt-state-error);
   /* 中性色(浅色) */
-  --qt-bg: #F5F6F8;  --qt-bg-elevated: #FFFFFF;  --qt-border: #E5E6EB;
-  --qt-text: #1F1F1F;  --qt-text-secondary: #595959;  --qt-text-disabled: #BFBFBF;
+  --qt-bg: #F5F4F7;  --qt-bg-elevated: #FFFFFF;  --qt-border: #E6E2EC;
+  --qt-text: #272131;  --qt-text-secondary: #706878;  --qt-text-disabled: #928A9A;
   /* 间距 / 字号 / 圆角 / 阴影 */
   --qt-space-1: 4px; --qt-space-2: 8px; --qt-space-3: 12px; --qt-space-4: 16px;
   --qt-space-6: 24px; --qt-space-8: 32px;
-  --qt-font-xs: 12px; --qt-font-sm: 13px; --qt-font-md: 14px; --qt-font-lg: 16px;
-  --qt-font-xl: 20px; --qt-font-xxl: 24px;
+  --qt-font-xs: 12px; --qt-font-sm: 14px; --qt-font-md: 14px; --qt-font-lg: 16px;
+  --qt-font-xl: 24px; --qt-font-xxl: 30px;
   --qt-font-mono: "Cascadia Mono","JetBrains Mono",Consolas,monospace;
-  --qt-radius-sm: 4px; --qt-radius-md: 6px; --qt-radius-lg: 8px;
-  --qt-shadow-1: 0 1px 2px rgba(0,0,0,.06);  --qt-shadow-2: 0 4px 12px rgba(0,0,0,.10);
+  --qt-radius-sm: 8px; --qt-radius-md: 16px; --qt-radius-lg: 24px;
+  --qt-shadow-1: 0 4px 24px rgba(61,38,85,.035);  --qt-shadow-2: 0 12px 36px rgba(61,38,85,.09);
   /* 布局 */
-  --qt-nav-w: 200px; --qt-nav-w-collapsed: 56px; --qt-header-h: 48px;
+  --qt-nav-w: 220px; --qt-nav-w-collapsed: 72px; --qt-header-h: 88px;
 }
 
 /* 深色留 M5;状态色深浅同值(状态灯是跨页面的语义信号) */
@@ -44,12 +48,14 @@ body {
   color: var(--qt-text);
   font-size: var(--qt-font-md);
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
 }
 
 .qt-mono { font-family: var(--qt-font-mono); }
 .qt-muted { color: var(--qt-text-secondary); }
 .qt-small { font-size: var(--qt-font-xs); }
-.qt-card { background: var(--qt-bg-elevated); border: 1px solid var(--qt-border); border-radius: var(--qt-radius-md); }
+.qt-card { background: var(--qt-bg-elevated); border: 1px solid var(--qt-border); border-radius: var(--qt-radius-md); box-shadow: var(--qt-shadow-1); }
 .qt-section-title { font-size: var(--qt-font-lg); font-weight: 600; margin-bottom: var(--qt-space-3); }
 .qt-row { display: flex; align-items: center; gap: var(--qt-space-2); }
 .qt-col { display: flex; flex-direction: column; gap: var(--qt-space-2); }
@@ -57,5 +63,35 @@ body {
 .qt-danger { color: var(--qt-state-error); }
 .qt-warn { color: var(--qt-sev-warn); }
 .qt-ok { color: var(--qt-state-running); }
-.qt-page { padding: var(--qt-space-4); }
-.qt-stack > * + * { margin-top: var(--qt-space-4); }
+.qt-page { padding: 28px 36px 40px; max-width: 1760px; margin: 0 auto; }
+.qt-stack > * + * { margin-top: 22px; }
+.qt-page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.qt-page-heading h1, .qt-page-heading h2 { margin: 0; font-size: 28px; line-height: 1.4; letter-spacing: -.8px; font-weight: 650; }
+.qt-page-heading p { color: var(--qt-text-secondary); margin: 8px 0 0; }
+.qt-eyebrow { display: block; font-size: 12px; font-weight: 600; letter-spacing: 1.6px; color: var(--qt-primary); margin-bottom: 8px; }
+.qt-glass { background: rgba(255,255,255,.66); border: 1px solid rgba(255,255,255,.94); box-shadow: 0 6px 24px #49316c08, inset 0 1px 0 #fff; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-radius: var(--qt-radius-lg); }
+.qt-surface { background: white; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-lg); padding: 24px; }
+.qt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 18px; background: #faf9fc; border: 1px solid var(--qt-border); border-radius: 16px; }
+.qt-stat { font-size: 32px; font-weight: 600; letter-spacing: -1.5px; }
+button, a, input, select, summary { -webkit-tap-highlight-color: transparent; }
+button { font: inherit; }
+button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 3px solid #a080c9; outline-offset: 3px; }
+a { color: var(--qt-primary); }
+summary { cursor: pointer; }
+.content .tbl { background: white; border-radius: 16px; overflow: hidden; }
+.content .tbl thead { background: #f6f4f9; color: var(--qt-text-secondary); }
+.content .tbl th { font-weight: 500; }
+.content .tbl th, .content .tbl td { padding: 14px 16px; line-height: 1.65; border-bottom: 1px solid #efedf2; }
+.content .tbl tbody tr:hover { background: #fcfaff; }
+.content .qt-card.box { padding: 24px; }
+.content .ant-collapse { border-color: var(--qt-border); }
+.content .ant-tabs-nav::before { border-bottom-color: var(--qt-border); }
+.content .ant-tabs-tab { padding: 14px 4px; }
+.ant-modal-mask { backdrop-filter: blur(6px); }
+.ant-drawer-mask { backdrop-filter: blur(4px); }
+.ant-modal-content, .ant-drawer-content { box-shadow: 0 18px 80px #29154126; }
+.ant-table-wrapper, .qt-mono { font-variant-numeric: tabular-nums; }
+@supports not (backdrop-filter: blur(1px)) { .qt-glass { background: #fff; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
+@media (max-width: 1000px) { .qt-page { padding: 22px; } .qt-page-heading h1, .qt-page-heading h2 { font-size: 24px; } }
+@media (max-width: 640px) { .qt-page { padding: 16px; } .qt-page-heading { align-items: flex-start; flex-wrap: wrap; } .qt-row { flex-wrap: wrap; } .qt-surface, .content .qt-card.box { padding: 16px; } }

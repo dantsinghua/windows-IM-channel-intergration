@@ -2,7 +2,7 @@
 
 两个后端同一接口:
 - ``LocalSqliteMainDb``:宿主能直接打开的库文件(单测 / 将来把容器数据卷挂到宿主时用)
-- ``AdbMainDb``:产品口径——设备上 ``sqlite3 'file:…?mode=ro'``,经 ``adb -s 127.0.0.1:160NN shell`` 一次调用查完一批表(不逐表起 shell)
+- ``AdbMainDb``:产品口径——设备上 ``sqlite3 'file:…?mode=ro'``,经 ``adb -P 16000 -s 127.0.0.1:160NN shell`` 一次调用查完一批表(不逐表起 shell)
 调用方(poll.py)只依赖 ``MainDb`` 协议;任何 sqlite 报错统一抛 ``MainDbError(reason)``,``reason ∈ {open_failed, schema_mismatch}``。
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from ...runtime.runtime import ADB_SERVER_PORT
 from .contacts import CONTACT_SQL
 from .msgdata import MainDbRow
 
@@ -121,20 +122,22 @@ class LocalSqliteMainDb:
 
 
 class AdbMainDb:
-    """产品后端:``adb -s 127.0.0.1:160NN shell sqlite3 -separator '|' 'file:…?mode=ro' "<sql>"``。
+    """产品后端:``adb -P 16000 -s 127.0.0.1:160NN shell sqlite3 -separator '|' 'file:…?mode=ro' "<sql>"``。
 
     前置 = ``ensure_root`` 已通过(06 §2.9.5;非 root 读不到 /data/data)。本类不做提权。
     """
 
-    def __init__(self, serial: str, self_uid: str, *, adb: str = "adb", timeout_s: float = 10.0):
+    def __init__(self, serial: str, self_uid: str, *, adb: str = "adb", timeout_s: float = 10.0,
+                 server_port: int = ADB_SERVER_PORT):
         self.serial = serial
         self.path = db_path_for(self_uid)
         self.adb = adb
+        self.server_port = server_port
         self.timeout_s = timeout_s
 
     def _shell(self, cmd: str) -> str:
         try:
-            p = subprocess.run([self.adb, "-s", self.serial, "shell", cmd], capture_output=True, text=True,
+            p = subprocess.run([self.adb, "-P", str(self.server_port), "-s", self.serial, "shell", cmd], capture_output=True, text=True,
                                timeout=self.timeout_s, check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise MainDbError("open_failed", str(e)) from e

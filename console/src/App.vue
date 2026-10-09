@@ -20,6 +20,8 @@ import { useUiStore } from '@/stores/ui'
 import { useSetupStore } from '@/stores/setup'
 import { installGuards } from '@/router'
 import AlertCard from '@/components/AlertCard.vue'
+import QtIcon from '@/components/QtIcon.vue'
+import zhCN from 'ant-design-vue/es/locale/zh_CN'
 import { CHANNELS, STATE_CODES } from '@/i18n/zh-CN/codes'
 import type { AccountStatePayload, QtEvent } from '@/api/types'
 
@@ -28,8 +30,6 @@ const NAV_ITEMS = [
   { seg: 'res', path: '/res', label: '资源监控' },
   { seg: 'acct', path: '/acct', label: '账号' },
   { seg: 'screen', path: '/screen', label: '画面' },
-  { seg: 'cmd', path: '/cmd', label: '指令台' },
-  { seg: 'flow', path: '/flow', label: '工作流' },
   { seg: 'msg', path: '/msg', label: '消息' },
   { seg: 'mail', path: '/mail', label: '邮件摆渡' },
   { seg: 'env', path: '/env', label: '环境' },
@@ -38,6 +38,8 @@ const NAV_ITEMS = [
 ] as const
 
 const route = useRoute()
+const primaryNav = ['dash', 'msg', 'log', 'res', 'env']
+const themeConfig = { token: { colorPrimary: '#7547A8', colorInfo: '#7547A8', colorText: '#272131', colorTextSecondary: '#706878', colorBgLayout: '#F5F4F7', colorBorder: '#E6E2EC', borderRadius: 10, fontSize: 14, controlHeight: 38, fontFamily: '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif' }, components: { Button: { primaryShadow: '0 4px 12px #7547a824' }, Table: { headerBg: '#F6F4F9', rowHoverBg: '#FAF7FF' }, Modal: { borderRadiusLG: 24 }, Drawer: { paddingLG: 28 } } }
 const router = useRouter()
 const session = useSessionStore()
 const events = useEventsStore()
@@ -95,7 +97,7 @@ async function runHintAction(act: string): Promise<void> {
 
 /** 全量拉:首启、以及 WS 重放截断时(§5.1) */
 async function fullReload(): Promise<void> {
-  await Promise.all([accounts.load(), resources.load(), mail.reloadAll().catch(() => undefined)])
+  await Promise.all([accounts.load(), resources.load(), resources.loadMetrics(), mail.reloadAll().catch(() => undefined)])
   events.markSynced()
 }
 
@@ -125,10 +127,12 @@ onMounted(async () => {
 
   await fullReload()
   void env.loadAll()
-  void commands.loadCatalog().catch(() => undefined)
 
-  // P-DASH 每 30s 拉一次 /resources(事件即时刷之外的兜底)
-  resourceTimer = setInterval(() => void resources.load(), 30000)
+  // 资源池与监控快照来自不同端点；首屏和事件流之外均需兜底刷新。
+  resourceTimer = setInterval(() => {
+    void resources.load()
+    void resources.loadMetrics()
+  }, 30000)
   staleTimer = setInterval(() => {
     staleSeconds.value = events.disconnectedAt ? Math.round((Date.now() - events.disconnectedAt) / 1000) : 0
   }, 1000)
@@ -175,38 +179,50 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <a-config-provider>
+  <a-config-provider :theme="themeConfig" :locale="zhCN">
     <a-app>
-      <div class="shell">
+      <div class="shell" :class="{ 'nav-collapsed': ui.navCollapsed, 'setup-shell': isSetupRoute }">
         <!-- 首次向导占满全屏,不套外框 -->
         <router-view v-if="isSetupRoute" />
 
         <template v-else>
           <aside class="nav" :style="{ width: ui.navCollapsed ? 'var(--qt-nav-w-collapsed)' : 'var(--qt-nav-w)' }">
-            <div class="brand">{{ ui.navCollapsed ? 'QT' : 'QTrade 控制台' }}</div>
+            <a class="brand" href="#/dash" aria-label="QTrade 首页"><span class="brand-mark">Q<span /></span><span v-if="!ui.navCollapsed" class="brand-name">QTrade<small>多通道工作台</small></span></a>
+            <nav class="nav-menu" aria-label="工作空间导航">
+            <div v-if="!ui.navCollapsed" class="nav-caption">工作空间</div>
             <a
-              v-for="it in NAV_ITEMS"
+              v-for="it in primaryNav.map(seg => NAV_ITEMS.find(x => x.seg === seg)!)"
               :key="it.seg"
               class="nav-item"
               :class="{ active: route.path.startsWith(it.path) }"
               :data-testid="T.nav(it.seg)"
-              @click="go(it.path)"
-            >{{ ui.navCollapsed ? it.label.slice(0, 1) : it.label }}</a>
-            <a class="nav-item collapse" :data-testid="T.navCollapse" @click="ui.toggleNav()">
-              {{ ui.navCollapsed ? '»' : '« 折叠' }}
-            </a>
+              :href="`#${it.path}`"
+              :aria-current="route.path.startsWith(it.path) ? 'page' : undefined"
+              :title="it.label"
+            ><QtIcon :name="it.seg" /><span v-if="!ui.navCollapsed">{{ it.seg === 'log' ? '日志与告警' : it.label }}</span></a>
+            <div class="nav-divider" />
+            <a class="nav-item" :class="{ active: route.path.startsWith('/acct') }" href="#/acct" :data-testid="T.nav('acct')" title="账号管理"><QtIcon name="acct" /><span v-if="!ui.navCollapsed">账号管理</span></a>
+            <a class="nav-item" href="#/mail" :data-testid="T.nav('mail')" title="邮件摆渡"><QtIcon name="mail" /><span v-if="!ui.navCollapsed">邮件摆渡</span></a>
+            </nav>
+            <div class="nav-footer">
+              <a class="nav-item" href="#/set" :data-testid="T.nav('set')" title="偏好设置"><QtIcon name="set" /><span v-if="!ui.navCollapsed">偏好设置</span></a>
+              <div v-if="!ui.navCollapsed" class="workspace-card"><QtIcon name="shield" /><div>本机工作空间<small>账号 · 消息 · 环境</small></div></div>
+              <button class="nav-item collapse" :data-testid="T.navCollapse" title="折叠导航" @click="ui.toggleNav()"><QtIcon name="menu" /><span v-if="!ui.navCollapsed">收起导航</span></button>
+            </div>
           </aside>
 
           <div class="main">
             <header class="header">
+              <span class="header-path">工作空间 <span>/</span> <b>{{ NAV_ITEMS.find(x => route.path.startsWith(x.path))?.label ?? '账号详情' }}</b></span>
+              <span class="qt-grow" />
+              <span class="connection-label">{{ events.connected ? '实时连接' : '连接已断开' }}</span>
               <span class="ws-dot" :data-testid="T.wsDot" :style="{ background: wsColor }"
                     :title="events.connected ? '实时连接正常' : '实时连接已断开'" />
-              <a class="chip" :data-testid="T.resChip" @click="go('/dash')">{{ resChipText }}</a>
-              <span class="qt-grow" />
+              <a class="chip" :data-testid="T.resChip" href="#/res">{{ resChipText }}</a>
               <a-badge :count="events.unreadCount" :offset="[-4, 4]">
-                <a-button size="small" :data-testid="T.alertBell" @click="ui.alertDrawerOpen = true">告警</a-button>
+                <button class="icon-button" aria-label="查看当前告警" :data-testid="T.alertBell" @click="ui.alertDrawerOpen = true"><QtIcon name="bell" /></button>
               </a-badge>
-              <a-switch
+              <a-switch v-show="false"
                 class="theme"
                 :data-testid="T.themeToggle"
                 :checked="ui.theme === 'dark'"
@@ -216,6 +232,7 @@ onUnmounted(() => {
                 title="深色模式 M5 交付"
                 @change="(v: any) => { ui.theme = v ? 'dark' : 'light'; ui.persist({ ui: { theme: ui.theme } }) }"
               />
+              <div class="avatar" title="本机控制台">QT</div>
             </header>
 
             <!-- WS 重连同步中 -->
@@ -300,24 +317,44 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.shell { display: flex; height: 100%; position: relative; }
+.shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; position: relative; background: radial-gradient(ellipse at 85% 4%, #f4d68d30 0, transparent 38%), radial-gradient(ellipse at 30% 18%, #ccb2ed29 0, transparent 46%), #f5f4f7; }
+.shell.setup-shell { display: block; overflow-y: auto; }
 .nav {
-  flex: 0 0 auto; background: var(--qt-bg-elevated); border-right: 1px solid var(--qt-border);
-  display: flex; flex-direction: column; overflow: hidden; transition: width .15s;
+  flex: 0 0 auto; background: rgba(251,250,253,.65); border-right: 1px solid #e8e3ef;
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden; transition: width .15s; padding: 0 16px; backdrop-filter: blur(28px);
 }
-.brand { padding: 0 var(--qt-space-4); height: var(--qt-header-h); display: flex; align-items: center; font-weight: 600; }
+.brand { height: 112px; flex: 0 0 auto; display: flex; gap: 12px; align-items: center; padding: 0 6px; color: #30213f; }
+.brand-mark { width: 37px; height: 40px; font-size: 40px; font-weight: 800; line-height: 1; color: var(--qt-primary); position: relative; letter-spacing: -4px; }
+.brand-mark span { position: absolute; right: -2px; bottom: 0; width: 12px; height: 7px; border-radius: 3px; transform: rotate(45deg); background: var(--qt-accent); }
+.brand-name { font-size: 23px; font-weight: 680; letter-spacing: -.7px; line-height: 1.1; }
+.brand-name small { display: block; font-size:12px; font-weight: 400; letter-spacing: 1.5px; color: var(--qt-text-secondary); margin-top: 8px; }
+.nav-menu { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; }
+.nav-caption { padding: 12px 16px; font-size: 12px; color: #9a919f; }
 .nav-item {
-  padding: 8px var(--qt-space-4); cursor: pointer; color: var(--qt-text); white-space: nowrap;
-  border-left: 3px solid transparent;
+  padding: 13px 16px; margin: 3px 0; display: flex; align-items: center; gap: 13px; cursor: pointer; color: #766b80; white-space: nowrap;
+  border: 0; border-radius: 13px; background: transparent; text-align: left; font-size: 14px; min-height: 45px; flex-shrink: 0;
 }
-.nav-item:hover { background: var(--qt-bg); }
-.nav-item.active { border-left-color: var(--qt-primary); color: var(--qt-primary); background: var(--qt-bg); }
-.collapse { margin-top: auto; color: var(--qt-text-secondary); }
-.main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+.nav-item:hover { background: #eee7f5; color: var(--qt-primary); }
+.nav-item.active { color: white; background: linear-gradient(115deg,#885fb3,#6d419f); box-shadow: 0 6px 14px #6d419f28; }
+.nav-divider { height: 1px; background: var(--qt-border); margin: 24px 12px 18px; flex-shrink: 0; }
+.tools-list .nav-item { font-size: 13px; min-height: 40px; padding-top: 9px; padding-bottom: 9px; }
+.tools-toggle { width: 100%; }
+.nav-footer { flex: 0 0 auto; padding-top: 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+.workspace-card { display: flex; align-items: center; gap: 10px; padding: 15px 10px; background: linear-gradient(110deg,#ebe2f7,#fbf2df); border: 1px solid #ffffff; border-radius: 16px; font-size: 12px; color: #635071; margin-bottom: 12px; }
+.workspace-card small { display: block; font-size:12px; margin-top: 5px; color: #8a7d94; }
+.nav-collapsed .nav { padding: 0 8px; }
+.nav-collapsed .brand { justify-content: center; }
+.nav-collapsed .nav-item { justify-content: center; padding-left: 10px; padding-right: 10px; }
+.collapse { width: 100%; color: var(--qt-text-secondary); }
+.main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .header {
   height: var(--qt-header-h); flex: 0 0 auto; display: flex; align-items: center; gap: var(--qt-space-3);
-  padding: 0 var(--qt-space-4); background: var(--qt-bg-elevated); border-bottom: 1px solid var(--qt-border);
+  padding: 0 36px; border-bottom: 1px solid #eae5ee88;
 }
+.header-path { color: var(--qt-text-secondary); font-size: 13px; }.header-path span { margin: 0 15px; color: #bab1c4; }.header-path b { color: var(--qt-text); font-weight: 500; }
+.connection-label { font-size: 12px; color: #84798e; }
+.icon-button { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid #e8e3ed; border-radius: 50%; background: #ffffff80; cursor: pointer; color: #776586; }
+.avatar { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 50%; background: #ebe4f3; color: var(--qt-primary); font-size: 12px; font-weight: 650; margin-left: 8px; }
 .ws-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .chip {
   border: 1px solid var(--qt-border); border-radius: 10px; padding: 1px 10px;
@@ -327,10 +364,13 @@ onUnmounted(() => {
 .banner { padding: 6px var(--qt-space-4); font-size: var(--qt-font-sm); }
 .sync { background: #E6F4FF; color: var(--qt-state-starting); }
 .crit { background: #FFF1F0; color: var(--qt-state-error); cursor: pointer; }
-.content { flex: 1 1 auto; overflow: auto; }
+.content { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
 .gate {
   position: absolute; inset: 0; background: rgba(0, 0, 0, .45);
   display: flex; align-items: center; justify-content: center; z-index: 1000;
 }
 .gate-box { padding: var(--qt-space-6); width: 520px; }
+@media (max-width: 1100px) { .nav { width: 72px !important; padding: 0 8px; } .brand-name,.nav-caption,.nav-item span,.workspace-card,.tools-toggle span { display: none; } .brand,.nav-item { justify-content: center; } .header { padding: 0 22px; height: 72px; } }
+@media (max-width: 640px) { .nav { width: 58px !important; padding: 0 5px; } .brand { height: 80px; } .brand-mark { font-size: 32px; width: 30px; } .nav-item { padding: 12px 8px; } .header { height: 62px; gap: 8px; padding: 0 16px; }.header-path,.chip,.connection-label { display: none; } .nav-divider { margin: 16px 7px; } .gate-box { width: calc(100% - 24px); } }
+@media (max-height: 640px) { .brand { height: 76px; } .nav-footer { padding-top: 8px; } .workspace-card { padding: 10px; margin-bottom: 4px; } }
 </style>

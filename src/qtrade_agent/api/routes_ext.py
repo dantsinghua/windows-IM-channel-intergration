@@ -409,7 +409,7 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
                 except Exception as e:
                     log.warning("#84 drain 账号 %s 失败(继续):%s", aid, e)
             try:
-                await _wa("POST", "/wa/v1/wsl/restart", json_body={"mode": mode, "run_id": run_id}, timeout_s=30.0)
+                await _wa("POST", "/wa/v1/wsl/restart", json_body={"mode": mode, "run_id": run_id, "confirm": bool(body.get("confirm") is True)}, timeout_s=30.0)
             except ApiError as e:
                 log.error("#84 调 WinAgent 重启失败:%s", e.message)
                 agent.store.settings_set(f"system.wsl_restart.{run_id}",

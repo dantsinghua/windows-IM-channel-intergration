@@ -136,7 +136,8 @@ export interface MetricsSnapshot {
   hardware?: {
     mem?: { total_mb: number; used_mb: number; avail_mb: number; vmmem_mb: number }
     cpu?: { logical_cores: number; load_pct: number }
-    disks?: { mount: string; total_mb: number; free_mb: number }[]
+    disks?: { mount: string; total_mb: number; free_mb: number; source?: string; roles?: string[]; backing_path?: string }[]
+    disk_source_error?: string | null
   }
   ours: {
     procs: { agent_mb: number | null; winagent_mb: number | null; console_mb: number | null }
@@ -158,8 +159,10 @@ export interface MetricsSnapshot {
   }
   budget_vs_actual: { id: string; quota_mb: number; rss_mb: number | null; drift_pct: number | null }[]
   disk_watermark: {
-    level: WatermarkLevel
-    free_mb: number
+    level: WatermarkLevel | 'unknown'
+    free_mb: number | null
+    scope?: 'deployment_volumes'
+    runtime_level?: WatermarkLevel
     actions: string[]
     retention_shrunk_to?: number | null
     /** R6-30:扁平两键,不嵌套 */
@@ -169,7 +172,7 @@ export interface MetricsSnapshot {
     vhdx_grown_mb?: number | null
   }
   mem_watermark: {
-    level: WatermarkLevel
+    level: WatermarkLevel | 'ok' | 'unknown'
     avail_mb: number
     warn_mb?: number
     critical_mb?: number
@@ -610,12 +613,12 @@ export interface SystemHealth {
   ok: boolean
   /** 免鉴权来源只回布尔级摘要(C-33);带令牌回全量对象 */
   agent: { version: string; api_version: string; uptime_s: number; db_mb: number; wal_mb: number } | boolean
-  dockerd: boolean
+  dockerd: boolean | null
   winagent: { online: boolean; version: string | null; user_agent: boolean } | boolean
   user_agent?: boolean
   accounts?: Record<string, number>
-  disk_free_mb?: number
-  mem?: { avail_mb: number; level: WatermarkLevel }
+  disk_free_mb?: number | null
+  mem?: { avail_mb: number; level: WatermarkLevel | 'ok' | 'unknown' }
   checks?: SystemHealthChecks
   /** 各定时任务 `runs/skipped/errors`(#72) */
   scheduler?: Record<string, { runs?: number; skipped?: number; errors?: number }>

@@ -1,4 +1,5 @@
 /** `window.qt` —— preload 经 contextBridge 暴露的白名单(01 §2.2) */
+import type { LocalMetricsSnapshot } from './local-metrics'
 
 export interface QtBridge {
   app: {
@@ -11,6 +12,8 @@ export interface QtBridge {
     openLogsDir(): Promise<void>
     openExternal(url: string): Promise<boolean>
     rssKb(): Promise<number>
+    /** 可选以兼容旧 preload；普通浏览器没有此能力。 */
+    localMetrics?(): Promise<LocalMetricsSnapshot>
   }
   files: {
     saveAs(suggestName: string, mime: string, data: Uint8Array | string): Promise<{ saved: boolean; path?: string }>

@@ -4,6 +4,9 @@
 #    ②`wsl.exe` 挂起是常态故障,超时包装只写一处(docs/03 §2.6.7 W5);③UTF-16/`\0` 剥离只写一处(W6)。
 #requires -Version 5.1
 Set-StrictMode -Version Latest
+Import-Module (Join-Path $PSScriptRoot 'QTrade.Log.psm1') -DisableNameChecking
+$script:QtWslLogPath = ''
+$script:QtWslLogStep = ''
 
 #region 时钟(测试可注入)
 function Get-QtNow { [OutputType([datetime])] param() return (Get-Date) }
@@ -25,48 +28,117 @@ function New-QtProcessResult {
     }
 }
 
+function ConvertTo-QtProcessArgument {
+    [CmdletBinding()][OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string] $Value)
+    if ($Value -and $Value -notmatch '[\s"]') { return $Value }
+    # CRT argv: double backslashes before a quote and before the closing quote.
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+function ConvertFrom-QtProcessBytes {
+    [CmdletBinding()][OutputType([string])]
+    param([byte[]] $Bytes)
+    if ($Bytes.Length -eq 0) { return '' }
+    # Preserve ReadAllText's BOM detection as well as WSL's UTF-8 default.
+    $stream = New-Object IO.MemoryStream(, $Bytes)
+    $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
+    try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
 function Invoke-QtProcess {
-    <#
-    .SYNOPSIS
-        带超时地跑一个外部程序,回 {ExitCode, StdOut, StdErr, TimedOut, DurationMs}。
-    .NOTES
-        用 Start-Process + 临时文件重定向再读回(PowerShell 5.1 对原生程序管道的编码处理不可靠)。
-        超时按 docs/03 §7 的各项超时值由调用方给。
-    #>
+    # Own the process handle; drain both pipes before waiting for its exit.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $FilePath,
         [string[]] $ArgumentList = @(),
-        [int] $TimeoutSec = 120,
-        [string] $WorkingDirectory
+        [ValidateRange(1, 2147483)][int] $TimeoutSec = 120,
+        [string] $WorkingDirectory,
+        [AllowEmptyString()][string] $StandardInput,
+        [hashtable] $Environment = @{}
     )
-    $so = [IO.Path]::GetTempFileName()
-    $se = [IO.Path]::GetTempFileName()
+    $p = New-Object Diagnostics.Process
+    $so = New-Object IO.MemoryStream
+    $se = New-Object IO.MemoryStream
+    $started = $false
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $splat = @{
-            FilePath               = $FilePath
-            RedirectStandardOutput = $so
-            RedirectStandardError  = $se
-            NoNewWindow            = $true
-            PassThru               = $true
+        $si = $p.StartInfo
+        $si.FileName = $FilePath
+        $si.Arguments = (@($ArgumentList | ForEach-Object { ConvertTo-QtProcessArgument -Value $_ }) -join ' ')
+        $si.UseShellExecute = $false
+        $si.CreateNoWindow = $true
+        $si.RedirectStandardOutput = $true
+        $si.RedirectStandardError = $true
+        $si.RedirectStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
+        if ($WorkingDirectory) { $si.WorkingDirectory = $WorkingDirectory }
+        foreach ($key in $Environment.Keys) { $si.EnvironmentVariables[$key] = [string]$Environment[$key] }
+        $started = $p.Start()
+        if (-not $started) { throw 'Process did not start.' }
+        $outTask = $p.StandardOutput.BaseStream.CopyToAsync($so)
+        $errTask = $p.StandardError.BaseStream.CopyToAsync($se)
+        $timedOut = $false
+        $inputError = ''
+        if ($si.RedirectStandardInput) {
+            $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($StandardInput)
+            $inputTask = $p.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+            $remaining = [Math]::Max(0, $TimeoutSec * 1000 - [int]$sw.ElapsedMilliseconds)
+            try { $timedOut = -not $inputTask.Wait($remaining) }
+            catch { $inputError = 'Standard input was not fully consumed.' }
+            if (-not $timedOut) { try { $p.StandardInput.Close() } catch { $inputError = 'Standard input was not fully consumed.' } }
         }
-        if ($ArgumentList.Count -gt 0) { $splat['ArgumentList'] = $ArgumentList }
-        if ($WorkingDirectory) { $splat['WorkingDirectory'] = $WorkingDirectory }
-        $p = Start-Process @splat
-        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-            try { $p.Kill() } catch { }
-            return (New-QtProcessResult -ExitCode -1 -TimedOut $true -DurationMs $sw.Elapsed.TotalMilliseconds)
+        if (-not $timedOut) {
+            $remaining = [Math]::Max(0, $TimeoutSec * 1000 - [int]$sw.ElapsedMilliseconds)
+            $timedOut = -not $p.WaitForExit($remaining)
         }
-        $out = ''
-        $err = ''
-        if (Test-Path -LiteralPath $so) { $out = [IO.File]::ReadAllText($so) }
-        if (Test-Path -LiteralPath $se) { $err = [IO.File]::ReadAllText($se) }
-        return (New-QtProcessResult -ExitCode $p.ExitCode -StdOut $out -StdErr $err -DurationMs $sw.Elapsed.TotalMilliseconds)
+        if ($timedOut) {
+            # Only terminate this owned handle, never a name or a process group.
+            if (-not $p.HasExited) { $p.Kill() }
+            if (-not $p.WaitForExit(5000)) { throw 'Timed-out child did not exit.' }
+        }
+        $exitCode = if ($timedOut) { -1 } else { $p.ExitCode }
+        if ($inputError -and $exitCode -eq 0) { $exitCode = -1 }
+        # A descendant may retain an inherited pipe. Do not wait indefinitely.
+        foreach ($task in @($outTask, $errTask)) {
+            try { [void]$task.Wait(1000) } catch { }
+        }
+        $p.StandardOutput.Close()
+        $p.StandardError.Close()
+        $out = ConvertFrom-QtProcessBytes -Bytes $so.ToArray()
+        $err = ConvertFrom-QtProcessBytes -Bytes $se.ToArray()
+        if ($inputError) { $err += "`n" + $inputError }
+        return (New-QtProcessResult -ExitCode $exitCode -StdOut $out -StdErr $err -TimedOut $timedOut -DurationMs $sw.Elapsed.TotalMilliseconds)
     } finally {
+        if ($started) {
+            try {
+                if (-not $p.HasExited) { $p.Kill(); [void]$p.WaitForExit(5000) }
+            } catch { }
+        }
+        $p.Dispose()
+        $so.Dispose()
+        $se.Dispose()
         $sw.Stop()
-        Remove-Item -LiteralPath $so, $se -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Set-QtWslLogContext {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string] $Path = '', [string] $Step = '')
+    $script:QtWslLogPath = $Path
+    $script:QtWslLogStep = $Step
+}
+
+function Get-QtProcessDiagnostic {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Result, [string] $Stage = '', [switch] $Sensitive)
+    $out = Protect-QtLogText -Text ([string]$Result.StdOut)
+    $err = Protect-QtLogText -Text ([string]$Result.StdErr)
+    if ($Sensitive) { $out = '[redacted: sensitive stdin]'; $err = '[redacted: sensitive stdin]' }
+    if ($out.Length -gt 32768) { $out = $out.Substring(0, 32768) + '[truncated]' }
+    if ($err.Length -gt 32768) { $err = $err.Substring(0, 32768) + '[truncated]' }
+    return [pscustomobject]@{ stage = $Stage; exit = $Result.ExitCode; timed_out = $Result.TimedOut; duration_ms = $Result.DurationMs; stdout = $out; stderr = $err }
 }
 
 function ConvertFrom-QtWslOutput {
@@ -95,19 +167,24 @@ function Invoke-QtWsl {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string[]] $WslArgs,
-        [int] $TimeoutSec = 60
+        [int] $TimeoutSec = 60,
+        [AllowEmptyString()][string] $StandardInput
     )
-    $prev = $env:WSL_UTF8
-    try {
-        $env:WSL_UTF8 = '1'
-        $r = Invoke-QtProcess -FilePath 'wsl.exe' -ArgumentList $WslArgs -TimeoutSec $TimeoutSec
-        return (New-QtProcessResult -ExitCode $r.ExitCode `
+    $invoke = @{ FilePath = 'wsl.exe'; ArgumentList = $WslArgs; TimeoutSec = $TimeoutSec; Environment = @{ WSL_UTF8 = '1' } }
+    $sensitive = $PSBoundParameters.ContainsKey('StandardInput')
+    if ($sensitive) { $invoke.StandardInput = $StandardInput }
+    $r = Invoke-QtProcess @invoke
+    $result = New-QtProcessResult -ExitCode $r.ExitCode `
                 -StdOut (ConvertFrom-QtWslOutput -Text $r.StdOut) `
                 -StdErr (ConvertFrom-QtWslOutput -Text $r.StdErr) `
-                -TimedOut $r.TimedOut -DurationMs $r.DurationMs)
-    } finally {
-        $env:WSL_UTF8 = $prev
+                -TimedOut $r.TimedOut -DurationMs $r.DurationMs
+    if ($script:QtWslLogPath) {
+        $record = Get-QtProcessDiagnostic -Result $result -Stage $script:QtWslLogStep -Sensitive:$sensitive
+        try {
+            [IO.File]::AppendAllText($script:QtWslLogPath, ($record | ConvertTo-Json -Compress) + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        } catch { Write-Verbose 'Could not persist WSL diagnostic output.' }
     }
+    return $result
 }
 
 function Get-QtProcessByName {

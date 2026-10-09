@@ -1,4 +1,10 @@
-# 交接入口 / HANDOFF(2026-09-21)
+# 交接入口 / HANDOFF(2026-10-08)
+
+> **2026-10-08 最终整合当前入口：**安琳已确认前端全部重改完成，原等待 UI 状态解除。已找回 HyperV-Exchange 安装报告并按当前源码修复，正式口径合入 R6-80/81/82/83；统一目录迁移、最终全量回归与独立验收仍在进行。先读 [本轮阶段交接](docs/handoffs/2026-10-08-final-integration.md)及下方 §3h。旧“嵌套 WSL 完全不能启动”仅为历史判断，已被 10 月 8 日完整 WSL 启动成功证据替代；真实 kcheck/切内核/真装仍未验证。
+
+> **2026-10-08 21:01 UI 最新补充：**本 UI 工作流已完成首页细化并更新同一私有 Sites 预览，见 §3g。保留下方关机交接的真实账号、联调和目录迁移开放项；UI 源码与示例预览更新不等于这些事项已完成，不自动重载服务或启动真实账号。
+
+> **2026-10-08 关机前最新入口：**先读 [阶段总结](docs/handoffs/2026-10-08-stage-summary.md)与下方 §3f。等待另一客户端UI明确交付后再做API对齐、联调和正式目录迁移；§3e的UI工作及更早快照均保留，不据旧测试数字宣布当前通过。现行规范以 `AGENTS.md` 与安琳当前指令为准。
 
 > 🔴 协作头等规范:**所有思考与交流一律中文,每次回复称呼「安琳」**(见 `CLAUDE.md`)。
 > 这是**任何机器上的第一入口**。细节都在指针后面,本文件只说「这是什么 / 怎么接上 / 现在卡在哪 / 下一步做什么」。
@@ -16,7 +22,7 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 | 目录 / 文件 | 一句话 | 细节看 |
 |---|---|---|
-| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表 + `check-truth-tables.py` 真值表对账器(改文档后必跑,须 exit 0)。裁决表在 `00` §15g,当前至 **R6-68** | `docs/00-共享基线与口径.md` §14/§15~§15g |
+| `docs/` | **唯一真值**:`00` 基线 + `01~06` 六册 + `07` 配置总表 + `check-truth-tables.py` 真值表对账器(改文档后必跑,须 exit 0)。裁决表在 `00` §15g,当前主树已承接 **R6-80 网络/S4、R6-81 最终 UI、R6-82 安装器、R6-83 QQ**，验证范围见 §3h | `docs/00-共享基线与口径.md` §14/§15~§15g |
 | `src/qtrade_agent/` | **Agent**(WSL 侧 systemd 服务):store / 企点读库 / 总线 + 安全闸 / scheduler / api(FastAPI + WS)/ runtime(docker·adb)/ pool / 账号生命周期 / 健康循环 / WinAgent 客户端 / mail / QQ / 微信 / 横切基础设施 | SKILL §5「代码现状总表」 |
 | `winagent/` | **WinAgent**:服务 + 会话代理两进程、`/wa/v1` 全量、Vault(DPAPI)、monitor/netprobe/power、IPC、wslctl、installer_ops、wechat;PyInstaller 打包 | `winagent/README.md` |
 | `console/` | **Electron + Vue3 控制台**(`docs/01` 全册);仓库里**不装 `node_modules`** | `console/README.md` |
@@ -31,9 +37,8 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
 ## 3. 接手第一步(任何机器)
 
-1. **先拉代码**:`git fetch --all` → 检出/快进到 `claude/lucid-dijkstra-uu5max`。
-   🔴 **先 pull、再读 skill** —— 全局 `~/.claude/skills/` 里那份会落后好几批。
-2. **跑五套确认基线**(数字见下表,**以你跑那一刻为准**;任一条红就先别开工,先弄清是不是自己环境的问题):
+1. **先只读检查**:核 cwd、`git status --short --branch`、HEAD和在途任务，读 `AGENTS.md`、本文件最新节及项目skill。原“先fetch/pull再读skill”要求自2026-10-08废止；不自动fetch/pull/检出/快进，不覆盖并行编辑。
+2. **按当前任务选择验证，接手不自动全跑或启动服务**。下列命令/数字保留为2026-09-21历史入口，先核路径、假后端及授权范围；本次关机收尾不运行这些业务测试：
 
    ```bash
    ~/.venvs/qtrade/bin/python -m pytest -q                      # 仓库根,约 5 分钟
@@ -55,7 +60,7 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 
    > 系统 python 没装 pytest,必须用 `~/.venvs/qtrade/bin/python`(uv 建的 venv,**没有 pip 模块**;打 wheel 用 `/usr/bin/python3 -m pip wheel`)。
 
-3. **读 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文**,重点 §4 禁区、§5「🔴 最新状态」与「下一步」、§5b 编排纪律;
+3. **读 `.agents/skills/qtrade-redroid-resume/SKILL.md` 与 `.codex/PROJECT_CONTEXT.md` 的最新交接**；原 `.claude/` skill仅作历史追溯，不覆盖当前规范；
    再按你这批要动的东西读对应规格段落与 `reference/e2e-lessons-2026-09-21.md`。
 
 ## 3b. 🔴 2026-09-21 23:45 交接快照(带签名正式包已出、独立校验通过;下文 §4~§6 已同步到同一时点)
@@ -126,6 +131,52 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 **独立校验 11 项(`.omc/handoffs/verify-package-1.0.1-r2.md`)**:大小/sha/签名、三段切段 + `7z t`、全表零杂物、manifest 7 条 sha、版本对齐逐项对本机、引擎 20 文件零间隙、三 exe 剥签名、**从包内解出的 svc/user 真跑 `--help`/`--selfcheck` 退出码 0**、rootfs 抽件 sha、SHA256SUMS 17/17、B1 专项。遗留(非阻塞):通配条目无单文件 sha(老问题);svc `--help` GBK 输出;升级路径是否真走 upgrade、目标机导入证书后签名 Valid、安装器运行期行为 —— **全部要真机**。
 
 **接下来**:①清理中间产物(安琳 2026-09-27 指令,清单先过目);②真机验收:先按验收手册 §1.4 导入证书,再按 §1.1 核 `4c93508d…`,本机 Hyper-V 虚拟机只能验到 KERNEL_SWITCH 之前(WSL2 在嵌套里起不来),内核切换及之后要物理机;③浏览器联调(拉 Agent + `QT_DEV_TOKEN=… npx vite`)前先只读核 Agent 启动对企点账号的副作用。
+
+## 3e. 2026-10-08 账号中心与紫金 UI 升级交接(R6-81)
+
+安琳本轮要求以 IM 账号为主体重排 `console/` 全部保留页面,并明确删除复杂低频配置及指令台。本轮以工作区源码为对象,分支仍为 `claude/lucid-dijkstra-uu5max`、HEAD `f25489a`;已有其它任务修改保留,原仓库没有提交/推送,未重出安装包。R6-80 留给在途目录拆分候选,本轮不占用该裁决。
+
+- **当前布局**:首页/消息/日志/资源/环境五项主导航,账号与邮件二级入口;首页为五指标、企点/微信/QQ 三组账号与代码事实架构。统一紫 `#7547A8`、金黄 `#F2AD38`、玻璃分层与柔和光晕,有减少动态和无模糊支持降级。
+- **简化范围**:删除指令台、工作流、邮件模板三页,旧路由分别重定向 `/dash`、`/dash`、`/set`;偏好仅桌面提醒、托盘、登录后自启与只读告知。账号详情按通道承接画面或 NapCat,复杂参数/端口/批量调试退役;邮件只收件/发件/待确认;环境只基本检查、受控维护。没有删除后端能力、权限、确认、审计或 R6-78 登录编排。
+- **数据事实**:WSL 内存/CPU 读取既有 #77;Windows 宿主实测未采集,累计消息缺聚合接口,故显示 `—` 并说明。首页告警为当前活动集合,日志告警为本次会话集合,均不声称完整近 7 天历史;资源池/账号配额明示预算,不冒充实占。真实部署卷仍按 R6-79。SQLite/redroid/NapCat 无独立探针时架构显示未知。
+- **核心链路**:消息保留实际账号/会话/时间/关键词/方向/类型查询、分页和导出,FTS 条件不被实时前插污染;日志保留系统/操作查询及明确范围的告警列表。消息/日志的本地时间输入经 `console/src/utils/datetime.ts` 转成带 `Z` 的 ISO UTC 后查询,分页/导出共用同一筛选值,避免浏览器与 WSL 时区不同造成偏移;这不改变 API。账号深链不在首页分页时按 ID 补取;详情画面明确点击才打开。重启/回滚和邮件危险确认沿原保护,Agent #84 仅补严格 `confirm is True` 到 WinAgent 的透传。
+- **最终开发者验证(r5,2026-10-08 19:50 CST)**:在独占副本实际运行类型检查 exit 0、完整前端测试 **21 文件 / 381 passed**(2.83s)、`TZ=Asia/Shanghai` 新 UI 专项 **26/26**(含本地 15:00 → UTC 07:00Z、回显/清空/导出范围)、renderer 构建 exit 0(5.36s)。#84 假后端专项沿用本轮 r3 **7 passed / 33 deselected**(1.10s),源码与测试再次逐字节核对一致。87 文件 SHA 复核匹配,该时点主树与副本 src/tests/unit/docs 无漂移。日志和清单见 `.codex/ui-redesign-20261008/developer-validation.md` 最终 r5 节及 `developer-evidence/`;保留主 chunk 超过 500 kB、既有 Ant 浅挂载与 Python 弃用警告。r3/r4 较早数字不再作为最终结果。
+- **独立浏览器验收 ACCEPT**:Windows Edge 隔离预览覆盖 13 条保留路由的 1440/1024/390 宽度、焦点/减少动态、消息/日志查询分页、三通道与列表外账号深链、取消零提交和独立 stub 确认参数。r3 共 **78 项,77 通过/1 失败**;唯一首次设置 1024 宽装饰光晕溢出由实现修复,最终增量 **7/7 通过**并关闭(另含消息/日志上海 19–20 点 → UTC 11–12 点带 Z)。各轮资源 SHA 前后稳定,真实业务网络/运维动作/页面异常均为 0。完整证据与未覆盖边界见 `.codex/ui-redesign-20261008/acceptance/acceptance-report.json`、`acceptance-report.md`,最终截图在 `acceptance/final-delta/`;该 ACCEPT 限隔离 UI,不外推真登录/视频或真实动作。
+- **独立文档回写**:原字节备份、SHA、增量及记录在 `.codex/ui-redesign-20261008/documentation/`;`docs/` 下 `timeout 120s python3 check-truth-tables.py` 与 `git diff --check -- docs HANDOFF.md .codex/PROJECT_CONTEXT.md` 均 exit 0,保留 5 项既有 MIRROR 提示。testid 动态模板的文档登记已按原门对齐,没有修改质量门。
+- **隔离与交付边界**:开发副本为 `/home/anlin/work/qtrade-build/ui-redesign-20261008/console`;浏览器预览使用示例 fixtures,与真实账户无连接,未执行真实外发、ADB、重启、内核回滚或安装程序。Sites 设计预览不代表真实桌面桥、三通道登录/视频或安装器已验收。正式 1.0.1 包与真装开放项仍按 §3d,本轮没有替代该包。
+- **接续入口**:裁决和完整代码证据在 `.codex/ui-redesign-20261008/decision.md`、`evidence.md`、`architecture.json`;实现交接为同目录 `implementation-shell.md`、`implementation-account-env.md` 与 `implementation-mail-setup.md`;最终页面/元素对照在 `docs/01-控制台前端设计.md` §2.7/§4。接手先重新核进程、工作区和本轮验证报告,不能仅凭预览截图启动真实 Agent 或复跑安装/账号操作。
+
+## 3f. 2026-10-08 关机前续接：等待最终UI，再联调与正式迁移
+
+安琳最新指令优先：另一客户端仍在美化UI并删增功能，先等其明确交付，不覆盖其页面、不应用旧目录迁移清单、不重载联调服务。§3e的UI交接原文保留；完整可携带事实与证据入口见 [阶段总结](docs/handoffs/2026-10-08-stage-summary.md)。
+
+- 正式仍为 `console/`、`src/`、`tests/`、`winagent/`；`frontend/backend`只在布局候选。R6-80网络/S4规格尚未写回主树，R6-81 UI已在主树，合并前统一核编号与语义。
+- 新企点 `qd82 / 3007378246` 已真实登录并确认running，3条新入向/3WS/0重复及页面/接口/主库hash吻合；**16:27 WAIT_PASSWORD/协议页是历史，不再作为当前状态**。未外发，未改历史核查的实时游标。
+- 网络/S4候选2626通过、独立APPROVE；布局3308通过/1失败后纯注释收口专项1通过、文档exit0，尚无修后全量。前端352仅旧候选；私有页面guard144项通过但未live部署，notice未ack导航与B13新QQ首次QR仍待做。
+- 关机前运行根、端口/PID见总结，仅作快照；开机重核，不凭旧PID终止或自动恢复账号。旧 `3007373675` 与旧redroid保持禁区，NapCat A一次重启授权已消费，无外发授权。
+
+## 3g. 2026-10-08 首页细化与固定侧栏交付(R6-81 同日补充)
+
+安琳在 §3e 界面基础上明确要求固定左侧底部功能、去掉首页底部重复内存/磁盘卡、重排顶部指标并改进架构分区/连线。本批只承接该 UI 细化；分支仍为 `claude/lucid-dijkstra-uu5max`、HEAD `f25489a`，原仓库未提交/推送，未应用目录迁移或替换正式安装包。§3f 所列其它任务成果和开放项保留。
+
+- **页面结果**：浏览器/Electron 壳层按可视窗口限高，右内容独立滚动；左下偏好、工作空间和折叠操作留在窗口底部，短窗口上部导航可以独立滚动。首页仅顶部五指标、三通道账号、系统架构；架构下两张重复大卡删除。架构分 WSL 紫色、Windows 金色区块，用圆弧连接既有真实关系；窄屏保留分区，隐藏拥挤连线，不增加虚构调用或健康信号。
+- **指标与清理**：“总内存”采用已向安琳说明的默认解释：宿主物理内存总容量，辅文显示已用量，不是 WSL 已用或程序预算。硬盘容量为当前客户端目录普通文件长度合计，硬链接去重、跳过符号链接/联接，不声称为分配簇占用。标题旁 `qt-dash-cleanup` 只跳 `/res?section=cleanup` 并聚焦资源清理区，零自动清理；原受控清理确认与作业反馈未改。#77/R6-79 的部署卷、水位和保护事实仍在资源页。
+- **只读桌面采样**：新增无参数 `qt.app.localMetrics()`，主进程固定安装版 EXE 所在目录或开发版应用目录，返回内存/目录数字与有限错误码，不回路径、文件名、文件内容或任意目录权限。默认 5 秒、100000 项、64 层预算，30 秒缓存，并发合并；失败或不完整为未知，真实零有效。普通浏览器/旧桥无能力时显示 `—`，不混用 WSL 或分区数值。实现交接见 [本机指标说明](.codex/ui-home-refinement-20261008/metrics-implementation.md)。
+- **本轮开发验证**：独占 ext4 副本 `/home/anlin/work/qtrade-build/ui-home-refinement-20261008/console`，r2 完整前端 **22 文件 / 403 passed**，类型检查与 renderer/Electron 构建均 exit 0。随后 r3 仅修正 `SystemTopology.vue` 的 SVG `gradientUnits`，消除水平/竖直段因零包围盒而不可见；增量类型检查与 renderer 重建 exit 0，**没有再次运行 403 项全量**。最新 112 输入 SHA 与工作区全匹配，36 产物登记；见 [开发者报告](.codex/ui-home-refinement-20261008/developer-validation.md)及 `developer-evidence/source-and-artifacts-r3.json`。既有 Ant 浅挂载警告和 chunk 大小提示保留。
+- **独立浏览器 ACCEPT / 只读终审 APPROVE**：[本轮验收 15/15](.codex/ui-home-refinement-20261008/acceptance/report.md)覆盖 1440/1920/1280/390 四尺寸、1280×420 短窗和手动折叠；右侧滚动前后左下控件坐标不变，无横向溢出。390/1440 的清理入口均定位并获焦，非 GET 请求和确认弹框为 0；r3 六条架构路径直段/圆弧完整，分区与 WinAgent 节点导航正确。截图以 `acceptance/r3-*` 为最终架构证据。[独立终审](.codex/ui-home-refinement-20261008/final-review.md)重算 112 输入 SHA 全匹配，未发现本批 P1/P2。既有折叠后按钮标题仍为“折叠导航”属非阻断低优先级文案观察，实际可展开，未扩大本批修改范围。
+- **同站私有发布**：[QTrade 紫金工作台](https://qtrade-purple-gold-workspace.tartfrost.chatgpt.site) 已于 `2026-10-08T13:01:26Z` 更新成功，仍为 owner-private；Site 源提交 `59b98d0ec3f51b0d1b7a85db2ade0a8a0f16972b`、部署 `appgdep_6ac7941e4f0c8191a57a783d7d7631b7`。身份与版本见 [发布记录](.codex/ui-home-refinement-20261008/site-publish.json)。使用明确标识的示例数据，未连接真实账号；Sites 示例桥不是 Windows 客户端真实采样验收。
+- **文档与边界**：正式规格同步 00/01/04 的 R6-81 同日细化，原字节备份与校验见 [文档记录](.codex/ui-home-refinement-20261008/documentation/report.md)。本批未运行 Electron、安装 EXE、WinAgent、真实 Agent 或真实账号操作，未执行 ADB、清理、重启、内核切换或外发；ProgramData 检查仍不存在。源码构建通过不能替代已安装 Electron/真实清理/完整安装器验收。接手先核本批证据与当前工作区，再按 §3f 单独收口 API 联调和布局候选，不覆盖本批最终 UI。
+
+## 3h. 2026-10-08 最终 UI 与安装日志整合（当前阶段）
+
+安琳本轮明确 UI 已完成，授权继续两部分修复及最终回归；§3f 的等待状态不再适用。分支/HEAD 仍为 `claude/lucid-dijkstra-uu5max` / `f25489a`，大量未提交集成修改保留，未 commit/push 或重出安装包。
+
+- **交换位置已找回**：`C:\Users\Public\Documents\HyperV-Exchange\QTrade-Diagnostic-20261008`，WSL 为 `/mnt/c/Users/Public/Documents/HyperV-Exchange/QTrade-Diagnostic-20261008`。报告是 9 月 22 日 **1.0.0** 安装问题及 10 月 8 日补充探针；清单 59/59 哈希匹配，子目录 60 文件。历史共享名 `\\LAPTOP-4NGU6M66\HyperV-Exchange` 本轮未重测 SMB。
+- **纠正历史归因**：同一 VM 完整 rootfs 约 21.19s 返回 uname、Docker active；微型 kcheck 仍超时。§3c/§3d 的“嵌套 WSL2 起不来/只能验切换前”保留为当日快照，现行结论以这次成功证据为准。官方内核缺 binder 与载荷自编内核有 binder 分开；本轮未切内核，`/init` 镜像根因未证。
+- **正式文档已承接**：R6-80 网络/S4 精确合入，02 DDL 镜像为总 27/失败 14；保留 R6-81 首页/导航细化并补微信启用、原地企点验证画面、QQ refresh-qr、notice 重试。R6-82 统一真实 argv/exit/stdin/日志、kcheck 写前 68 和 shutdown 非零 69、正常/resume 严格结果。R6-83 明确官方 4.18.28 PNG/disableWebUI、实际容器 ACCOUNT 与归属、新 WS 同 UID 收尾、K6 到期重试、QR 不进 outbox/webhook/重放。
+- **验证按时点**：本轮 531 文件基线 Agent 2505 / WinAgent 523 / Installer Python 160 / 前端 403 通过；网络专项 201，WinWsl 11，UI 同一用例 9 RED→9 GREEN。安装 61/61 后源码变化，最终 Native 11/11、无害 probe 8/8；QQ 187 既有专项后又有 3 RED 返修，新增 QQ 专项最终 69/69。全部只归各冻结/增量时点，不能拼成最终全量或全域零回归。
+- **当前未完**：正式目录迁移、含最终 QQ/安装/UI 的同一快照全量、独立浏览器与安装/QQ 验收、终审；新源码不在旧 1.0.1 包内。真实微型 kcheck/内核切换/完整真装/扫码重建和 K6 真实到期仍未验证，未新增真实操作授权。
+- **接续材料**：[可携带阶段交接](docs/handoffs/2026-10-08-final-integration.md)含日志结论、修复/证据矩阵及顺序；详细材料在 `.codex/final-integration-20261008/`。文档原字节备份在 `documentation/before/`，本批最终 checker exit 0（5 既有 MIRROR 提示），未改门。后续迁移/验收结果继续回写同一交接。
 
 ## 4. 现在卡在哪(2026-09-21 深夜)
 

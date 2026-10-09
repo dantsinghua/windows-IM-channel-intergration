@@ -6,13 +6,13 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { screen as T, SCREEN_PERF_ITEMS, SCREEN_TOOLS } from '@/testids'
+import { screen as T, SCREEN_TOOLS } from '@/testids'
 import { useAccountsStore } from '@/stores/accounts'
 import { useUiStore } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { accountsApi } from '@/api/client'
 import { ApiFailure } from '@/api/http'
-import { ScreenStream, type DecodePath, type StreamClosed, type StreamProfile } from '@/codec/stream'
+import { ScreenStream, type StreamClosed, type StreamProfile, type StreamStats } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
 import { normInContain, PointerRelay, restGesture } from './pointer'
@@ -22,10 +22,11 @@ const router = useRouter()
 const accounts = useAccountsStore()
 const ui = useUiStore()
 const session = useSessionStore()
+const props = withDefaults(defineProps<{ embedded?: boolean; accountId?: string }>(), { embedded: false, accountId: '' })
 
-const focusId = ref<string>(String(route.params.id ?? ''))
+const focusId = ref<string>(props.accountId || String(route.params.id ?? ''))
 const canvas = ref<HTMLCanvasElement | null>(null)
-const stats = ref({ fps: 0, latencyMs: 0, decoder: 'hardware' as DecodePath, codec: '', connected: false })
+const stats = ref<StreamStats>({ fps: 0, latencyMs: null, decoder: 'hardware', codec: '', connected: false })
 const degradeMsg = ref('')
 /** #34 关闭码分诊结果(4401/4400/4409/4410/4503 分别提示,不一律「连接失败」) */
 const streamClosed = ref<StreamClosed | null>(null)
@@ -46,6 +47,7 @@ let previewTimer: ReturnType<typeof setInterval> | null = null
 let visibilityOff: (() => void) | undefined
 /** 窗口当前是否被最小化/隐藏(§2.7.4:隐藏时全部 pause,轮询也停) */
 let hidden = false
+let active = true
 
 const streamable = computed(() => accounts.items.filter((a) => a.channel !== 'qq'))
 const qqAccounts = computed(() => accounts.items.filter((a) => a.channel === 'qq'))
@@ -88,12 +90,15 @@ function stopAll(): void {
 }
 
 async function startFocus(): Promise<void> {
+  if (!active) return
   stopAll()
   degradeMsg.value = ''
   closeIme()
   const a = focus.value
   if (!a) return
+  if (a.channel === 'qq') return
   if (a.channel === 'wechat') {
+    if (['stopped', 'disabled', 'created'].includes(a.state)) return
     // 微信:2s 一帧窗口截图,不接收任何输入
     previewTimer = setInterval(() => void pollWechat(), 2000)
     void pollWechat()
@@ -141,27 +146,32 @@ function onRestInjectError(e: unknown): void {
 }
 
 function startStaticPreview(): void {
+  if (!active) return
   if (previewTimer) clearInterval(previewTimer)
   previewTimer = setInterval(() => void pollStatic(), 2000)
   void pollStatic()
 }
 
 async function pollStatic(): Promise<void> {
-  if (!focus.value || hidden) return
+  if (!active || !focus.value || hidden) return
+  const accountId = focus.value.id
   try {
-    const shot = await accountsApi.screenshot(focus.value.id)
-    if (!shot.blob) return
+    const shot = await accountsApi.screenshot(accountId)
+    if (!active || focus.value?.id !== accountId || !shot.blob) return
     if (staticSrc.value) URL.revokeObjectURL(staticSrc.value)
     staticSrc.value = URL.createObjectURL(shot.blob)
   } catch { /* 下一轮再试 */ }
 }
 
 async function pollWechat(): Promise<void> {
-  if (!focus.value || hidden) return
+  if (!active || !focus.value || hidden) return
+  const accountId = focus.value.id
   try {
     const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
     if (v && v.visible === false) { wechatNotReady.value = true; return }
-    const shot = await accountsApi.screenshot(focus.value.id)
+    if (!active || focus.value?.id !== accountId) return
+    const shot = await accountsApi.screenshot(accountId)
+    if (!active || focus.value?.id !== accountId) return
     if (!shot.blob) { wechatNotReady.value = true; return }
     wechatNotReady.value = false
     if (wechatSrc.value) URL.revokeObjectURL(wechatSrc.value)
@@ -361,34 +371,32 @@ async function saveShot(): Promise<void> {
   await window.qt?.files.saveAs(`${focus.value?.id}-${Date.now()}.png`, 'image/png', bytes)
 }
 
-function setPerf(p: string): void {
-  if (p === 'retry-hw') {
-    // 静态预览档流已关:整条重开(start 会重新探测);其余档在原流上升回硬解
-    if (isStatic.value || !stream) {
-      stats.value = { ...stats.value, decoder: 'hardware' }
-      void startFocus()
-    } else stream.retryHardware()
-    return
-  }
-  ui.perfProfile = p as typeof ui.perfProfile
-  stream?.setProfile(PROFILE_OF[p] ?? 'focus')
-}
-
 function selectThumb(id: string): void {
   focusId.value = id
   ui.focusedAccountId = id
   void router.replace(`/screen/${id}`)
 }
 
+function startAccount(id: string): void {
+  if (accounts.byId[id]?.channel === 'wechat') void router.push({ path: '/acct/new', query: { ch: 'wechat', wxnn: id } })
+  else void accountsApi.start(id)
+}
+
 watch(focusId, () => void startFocus())
 // 令牌变化(离开 ok 再回到 ok = 重新取过令牌)才解除只读;换账号不解除
 watch(() => session.authState, (v, old) => { if (v === 'ok' && old !== 'ok') readOnly.value = false })
-watch(() => route.params.id, (v) => { if (v) focusId.value = String(v) })
+watch(() => route.params.id, (v) => { if (!props.embedded && v) focusId.value = String(v) })
+watch(() => props.accountId, (v) => { if (props.embedded && v) focusId.value = v })
 
 onMounted(async () => {
   // 🔴 先注册可见性监听,再走任何可能提前 return 的分支(B5:以前首次自动选账号后 return,监听没注册)
   visibilityOff = watchVisibility()
   if (!accounts.items.length) await accounts.load()
+  if (!active) return
+  if (focusId.value && !accounts.byId[focusId.value]) {
+    try { accounts.upsert(await accountsApi.get(focusId.value)) } catch { return }
+  }
+  if (!active) return
   // 这里再调一次 startFocus 会和上面的 watch 各开一条 focus 流。
   // 后到的那条被服务端拒绝(同时只允许 1 个),页面就停在空白画布上。
   if (!focusId.value && streamable.value.length) {
@@ -399,6 +407,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  active = false
   stopAll()
   visibilityOff?.()
   visibilityOff = undefined
@@ -409,9 +418,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="screen">
-    <aside class="thumbs">
-      <div class="qt-section-title">账号</div>
+  <div class="screen" :class="{ embedded: props.embedded }">
+    <aside v-if="!props.embedded" class="thumbs qt-glass">
+      <div class="qt-eyebrow">ACCOUNT VIEWS</div>
+      <div class="qt-section-title">账号画面</div>
       <div
         v-for="a in streamable"
         :key="a.id"
@@ -421,13 +431,13 @@ onUnmounted(() => {
         @click="selectThumb(a.id)"
       >
         <StateDot :state="a.state" :reason="a.state_reason" />
-        <span class="qt-grow">{{ a.id }}</span>
+        <span class="qt-grow">{{ a.label || a.id }}<small class="thumb-id">{{ a.id }}</small></span>
         <span class="qt-small qt-muted">{{ a.channel === 'wechat' ? '截图 2s' : '540p@5fps' }}</span>
         <a-button
           v-if="['stopped', 'created', 'disabled'].includes(a.state)"
           size="small"
           :data-testid="T.thumbStart(a.id)"
-          @click.stop="accountsApi.start(a.id)"
+          @click.stop="startAccount(a.id)"
         >启动</a-button>
       </div>
       <div
@@ -435,13 +445,13 @@ onUnmounted(() => {
         :key="a.id"
         class="thumb qq"
         :data-testid="T.qqHint(a.id)"
-        @click="router.push({ path: '/msg', query: { account_id: a.id } })"
+        @click="router.push(`/acct/${a.id}`)"
       >
-        {{ a.id }} —— 无画面,去消息页
+        {{ a.label || a.id }} · 打开 QQ 工作台
       </div>
     </aside>
 
-    <main class="focus">
+    <main class="focus qt-surface">
       <template v-if="focus">
         <header class="qt-row">
           <StateDot :state="focus.state" :reason="focus.state_reason" />
@@ -453,13 +463,17 @@ onUnmounted(() => {
 
         <!-- R-06:登录态可在画面里输验证码 / 拖滑块 -->
         <div v-if="loginPhase && !isWechat" class="banner" :data-testid="T.loginHint">
-          登录中:可在画面里输验证码/拖滑块。发消息类请去指令台(登录态置灰)。
+          登录中：可在画面里输入验证码或拖动滑块，完成当前账号的登录。
           ⚠️ 密码与短信码不回显、不落任何前端日志。
         </div>
 
         <a-skeleton v-if="starting" active />
         <a-empty v-else-if="notRunning" description="未运行">
-          <a-button type="primary" @click="accountsApi.start(focus.id)">启动</a-button>
+          <a-button type="primary" @click="startAccount(focus.id)">{{ isWechat ? '登录此微信' : '启动' }}</a-button>
+        </a-empty>
+
+        <a-empty v-else-if="focus.channel === 'qq'" description="QQ 通过 NapCat 工作台管理">
+          <a-button type="primary" @click="router.push(`/acct/${focus.id}`)">打开账号详情</a-button>
         </a-empty>
 
         <!-- 微信:只看不点 -->
@@ -570,16 +584,6 @@ onUnmounted(() => {
             >
               {{ ({ back: '返回', home: '主页', shot: '截图', keyboard: '键盘输入' } as Record<string, string>)[t] }}
             </a-button>
-            <a-dropdown>
-              <a-button size="small" :data-testid="T.perfMenu">性能 ▾</a-button>
-              <template #overlay>
-                <a-menu>
-                  <a-menu-item v-for="p in SCREEN_PERF_ITEMS" :key="p" :data-testid="T.perf(p)" @click="setPerf(p)">
-                    {{ ({ focus30: '720p@30fps', focus15: '720p@15fps', thumb10: '540p@10fps', 'retry-hw': '重试硬解' } as Record<string, string>)[p] }}
-                  </a-menu-item>
-                </a-menu>
-              </template>
-            </a-dropdown>
             <span v-if="degradeMsg" class="tag" :data-testid="T.degradeTag">{{ degradeMsg }}</span>
           </div>
           <div class="qt-row status qt-small qt-muted">
@@ -588,7 +592,7 @@ onUnmounted(() => {
               {{ stats.codec }}
             </span>
             <span :data-testid="T.statusFps">{{ stats.fps }} fps</span>
-            <span :data-testid="T.statusLatency">延迟 {{ stats.latencyMs }} ms</span>
+            <span :data-testid="T.statusLatency">延迟 {{ stats.latencyMs == null ? '—' : `${stats.latencyMs} ms` }}</span>
             <span :data-testid="T.statusStreamDot" class="dot"
                   :style="{ background: stats.connected ? 'var(--qt-state-running)' : 'var(--qt-state-stopped)' }" />
             <label class="zoom">缩放
@@ -613,19 +617,23 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.screen { display: flex; height: 100%; }
-.thumbs { width: 260px; flex: 0 0 auto; padding: var(--qt-space-3); border-right: 1px solid var(--qt-border); overflow: auto; }
-.thumb { display: flex; align-items: center; gap: var(--qt-space-2); padding: 6px; cursor: pointer; border-radius: var(--qt-radius-sm); }
+.screen { display: flex; min-height: 540px; height: 100%; gap: 20px; padding: 24px; }
+.screen.embedded { padding: 0; min-height: 460px; }
+.thumbs { width: 250px; flex: 0 0 auto; padding: 22px 16px; border: 1px solid var(--qt-border); border-radius: 24px; overflow: auto; }
+.thumb { display: flex; align-items: center; gap: var(--qt-space-2); padding: 14px 12px; margin-top: 10px; cursor: pointer; border: 1px solid transparent; border-radius: 16px; }
+.thumb-id { display: block; font-size: 11px; color: var(--qt-text-secondary); margin-top: 3px; }
 .thumb:hover { background: var(--qt-bg-elevated); }
 .thumb.active { background: var(--qt-bg-elevated); border: 1px solid var(--qt-primary); }
 .thumb.guide { box-shadow: 0 0 0 2px var(--qt-state-login_required) inset; }
 .thumb.qq { color: var(--qt-text-disabled); }
-.focus { flex: 1 1 auto; padding: var(--qt-space-3); overflow: auto; }
+.focus { flex: 1 1 auto; min-width: 0; padding: 24px; overflow: auto; border: 1px solid var(--qt-border); border-radius: 24px; background: rgba(255,255,255,.82); }
+.focus > header { padding-bottom: 18px; }
+.embedded .focus { border: 0; background: transparent; padding: 12px 0 0; }
 .banner { background: #FFFBE6; color: var(--qt-sev-warn); padding: 6px var(--qt-space-3); margin: var(--qt-space-2) 0; }
 .banner.crit { background: #FFF1F0; color: var(--qt-sev-crit); }
 .canvas, .wxpreview {
   width: 100%; max-width: 720px; max-height: 70vh; object-fit: contain;
-  background: #000; display: block; outline: none; cursor: pointer;
+  background: #211a2c; display: block; outline: none; cursor: pointer; margin: 18px auto; border-radius: 16px; box-shadow: 0 18px 44px rgba(56,35,82,.15);
 }
 /* 触屏/笔:不让浏览器把拖动当成页面滚动或缩放吞掉 */
 .canvas, .static-preview { touch-action: none; user-select: none; }
@@ -634,8 +642,9 @@ onUnmounted(() => {
 .ime-input { flex: 1 1 auto; max-width: 480px; padding: 2px 8px; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-sm); }
 .zoom { display: inline-flex; align-items: center; gap: 6px; }
 .tools { margin-top: var(--qt-space-2); flex-wrap: wrap; }
-.status { margin-top: var(--qt-space-2); gap: var(--qt-space-3); }
+.status { margin-top: var(--qt-space-2); gap: var(--qt-space-3); flex-wrap: wrap; padding: 10px 0; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .tag { color: var(--qt-sev-warn); border: 1px solid var(--qt-sev-warn); border-radius: 8px; padding: 0 6px; font-size: var(--qt-font-xs); }
 .shot { max-width: 100%; margin-bottom: var(--qt-space-3); }
+@media (max-width: 900px) { .screen { flex-direction: column; padding: 16px; } .thumbs { width: auto; } .focus { padding: 16px; } }
 </style>

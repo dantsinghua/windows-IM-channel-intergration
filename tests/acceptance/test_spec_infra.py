@@ -2454,10 +2454,56 @@ def test_AP18_metrics_disk_watermark_is_flat_two_keys(rig5, c5):
     assert "last_cleanup_at" in dw and "last_cleanup_freed_mb" in dw and "last_cleanup" not in dw
 
 
-def test_AP19_metrics_reports_current_disk_level(rig5, c5):
-    """04 §2.4.5 + §2.8.8:`P-RES` 要显示「处在 normal/warn/high/critical 哪一级」。"""
-    dw = c5.get(f"{P}/system/metrics", headers=H(TOK_R)).json()["disk_watermark"]
+@pytest.mark.parametrize("free_mb, expected_level", [
+    (10_000, "normal"), (3_000, "warn"), (1_500, "high"), (500, "critical"), (0, "critical"),
+])
+def test_AP19_metrics_reports_current_disk_level(rig5, c5, free_mb, expected_level):
+    """04 §2.4.5 + §2.8.8:已知部署卷显示四级水位;2026-10-08 裁决要求先证明来源。
+
+    原 rig5 只提供运行期 FakeDiskProbe,不能据它虚构 Windows 承载卷容量。
+    显式给出已知部署卷,保留原四级断言,并验证零余量是真实 critical 而非 unknown。
+    """
+    class KnownDeployment:
+        async def snapshot(self):
+            return {"disks": [{"mount": "Z:\\", "total_mb": 20_000, "free_mb": free_mb,
+                               "source": "windows_volume", "roles": ["app", "data"],
+                               "backing_path": "Z:\\isolated-acceptance\\ext4.vhdx"}], "error": None}
+
+    rig5.agent.deployment_disks = KnownDeployment()
+    jobs_before = count(rig5.store, "jobs")
+    response = c5.get(f"{P}/system/metrics", headers=H(TOK_R))
+    assert response.status_code == 200
+    body = response.json()
+    dw = body["disk_watermark"]
     assert dw["level"] in ("normal", "warn", "high", "critical")
+    assert dw["level"] == expected_level and dw["free_mb"] == free_mb
+    assert dw["scope"] == "deployment_volumes" and dw["runtime_level"] == "normal"
+    assert body["hardware"]["disk_source_error"] is None
+    assert body["hardware"]["disks"][0]["total_mb"] == 20_000
+    assert body["hardware"]["disks"][0]["free_mb"] == free_mb
+    assert dw["actions"] == [] and count(rig5.store, "jobs") == jobs_before
+
+
+@pytest.mark.parametrize("reason", [
+    "windows_host_unavailable", "wsl_vhdx_mapping_failed", "application_path_unavailable",
+])
+def test_AP19_unknown_deployment_source_is_not_a_known_watermark(rig5, c5, reason):
+    """2026-10-08 安琳裁决:不能确认 Windows 承载卷时必须未知,不拿 WSL 内部余量兜成宿主正常。"""
+    class UnavailableDeployment:
+        async def snapshot(self):
+            return {"disks": [], "error": reason}
+
+    rig5.agent.deployment_disks = UnavailableDeployment()
+    jobs_before = count(rig5.store, "jobs")
+    response = c5.get(f"{P}/system/metrics", headers=H(TOK_R))
+    assert response.status_code == 200
+    body = response.json()
+    dw = body["disk_watermark"]
+    assert dw["level"] == "unknown" and dw["free_mb"] is None
+    assert dw["scope"] == "deployment_volumes" and dw["runtime_level"] == "normal"
+    assert body["hardware"]["disks"] == []
+    assert body["hardware"]["disk_source_error"] == reason
+    assert dw["actions"] == [] and count(rig5.store, "jobs") == jobs_before
 
 
 def test_AP20_calibrate_requires_admin(rig5, c5):

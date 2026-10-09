@@ -96,6 +96,11 @@ export const useMessagesStore = defineStore('messages', () => {
     if (f.dir && m.dir !== f.dir) return false
     if (f.type && m.type !== f.type) return false
     if (f.needs_review && !m.needs_review) return false
+    // 全文匹配交给后端；查询中不前插未经同一 FTS 规则验证的事件。
+    if (f.q?.trim()) return false
+    const at = Date.parse(m.ts)
+    if (f.since && (!Number.isFinite(at) || at < Date.parse(f.since))) return false
+    if (f.until && (!Number.isFinite(at) || at > Date.parse(f.until))) return false
     return true
   }
 

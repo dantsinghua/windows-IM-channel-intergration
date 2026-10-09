@@ -14,13 +14,16 @@
  * 而 SFC 是预编译的,`compilerOptions.isCustomElement` 对它无效。这些 warn 与本文件的判据无关
  * (断的是原生 `<table>` 里的单元格),**不要**为了消 warn 去把真实组件装进来。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { flushPromises, shallowMount } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import MailPage from '@/pages/mail/MailPage.vue'
 import { useMailStore } from '@/stores/mail'
 import { useSettingsStore } from '@/stores/settings'
 import type { MailInboxRow, MailOutboxRow } from '@/api/types'
+import { mailApi } from '@/api/client'
+
+const wrappers: VueWrapper[] = []
 
 vi.mock('vue-router', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-router')>()),
@@ -30,6 +33,15 @@ vi.mock('vue-router', async (importOriginal) => ({
 beforeEach(() => {
   setActivePinia(createPinia())
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"ok":true,"data":[]}')))
+  vi.spyOn(useMailStore(), 'reloadAll').mockResolvedValue()
+  vi.spyOn(useMailStore(), 'startPolling').mockImplementation(() => undefined)
+  vi.spyOn(useMailStore(), 'stopPolling').mockImplementation(() => undefined)
+})
+
+afterEach(() => {
+  for (const wrapper of wrappers.splice(0)) wrapper.unmount()
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 const INBOX: MailInboxRow[] = [{
@@ -57,18 +69,25 @@ const OUTBOX: MailOutboxRow[] = [{
   ref: 'mi_0004',
 }]
 
-async function renderMail() {
+async function renderMail(tab: 'inbox' | 'outbox' = 'inbox') {
   const w = shallowMount(MailPage, {
     global: {
+      renderStubDefaultSlot: true,
       // 两张表都包在 `PageState` 的默认插槽里;shallowMount 会整个 stub 掉 ⇒ 插槽不渲染
-      stubs: { teleport: true, PageState: { template: '<div><slot /></div>' } },
+      stubs: {
+        teleport: true, 'a-button': true, 'a-popconfirm': true,
+        'a-popover': { data: () => ({ open: false }), template: '<div><div @click="open = true"><slot /></div><div v-if="open"><slot name="content" /></div></div>' },
+        PageState: { template: '<div><slot /></div>' },
+      },
     },
   })
+  wrappers.push(w)
   useSettingsStore().mailEnabled = true
   const mail = useMailStore()
   mail.inbox = INBOX
   mail.outbox = OUTBOX
   await flushPromises()
+  if (tab === 'outbox') await w.get('#mail-tab-outbox').trigger('click')
   return w
 }
 
@@ -76,14 +95,15 @@ describe('P-MAIL 收件列表:时间 / 发件人 / route 三列都不许空(联�
   it('时间列显示 `received_at`,不是空白也不是毫秒整数', async () => {
     const row = (await renderMail()).find('[data-testid="qt-mail-inbox-row-0"]')
     expect(row.exists(), '收件行没渲染出来').toBe(true)
-    const cells = row.findAll('td')
-    expect(cells[0].text(), '时间列空了 —— 键名又对不上了(P-1 的原样)').toBe('2026-09-21T08:30:47+08:00')
-    expect(cells[0].text(), '不该透出 *_ms 库列').not.toMatch(/^\d{10,}$/)
+    const cell = row.get('.time-cell')
+    expect(cell.text(), '时间列空了 —— 键名又对不上了(P-1 的原样)')
+      .toBe(new Date(INBOX[0].received_at).toLocaleString('zh-CN', { hour12: false }))
+    expect(cell.text(), '不该透出 *_ms 库列').not.toMatch(/^\d{10,}$/)
   })
 
   it('发件人列显示 `from_addr`', async () => {
-    const cells = (await renderMail()).find('[data-testid="qt-mail-inbox-row-0"]').findAll('td')
-    expect(cells[2].text()).toBe('ops@corp')
+    const row = (await renderMail()).get('[data-testid="qt-mail-inbox-row-0"]')
+    expect(row.get('.row-secondary').text()).toBe('ops@corp')
   })
 
   it('route 列渲染**中文显示名**,不甩后端的 scope 名', async () => {
@@ -94,20 +114,32 @@ describe('P-MAIL 收件列表:时间 / 发件人 / route 三列都不许空(联�
 
 describe('P-MAIL 发件队列:收件人 / 下次 / 失败原因 / 关联(01 §2.7.8 逐字)', () => {
   it('收件人列显示 `to`(后端 `to_addrs` 已在出参视图里改名)', async () => {
-    const cells = (await renderMail()).find('[data-testid="qt-mail-outbox-row-0"]').findAll('td')
-    expect(cells[1].text(), '收件人列空了').toBe('ops@corp')
+    const row = (await renderMail('outbox')).get('[data-testid="qt-mail-outbox-row-0"]')
+    expect(row.get('.row-secondary').text(), '收件人列空了').toBe('ops@corp')
   })
 
-  it('终态行没有下次重投 ⇒ 显示「—」而不是 1970', async () => {
-    const cells = (await renderMail()).find('[data-testid="qt-mail-outbox-row-0"]').findAll('td')
-    expect(cells[5].text()).toBe('—')
-    expect(cells[5].text()).not.toContain('1970')
+  it('终态行没有下次重投 ⇒ 不虚构重试时间或显示 1970', async () => {
+    const row = (await renderMail('outbox')).get('[data-testid="qt-mail-outbox-row-0"]')
+    expect(row.text()).not.toContain('下次尝试')
+    expect(row.text()).not.toContain('1970')
   })
 
-  it('DEAD 行要说得出为什么死(`last_error`),回执要对得回哪封来信(`ref`)', async () => {
-    const cells = (await renderMail()).find('[data-testid="qt-mail-outbox-row-0"]').findAll('td')
-    expect(cells[6].text()).toBe('smtp 550 mailbox unavailable')
-    expect(cells[6].classes(), '失败原因该标红').toContain('qt-danger')
-    expect(cells[7].text()).toBe('mi_0004')
+  it('DEAD 行保留失败原因，并以失败状态明确标识', async () => {
+    const row = (await renderMail('outbox')).get('[data-testid="qt-mail-outbox-row-0"]')
+    expect(row.get('.reason').text()).toBe('smtp 550 mailbox unavailable')
+    expect(row.get('.status-chip.failure').text()).toBe('发送失败')
+  })
+
+  it('关联来源仍展示 ref，非数字来源不错误当成原邮件 ID', async () => {
+    const detail = vi.spyOn(mailApi, 'inboxDetail').mockResolvedValue(INBOX[0])
+    const page = await renderMail('outbox')
+    const row = page.get('[data-testid="qt-mail-outbox-row-0"]')
+    const source = row.findAll('button,a-button-stub,a').find((button) => /关联来源/.test(button.text()))
+    expect(source, '发件记录缺少关联来源入口').toBeDefined()
+    await source!.trigger('click')
+    await flushPromises()
+    expect(page.text()).toContain(OUTBOX[0].ref)
+    expect(page.findAll('button,a-button-stub,a').some((button) => /查看原邮件/.test(button.text()))).toBe(false)
+    expect(detail).not.toHaveBeenCalled()
   })
 })

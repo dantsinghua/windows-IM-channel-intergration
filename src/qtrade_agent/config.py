@@ -220,6 +220,8 @@ class ProbeConfig:
     (04 §3.4;Windows 侧不受本键影响)。
     """
     agent_probe_enabled: bool = False
+    # 账号启动前置独立于上面的周期/手动宿主探针开关(R6-80)。
+    qidian_hosts: tuple[str, ...] = ("msfxg.3g.qq.com:8080", "msfxg.3g.qq.com:14000", "msfxg.3g.qq.com:443")
 
 
 @dataclass(frozen=True)
@@ -274,7 +276,7 @@ class AgentConfig:
             section = section or {}
             names = klass.__dataclass_fields__.keys()
             vals = {k: section[k] for k in names if k in section}
-            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms", "public_ip_probe_urls"):
+            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms", "public_ip_probe_urls", "qidian_hosts"):
                 if tup_key in vals and isinstance(vals[tup_key], list):
                     vals[tup_key] = tuple(vals[tup_key])
             return klass(**vals)

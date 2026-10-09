@@ -11,9 +11,9 @@ import glob
 import hashlib
 import json
 import logging
+import math
 import os
 import re
-import shutil
 import time
 from datetime import datetime
 from email.utils import formatdate
@@ -372,6 +372,24 @@ def create_api(agent) -> FastAPI:
     ACCOUNT_HEALTH_CODES = {"H04": "H04_CONTAINER_EXITED", "H05": "H05_BOOT_INCOMPLETE", "H06": "H06_ADB_OFFLINE",
                             "H07": "H07_SCRCPY_STALLED", "H08": "H08_NAPCAT_HEARTBEAT_LOST"}
 
+    async def _deployment_disk_snapshot() -> tuple[list[dict[str, Any]], Optional[str]]:
+        """#72/#77 共用 reader 自带的缓存；未知时不以 WSL 虚拟盘余量兜底。"""
+        reader = getattr(agent, "deployment_disks", None)
+        if reader is None:
+            return [], "deployment_disk_reader_unavailable"
+        try:
+            observed = await reader.snapshot()
+            disks, error = observed.get("disks") or [], observed.get("error")
+            if error or not disks:
+                return [], error or "deployment_disks_unavailable"
+            for disk in disks:
+                free = disk["free_mb"]
+                if isinstance(free, bool) or not isinstance(free, (int, float)) or not math.isfinite(free) or free < 0:
+                    raise ValueError("invalid_disk_measurement")
+            return disks, None
+        except Exception:
+            return [], "deployment_disk_probe_failed"
+
     def _per_account_checks() -> dict[str, dict[str, str]]:
         """``#72 checks.accounts``:每账号的 H04/H05/H06/H07/H08(01 §2.7.3.4 的五个状态点)。
 
@@ -397,9 +415,21 @@ def create_api(agent) -> FastAPI:
     async def system_version(request: Request):
         _principal(request, "read")
         sv = agent.store.con.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        versions: dict[str, Optional[str]] = {"kernel": None, "docker": None, "distro": None}
+        read_versions = getattr(agent.wsl_env_reader, "versions", None)
+        if callable(read_versions):
+            try:
+                observed = await asyncio.wait_for(read_versions(), timeout=12)
+                if isinstance(observed, dict):
+                    for key in versions:
+                        value = observed.get(key)
+                        if isinstance(value, str) and value.strip():
+                            versions[key] = value.strip()
+            except Exception:
+                log.debug("系统版本只读探测未成功")
         return {"ok": True, "agent": {"version": AGENT_VERSION}, "api_version": cfg.api.api_version, "capabilities_version": caps_version,
                 "schema_version": sv, "winagent": {"version": agent.health.winagent_version, "online": agent.health.winagent_online},
-                "kernel": None, "wsl": None, "docker": None, "images": {}}
+                **versions, "kernel_state": None, "wsl": None, "wsl_state": None, "images": {}}
 
     @app.get(f"{API_PREFIX}/system/health")
     async def system_health(request: Request):
@@ -410,11 +440,9 @@ def create_api(agent) -> FastAPI:
             db_mb, wal_mb = agent.store.db_size_mb()
             running = agent.store.con.execute("SELECT COUNT(*) FROM accounts WHERE state='running' AND deleted_ms IS NULL").fetchone()[0]
             total = agent.store.con.execute("SELECT COUNT(*) FROM accounts WHERE deleted_ms IS NULL").fetchone()[0]
-            data_dir = os.path.dirname(os.path.abspath(agent.store.path)) if agent.store.path != ":memory:" else os.getcwd()
-            try:
-                disk_free_mb = shutil.disk_usage(data_dir).free // 1048576      # 02 #72 / B-35:agent.db 所在盘剩余
-            except OSError:
-                disk_free_mb = None
+            disks, _ = await _deployment_disk_snapshot()
+            data_free = [disk["free_mb"] for disk in disks if "data" in (disk.get("roles") or [])]
+            disk_free_mb = min(data_free) if data_free else None   # 02 #72/B-35:数据盘，不取其它应用卷的最小值
             return {"ok": True, "agent": {"version": AGENT_VERSION, "api_version": cfg.api.api_version, "uptime_s": agent.health.uptime_s(),
                                           "db_mb": db_mb, "wal_mb": wal_mb},
                     "dockerd": agent.health.dockerd_ok,
@@ -631,7 +659,7 @@ def create_api(agent) -> FastAPI:
         p = _principal(request, "read")
         require_account(p, account_id)
         request.state.account_id = account_id
-        return {"ok": True, **agent.accounts.prompt(account_id, login_session_id)}
+        return {"ok": True, **(await agent.accounts.refresh_prompt(account_id, login_session_id))}
 
     @app.post(f"{API_PREFIX}/accounts/{{account_id}}/login/cancel")
     async def login_cancel(request: Request, account_id: str):
@@ -1048,11 +1076,17 @@ def create_api(agent) -> FastAPI:
         procs_detail = [{"name": n, "rss_mb": None, "cpu_pct": None} for n in ("agent", "winagent", "console")]
         watermark = dict(agent.maintenance.watermark_snapshot())
         watermark.setdefault("vhdx_grown_mb", None)       # 02 #77 列了这一键;VHDX 增量没有采集执行体 ⇒ null
+        watermark.update(scope="deployment_volumes", runtime_level=watermark["level"])
+        hardware = _hardware_snapshot()
+        disks, error = await _deployment_disk_snapshot()
+        hardware.update(disks=disks, disk_source_error=error)
+        free = min(d["free_mb"] for d in disks) if disks else None
+        watermark.update(free_mb=free, level=agent.maintenance.disk_level(free) if free is not None else "unknown")
         return {"ok": True, "disk_watermark": watermark,
                 "mem_watermark": {"level": agent.pressure.level, "avail_mb": agent.pressure.avail_mb,
                                   "lru_suggest": agent.pressure.lru_suggest() if agent.pressure.blocked() else []},
                 "budget_vs_actual": budget, "pools": snap["pools"], "realtime": snap["realtime"],
-                "hardware": _hardware_snapshot(),
+                "hardware": hardware,
                 "ours": {"procs": procs, "procs_detail": procs_detail,
                          # 02 #77 的 `ours.accounts[]` 列的是 anon_mb/current_mb/cpu_pct/quota_mb
                          # (`rss_mb` 是 budget_vs_actual 那一组的键);采样缺失时一律 null,不编造
@@ -1083,14 +1117,7 @@ def create_api(agent) -> FastAPI:
                 load_pct = reader.cpu_pct()
             except Exception:
                 load_pct = None
-        disks: list[dict[str, Any]] = []
-        data_dir = agent.data_dir
-        try:
-            du = shutil.disk_usage(data_dir)
-            disks.append({"mount": data_dir, "total_mb": du.total // 1048576, "free_mb": du.free // 1048576})
-        except OSError:
-            pass
-        return {"mem": mem, "cpu": {"logical_cores": os.cpu_count(), "load_pct": load_pct}, "disks": disks}
+        return {"mem": mem, "cpu": {"logical_cores": os.cpu_count(), "load_pct": load_pct}, "disks": []}
 
     def _storage_snapshot() -> dict[str, Any]:
         """#77 的 ``ours.storage``:只报**量得到**的两项(agent.db、media),其余无采集方 ⇒ ``null``。"""

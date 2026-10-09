@@ -246,6 +246,8 @@ class QQAdapter:
     async def _on_event(self, sess: QQSession, frame: dict[str, Any]) -> None:
         post = frame.get("post_type")
         sess.events_seen[str(post)] = sess.events_seen.get(str(post), 0) + 1
+        if sess.acct.extra.get("login_pending") and post != "meta_event":
+            return                  # 身份确认完成前，不能把扫码者的消息写进指定账号。
         if post in ("message", "message_sent"):
             self._ingest_event(sess, frame)
             return
@@ -335,7 +337,7 @@ class QQAdapter:
         """
         sess = self._sessions.get(acct.id)
         n = self.qq.history_backfill_on_reconnect
-        if sess is None or n <= 0:
+        if sess is None or n <= 0 or sess.acct.extra.get("login_pending"):
             return 0
         total = 0
         for row in self.store.list_sessions(account_id=acct.id, limit=1000):

@@ -122,8 +122,8 @@ function Install-QtWinAgentService {
         [string] $DisplayName = 'QTrade WinAgent'
     )
     $cmds = @()
-    $create = @('create', $Name, ('binPath= "{0}"' -f $ExePath), 'start= delayed-auto', 'obj= LocalSystem',
-        ('DisplayName= "{0}"' -f $DisplayName), 'depend= LxssManager')
+    $create = @('create', $Name, 'binPath=', ('"{0}"' -f $ExePath), 'start=', 'delayed-auto', 'obj=', 'LocalSystem',
+        'DisplayName=', $DisplayName, 'depend=', 'LxssManager')
     $cmds += ($create -join ' ')
     $r = Invoke-QtSc -ScArgs $create
     if ($r.ExitCode -ne 0 -and $r.ExitCode -ne 1073) {
@@ -135,7 +135,7 @@ function Install-QtWinAgentService {
     Invoke-QtSc -ScArgs $desc | Out-Null
 
     # 失败恢复:重启 5 s / 30 s / 60 s;failureflag 1 = 非崩溃退出也算失败
-    $failure = @('failure', $Name, 'reset= 86400', 'actions= restart/5000/restart/30000/restart/60000')
+    $failure = @('failure', $Name, 'reset=', '86400', 'actions=', 'restart/5000/restart/30000/restart/60000')
     $cmds += ($failure -join ' ')
     Invoke-QtSc -ScArgs $failure | Out-Null
     $flag = @('failureflag', $Name, '1')
@@ -251,17 +251,11 @@ function Write-QtWinAgentToken {
         [int] $TimeoutSec = 60
     )
     if ([string]::IsNullOrWhiteSpace($Token)) { return [pscustomobject]@{ Ok = $false; Reason = 'EMPTY_TOKEN' } }
-    # 经 stdin 传入,避免令牌出现在命令行(命令行会被 wa_audit_log / 进程列表看到)
-    $script = 'umask 077; mkdir -p /etc/qtrade; cat > /etc/qtrade/winagent.token; chmod 600 /etc/qtrade/winagent.token; chown root:root /etc/qtrade/winagent.token'
-    $tmp = [IO.Path]::GetTempFileName()
-    try {
-        [IO.File]::WriteAllText($tmp, $Token, (New-Object Text.UTF8Encoding($false)))
-        $r = Invoke-QtProcess -FilePath 'cmd.exe' -ArgumentList @('/c', ('type "{0}" | wsl.exe -d {1} --user root --exec sh -c "{2}"' -f $tmp, $DistroName, $script)) -TimeoutSec $TimeoutSec
-        if ($r.TimedOut -or $r.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Reason = 'TOKEN_WRITE_FAILED' } }
-        return [pscustomobject]@{ Ok = $true; Reason = '' }
-    } finally {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-    }
+    # Send exact UTF-8 bytes through stdin, without a shell or a plaintext temp file.
+    $script = 'umask 077 && mkdir -p /etc/qtrade && cat > /etc/qtrade/winagent.token && chmod 600 /etc/qtrade/winagent.token && chown root:root /etc/qtrade/winagent.token'
+    $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'sh', '-c', $script) -StandardInput $Token -TimeoutSec $TimeoutSec
+    if ($r.TimedOut -or $r.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Reason = 'TOKEN_WRITE_FAILED' } }
+    return [pscustomobject]@{ Ok = $true; Reason = '' }
 }
 
 function Uninstall-QtWinAgent {

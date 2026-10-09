@@ -1,233 +1,65 @@
 <script setup lang="ts">
-/**
- * `P-DASH` 首页 / 资源仪表(01 §2.7.2)。
- * 一眼看到两个池的余量、能再开几个、账号在线汇总、最近告警;
- * 资源**只留两格摘要**(内存/磁盘),细节全在 `P-RES`(E-19)。
- */
-import { computed } from 'vue'
-import { useRouter } from 'vue-router'
-import { dash as T, DASH_SYS_DOTS } from '@/testids'
+import { computed, onMounted, ref } from 'vue'
+import { useLocalMetrics } from '@/composables/useLocalMetrics'
 import { useResourcesStore } from '@/stores/resources'
 import { useAccountsStore } from '@/stores/accounts'
-import { useEventsStore, alertRoute } from '@/stores/events'
-import { useEnvStore } from '@/stores/env'
-import { useMailStore } from '@/stores/mail'
-import { useSessionStore } from '@/stores/session'
-import AlertCard from '@/components/AlertCard.vue'
-import { CHANNELS, CHANNEL_TEXT, KERNEL_STATE_TEXT } from '@/i18n/zh-CN/codes'
-
-const router = useRouter()
+import { useEventsStore } from '@/stores/events'
+import { messagesApi } from '@/api/client'
+import { dash as T } from '@/testids'
+import { ACCOUNT_STATES, CHANNEL_TEXT, type Channel } from '@/i18n/zh-CN/codes'
+import type { Account } from '@/api/types'
+import QtIcon from '@/components/QtIcon.vue'
+import StateDot from '@/components/StateDot.vue'
+import SystemTopology from '@/components/SystemTopology.vue'
 const resources = useResourcesStore()
+const { snapshot: localMetrics, loading: localLoading, unavailable: localUnavailable } = useLocalMetrics()
+const hostMemory = computed(() => localMetrics.value?.memory.available ? localMetrics.value.memory : null)
+const clientStorage = computed(() => localMetrics.value?.storage.available ? localMetrics.value.storage : null)
+function localGb(bytes?: number | null): string { return bytes == null || !Number.isFinite(bytes) ? '—' : (bytes / 1024 ** 3).toFixed(2) }
+const storageNote = computed(() => clientStorage.value ? '客户端目录占用' : localLoading.value ? '正在读取目录大小' : localUnavailable.value ? '请在桌面客户端查看' : '目录大小暂不可用')
 const accounts = useAccountsStore()
 const events = useEventsStore()
-const env = useEnvStore()
-const mail = useMailStore()
-const session = useSessionStore()
-
-const pool = computed(() => resources.pool)
-const slots = computed(() => resources.slots)
+const order: Channel[] = ['qidian','wechat','qq']
+const messageCount = ref<number | null>(null)
+const messageError = ref(false)
 const metrics = computed(() => resources.metrics)
-const zeroAccounts = computed(() => accounts.items.length === 0)
-
-/** 「档案 N」= channel=wechat 且 stopped 的 Account 行数(C-01) */
-const wechatProfileCount = computed(() => accounts.wechatProfiles.length)
-
-const mailSummary = computed(() => {
-  const r = mail.status?.routes?.[0]
-  if (!r) return null
-  return {
-    lastRecv: r.inbound.last_success_at ?? '—',
-    queued: r.outbound.queued,
-    dead: r.outbound.dead,
-    quota: r.inbound.quota.limit_mb ? Math.round((r.inbound.quota.used_mb / r.inbound.quota.limit_mb) * 100) : 0,
-    idle: r.inbound.idle_supported,
-  }
+function gb(n?: number | null): string { return n == null || !Number.isFinite(n) ? '—' : (n / 1024).toFixed(2) }
+function percent(n?: number | null): string { return n == null || !Number.isFinite(n) ? '—' : n.toFixed(1) }
+function budget(ch: Channel): string { return gb(accounts.byChannel[ch].reduce((sum,a) => sum + (a.quota_mb ?? 0),0)) }
+function accountMemory(a: Account): string { const row = metrics.value?.ours.accounts.find(x => x.id === a.id); const value = row?.rss_mb ?? row?.current_mb; return value == null ? `预算 ${gb(a.quota_mb)} GB` : `已用 ${gb(value)} GB` }
+const activeCount = computed(() => accounts.items.filter(a => a.state === 'running' || a.state === 'degraded').length)
+onMounted(async () => {
+  try { const r = await messagesApi.list({ limit: 1 }); messageCount.value = r.items.length }
+  catch { messageError.value = true }
 })
-
-function levelColor(level?: string): string {
-  if (level === 'warn') return 'var(--qt-sev-warn)'
-  if (level === 'high' || level === 'critical') return 'var(--qt-sev-crit)'
-  return 'var(--qt-border)'
-}
-
-function gb(mb?: number | null): string {
-  return mb == null ? '—' : (mb / 1024).toFixed(1)
-}
-
-function go(p: string): void { void router.push(p) }
-
-/** 新增入口:can_add==0 也可点,进 P-ACCT-NEW 第一步被拒并显示 Agent 给的替代方案 */
-function add(ch: string): void { void router.push({ path: '/acct/new', query: { ch } }) }
-
-function sysDot(what: string): { ok: boolean; text: string } {
-  switch (what) {
-    case 'agent': return { ok: session.agentReachable, text: 'Agent' }
-    case 'winagent': return { ok: session.winagentOnline, text: 'WinAgent' }
-    case 'winagent-user': return { ok: session.userAgentOnline, text: '会话代理' }
-    case 'ws': return { ok: events.connected, text: 'WS' }
-    case 'kernel': return {
-      ok: env.version?.kernel_state === 'OURS',
-      text: `内核 ${KERNEL_STATE_TEXT[env.version?.kernel_state ?? ''] ?? '—'}`,
-    }
-    default: return { ok: !!env.version?.docker, text: `docker ${env.version?.docker ?? '—'}` }
-  }
-}
 </script>
-
 <template>
-  <div class="qt-page qt-stack">
-    <div class="grid2">
-      <!-- 资源池两条进度条留在 P-DASH:它们是「还能开几个」的直接依据 -->
-      <div class="qt-card box">
-        <div class="qt-section-title">资源池</div>
-        <div :data-testid="T.poolWsl" class="pool">
-          <div class="qt-row"><span class="qt-grow">WSL 池</span>
-            <span>{{ gb(pool?.pools.wsl.used_mb) }} / {{ gb(pool?.pools.wsl.total_mb) }} GB</span>
-          </div>
-          <a-progress
-            :percent="pool ? Math.round((pool.pools.wsl.used_mb / Math.max(1, pool.pools.wsl.total_mb)) * 100) : 0"
-            size="small" :show-info="false"
-          />
-          <div class="qt-small qt-muted">预留 {{ gb(pool?.pools.wsl.reserved_mb) }} GB</div>
-        </div>
-        <div :data-testid="T.poolWindows" class="pool">
-          <div class="qt-row"><span class="qt-grow">Windows 池</span>
-            <span>微信 {{ gb(pool?.pools.windows.wechat_mb) }} GB</span>
-          </div>
-          <a-progress
-            :percent="pool ? Math.round((pool.pools.windows.wechat_mb / Math.max(1, pool.pools.windows.total_mb)) * 100) : 0"
-            size="small" :show-info="false"
-          />
-          <div class="qt-small qt-muted" :data-testid="T.wechatSlot">
-            微信槽 {{ slots?.used ?? 0 }}/{{ slots?.max ?? 1 }} · holder {{ slots?.holder || '—' }} · pending {{ slots?.pending || '—' }}
-          </div>
-        </div>
-      </div>
-
-      <div class="qt-card box">
-        <div class="qt-section-title">可新增</div>
-        <div v-for="ch in CHANNELS" :key="ch" class="qt-row canadd">
-          <span class="qt-grow">{{ CHANNEL_TEXT[ch] }}</span>
-          <!-- 直接显示 can_add[通道],控制台不重算(算法在 Agent) -->
-          <span :data-testid="T.canadd(ch)" class="qt-mono">还能开 {{ resources.canAdd[ch] ?? 0 }} 个</span>
-          <span class="qt-small qt-muted">{{ gb(pool?.quota_mb?.[ch]) }} GB/个</span>
-          <a-button size="small" :data-testid="T.add(ch)" @click="add(ch)">新增</a-button>
-        </div>
-        <a-button
-          v-if="!session.wechatDisabled"
-          size="small"
-          :data-testid="T.wechatSwitch"
-          @click="go('/acct')"
-        >切换微信({{ wechatProfileCount }} 个档案)</a-button>
-      </div>
-    </div>
-
-    <div class="grid2">
-      <div class="qt-card box">
-        <div class="qt-section-title">账号状态</div>
-        <a
-          v-for="ch in CHANNELS"
-          :key="ch"
-          class="qt-row summary"
-          :data-testid="T.acctSummary(ch)"
-          @click="go('/acct')"
-        >
-          <span class="qt-grow">{{ CHANNEL_TEXT[ch] }}</span>
-          <span class="qt-ok">{{ accounts.summary[ch].online }} 在线</span>
-          <span class="qt-warn">{{ accounts.summary[ch].loginRequired }} 待登录</span>
-          <span class="qt-muted">{{ accounts.summary[ch].stopped }} 停止</span>
-        </a>
-        <div v-if="zeroAccounts" class="qt-row">
-          <a-button
-            v-for="ch in CHANNELS"
-            :key="ch"
-            size="small"
-            :data-testid="T.emptyAdd(ch)"
-            @click="add(ch)"
-          >添加第一个{{ CHANNEL_TEXT[ch] }}账号</a-button>
-        </div>
-      </div>
-
-      <div class="qt-card box">
-        <div class="qt-section-title">最近告警(firing,按 severity)</div>
-        <div :data-testid="T.alertList">
-          <AlertCard
-            v-for="(a, i) in events.firing.slice(0, 6)"
-            :key="a.code + a.subject"
-            :alert="a"
-            :testid="T.alertItem(i)"
-            :action-testid="(act) => T.alertItemAction(i, act)"
-            @open="go(alertRoute(a))"
-            @action="(act) => go(act === 'open_mail' ? '/mail' : act === 'open_account' ? '/acct' : '/env')"
-          />
-          <a-empty v-if="!events.firing.length" description="暂无未恢复告警" />
-        </div>
-      </div>
-    </div>
-
-    <!-- 邮件健康格(C-45,06 §4) -->
-    <div v-if="mailSummary" class="qt-card box mailbar" :data-testid="T.mailHealth" @click="go('/mail')">
-      邮件摆渡 —— 最近收到 {{ mailSummary.lastRecv }} | 队列 {{ mailSummary.queued }} |
-      死信 {{ mailSummary.dead }} | 容量 {{ mailSummary.quota }}% | IDLE {{ mailSummary.idle ? '✔' : '—' }}
-    </div>
-
-    <!-- 资源摘要:只此两格,点击跳 P-RES -->
-    <div class="grid2">
-      <div
-        class="qt-card box resbox"
-        :data-testid="T.resMem"
-        :style="{ borderColor: levelColor(metrics?.mem_watermark.level) }"
-        @click="go('/res')"
-      >
-        <div class="qt-row">
-          <strong class="qt-grow">内存</strong>
-          <span class="qt-small">[{{ metrics?.mem_watermark.level ?? 'normal' }}]</span>
-        </div>
-        <div>
-          已用 {{ gb(metrics?.hardware?.mem?.used_mb) }} / {{ gb(metrics?.hardware?.mem?.total_mb) }} GB ·
-          可用 {{ gb(metrics?.hardware?.mem?.avail_mb) }} GB
-        </div>
-      </div>
-      <div
-        class="qt-card box resbox"
-        :data-testid="T.resDisk"
-        :style="{ borderColor: levelColor(metrics?.disk_watermark.level) }"
-        @click="go('/res')"
-      >
-        <div class="qt-row">
-          <strong class="qt-grow">磁盘</strong>
-          <span class="qt-small">[{{ metrics?.disk_watermark.level ?? 'normal' }}]</span>
-        </div>
-        <div>
-          <span v-for="d in metrics?.hardware?.disks ?? []" :key="d.mount" class="diskpart">
-            {{ d.mount }} 剩 {{ gb(d.free_mb) }} GB
-          </span>
-          <span v-if="!metrics">—</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="qt-card box sysbar">
-      <a v-for="w in DASH_SYS_DOTS" :key="w" class="sysdot" :data-testid="T.sys(w)" @click="go('/env')">
-        <span class="dot" :style="{ background: sysDot(w).ok ? 'var(--qt-state-running)' : 'var(--qt-state-error)' }" />
-        {{ sysDot(w).text }}
-      </a>
-      <span class="qt-grow" />
-      <span class="qt-small qt-muted">上次自检 {{ env.selftestAt ?? '—' }}</span>
-    </div>
+  <div class="qt-page dashboard">
+    <header class="qt-page-heading"><div><span class="qt-eyebrow">YOUR CONNECTED WORKSPACE</span><h1>工作台<span class="heading-dot">.</span></h1><p>所有账号，一处掌握。</p></div><div class="heading-tools"><span class="update-time"><QtIcon name="clock" :size="14" />{{ resources.lastAt ? `更新于 ${new Date(resources.lastAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}` : '等待首次采样' }}</span><a class="add-account" href="#/acct/new"><QtIcon name="plus" :size="16" />添加账号</a></div></header>
+    <section class="metrics-strip qt-glass" aria-label="运行摘要">
+      <a href="#/res" class="metric" :data-testid="T.resMem"><span class="metric-label"><QtIcon name="memory" :size="16" />总内存</span><strong>{{ localGb(hostMemory?.totalBytes) }}<small>GB</small></strong><span class="metric-note">{{ hostMemory ? `本机已用 ${localGb(hostMemory.usedBytes)} GB` : localLoading ? '正在读取本机内存' : localUnavailable ? '请在桌面客户端查看' : '本机内存暂不可用' }}</span><span class="metric-line purple" /></a>
+      <div class="metric storage-metric" :data-testid="T.resDisk"><div class="metric-label"><QtIcon name="res" :size="16" /><a href="#/res">硬盘容量</a><a class="cleanup-link" href="#/res?section=cleanup" :data-testid="T.cleanup" aria-label="清理磁盘：前往日常清理" title="前往日常清理">清理<QtIcon name="chevron" :size="11" /></a></div><a href="#/res" class="metric-body" aria-label="查看客户端目录占用"><strong>{{ localGb(clientStorage?.bytes) }}<small>GB</small></strong><span class="metric-note">{{ storageNote }}</span><span class="metric-line gold" /></a></div>
+      <a href="#/res" class="metric"><span class="metric-label"><QtIcon name="cpu" :size="16" />CPU 占用</span><strong>{{ percent(metrics?.hardware?.cpu?.load_pct) }}<small>%</small></strong><span class="metric-note">WSL · {{ metrics?.hardware?.cpu?.logical_cores ?? '—' }} 逻辑核</span><span class="metric-line purple" /></a>
+      <a href="#/msg" class="metric"><span class="metric-label"><QtIcon name="msg" :size="16" />累计收发消息</span><strong>—<small>条</small></strong><span class="metric-note">{{ messageError ? '查询暂不可用' : messageCount === 0 ? '暂无消息记录' : '查看历史 · 总量尚未提供' }}</span><span class="metric-line gold" /></a>
+      <a href="#/log?tab=alerts" class="metric"><span class="metric-label"><QtIcon name="bell" :size="16" />当前活动告警</span><strong>{{ events.firing.length }}<small>项</small></strong><span class="metric-note">查看日志与告警</span><span class="metric-line purple" /></a>
+    </section>
+    <p v-if="resources.metricsError" class="sample-warning">采样更新失败{{ metrics ? '，显示上次数据' : '' }}：{{ resources.metricsError }}</p>
+    <div class="section-heading"><h2>IM 账号 <span>{{ accounts.items.length }}</span></h2><span class="online-summary"><i />{{ activeCount }} 个在线<a href="#/acct">管理全部账号</a></span></div>
+    <p v-if="accounts.error" class="sample-warning">{{ accounts.error }} <button @click="accounts.load()">重新获取</button></p>
+    <section class="account-columns">
+      <article v-for="ch in order" :key="ch" class="channel-panel" :class="ch">
+        <div class="channel-glow" aria-hidden="true" /><header class="channel-heading"><div class="channel-identity"><span class="channel-symbol">{{ ch === 'qidian' ? '企' : ch === 'wechat' ? '微' : 'Q' }}</span><div><h3>{{ CHANNEL_TEXT[ch] }}账号</h3><span :data-testid="T.acctSummary(ch)">{{ accounts.summary[ch].online }} 在线 · {{ accounts.summary[ch].total }} 个账号</span></div></div><span class="channel-budget">预算 {{ budget(ch) }} GB</span></header>
+        <div class="account-list"><a v-for="a in accounts.byChannel[ch]" :key="a.id" :href="`#/acct/${encodeURIComponent(a.id)}`" class="account-card"><span class="account-avatar">{{ (a.self_nick || a.label || a.id).slice(0,1) }}</span><div class="account-identity"><strong>{{ a.self_nick || a.label || a.id }}</strong><span>{{ a.self_uid || a.id }}</span></div><span class="account-state"><StateDot :state="a.state" :reason="a.state_reason" />{{ ACCOUNT_STATES[a.state]?.zh ?? a.state }}</span><div class="account-foot"><span>{{ accountMemory(a) }}</span><span>查看账号<QtIcon name="chevron" :size="13" /></span></div></a>
+          <div v-if="!accounts.byChannel[ch].length" class="account-empty"><QtIcon name="acct" :size="28" /><strong>{{ accounts.loading ? '正在获取账号' : '还没有账号' }}</strong><span>添加{{ CHANNEL_TEXT[ch] }}账号，开始接入消息</span><a :href="`#/acct/new?ch=${ch}`" :data-testid="T.emptyAdd(ch)">添加第一个账号</a></div>
+        </div><footer class="channel-footer"><a :href="`#/acct/new?ch=${ch}`" :data-testid="T.add(ch)"><QtIcon name="plus" :size="14" />添加{{ CHANNEL_TEXT[ch] }}</a><span :data-testid="T.canadd(ch)">可新增 {{ resources.canAdd[ch] ?? 0 }} 个</span></footer>
+      </article>
+    </section>
+    <div v-if="accounts.nextCursor" class="more-accounts"><a-button @click="accounts.load(true)">加载更多账号</a-button></div>
+    <SystemTopology />
   </div>
 </template>
-
 <style scoped>
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--qt-space-4); }
-.box { padding: var(--qt-space-4); }
-.pool + .pool { margin-top: var(--qt-space-3); }
-.canadd { padding: 4px 0; }
-.summary { padding: 6px 0; cursor: pointer; border-bottom: 1px solid var(--qt-border); }
-.mailbar { cursor: pointer; }
-.resbox { cursor: pointer; border-width: 2px; }
-.diskpart + .diskpart { margin-left: var(--qt-space-3); }
-.sysbar { display: flex; align-items: center; gap: var(--qt-space-4); }
-.sysdot { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--qt-text); }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dashboard{padding-top:28px}.heading-dot{color:var(--qt-accent);font-size:36px;padding-left:2px}.qt-page-heading h1{font-size:32px;letter-spacing:-1px}.qt-page-heading p{font-size:13px;color:#8e819a;margin-top:5px}.heading-tools{display:flex;align-items:center;gap:22px}.update-time{display:flex;align-items:center;gap:6px;font-size:12px;color:#7c6e88}.add-account{display:flex;align-items:center;gap:7px;background:#7547a8;color:white;padding:11px 17px;border-radius:11px;font-size:13px;box-shadow:0 6px 12px #7547a81c}.metrics-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:25px 8px;background:linear-gradient(105deg,#ffffffbd,#ffffff70);margin-top:26px}.metric{position:relative;padding:0 24px;display:flex;flex-direction:column;color:var(--qt-text);border-right:1px solid #e7e1ed;min-width:0}.metric:last-child{border:0}.metric-label{display:flex;align-items:center;gap:7px;font-size:13px;color:#877b92}.metric strong{font-size:35px;font-weight:600;line-height:1.55;letter-spacing:-1px;margin-top:7px}.metric strong small{font-size:13px;font-weight:400;color:#9d91a9;letter-spacing:0;margin-left:6px}.metric-note{font-size:12px;color:#7a6c86}.metric-line{width:28px;height:3px;border-radius:2px;margin-top:16px;transition:width .2s}.metric:hover .metric-line{width:48px}.purple{background:#b394d1}.gold{background:#efc168}.section-heading{display:flex;align-items:center;justify-content:space-between;margin:32px 0 16px}.section-heading h2{font-size:19px;font-weight:600;margin:0}.section-heading h2 span{background:#e8e0f1;color:#8b69ad;font-size:12px;border-radius:7px;padding:3px 7px;vertical-align:middle;margin-left:7px}.online-summary{display:flex;align-items:center;gap:6px;font-size:12px;color:#8b7f96}.online-summary i{width:5px;height:5px;background:#62b386;border-radius:50%}.online-summary a{margin-left:18px}.account-columns{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin-bottom:30px}.channel-panel{position:relative;isolation:isolate;overflow:hidden;display:flex;flex-direction:column;min-height:315px;background:#ffffff7a;border:1px solid #fff;border-radius:22px;padding:22px 18px 0;box-shadow:0 6px 24px #57337904}.channel-glow{position:absolute;z-index:-1;width:230px;height:180px;filter:blur(42px);background:#c3a3e842;left:-60px;top:-70px}.wechat .channel-glow{background:#f3d59c4f;left:auto;right:-40px}.qq .channel-glow{background:#c5ace247}.channel-heading{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:20px}.channel-identity{display:flex;gap:10px;align-items:center}.channel-symbol{display:grid;place-items:center;width:37px;height:39px;background:#e9def4;color:#7b55a0;border:1px solid #fff;border-radius:12px;font-size:18px;font-weight:650;box-shadow:inset 0 1px 2px #fff}.wechat .channel-symbol{background:#faedce;color:#ac812b}.qq .channel-symbol{background:#eae1f7;color:#7b55a0}.channel-heading h3{font-size:16px;font-weight:600;margin:0 0 5px}.channel-identity div>span,.channel-budget{font-size:12px;color:#7d6c8c}.channel-budget{align-self:flex-start;margin-top:5px;white-space:nowrap}.account-list{display:flex;flex-direction:column;gap:12px;flex:1}.account-card{display:grid;grid-template-columns:36px minmax(0,1fr) auto;align-items:center;gap:10px;padding:17px 15px 12px;background:#ffffffe0;border:1px solid #ece6f3;border-radius:15px;color:var(--qt-text);box-shadow:0 3px 9px #5b387403;transition:box-shadow .2s,border-color .2s}.account-card:hover{border-color:#bb9fd6;box-shadow:0 7px 22px #7547a813}.account-avatar{display:grid;place-items:center;height:36px;width:36px;border-radius:50%;background:linear-gradient(135deg,#e9e1f4,#f7f3fc);color:#8a6aa7;font-size:14px}.account-identity strong{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}.account-identity>span{display:block;font-size:12px;color:#7f708a;margin-top:4px}.account-state{display:flex;align-items:center;gap:6px;font-size:12px;color:#8b8095;white-space:nowrap}.account-state:deep(.dot){width:6px;height:6px}.account-foot{grid-column:1/-1;display:flex;justify-content:space-between;font-size:12px;color:#7c6e88;border-top:1px solid #f2eef7;padding-top:10px;margin-top:3px}.account-foot span:last-child{display:flex;gap:4px;align-items:center;color:#a48ab9}.channel-footer{display:flex;justify-content:space-between;align-items:center;margin-top:18px;padding:16px 0;font-size:12px;color:#83718f;border-top:1px solid #e9e1f0}.channel-footer a{display:flex;align-items:center;gap:5px;font-size:12px;color:#8c6aa8}.account-empty{display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px 0;color:#aa9bb7}.account-empty strong{font-size:13px;font-weight:500}.account-empty span{font-size:12px}.account-empty a{font-size:12px}.sample-warning{font-size:12px;color:#ae721e}.more-accounts{text-align:center;margin-bottom:24px}
+@media(min-width:1650px){.account-card{padding:20px}.channel-panel{min-height:340px}}@media(max-width:1250px){.metric{padding:0 15px}.metric strong{font-size:29px}.channel-panel{padding:18px 12px 0}.channel-budget{display:none}.account-state{font-size:12px}.account-columns{gap:14px}}@media(max-width:850px){.metrics-strip{grid-template-columns:repeat(3,1fr);row-gap:25px}.metric:nth-child(3){border:0}.account-columns{grid-template-columns:1fr}.channel-panel{min-height:220px}.channel-budget{display:block}.heading-tools .update-time{display:none}.account-list{display:grid;grid-template-columns:1fr 1fr}.channel-heading{margin-bottom:15px}}@media(max-width:560px){.metrics-strip{grid-template-columns:repeat(2,1fr)}.metric:nth-child(3){border-right:1px solid #e7e1ed}.metric:nth-child(2n){border:0}.metric-label{font-size:12px}.account-list{display:flex}.online-summary a{display:none}.qt-page-heading h1{font-size:28px}}
+.metric-body{display:flex;flex-direction:column;color:inherit}.metric-label>a{color:inherit}.storage-metric .metric-label{gap:6px;flex-wrap:wrap}.cleanup-link{display:inline-flex;align-items:center;gap:2px;padding:2px 6px;margin-left:auto;border:1px solid #e8d6b5;border-radius:7px;background:#fff5e3b5;color:#a27b36!important;font-size:10px;line-height:16px;white-space:nowrap;transition:background .15s}.cleanup-link:hover{background:#fbe6be}.cleanup-link:focus-visible{outline:2px solid #a8854b;outline-offset:3px}
 </style>

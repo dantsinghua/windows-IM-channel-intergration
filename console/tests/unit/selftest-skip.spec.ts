@@ -19,6 +19,8 @@ import EnvPage from '@/pages/env/EnvPage.vue'
 import { useEnvStore } from '@/stores/env'
 import type { SelftestRow } from '@/api/types'
 
+vi.mock('vue-router', () => ({ useRoute: () => ({ path: '/env', query: {} }) }))
+
 beforeEach(() => {
   setActivePinia(createPinia())
   // 页面 onMounted 会拉一串端点;一律回空信封,本测试只关心自检表那几行怎么渲染
@@ -51,13 +53,14 @@ async function renderEnv() {
 function cellOf(w: Awaited<ReturnType<typeof renderEnv>>, item: string) {
   const row = w.find(`[data-testid="qt-env-selfcheck-row-${item}"]`)
   expect(row.exists(), `P-ENV 自检表没渲染出 ${item} 这一行`).toBe(true)
-  return row.findAll('td')[0]
+  // R6-81 左列仅为状态圆点；可读结论迁至末列，继续核四档语义和颜色。
+  return row.findAll('td').at(-1)!
 }
 
-describe('P-ENV 一键自检:四档各渲染各的色与图标', () => {
-  it('`skip` = 灰「—」,**既不是 ✔ 也不是 ⚠**', async () => {
+describe('P-ENV 一键自检:四档各渲染各的色与结论', () => {
+  it('`skip` = 灰「未探测」,不得显示成正常或提醒', async () => {
     const cell = cellOf(await renderEnv(), 'probes')
-    expect(cell.text(), '把「没探测」显示成了 ✔ 或 ⚠').toBe('—')
+    expect(cell.text(), '把「没探测」显示成了正常或提醒').toBe('未探测')
     expect(cell.classes(), 'skip 行应走 qt-muted(灰)').toContain('qt-muted')
     expect(cell.classes()).not.toContain('qt-ok')
     expect(cell.classes()).not.toContain('qt-warn')
@@ -66,11 +69,11 @@ describe('P-ENV 一键自检:四档各渲染各的色与图标', () => {
 
   it('`ok`/`warn`/`error` 三档不受影响', async () => {
     const w = await renderEnv()
-    expect(cellOf(w, 'napcat').text()).toBe('✔')
+    expect(cellOf(w, 'napcat').text()).toBe('正常')
     expect(cellOf(w, 'napcat').classes()).toContain('qt-ok')
-    expect(cellOf(w, 'winagent').text()).toBe('⚠')
+    expect(cellOf(w, 'winagent').text()).toBe('提醒')
     expect(cellOf(w, 'winagent').classes()).toContain('qt-warn')
-    expect(cellOf(w, 'redroid_boot').text()).toBe('✗')
+    expect(cellOf(w, 'redroid_boot').text()).toBe('异常')
     expect(cellOf(w, 'redroid_boot').classes()).toContain('qt-danger')
   })
 

@@ -41,10 +41,10 @@ CREATE TABLE accounts (
   state           TEXT NOT NULL DEFAULT 'created' CHECK (state IN
                     ('created','provisioning','starting','login_required','logging_in',
                      'running','degraded','stopping','stopped','error','disabled')),
-  state_code      TEXT,                          -- 机器可读原因;不 CHECK(05 维护、可增,故不锁枚举)。单一来源 = 05 §2.0 = 基线 §8.1 N-16 的三组共 26 码:
+  state_code      TEXT,                          -- 机器可读原因;不 CHECK(05 维护、可增,故不锁枚举)。单一来源 = 05 §2.0 = 基线 §8.1 N-16 的三组共 27 码:
                                                   --   ① 等人(9,伴 login_required+prompt):WAIT_PASSWORD|WAIT_SMS|WAIT_CAPTCHA|WAIT_DEVICE_CONFIRM|WAIT_QRCODE|WAIT_NARRATOR|WAIT_UI_TREE|WAIT_KEY_IMG|WAIT_KEY_RELOGIN
                                                   --   ② 掉线原因(4,亦伴 login_required,「为何回到登录阶段」):KICKED|LOGGED_OUT|TOKEN_EXPIRED|LOGIN_TIMEOUT  ← KICKED/LOGIN_TIMEOUT 属本组不属失败组(不是「坏了」是「等人重登」,不计告警风暴)
-                                                  --   ③ 失败/异常(13,伴 error 或 degraded):BOOT_TIMEOUT|APK_UNAVAILABLE|INSTALL_FAILED|BAD_CREDENTIAL|VAULT_UNAVAILABLE|UI_UNEXPECTED|ONEBOT_UNREACHABLE|CONTAINER_EXIT|NARRATOR_UNAVAILABLE|KEY_FAIL|SCREEN_LOCKED|WINAGENT_OFFLINE|WINAGENT_USER_OFFLINE
+                                                  --   ③ 失败/异常(14,伴 error 或 degraded):BOOT_TIMEOUT|APK_UNAVAILABLE|INSTALL_FAILED|NETWORK_UNAVAILABLE|BAD_CREDENTIAL|VAULT_UNAVAILABLE|UI_UNEXPECTED|ONEBOT_UNREACHABLE|CONTAINER_EXIT|NARRATOR_UNAVAILABLE|KEY_FAIL|SCREEN_LOCKED|WINAGENT_OFFLINE|WINAGENT_USER_OFFLINE
                                                   --   RATE_LIMITED 作为 state_code 已停产(R-12,无自动重登即无限流);本表的 RATE_LIMITED 只出现在 command_results.code(HTTP 429),是另一个量(R2-12/C-17)
   state_reason    TEXT NOT NULL DEFAULT '',
   enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),

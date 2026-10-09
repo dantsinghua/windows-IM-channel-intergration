@@ -13,22 +13,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
-from .accounts import AccountService, LoginFn
+from .accounts import AccountService, LoginFn, LoginProbeFn, PrepareLoginFn
 from .adapters.base import Account
 from .adapters.qidian.adapter import QidianAdapter, SendFn
 from .adapters.qidian.maindb import AdbMainDb, LocalSqliteMainDb, MainDb
 from .adapters.qidian.poll import QidianPoller
 from .adapters.qidian.ui import QidianUi
 from .adapters.qq import H08_INTERVAL_S, OneBotTransport, QQAdapter, QQHealth
+from .adapters.qq.login import NapCatLoginBackend
 from .adapters.wechat import WeChatWinAgent, WechatAdapter, WechatLoginFlow, WechatPoller
 from .alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, Alerts
 from .bus.bus import Bus
 from . import device_profiles as device_profiles_mod
 from .config import H13_INTERVAL_S, AgentConfig
+from .deployment_disks import DeploymentDiskReader
 from .events import TZ_SHANGHAI, Events
 from .gate import Gate
 from .health import Health
@@ -113,7 +116,11 @@ class AgentApp:
                  smtp_factory: Optional[Callable[[Any], Any]] = None,
                  downloader: Optional[Downloader] = None, proc_reader: Optional[ProcReader] = None,
                  config_path: Optional[str] = None, net_probe: Optional[Any] = None,
-                 docker_proxy: Optional[Any] = None, wsl_env_reader: Optional[Any] = None):
+                 docker_proxy: Optional[Any] = None, wsl_env_reader: Optional[Any] = None,
+                 adbkeyboard_apk: Optional[str] = None, prepare_login_fn: Optional[PrepareLoginFn] = None,
+                 login_probe_fn: Optional[LoginProbeFn] = None,
+                 qq_login_backend=None,
+                 deployment_disks: Optional[Any] = None):
         self.cfg = cfg
         self.clock = clock
         self.wsl_gateway = wsl_gateway
@@ -132,13 +139,19 @@ class AgentApp:
         self._wa_token = winagent_token
         self._fs = fs
         self._login_fn = login_fn
+        self._prepare_login_fn = prepare_login_fn
+        self._login_probe_fn = login_probe_fn
+        self._adbkeyboard_apk = adbkeyboard_apk
         self._aligner = aligner
         self._wsl_total_mb = wsl_total_mb
         self._boot_poll_s = boot_poll_s
         self._qq_transport_factory = qq_transport_factory
+        self._qq_login_backend = qq_login_backend
         self._http = http
         self._disk = disk
         self._data_dir = data_dir
+        self._deployment_disks_arg = deployment_disks
+        self.deployment_disks = deployment_disks
         self._imap_factory = imap_factory
         self._pop3_factory = pop3_factory
         self._smtp_factory = smtp_factory
@@ -201,6 +214,9 @@ class AgentApp:
         # ---- #74 的 WSL 侧只读采集 / #85 的 docker 代理执行体:只在**真后端**下自动装
         # (注了假 adb/假容器的开发容器与测试一律不装 —— 它们一个读 /proc、一个写 /etc,都不该在测试里碰真机)
         real_host = self._adb is None and self._containers is None
+        self.deployment_disks = self._deployment_disks_arg if self._deployment_disks_arg is not None else (
+            DeploymentDiskReader(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__), self.data_dir)
+            if real_host else None)
         self.wsl_env_reader = self._wsl_env_reader_arg or (WslEnvReader() if real_host else None)
         # 🔴 docker_proxy 只写 drop-in、**不重启 dockerd**(sysenv.DockerProxyApplier 的 last_result.restart_required)
         self.docker_proxy = self._docker_proxy_arg or (DockerProxyApplier() if real_host else None)
@@ -210,11 +226,17 @@ class AgentApp:
             SocketLevelProbe() if (real_host and self.cfg.probe.agent_probe_enabled) else None)
         adb_backend = self._adb or AdbCliBackend()          # runtime 与企点 UI 执行层共用同一条 adb 后端
         self.runtime = Runtime(containers=self._containers or DockerCliBackend(), adb=adb_backend, cfg=self.cfg, health=self.health,
-                               alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs, **rt_kw)
+                               alerts=self.alerts, store=self.store, clock=self.clock, fs=self._fs,
+                               adbkeyboard_apk=self._adbkeyboard_apk, **rt_kw)
         self.poller = QidianPoller(store=self.store, events=self.events, alerts=self.alerts, cfg=self.cfg, h13_firing=self.health.h13_firing,
                                    clock=self.clock, maindb_factory=self._maindb_for_uid)
         # ---- 三通道适配器(建连都在账号 start 时才发生,open() 只建对象)
         qq_kw = {} if self._qq_transport_factory is None else {"transport_factory": self._qq_transport_factory}
+        qq_kw["access_token_for"] = lambda acct: self.runtime.napcat_onebot_token(self.store.get_account_full(acct.id))
+        qq_login_backend = self._qq_login_backend
+        if qq_login_backend is None and self._containers is None:
+            qq_login_backend = NapCatLoginBackend(token_for=self.runtime.napcat_webui_token,
+                                                 read_png=self.runtime.read_napcat_qrcode)
         self.wechat_client = WeChatWinAgent(self.winagent)
         # 媒体子系统(02 §2.8.2):下载器可注入;真实现经 WinAgent 的 raw 出口取 chatlog 图片,开发容器里注 FakeDownloader
         self.media = MediaStore(self.store, media_dir=os.path.join(self.data_dir, "media"), clock=self.clock,
@@ -234,6 +256,8 @@ class AgentApp:
         login_fn = self._login_fn or (
             self.qidian_ui.login_fn(on_self_uid=lambda aid, uid: self.accounts.note_self_uid(aid, uid))
             if real_backend else None)
+        prepare_login_fn = self._prepare_login_fn or (self.qidian_ui.prepare_login_fn() if real_backend else None)
+        login_probe_fn = self._login_probe_fn or (self.qidian_ui.login_probe_fn() if real_backend else None)
         self.adapters = {
             "qidian": QidianAdapter(self.poller, sender=sender, store=self.store),
             "qq": QQAdapter(store=self.store, events=self.events, cfg=self.cfg, qq_cfg=self.cfg.qq, clock=self.clock, **qq_kw),
@@ -246,7 +270,8 @@ class AgentApp:
         caps, _ = load_capabilities()
         self.accounts = AccountService(store=self.store, events=self.events, pool=self.pool, runtime=self.runtime, vault=self.vault, cfg=self.cfg,
                                        adapters=self.adapters, health=self.health, clock=self.clock, login_fn=login_fn,
-                                       caps_by_op={c["op"]: c for c in caps})
+                                       caps_by_op={c["op"]: c for c in caps}, prepare_login_fn=prepare_login_fn, login_probe_fn=login_probe_fn,
+                                       qq_login_backend=qq_login_backend)
         self.accounts._alerts = self.alerts
         self.accounts._bus = self.bus
         self.pressure = MemoryWatermark(store=self.store, accounts=self.accounts, alerts=self.alerts, cfg=self.cfg, clock=self.clock)
@@ -265,7 +290,8 @@ class AgentApp:
         self.healthloop.wechat_poller = self.wechat_poller
         self.healthloop.wechat_client = self.wechat_client
         self.qqhealth = QQHealth(adapter=self.adapters["qq"], store=self.store, alerts=self.alerts, cfg=self.cfg, clock=self.clock,
-                                 busy=self.accounts.busy, on_login_required=self._qq_login_required)
+                                 busy=lambda aid: self.accounts.busy(aid) or self.accounts.qq_login_pending(aid),
+                                 on_login_required=self._qq_login_required)
         self.timesync = TimeSync(self.winagent, health=self.health, alerts=self.alerts, clock=self.clock, aligner=self._aligner, on_resume=self.on_host_resume)
         # ---- 横切:webhook / 保留期与磁盘 / 资源池自校准 / 工作流 / HMAC 公网入站
         self.http = self._http if self._http is not None else UrllibHttp(honor_env_proxy=self.cfg.net.honor_env_proxy)
@@ -294,6 +320,9 @@ class AgentApp:
                                 imap_factory=self._imap_factory or self._real_imap, pop3_factory=self._pop3_factory or self._real_pop3,
                                 smtp_factory=self._smtp_factory or self._real_smtp, disk_state=lambda: self.maintenance.level)
         self.scheduler.register("qidian_poll_all", self.cfg.qidian.poll_interval_s, self.qidian_poll_all)
+        self.scheduler.register("qidian_login_probe", 5, self.accounts.probe_manual_logins)
+        self.scheduler.register("qq_login_probe", 1, self.accounts.poll_qq_logins)
+        self.scheduler.register("qq_webui_expiry", 1, self.accounts.expire_qq_webui)
         self.scheduler.register("qidian_gaps_all", self.cfg.qidian.gap_check_interval_s, self.qidian_gaps_all)
         self.scheduler.register("outbox_ws_retention", 3600, self.outbox_retention)
         self.scheduler.register("winagent_probe", min(H02_INTERVAL_S, self.cfg.winagent.probe_interval_s), self.winagent_probe, run_immediately=True)
@@ -428,7 +457,9 @@ class AgentApp:
     def running_qidian_accounts(self) -> list[Account]:
         out = []
         for row in self.store.list_accounts(channel="qidian"):
-            if row["state"] != "running" or not row.get("enabled"):
+            if row["state"] not in ("running", "degraded") or not row.get("enabled"):
+                continue
+            if row["state"] == "degraded" and not row.get("self_uid"):
                 continue
             seq = int(row["seq"])
             out.append(Account(id=row["id"], channel="qidian", state=row["state"], self_uid=row.get("self_uid"), self_nick=row.get("self_nick"),

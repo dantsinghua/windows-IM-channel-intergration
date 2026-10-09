@@ -30,6 +30,8 @@ Describe 'QTrade.Exit —— 退出码表' {
         @{ Name = 'E_INSTALL_KERNEL_ROLLBACK_FAILED'; Code = 65 }
         @{ Name = 'E_INSTALL_KERNEL_SHUTDOWN_TIMEOUT'; Code = 66 }
         @{ Name = 'E_INSTALL_KCHECK_IMPORT_FAILED'; Code = 67 }
+        @{ Name = 'E_INSTALL_KCHECK_BOOT_FAILED'; Code = 68 }
+        @{ Name = 'E_INSTALL_KERNEL_SHUTDOWN_FAILED'; Code = 69 }
         @{ Name = 'E_INSTALL_DOCKER_CIDR_EXHAUSTED'; Code = 76 }
         @{ Name = 'E_INSTALL_DOWNGRADE_REFUSED'; Code = 122 }
         @{ Name = 'E_INSTALL_DISK_FULL'; Code = 123 }

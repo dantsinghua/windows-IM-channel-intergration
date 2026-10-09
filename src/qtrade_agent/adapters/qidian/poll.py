@@ -101,8 +101,8 @@ class QidianPoller:
         full = only_sessions is None
         subject = self._subject(acct)
 
-        # ⓪ 登录前空转 —— 不是故障:不读、不告警、不推水位;离开 running 即全部重置(两种轮都做)
-        if acct.state != "running" or not acct.self_uid:
+        # ⓪ 登录前空转；已登录但 UI 能力降级时，保持主库旁路读取(两种轮同口径)。
+        if acct.state not in ("running", "degraded") or not acct.self_uid:
             st.maindb_seen = False
             st.db_fail_rounds = 0
             st.table_map = {}
@@ -263,7 +263,7 @@ class QidianPoller:
     def check_group_gaps(self, acct: QidianAccountView) -> None:
         st = self.state_of(acct.id)
         subject = self._subject(acct)
-        if acct.state != "running" or not st.table_map:
+        if acct.state not in ("running", "degraded") or not st.table_map:
             return                                  # 未登录 / 进程刚重启、全量轮还没重建映射:既不产出也不 resolve
         if self.h13_firing():
             return                                  # 时钟漂移中:窗口起点不可信,本轮不判

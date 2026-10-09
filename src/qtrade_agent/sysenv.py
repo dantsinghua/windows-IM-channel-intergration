@@ -11,10 +11,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 log = logging.getLogger("qtrade.sysenv")
 
@@ -85,18 +86,51 @@ class LinuxSysReader:
         return rows
 
 
+async def _docker_version() -> Optional[str]:
+    """只读服务端版本；失败不等于已证明 Docker 离线，健康判据仍由 H03 负责。"""
+    from .runtime.backends import _run_cancellable
+
+    try:
+        rc, value = await _run_cancellable(
+            ["docker", "version", "--format", "{{.Server.Version}}"], timeout_s=5)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    value = value.strip()
+    return value if rc == 0 and value and "\n" not in value else None
+
+
 class WslEnvReader:
     """#74 的 WSL 侧快照:``LinuxWslEnvReader``(网络/docker/KSM/ZRAM/kernel)+ 本模块三项。
 
     ``base`` 缺省 = ``routes_ext.LinuxWslEnvReader()``;两者都可注入,故整条码路在测试里不碰真 ``/proc``。
     """
 
-    def __init__(self, *, base=None, sys_reader: Optional[LinuxSysReader] = None):
+    def __init__(self, *, base=None, sys_reader: Optional[LinuxSysReader] = None,
+                 docker_version: Optional[Callable[[], Awaitable[Optional[str]]]] = None):
         if base is None:
             from .api.routes_ext import LinuxWslEnvReader          # 局部导入:避免包导入期就拉起 FastAPI 那一串
             base = LinuxWslEnvReader()
         self._base = base
         self._sys = sys_reader or LinuxSysReader()
+        self._docker_version = docker_version or _docker_version
+
+    async def versions(self) -> dict[str, Optional[str]]:
+        """读取本机已知版本；没有 Windows 权威来源时不推断 WSL/内核归属状态。"""
+        out: dict[str, Optional[str]] = {"kernel": None, "docker": None, "distro": None}
+        try:
+            out["kernel"] = self._sys.uname().get("release")
+        except OSError:
+            pass
+        try:
+            out["distro"] = self._sys.os_release().get("pretty_name")
+        except OSError:
+            pass
+        try:
+            out["docker"] = await asyncio.wait_for(self._docker_version(), timeout=10)
+        except Exception:
+            # 版本探测失败不妨碍 API 返回 Agent/schema 等已知元信息。
+            pass
+        return out
 
     def snapshot(self) -> dict[str, Any]:
         out = dict(self._base.snapshot())

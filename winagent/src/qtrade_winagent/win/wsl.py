@@ -33,11 +33,14 @@ class WinWsl:
         except asyncio.TimeoutError:
             p.kill()
             raise
-        # wsl.exe 在 Windows 上输出 UTF-16LE;转成 str 时两种都试
-        try:
-            text = out.decode("utf-16-le").replace("\x00", "")
-        except UnicodeDecodeError:
-            text = out.decode("utf-8", "replace")
+        # WSL commands can return UTF-8 or UTF-16. A successful UTF-16
+        # decode alone proves nothing: any even-length ASCII buffer decodes.
+        if out.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = out.decode("utf-16", "replace")
+        elif b"\x00" in out:
+            text = out.decode("utf-16-le", "replace")
+        else:
+            text = out.decode("utf-8-sig", "replace")
         return int(p.returncode or 0), text.strip()
 
     async def list_distros(self) -> list[dict[str, Any]]:

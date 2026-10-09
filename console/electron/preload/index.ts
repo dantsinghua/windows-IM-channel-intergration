@@ -17,6 +17,8 @@ const qt = {
     openExternal: (url: string) => ipcRenderer.invoke('qt:app.openExternal', url),
     /** 控制台自身 RSS(P-RES 右栏,由主进程 process.getProcessMemoryInfo 上报) */
     rssKb: () => ipcRenderer.invoke('qt:app.rss'),
+    /** 客户端目录文件大小与宿主物理内存；不接受路径，不返回路径。 */
+    localMetrics: () => ipcRenderer.invoke('qt:app.localMetrics'),
   },
   files: {
     saveAs: (suggestName: string, mime: string, data: Uint8Array | string) =>

@@ -80,9 +80,8 @@ function Test-QtUnameLooksLikeVersion {
     #>
     [CmdletBinding()][OutputType([bool])]
     param([Parameter(Mandatory)][AllowEmptyString()][string] $Text)
-    $t = (($Text -replace '[\r\n]+', ' ') -replace '\s+', ' ').Trim()
-    if ($t -match 'HCS_E_CONNECTION_TIMEOUT') { return $false }
-    return [bool]($t -match '^\d+\.\d+')
+    $t = $Text.Trim()
+    return [bool]($t -cmatch '\A\d+\.\d+(?:\.\d+)*(?:[-+_][A-Za-z0-9._+\-]+)?\z')
 }
 
 function Test-QtKernelPreconditions {
@@ -219,9 +218,24 @@ function Import-QtKCheck {
     New-QtDirectory -Path $Directory | Out-Null
     $r = Invoke-QtWsl -WslArgs @('--import', $script:QtKCheckDistro, $Directory, $TarPath, '--version', '2') -TimeoutSec $TimeoutSec
     if ($r.TimedOut -or $r.ExitCode -ne 0) {
-        return [pscustomobject]@{ Ok = $false; Reason = 'KCHECK_IMPORT_FAILED' }
+        return [pscustomobject]@{ Ok = $false; Reason = 'KCHECK_IMPORT_FAILED'; Records = @(Get-QtProcessDiagnostic -Result $r -Stage 'kcheck_import') }
     }
-    return [pscustomobject]@{ Ok = $true; Reason = '' }
+    return [pscustomobject]@{ Ok = $true; Reason = ''; Records = @(Get-QtProcessDiagnostic -Result $r -Stage 'kcheck_import') }
+}
+
+function Test-QtKCheckBaseline {
+    # R6-82: importing a distro does not prove that it can boot.
+    [CmdletBinding()]
+    param([int] $TimeoutSec = 0)
+    if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtKernelTimeouts.kernel_boot_timeout_s }
+    $r = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--exec', 'uname', '-r') -TimeoutSec $TimeoutSec
+    $ok = (-not $r.TimedOut) -and ($r.ExitCode -eq 0) -and (Test-QtUnameLooksLikeVersion -Text $r.StdOut)
+    return [pscustomobject]@{
+        Ok = $ok
+        Reason = $(if ($ok) { '' } else { 'KCHECK_BOOT_FAILED' })
+        Uname = $(if ($ok) { $r.StdOut.Trim() } else { '' })
+        Records = @(Get-QtProcessDiagnostic -Result $r -Stage 'kcheck_baseline')
+    }
 }
 
 function Invoke-QtWslShutdown {
@@ -245,9 +259,11 @@ function Invoke-QtWslShutdown {
     if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtKernelTimeouts.shutdown_timeout_s }
     if ($GraceSec -lt 0) { $GraceSec = $script:QtKernelTimeouts.shutdown_grace_s }
     $r = Invoke-QtWsl -WslArgs @('--shutdown') -TimeoutSec $TimeoutSec
-    if ($r.TimedOut) { return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_SHUTDOWN_TIMEOUT' } }
+    $record = Get-QtProcessDiagnostic -Result $r -Stage 'shutdown'
+    if ($r.TimedOut) { return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_SHUTDOWN_TIMEOUT'; Process = $record } }
+    if ($r.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_SHUTDOWN_FAILED'; Process = $record } }
     Start-QtSleep -Seconds $GraceSec
-    return [pscustomobject]@{ Ok = $true; Reason = '' }
+    return [pscustomobject]@{ Ok = $true; Reason = ''; Process = $record }
 }
 
 function Invoke-QtKernelVerify {
@@ -270,20 +286,22 @@ function Invoke-QtKernelVerify {
         [switch] $SkipShutdown
     )
     $t = $script:QtKernelTimeouts
-    $records = [ordered]@{}
+    $records = [ordered]@{ processes = @() }
     $failures = @()
 
     # 2. wsl --shutdown(≤60 s)+ sleep 8
     if (-not $SkipShutdown) {
         $sd = Invoke-QtWslShutdown -Confirmed $ShutdownConfirmed
+        if (Test-QtHasProperty -Object $sd -Name 'Process') { $records.processes += $sd.Process }
         if (-not $sd.Ok) {
             # 🔴 此刻**不回滚**(回滚也要 shutdown,同样会挂);配置已写、RunOnce 已指 verify-kernel
-            return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_SHUTDOWN_TIMEOUT'; Message = ''; Uname = ''; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
+            return [pscustomobject]@{ Ok = $false; Reason = $sd.Reason; Message = ''; Uname = ''; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
         }
     }
 
     # 4. 启动 + 内核名(≤120 s)
     $u = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--exec', 'uname', '-r') -TimeoutSec $t.kernel_boot_timeout_s
+    $records.processes += Get-QtProcessDiagnostic -Result $u -Stage 'kernel_uname'
     if ($u.TimedOut) {
         return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_TIMEOUT'; Message = ''; Uname = ''; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
     }
@@ -291,9 +309,8 @@ function Invoke-QtKernelVerify {
         return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = ''; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
     }
     if (-not (Test-QtUnameLooksLikeVersion -Text $u.StdOut)) {
-        # B6:此刻只知道「QTrade 内核下 WSL2 没起来」,**不能**下「与 QTrade 内核无关」的结论 ——
-        #     要等回滚后原装内核的复验结果才分得清(见 Resolve-QtKernelSwitchFailure)
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = 'QTrade 内核下 WSL2 未能正常启动(uname 输出不是版本串)'; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
+        # Invalid output only establishes that this kcheck probe failed.
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = 'qtrade-kcheck did not return a valid kernel version after the switch.'; Uname = $u.StdOut; BinderOutput = ''; Records = $records; UserDistroFailures = @() }
     }
     if (-not (Test-QtKernelVersionExact -UnameOutput $u.StdOut -ManifestVersion $ManifestVersion)) {
         # W12:不等且策略键存在 → 原因码改 POLICY_BLOCKED(否则排查方向全错)
@@ -303,24 +320,28 @@ function Invoke-QtKernelVerify {
 
     # 5. binder 判据(≤60 s,以 root、sh -c,命令串不含双引号 W7)
     $b = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--user', 'root', '--exec', 'sh', '-c', $script:QtBinderCheckCommand) -TimeoutSec $t.binder_check_timeout_s
-    if ($b.TimedOut -or -not (Test-QtBinderCheckOutput -Output $b.StdOut)) {
+    $records.processes += Get-QtProcessDiagnostic -Result $b -Stage 'kernel_binder'
+    if ($b.TimedOut -or $b.ExitCode -ne 0 -or -not (Test-QtBinderCheckOutput -Output $b.StdOut)) {
         return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_NO_BINDER'; Message = ''; Uname = $u.StdOut.Trim(); BinderOutput = $b.StdOut; Records = $records; UserDistroFailures = @() }
     }
 
     # 6. 记档(≤30 s,只记不判;K1 真机痕迹 / K7 / K3)
     foreach ($item in @(
-            @{ Key = 'hv_sock'; Cmd = 'dmesg | grep -c registering driver hv_sock' }
+            @{ Key = 'hv_sock'; Cmd = "dmesg | grep -c 'registering driver hv_sock'" }
             @{ Key = 'cmdline'; Cmd = 'cat /proc/cmdline' }
-            @{ Key = 'alg_selftests'; Cmd = 'dmesg | grep -c alg: self-tests' }
-            @{ Key = 'config'; Cmd = 'zcat /proc/config.gz | grep -E BINDER|VSOCKETS|CRYPTO_TEST|LOCALVERSION' }
+            @{ Key = 'alg_selftests'; Cmd = "dmesg | grep -c 'alg: self-tests'" }
+            @{ Key = 'config'; Cmd = "zcat /proc/config.gz | grep -E 'BINDER|VSOCKETS|CRYPTO_TEST|LOCALVERSION'" }
         )) {
         $r = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--user', 'root', '--exec', 'sh', '-c', $item.Cmd) -TimeoutSec $t.record_timeout_s
-        $records[$item.Key] = $r.StdOut.Trim()
+        $record = Get-QtProcessDiagnostic -Result $r -Stage $item.Key
+        $records.processes += $record
+        $records[$item.Key] = $record.stdout.Trim()
     }
 
     # 8. 用户已有发行版的被动检查(只报不回滚,B-4 / P-22)
     foreach ($d in $UserDistros) {
         $r = Invoke-QtWsl -WslArgs @('-d', $d, '--exec', 'uname', '-r') -TimeoutSec $t.user_distro_check_timeout_s
+        $records.processes += Get-QtProcessDiagnostic -Result $r -Stage 'user_distro_uname'
         if ($r.TimedOut -or $r.ExitCode -ne 0) {
             $failures += [pscustomobject]@{ name = $d; summary = (($r.StdErr + ' ' + $r.StdOut).Trim()) }
         }
@@ -344,9 +365,9 @@ function Invoke-QtKernelRollback {
         回滚基线 = 当前文件去掉所有 `kernel=` 行(W4),**不是旧备份文件**。
     .OUTPUTS
         {Ok, Reason, OfficialKernel, Stage}
-        Stage(B6):'' = 成功;'shutdown' = 回滚那次 shutdown 挂住(分不清原装内核好坏);
-                   'verify' = 已回到原装内核、但原装内核下 kcheck 也起不来(uname 超时 / 非 0 / 不像版本串)
-                   ——只有这一种才能说「与 QTrade 内核无关」。
+        Stage: '' = success; 'shutdown' = rollback shutdown did not succeed;
+               'verify' = kernel= was removed, but the kcheck startup probe failed.
+        A failed kcheck probe does not establish the state of other WSL distributions.
     #>
     [CmdletBinding()]
     param(
@@ -366,7 +387,7 @@ function Invoke-QtKernelRollback {
     if (-not $sd.Ok) {
         # 🔴 §2.6.6 不变量②:任何路径结束时 kcheck 都被注销 —— 提前 return 也不能漏
         Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'shutdown' }
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'shutdown'; Records = @($sd.Process) }
     }
 
     # 3. kcheck uname -r 应为官方版本串
@@ -377,19 +398,17 @@ function Invoke-QtKernelRollback {
     Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
 
     if (-not $ok) {
-        # .wslconfig 已是无 kernel= 的基线 —— 原装内核下也起不来,才与我们无关(文案给手工步骤)
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'verify' }
+        # Restoring configuration is not proof that the kernel recovery succeeded.
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'verify'; Records = @(Get-QtProcessDiagnostic -Result $u -Stage 'rollback_uname') }
     }
-    return [pscustomobject]@{ Ok = $true; Reason = ''; OfficialKernel = $u.StdOut.Trim(); Stage = '' }
+    return [pscustomobject]@{ Ok = $true; Reason = ''; OfficialKernel = $u.StdOut.Trim(); Stage = ''; Records = @(Get-QtProcessDiagnostic -Result $u -Stage 'rollback_uname') }
 }
 
 function Resolve-QtKernelSwitchFailure {
     <#
     .SYNOPSIS
-        B6:KERNEL_SWITCH 内核自身验证失败、回滚之后,给用户看的原因码与文案。纯函数。
-        🔴「与 QTrade 内核无关」**只**在回滚后原装内核也起不来(Rollback.Stage = 'verify')时才说;
-           回滚成功 = 原装内核好好的 ⇒ 问题就在 QTrade 内核上,文案必须这么说、并保留原因码,
-           否则排查方向会被带反(评审 B6)。
+        Resolve the switch failure using the observed rollback result.
+        Report kcheck startup failures without blaming the entire WSL environment.
     .PARAMETER Verify
         Invoke-QtKernelVerify 的结果({Reason, Message, ...})。
     .PARAMETER Rollback
@@ -420,8 +439,9 @@ function Resolve-QtKernelSwitchFailure {
     }
 
     if ($stage -eq 'verify') {
-        $msg = ('已去掉 .wslconfig 里的 kernel= 行、回到原装内核,但原装内核下本机 WSL2 仍无法启动,与 QTrade 内核无关' +
-            '(QTrade 内核验证原因码 {0})。请先让 WSL2 本身恢复正常(可运行 wsl --status 查看),必要时重启电脑后再重试安装' -f $vr)
+        $msg = ('Removed kernel= from .wslconfig, but qtrade-kcheck still failed its startup probe. ' +
+            'Kernel recovery is unverified; this does not establish whether other WSL distributions can start. ' +
+            'Original verification reason: {0}. Inspect the saved diagnostics before retrying.' -f $vr)
     } else {
         $msg = ('回滚失败(QTrade 内核验证原因码 {0}):请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑' -f $vr)
     }
@@ -448,10 +468,10 @@ function Save-QtKCheckDmesg {
         if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtKernelTimeouts.record_timeout_s }
         if (-not $Stamp) { $Stamp = Get-QtTimestamp }
         $r = Invoke-QtWsl -WslArgs @('-d', $script:QtKCheckDistro, '--user', 'root', '--exec', 'sh', '-c', 'dmesg | tail -200') -TimeoutSec $TimeoutSec
-        $head = ('# {0} 的 dmesg(注销前抓取;阶段 {1};exit={2};timed_out={3})' -f $script:QtKCheckDistro, $Phase, $r.ExitCode, $r.TimedOut)
-        $body = [string]$r.StdOut
-        if ($r.TimedOut) { $body = ('(抓取超时 {0} s)' -f $TimeoutSec) }
-        elseif ([string]::IsNullOrWhiteSpace($body)) { $body = '(dmesg 无输出)' + "`n" + [string]$r.StdErr }
+        $record = Get-QtProcessDiagnostic -Result $r -Stage $Phase
+        $head = ('# {0} dmesg before unregister; stage={1}; exit={2}; timed_out={3}; duration_ms={4}' -f $script:QtKCheckDistro, $Phase, $r.ExitCode, $r.TimedOut, $r.DurationMs)
+        $body = '[stdout]' + "`n" + $record.stdout + "`n[stderr]`n" + $record.stderr
+        if ($r.TimedOut) { $body += ("`n[collection timed out after {0} s]" -f $TimeoutSec) }
         New-QtDirectory -Path $Directory | Out-Null
         $path = Join-Path $Directory ('kcheck-dmesg-{0}.txt' -f $Stamp)
         Write-QtUtf8NoBom -Path $path -Text (Protect-QtLogText -Text ($head + "`n" + $body)) | Out-Null
@@ -513,5 +533,5 @@ Export-ModuleMember -Function Get-QtKernelTimeouts, Get-QtBinderCheckCommand, Ge
 Get-QtKernelLine, Get-QtDmesgNoiseAllowlist, Test-QtBinderCheckOutput, Test-QtKernelVersionExact,
 Test-QtKernelPreconditions, Write-QtKernelPointer, Set-QtKernelAcl, Import-QtKCheck, Remove-QtKCheck,
 Invoke-QtWslShutdown, Invoke-QtKernelVerify, Invoke-QtKernelRollback, Resolve-QtKernelSwitchFailure, Save-QtKCheckDmesg,
-Test-QtUnameLooksLikeVersion, Test-QtKernelStaged,
+Test-QtUnameLooksLikeVersion, Test-QtKCheckBaseline, Test-QtKernelStaged,
 Test-QtWslConfigWritten, Test-QtDmesgNoiseOnly

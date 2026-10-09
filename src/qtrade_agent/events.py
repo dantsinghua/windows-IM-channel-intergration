@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -62,12 +63,16 @@ class Events:
         if event not in EVENT_NAMES:
             raise ValueError(f"unknown event {event!r}")
         event_id = ulid(now_ms)
+        durable_payload = payload
+        if event == "account_state" and isinstance(payload.get("prompt"), dict) and "qrcode_png_b64" in payload["prompt"]:
+            durable_payload = copy.deepcopy(payload)
+            durable_payload["prompt"].pop("qrcode_png_b64", None)
         seq = self._store.insert_outbox_event(event_id=event_id, target="ws", event=event, trace_id=trace_id,
                                               account_id=account_id, channel=channel,
-                                              payload_json=json.dumps(payload, ensure_ascii=False), now_ms=now_ms)
+                                              payload_json=json.dumps(durable_payload, ensure_ascii=False), now_ms=now_ms)
         if self.on_emit is not None:
             try:
-                self.on_emit(event_id=event_id, event=event, payload=payload, account_id=account_id,
+                self.on_emit(event_id=event_id, event=event, payload=durable_payload, account_id=account_id,
                              channel=channel, trace_id=trace_id, now_ms=now_ms)
             except Exception as e:                  # 扇出失败不拖垮 WS:ws 行已落库
                 log.exception("events 扇出钩子异常(event=%s): %s", event, e)
