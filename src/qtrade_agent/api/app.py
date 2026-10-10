@@ -1665,7 +1665,7 @@ def create_api(agent) -> FastAPI:
         until = agent.clock() + minutes * 60_000
         res = await agent.accounts.set_webui(account_id, True, until_ms=until, actor=p.actor)
         port = row.get("webui_port") or (16300 + int(row["seq"]))
-        return {"ok": True, "url": f"http://127.0.0.1:{port}/", "until": iso8601(until), **res}
+        return {"ok": True, "url": f"http://127.0.0.1:{port}/", "until": iso8601(res["until_ms"]), **res}
 
     @app.post(f"{API_PREFIX}/accounts/{{account_id}}/webui/close")
     async def webui_close(request: Request, account_id: str):
@@ -2413,15 +2413,15 @@ def create_api(agent) -> FastAPI:
         channels_f = set(sub.get("channels") or [])
         since_seq = sub.get("since_seq")
         last_seq = 0
+        mn, mx = agent.store.outbox_seq_bounds()
+        subscribed_after = mx or 0
         if since_seq is not None:
-            mn, _mx = agent.store.outbox_seq_bounds()
             if mn is not None and int(since_seq) + 1 < mn:
                 await ws.send_json({"replay": "truncated", "from_seq": mn})
                 last_seq = mn - 1
             else:
                 last_seq = int(since_seq)
         else:
-            _mn, mx = agent.store.outbox_seq_bounds()
             last_seq = mx or 0                       # 不带 since_seq = 只要之后的新事件
 
         def allowed(frame: dict[str, Any]) -> bool:
@@ -2446,6 +2446,7 @@ def create_api(agent) -> FastAPI:
                     frame = {"event": r["event"], "seq": r["seq"], "ts": iso8601(r["ts_ms"]), "trace_id": r["trace_id"], "account_id": r["account_id"],
                              "channel": r["channel"], "payload": r["payload"]}       # 00 §7.5 Event:ts ISO 8601(00 §6)
                     if allowed(frame):
+                        frame["payload"] = agent.events.live_payload(frame, subscribed_after=subscribed_after)
                         await ws.send_json(frame)
                 if time.monotonic() - last_ping >= WS_PING_INTERVAL_S:
                     await ws.send_json({"event": "ping"})
@@ -2466,4 +2467,32 @@ def create_api(agent) -> FastAPI:
         except RuntimeError:
             return
 
+    # ------------------------------------------------------------------ R6-85:桌面壳跨源直连的 CORS(最外层,预检不进审计/鉴权)
+    # 2026-10-10 真实链路实测:渲染进程按 `qt.endpoint.agent` 绝对地址直连 Agent,页面来源是 Vite 回环源或 `file://`(Origin: null),
+    # 带 `X-Trace-Id`/`X-QT-Api-Min` 自定义头 ⇒ 浏览器先发 OPTIONS 预检,此前 Agent 回 405,桌面壳一条 API 都发不出去。
+    # 🔴 放行表 = `[api] console_origins`,只收 `null` 与回环 http(s) 源;它只决定「浏览器要不要把响应交给页面」,不是鉴权。
+    from starlette.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=console_cors_origins(cfg.api.console_origins),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-Trace-Id", "X-QT-Api-Min", "X-Idempotency-Key"],
+        expose_headers=["X-QT-Api-Version", "X-QT-Agent-Version", "X-QT-Capabilities-Version", "X-QT-Trace-Id",
+                        "X-QT-Media-Id", "X-QT-Sha256", "Retry-After", "Date", "Content-Disposition"],
+        max_age=600,
+    )
     return app
+
+
+_LOOPBACK_ORIGIN_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$")
+
+
+def console_cors_origins(configured: tuple[str, ...] | list[str]) -> list[str]:
+    """R6-85:把 `[api] console_origins` 过滤成 CORS 放行表 —— 只认 `null`(file://)与回环 http(s) 源,其余静默丢弃。"""
+    out: list[str] = []
+    for raw in configured or ():
+        o = str(raw).strip().rstrip("/")
+        if o == "null" or _LOOPBACK_ORIGIN_RE.match(o):
+            if o not in out:
+                out.append(o)
+    return out

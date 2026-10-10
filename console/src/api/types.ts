@@ -959,10 +959,13 @@ export interface AccountStatePayload {
   enabled: boolean
   runtime: AccountRuntime
   capabilities: string[]
+  self_uid?: string
   self_nick?: string
   prompt?: Prompt
   /** 标识**一次登录尝试**;非登录态为 null(N-3) */
   login_session_id?: string | null
+  /** 软删后的时间;有值表示该号已从列表移除 */
+  deleted_at?: string | null
 }
 
 /* ── 设置 ── */

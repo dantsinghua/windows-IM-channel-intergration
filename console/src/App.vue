@@ -60,6 +60,8 @@ let resourceTimer: ReturnType<typeof setInterval> | null = null
 let unsubRoute: (() => void) | undefined
 
 const isSetupRoute = computed(() => route.path === '/setup')
+/** 环境页是门禁的恢复入口,不被门禁覆盖(页内自有「拉起 Agent / 重启 WSL」等动作与状态提示) */
+const isEnvRoute = computed(() => route.path === '/env')
 const wsColor = computed(() => (events.connected ? 'var(--qt-state-running)' : 'var(--qt-state-stopped)'))
 const resChipText = computed(() => {
   const p = resources.pool
@@ -73,6 +75,15 @@ const onlineByChannel = computed(() =>
 async function retryRealtime(): Promise<void> {
   await session.retryToken()
   events.retry()
+}
+
+/**
+ * 门禁「去环境页」:环境页本身就是恢复入口(拉起 Agent / 重启 WSL / 看日志),到了那里门禁不能再盖着——
+ * 否则按钮只换了路由、覆盖层纹丝不动(2026-10-10 安琳实测)。顺手重试一次令牌,多数情况直接恢复。
+ */
+async function goEnvFromGate(): Promise<void> {
+  await router.push('/env')
+  await retryRealtime()
 }
 
 function go(path: string): void {
@@ -92,6 +103,7 @@ async function runHintAction(act: string): Promise<void> {
   else if (act === 'wechat_switch') go('/acct')
   else if (act === 'wechat_reinstall_bundled') go('/acct/new?ch=wechat&step=reinstall')
   else if (act === 'retry_key') go('/acct')
+  else if (act === 'calibrate') go('/res')                   // POOL_CALIBRATION_DRIFT:资源页「重新校准」(02 #78)
   else if (act === 'fix_firewall') await window.qt?.wa.invoke('firewall.ensure', {})
 }
 
@@ -106,13 +118,9 @@ onMounted(async () => {
   await ui.loadFromConfig()
   ui.applyTheme()
   await setup.loadConfig()
-  installGuards(() => setup.done, () => setup.reackRequired)
+  installGuards(() => setup.done)
   if (!setup.done && route.path !== '/setup') void router.replace('/setup')
-  // 告知页改版 ⇒ 已完成向导的机器重启后也要重新勾一次(05 §6.1 末句 / §8b.6 U1)。
-  // 异步核对、不挡首屏;#86 拉不到时不判(见 store.refreshAck)。
-  void setup.refreshAck().then(() => {
-    if (setup.reackRequired && route.path !== '/setup') void router.replace('/setup')
-  }).catch(() => undefined)
+  // R6-84(2026-10-10):告知改版重勾随「阅读须知」步退役;告知只在偏好设置里按需查看,启动不再核对 ack。
 
   accounts.bindEvents()
   resources.bindEvents()
@@ -281,7 +289,7 @@ onUnmounted(() => {
         </template>
 
         <!-- 门禁覆盖层:保留原路由,恢复后原地继续(§2.5 ②) -->
-        <div v-if="session.gateVisible && !isSetupRoute" class="gate" :data-testid="T.gate">
+        <div v-if="session.gateVisible && !isSetupRoute && !isEnvRoute" class="gate" :data-testid="T.gate">
           <div class="gate-box qt-card">
             <h2>{{ session.gateTitle }}</h2>
             <!-- 426:把「要什么版本、现在是什么版本、该怎么办」一次说清(02 §3.8) -->
@@ -292,7 +300,7 @@ onUnmounted(() => {
             <div class="qt-row">
               <a-button type="primary" :data-testid="T.gateRetry" @click="retryRealtime">重试</a-button>
               <a-button v-if="!session.agentReachable" @click="session.startWsl()">让 WinAgent 拉起 Agent</a-button>
-              <a-button @click="go('/env')">去环境页</a-button>
+              <a-button @click="goEnvFromGate">去环境页</a-button>
             </div>
             <p class="qt-small qt-muted">
               本页**不提供**手工粘贴令牌的入口——令牌一旦经剪贴板与渲染进程就失去了 DPAPI 保护。

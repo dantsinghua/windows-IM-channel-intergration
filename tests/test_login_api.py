@@ -119,6 +119,21 @@ def test_login_bad_credential_flags_vault_and_errors(api):
     assert c.post(f"/api/v1/accounts/{aid}/login", json={"secret": "x"}, headers=H(TW)).json()["error"]["reason"] == "bad_state"   # error 态先 start
 
 
+def test_login_wechat_goes_keytry_not_password(api):
+    """🔴 R6-97:微信 login(#12) 必须走取钥流(_wechat_start),绝不落进账密流返回 WAIT_PASSWORD(微信 PC 没账密登录,00 §354)。"""
+    rig = api()
+    c, st = rig.client, rig.store
+    st.ensure_account("wx01", "wechat", state="login_required", login_mode="qrcode")
+    st.transition("wx01", "login_required", state_code="WAIT_QRCODE")
+    r = c.post("/api/v1/accounts/wx01/login", json={}, headers=H(TW))
+    assert r.status_code == 202 and r.json()["state"] == "starting"           # 走取钥流,不是企点账密的 WAIT_PASSWORD
+    assert r.json().get("state_code") != "WAIT_PASSWORD" and r.json()["login_session_id"].startswith("ls_")
+    rig.idle("wx01")
+    assert st.get_account_full("wx01")["state_code"] != "WAIT_PASSWORD"       # 微信永不进账密等待
+    acts = [json.loads(x["detail_json"]).get("mode") for x in st.list_audit() if x["action"] == "account.login"]
+    assert "wechat_keytry" in acts and "password" not in acts
+
+
 # ---------------------------------------------------------------- #13 / #14
 def test_put_and_delete_credential_do_not_login(api):
     rig = api()

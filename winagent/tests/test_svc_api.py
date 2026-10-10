@@ -441,6 +441,7 @@ async def test_wechat_send_rejected_without_key_and_ok_with(rig_with_user):
         r = await c.post("/wa/v1/wechat/send", json={"session_name": "群A", "text": "hi"})
         assert r.status_code == 503 and r.json()["error"]["reason"] == "key_fail"
         rig_with_user.wechat.data_key = rig_with_user.wechat.img_key = True
+        rig_with_user.wechat.ui_visible = True                     # R6-93:发送要求 UI 树可见
         ok = await c.post("/wa/v1/wechat/send", json={"session_name": "群A", "text": "hi"})
     assert ok.json()["code"] == "DELIVERED" and ok.json()["ext_msg_id"] == "群A:1"
 

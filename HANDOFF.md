@@ -178,6 +178,17 @@ QTrade「**redroid 多实例 IM 控制台 + 统一 RPA**」项目的**设计文�
 - **当前未完**：正式目录迁移、含最终 QQ/安装/UI 的同一快照全量、独立浏览器与安装/QQ 验收、终审；新源码不在旧 1.0.1 包内。真实微型 kcheck/内核切换/完整真装/扫码重建和 K6 真实到期仍未验证，未新增真实操作授权。
 - **接续材料**：[可携带阶段交接](docs/handoffs/2026-10-08-final-integration.md)含日志结论、修复/证据矩阵及顺序；详细材料在 `.codex/final-integration-20261008/`。文档原字节备份在 `documentation/before/`，本批最终 checker exit 0（5 既有 MIRROR 提示），未改门。后续迁移/验收结果继续回写同一交接。
 
+## 3i. 2026-10-10 最终整合收口：候选修复回合主树 + 同一冻结全量回归
+
+HEAD `5e15b6f`（10-09 以原目录布局提交了 10-08 的集成修改）。10-08 深夜落在 ext4 布局候选上的最后一批修复（R6-83 实时 WS 二维码 `live_payload`、#97 webui 幂等与 `until`、控制台登录尝试隔离/`self_uid`）与独立维护者的测试更新此前**未回到主树**；本轮按归一化差异逐文件回合（产品 6 文件、测试/配置/文档若干，新增 3 份测试），目录迁移仍未执行。
+
+- **同一冻结版本全量**（主树 == ext4 副本，rsync 零差异）：Agent **2709** passed、WinAgent **534**、安装器 Python **160**、Pester **695/0/0**（PS 5.1）、文档门 exit 0、控制台 **425** 单测 / typecheck 0 / lint 0 errors / build 0、HTTP-WS 联调 **127**（真 Agent + 全假后端）、Playwright **47**、内置浏览器冒烟（五步向导含守卫窄例外、企点/QQ 建号到完成页、13 条路由零运行时错误）。
+- 过程中修掉三处仅属测试/配置的红：三份新 Pester 测试缺 BOM、新增前端测试夹具 `trace_id: null` 类型错误、旧 e2e-real vitest config 的 alias 落点；均已在最终复跑中覆盖。
+- 未覆盖：acceptance 专用宿主用例、Windows 真路径 WinAgent、真实 kcheck/内核切换/真装/扫码重建/K6、Electron 桥、目录迁移、重出包；1.0.1 包不含本轮源码。未 commit/push。
+- **真实链路联调（15:42 安琳授权）**：隔离的真 Docker/adb/scrcpy Agent（17650，容器 `qtrade-qd90`，不碰历史容器）首轮停在 `UI_UNEXPECTED`，真机排出四条此前被 [推测] 假树掩盖的缺陷并修复：`uiautomator dump /dev/tty` 在非 tty 会话不出 XML（改落 `/data/local/tmp` 再读）、协议弹窗「同意」锚点被正文/「不同意」抢先（`find_node` id 优先 + `dialogRightBtn`）、账号框无 resource-id（加 desc 锚点）、点登录后二次协议弹窗未处理。修后真机 17 s 到 `WAIT_PASSWORD`，#33 真截图与最终 UI 的 scrcpy 视频流均通过；新增 `tests/test_qidian_real_device_697.py`（真机控件树），企点相关 425 passed，Agent 全量复跑见交接。`app_version` 回填缺失、登录后锚点仍待真机核对。
+- **安琳当日 UI 指令（均已落源码并过单测/文档门）**：16:34 账号详情页重排（操作入头部、状态卡入右栏、名称 hover 原位改名）；17:10 **删除首次设置向导「阅读须知」步 → 裁决 R6-84**（向导四步、守卫只看 `done`、`qt-setup-notice-*` 退役、告知仅偏好页只读查看），控制台单测 423、Playwright 44、typecheck/lint 0 errors。另 Electron 壳 CSP/`connect-src` 写死 17600 导致真实链路全部 API 被拒已修（`electron/main/origins.ts` + preload `qt.endpoint.agent`）。17:40 再修三处：托盘对已销毁窗口崩溃（`closed` 置空 + 托盘重建窗口）；**R6-85** Agent 加 `[api] console_origins` CORS 放行（默认只 `null`，回环源可配，预检不进审计），否则桌面壳跨源直连 Agent 一条都发不出去；**R6-86** 微信向导步①② 以 02 #28/#29 为准（01 旧字段 `module_enabled/user_agent/match` WinAgent 从不返回），白名单③补 `wechat.version-match`。
+- 细节与命令见 [本轮可携带交接](docs/handoffs/2026-10-10-final-regression.md)，本机证据在 `.codex/final-regression-20261010/`。
+
 ## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。

@@ -92,6 +92,12 @@ class PipeHub:
         self._pending: dict[int, asyncio.Future] = {}
         self._next_id = 0
         self._accept_task: Optional[asyncio.Task] = None
+        #: R6-88:会话代理成为持有者后要做的同步(服务 → 会话代理推当前模块开关等);每个回调独立任务,异常只记日志
+        self.on_holder: list[Callable[[UserSession], Awaitable[None]]] = []
+        self._hook_tasks: set[asyncio.Task] = set()
+        #: R6-88:WELCOME 帧里随带的服务侧状态(如 ``{"wechat_enabled": bool}``),会话代理在跑读循环前就能对齐,
+        #: 不依赖随后的推送是否赶在 autostart 等慢动作之前被读到
+        self.welcome_extras: Callable[[], dict[str, Any]] = lambda: {}
 
     # ---------------------------------------------------------------- 心跳状态(探活只读它,绝不穿管道)
     @property
@@ -181,13 +187,30 @@ class PipeHub:
         s.holder = True
         self.sessions[session_id] = s
         self.holder_session_id = session_id
-        await conn.send(PipeFrame(id=frame.id, ok=True, result={"type": WELCOME, "ipc_version": IPC_VERSION,
+        try:
+            extras = dict(self.welcome_extras() or {})
+        except Exception:                                      # noqa: BLE001 —— 附带状态算不出不影响握手
+            log.exception("WELCOME 附带状态计算失败")
+            extras = {}
+        await conn.send(PipeFrame(id=frame.id, ok=True, result={**extras, "type": WELCOME, "ipc_version": IPC_VERSION,
                                                                 "svc_version": self._version}))
         s.reader = asyncio.create_task(self._read_loop(s), name=f"pipe-read-{session_id}")
         if self._alerts:
             self._alerts.resolve(A.WA_USER_VERSION_MISMATCH, subject="host")
         log.info("会话代理上线", extra={"op": "pipe.hello", "code": "OK", "kv": {"session": session_id}})
+        for hook in list(self.on_holder):
+            t = asyncio.create_task(self._run_hook(hook, s), name=f"pipe-hook-{session_id}")
+            self._hook_tasks.add(t)
+            t.add_done_callback(self._hook_tasks.discard)
         return s
+
+    async def _run_hook(self, hook: Callable[[UserSession], Awaitable[None]], s: UserSession) -> None:
+        try:
+            await hook(s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                      # noqa: BLE001 —— 同步失败不影响会话代理在线
+            log.exception("会话代理上线同步失败")
 
     async def _read_loop(self, s: UserSession) -> None:
         try:

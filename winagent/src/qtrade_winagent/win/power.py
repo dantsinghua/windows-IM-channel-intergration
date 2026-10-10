@@ -7,10 +7,9 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from typing import Optional
 
-from . import require_windows
+from . import require_windows, run_text
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -37,13 +36,13 @@ class WinPower:
     def current_requests(self) -> dict[str, bool]:
         """``powercfg /requests`` 看我方请求是否还在(H11 的判据之一)。"""
         require_windows("powercfg /requests")
-        out = subprocess.run(["powercfg", "/requests"], capture_output=True, text=True, timeout=10).stdout
+        out = run_text(["powercfg", "/requests"], timeout=10).stdout
         return {"system_required": self._system and "qtrade-winagent" in out.lower() or self._system,
                 "display_required": self._display}
 
     def active_scheme(self) -> str:
         require_windows("powercfg /getactivescheme")
-        out = subprocess.run(["powercfg", "/getactivescheme"], capture_output=True, text=True, timeout=10).stdout
+        out = run_text(["powercfg", "/getactivescheme"], timeout=10).stdout
         m = re.search(r"([0-9a-fA-F-]{36})", out)
         if not m:
             raise OSError("取不到当前活动电源计划 GUID")
@@ -52,7 +51,7 @@ class WinPower:
     def query_timeouts(self, scheme: str, items: tuple[str, ...]) -> dict[str, int]:
         """``powercfg /q <scheme> SUB_SLEEP|SUB_VIDEO`` 解析六项当前值(单位秒;``powercfg /change`` 收的是分钟)。"""
         require_windows("powercfg /q")
-        out = subprocess.run(["powercfg", "/q", scheme], capture_output=True, text=True, timeout=15).stdout
+        out = run_text(["powercfg", "/q", scheme], timeout=15).stdout
         vals: dict[str, int] = {}
         setting, ac, dc = None, None, None
         for line in out.splitlines():
@@ -75,6 +74,6 @@ class WinPower:
 
     def change_timeout(self, scheme: str, item: str, value: int) -> None:
         require_windows("powercfg /change")
-        p = subprocess.run(["powercfg", "/change", item, str(value)], capture_output=True, text=True, timeout=15)
+        p = run_text(["powercfg", "/change", item, str(value)], timeout=15)
         if p.returncode != 0:
             raise PermissionError(f"powercfg /change {item} 失败(电源计划可能由公司策略管理):{p.stderr.strip()}")

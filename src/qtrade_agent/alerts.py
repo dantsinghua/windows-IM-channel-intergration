@@ -9,7 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .events import iso8601
 from .mail.codes import MAIL_ALERT_CODES
+
+
+def _iso(ms: Optional[int]) -> Optional[str]:
+    return iso8601(int(ms)) if ms else None
 
 QIDIAN_NOT_ROOT = "QIDIAN_NOT_ROOT"
 QIDIAN_DB_UNAVAILABLE = "QIDIAN_DB_UNAVAILABLE"
@@ -100,9 +105,12 @@ class Alerts:
         self.active: dict[tuple[str, str], ActiveAlert] = {}
 
     def _payload(self, a: ActiveAlert, state: str) -> dict[str, Any]:
+        # `*_at` 一律 ISO 8601(00 §6;04 §2.4.1 示例即字符串)。2026-10-10 真机:此前发毫秒整数,
+        # 控制台按字符串排序告警 `last_seen_at.localeCompare` 直接抛 TypeError,告警铃整体不渲染。
         return {"code": a.code, "severity": a.severity, "state": state, "subject": a.subject,
                 "title": None, "message": None, "hint_actions": a.hint_actions,
-                "first_seen_at": a.first_seen_ms, "last_seen_at": a.last_seen_ms, "count": a.count, "evidence": a.evidence}
+                "first_seen_at": _iso(a.first_seen_ms), "last_seen_at": _iso(a.last_seen_ms),
+                "count": a.count, "evidence": a.evidence}
 
     @staticmethod
     def event_of(code: str, event: Optional[str] = None) -> str:

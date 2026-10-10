@@ -118,18 +118,10 @@ export async function installQtStub(page, opts = {}) {
   }, opts)
 }
 
-/** 浏览器形态(无 window.qt)下把向导一路点完;返回时停在 P-DASH */
+/** 浏览器形态(无 window.qt)下把向导一路点完;返回时停在 P-DASH。R6-84:四步,第 1 步即「连接服务」 */
 export async function walkWizardToDash(page) {
   await expect(page).toHaveURL(/#\/setup/)
-  // a-checkbox 把 data-testid 透传到了 <input type=checkbox> 本身
-  const box = page.getByTestId('qt-setup-notice-ack')
-  await expect(page.getByTestId('qt-setup-notice-text')).not.toHaveText(/正在读取/)
-  // 需要滚动时先滚到底
-  await page.locator('.notice').evaluate((el) => { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll')) })
-  await expect(box).toBeEnabled()
-  if (!(await box.isChecked())) await box.click()
-  await expect(box).toBeChecked()
-  await page.getByTestId('qt-setup-next').click()
+  await expect(page.getByTestId('qt-setup-notice-ack')).toHaveCount(0)
   await expect(page.getByTestId('qt-setup-conn-agent')).toBeVisible()
   await page.getByTestId('qt-setup-next').click()
   await expect(page.getByTestId('qt-setup-selfcheck-run')).toBeVisible()

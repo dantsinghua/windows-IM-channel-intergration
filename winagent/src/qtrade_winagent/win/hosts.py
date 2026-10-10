@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import time
 from typing import Optional
 
-from . import require_windows
+from . import require_windows, run_text
 
 DEFAULT_HOSTS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
 
@@ -52,8 +51,7 @@ class WinHosts:
     def resolve(self, domain: str) -> Optional[str]:
         """写后复核:``Resolve-DnsName <域名>`` 应回 ``0.0.0.0``(04 H21 判据)。"""
         require_windows("Resolve-DnsName")
-        out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                              f"(Resolve-DnsName -Name {domain} -Type A -ErrorAction SilentlyContinue "
-                              f"| Select-Object -First 1).IPAddress"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+        out = run_text(["powershell", "-NoProfile", "-Command",
+                        f"(Resolve-DnsName -Name {domain} -Type A -ErrorAction SilentlyContinue "
+                        f"| Select-Object -First 1).IPAddress"], timeout=10).stdout.strip()
         return out or None

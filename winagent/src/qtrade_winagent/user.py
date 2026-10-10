@@ -62,7 +62,8 @@ class UserAgent:
         self.link.on("wsl.distro.repair", self._distro_repair)
         self.link.on("power.display", self._power_display)
         self.link.on("wechat.module", self._wechat_module)
-        for method, fn in (("wechat.status", self._wechat_status), ("wechat.login.start", self._wechat_login_start),
+        for method, fn in (("wechat.status", self._wechat_status), ("wechat.locate", self._wechat_locate),
+                           ("wechat.login.start", self._wechat_login_start),
                            ("wechat.login.cancel", self._wechat_login_cancel),
                            ("wechat.login.status", self._wechat_login_status), ("wechat.bind", self._wechat_bind),
                            ("wechat.logout", self._wechat_logout), ("wechat.key.retry", self._wechat_key_retry),
@@ -75,12 +76,25 @@ class UserAgent:
     # ---------------------------------------------------------------- 生命周期
     async def start(self) -> dict[str, Any]:
         welcome = await self.link.connect()
+        # R6-88:微信模块开关以服务侧(C-43 真值 toml 的持有者)为准 —— 本进程启动时读到的 toml 可能已过时
+        # (用户登录桌面前控制台已启用过模块 / 服务与会话代理任一方重启过);握手即对齐,后续 `wechat.module` 推送再变更。
+        if isinstance(welcome, dict) and "wechat_enabled" in welcome:
+            await self._wechat_module({"enabled": bool(welcome["wechat_enabled"])})
         if self.cfg.wsl.autostart:                     # 02 §2.1 步 2′:上线即拉起发行版(随用户登录,不随开机)
             try:
                 await self.wslctl.start()
             except Exception as e:                     # 失败不阻断上线,由服务侧按 60s 重试
                 log.warning("autostart 拉起发行版失败", extra={"op": "wsl.start", "code": "FAILED", "kv": {"err": repr(e)}})
+        if self.cfg.wechat.enabled:
+            self._warm_wechat()
         return welcome
+
+    def _warm_wechat(self) -> None:
+        """微信后端预热放线程、不等待(全新机器首次导入 pywinauto/comtypes 可达十几秒,别让第一次 #28 撞超时)。"""
+        if self.wechat is None:
+            return
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, self.wechat.warmup)
 
     async def run(self) -> None:
         await self.link.run()
@@ -133,16 +147,32 @@ class UserAgent:
         return self.wechat
 
     async def _wechat_module(self, p: dict[str, Any]) -> Any:
-        """#43:``enabled`` 改动后服务通知会话代理起/停模块。"""
-        self.cfg = self.cfg.with_wechat(enabled=bool(p.get("enabled")))
+        """#43:``enabled`` 改动后服务通知会话代理起/停模块(握手 WELCOME 附带值也走这里)。幂等:同值不动作。"""
+        want = bool(p.get("enabled"))
+        changed = want != self.cfg.wechat.enabled
+        self.cfg = self.cfg.with_wechat(enabled=want)
         if self.wechat is not None:
             self.wechat._cfg = self.cfg.wechat          # noqa: SLF001 —— 配置热更新,唯一写点
-            if not self.cfg.wechat.enabled:
+            if changed and not want:
                 await self.wechat.logout()
+            elif want:
+                self._warm_wechat()
         return {"enabled": self.cfg.wechat.enabled}
 
     async def _wechat_status(self, p: dict[str, Any]) -> Any:
-        return self._wx().status(screen_locked=bool(p.get("screen_locked")))
+        # 2026-10-10 真机:status() 里 psutil 扫进程 / pywinauto 探窗都是阻塞调用,直接跑在事件循环上会把心跳一起卡住;
+        # 放到线程里,管道读循环与心跳不受影响(deadline 仍由服务侧 via_pipe 掌握)。
+        wx = self._wx()
+        try:
+            await wx.ensure_server()                     # R6-91 自愈:两钥在但 server 没跑(开机/崩溃)⇒ 拉起
+        except Exception as e:                           # noqa: BLE001 —— 自愈失败不挡状态查询
+            log.warning("chatlog 自愈失败", extra={"op": "wechat.serve", "code": "FAILED", "kv": {"err": repr(e)}})
+        return await asyncio.to_thread(wx.status, screen_locked=bool(p.get("screen_locked")))
+
+    async def _wechat_locate(self, p: dict[str, Any]) -> Any:
+        """服务侧 #29 version-match 的事实来源(R6-86 承接):``wechat_install`` 没行时按本机实际安装算,不再假定「未安装」。"""
+        wx = self._wx()
+        return await asyncio.to_thread(wx.locate)
 
     async def _wechat_login_start(self, p: dict[str, Any]) -> Any:
         # main_wnd_class:R6-58 (at) ②——服务侧按 account_id 算好的「该 wxid 行值 / 配置默认」,这里只应用

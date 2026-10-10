@@ -1,3 +1,4 @@
+import { fileURLToPath, URL } from 'node:url'
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
 import { createRequire } from 'node:module'
@@ -6,7 +7,7 @@ import { promisify } from 'node:util'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 
-const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || '/home/anlin/work/qtrade-build/manual-20261008-a0stq5rk/console/node_modules', '__volume_acceptance__.cjs'))
+const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || fileURLToPath(new URL('../../node_modules', import.meta.url)), '__volume_acceptance__.cjs'))
 const { test, expect } = require('@playwright/test')
 const run = promisify(execFile)
 const origin = process.env.QT_MONITOR_UI_URL || 'http://127.0.0.1:5273'

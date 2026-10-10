@@ -82,8 +82,16 @@ beforeEach(() => {
   routing.route = reactive({ path: '/acct/new', query: {}, params: {} })
   routing.push.mockReset(); routing.replace.mockReset(); eventErrors.length = 0
   moduleEnabled = false
-  waInvoke.mockReset().mockImplementation(async (method: string) => method === 'wechat.status'
-    ? { module_enabled: moduleEnabled, user_agent: true, match: 'EXACT' } : {})
+  // R6-86:#28 按 02 的真实形态返回(WinAgent 从不返回 module_enabled/user_agent);#29 单独一跳
+  waInvoke.mockReset().mockImplementation(async (method: string) => {
+    if (method === 'wechat.status') {
+      return moduleEnabled
+        ? { enabled: true, wechat: { installed: true, version: '4.0.6.21', running: false, logged_in: false, wxid: null, nickname: null, pid: null }, hosts_block: null }
+        : { enabled: false, wechat: null, chatlog: null, ritual_done: null, screen_locked: null, login_session: null, hosts_block: null }
+    }
+    if (method === 'wechat.version-match') return { match: 'EXACT', action: 'none', current_version: '4.0.6.21', bundled_version: '4.0.6.21', dll: null, status: 'verified' }
+    return {}
+  })
   vi.stubGlobal('qt', { wa: { invoke: waInvoke } })
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unexpected network request')))
   vi.spyOn(useResourcesStore(), 'load').mockResolvedValue()
@@ -128,7 +136,9 @@ describe('WeChat module enablement at first account creation', () => {
     vi.mocked(useSettingsStore().saveWechatModule).mockRejectedValueOnce(new Error('enable failed'))
     const wrapper = await mountWechat()
     await confirmEnable(wrapper)
-    expect(wrapper.get('[role="alert"]').text()).toContain('enable failed')
+    // 2026-10-10 安琳:操作失败一律 3 秒 toast,页面不留红字
+    expect(notices.error).toHaveBeenCalledWith(expect.stringContaining('enable failed'), 3)
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
     expect(byId(wrapper, NEW.next).attributes('disabled')).toBeDefined()
     await confirmEnable(wrapper)
     expect(useSettingsStore().saveWechatModule).toHaveBeenCalledTimes(2)
@@ -162,7 +172,7 @@ describe('First setup Qidian manual verification stays inside the account flow',
     expect(accountsApi.create).not.toHaveBeenCalled()
     expect(accountsApi.start).not.toHaveBeenCalled()
     expect(JSON.parse(sessionStorage.getItem('qtrade.acct-new.pending')!)).toEqual({ createdId: 'qidian-test', channel: 'qidian' })
-    expect(setupRedirect({ path: '/screen/qidian-test', query: {} }, { done: false, needsReack: false })).toEqual({ path: '/setup' })
+    expect(setupRedirect({ path: '/screen/qidian-test', query: {} }, { done: false })).toEqual({ path: '/setup' })
   })
 })
 
@@ -185,27 +195,20 @@ describe('QQ account detail refreshes its QR instead of requesting scrcpy', () =
   })
 })
 
-describe('Notice acknowledgment reports failures and stays retryable', () => {
-  it('failed acknowledgment leaves the box unchecked and next disabled, then retry succeeds', async () => {
+describe('Setup wizard starts at the connection step (R6-84: notice step retired)', () => {
+  it('first pane is the connection check, the notice box/ack no longer render and no ack request is made', async () => {
     const store = useSetupStore()
-    store.step = 0; store.noticeText = 'Test notice'; store.noticeVersion = 'test-v1'; store.scrolledToBottom = true
-    const ack = vi.spyOn(systemApi, 'noticeAck').mockRejectedValueOnce(new Error('notice save failed')).mockResolvedValue({ ok: true })
-    vi.spyOn(systemApi, 'notice').mockImplementation(async () => ({
-      notice_version: 'test-v1', text: 'Test notice', acked_version: ack.mock.calls.length > 1 ? 'test-v1' : null,
-    }))
+    store.step = 0
+    const ack = vi.spyOn(systemApi, 'noticeAck').mockResolvedValue({ ok: true })
+    const notice = vi.spyOn(systemApi, 'notice').mockResolvedValue({ notice_version: 'test-v1', text: 'Test notice', acked_version: null })
     const wrapper = mountPage(SetupPage)
     await flushPromises()
-    await byId(wrapper, SETUP.noticeAck).setValue(true)
-    await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('notice save failed')
-    expect(store.acked).toBe(false)
-    expect(byId(wrapper, SETUP.next).attributes('disabled')).toBeDefined()
+    expect(wrapper.find(`[data-testid="${SETUP.connAgent}"]`).exists()).toBe(true)
+    expect(wrapper.find('[data-testid="qt-setup-notice-ack"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="qt-setup-notice-text"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('阅读须知')
+    expect(ack).not.toHaveBeenCalled()
+    expect(notice).not.toHaveBeenCalled()
     expect(eventErrors).toHaveLength(0)
-    await byId(wrapper, SETUP.noticeAck).setValue(false)
-    await byId(wrapper, SETUP.noticeAck).setValue(true)
-    await flushPromises()
-    expect(ack).toHaveBeenCalledTimes(2)
-    expect(store.acked).toBe(true)
-    expect(byId(wrapper, SETUP.next).attributes('disabled')).toBeUndefined()
   })
 })

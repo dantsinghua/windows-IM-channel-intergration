@@ -39,7 +39,21 @@ class ProcReader(Protocol):
     def meminfo(self) -> dict[str, float]: ...
     def cpu_pct(self) -> Optional[float]: ...
     def self_rss_mb(self) -> Optional[float]: ...
-    def cgroup(self, container: str) -> dict[str, float]: ...
+    def cgroup(self, container: str, container_id: Optional[str] = None) -> dict[str, float]: ...
+
+
+def cgroup_candidates(cgroup_root: str, container: str, container_id: Optional[str]) -> list[str]:
+    """容器 cgroup v2 目录候选,按命中可能性排序。
+
+    🔴 2026-10-10 真机:dockerd 的两种 cgroup 驱动**都按容器完整 ID 命名**——systemd 驱动
+    ``system.slice/docker-<ID>.scope``、cgroupfs 驱动 ``docker/<ID>``;此前按**容器名**拼路径,永远不存在,
+    容器内存一行样本都没写 ⇒ 资源池漂移把「没样本」算成「实占 0」恒报 100%、内存压力 LRU 拿不到读数。
+    名字只作最后兜底(个别发行版 / rootless 布局)。"""
+    out: list[str] = []
+    for ident in ([container_id] if container_id else []) + [container]:
+        out.append(os.path.join(cgroup_root, "system.slice", f"docker-{ident}.scope"))
+        out.append(os.path.join(cgroup_root, "docker", ident))
+    return out
 
 
 class LinuxProcReader:
@@ -92,11 +106,11 @@ class LinuxProcReader:
         except (ValueError, OSError):
             return None
 
-    def cgroup(self, container: str) -> dict[str, float]:
+    def cgroup(self, container: str, container_id: Optional[str] = None) -> dict[str, float]:
         """cgroup v2:``memory.current``(容器 RSS+cache)与 ``memory.stat`` 的 ``anon``(资源池真值,04 §2.5.3)。"""
-        base = os.path.join(self._cgroup_root, "system.slice", f"docker-{container}.scope")
-        if not os.path.isdir(base):
-            base = os.path.join(self._cgroup_root, "docker", container)
+        base = next((p for p in cgroup_candidates(self._cgroup_root, container, container_id) if os.path.isdir(p)), None)
+        if base is None:
+            return {}
         out: dict[str, float] = {}
         cur = self._read(os.path.join(base, "memory.current")).strip()
         if cur.isdigit():
@@ -128,8 +142,8 @@ class FakeProcReader:
     def self_rss_mb(self) -> Optional[float]:
         return self.rss
 
-    def cgroup(self, container: str) -> dict[str, float]:
-        return dict(self.containers.get(container) or {})
+    def cgroup(self, container: str, container_id: Optional[str] = None) -> dict[str, float]:
+        return dict(self.containers.get(container) or self.containers.get(container_id or "") or {})
 
 
 # ══════════════════════════════════════════════════════════════════ 采样
@@ -192,11 +206,15 @@ class Sampler:
                 if row["host"] != "wsl" or row["state"] not in ("running", "degraded"):
                     continue
                 name = row.get("container_name") or f"qtrade-{row['id']}"
-                cg = self._reader.cgroup(name)
+                cg = self._reader.cgroup(name, container_id=row.get("container_id"))
                 if not cg:
                     continue
                 self._insert(c, now=now, scope="container", subject=name, **cg)
                 rows += 1
+                if cg.get("mem_anon_mb") is not None:
+                    # 列表页 / 内存压力 LRU 读的「最近一次 anon」(04-P7:不查样本表);此前从没人写这一列
+                    c.execute("UPDATE account_runtime SET container_mem_anon_mb=? WHERE account_id=?",
+                              (int(cg["mem_anon_mb"]), row["id"]))
         return rows
 
     # ---------------------------------------------------------- 降采样(04 §3.1 三级)

@@ -123,7 +123,6 @@ beforeEach(() => {
   vi.spyOn(useEventsStore(), 'stop').mockImplementation(() => undefined)
   vi.spyOn(useEventsStore(), 'onReplayTruncated').mockImplementation((fn) => { replayTruncated = fn })
   vi.spyOn(useSetupStore(), 'loadConfig').mockResolvedValue()
-  vi.spyOn(useSetupStore(), 'refreshAck').mockResolvedValue()
   vi.spyOn(useUiStore(), 'loadFromConfig').mockResolvedValue()
   vi.spyOn(useUiStore(), 'applyTheme').mockImplementation(() => undefined)
 })

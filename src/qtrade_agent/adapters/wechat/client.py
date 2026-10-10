@@ -21,6 +21,13 @@ from ...winagent_client import WinAgentClient, WinAgentUnavailable
 # 02 §2.5 超时表:微信端点走「通用」一档;send 另按 confirm_timeout_ms 放宽(它要等 WinAgent 侧读回)
 WECHAT_TIMEOUT_S = 5.0
 WECHAT_SEND_EXTRA_S = 5.0          # send 的 HTTP 超时 = confirm_timeout_ms/1000 + 本值(留 WinAgent 收尾余量)
+# R6-91(2026-10-10 真机):慢动作的 HTTP 超时必须 ≥ WinAgent 服务侧给会话代理的时限(svc.TIMEOUT_S)再留余量,
+# 否则 Agent 5 s 就判「登录会话未起来」把号打 stopped,而 WinAgent 那边照样把讲述人 / chatlog 拉起来 —— 两边状态分叉。
+# 全新机器首次 import pywinauto/comtypes 就要十几秒。值 = 服务侧时限 + 5 s(让服务侧先超时、回干净的错误信封)。
+WECHAT_LOGIN_START_TIMEOUT_S = 65.0     # svc TIMEOUT_S["wechat_login_start"]=60
+WECHAT_KEY_RETRY_TIMEOUT_S = 65.0       # svc 同用 wechat_login_start=60
+WECHAT_LOGOUT_TIMEOUT_S = 30.0          # WM_CLOSE 后 process_close_grace_s(默认 10)再强杀
+WECHAT_READ_TIMEOUT_S = 15.0            # svc TIMEOUT_S["wechat_read"]=10;无 talker 时要逐会话取
 
 # #33 GET /wa/v1/wechat/login/status 的相位枚举(以 05 为准,R3-3;identified 是两钥取钥流程的枢纽相位)
 PHASES = ("idle", "narrator", "qrcode", "identified", "keytry", "ready", "key_failed")
@@ -115,7 +122,7 @@ class WeChatWinAgent:
         if limit is not None:
             q.append(f"limit={int(limit)}")
         path = "/wa/v1/wechat/read" + ("?" + "&".join(q) if q else "")
-        body = await self._call("GET", path, retry=True)
+        body = await self._call("GET", path, retry=True, timeout_s=WECHAT_READ_TIMEOUT_S)
         return list(body.get("data") or body.get("messages") or [])
 
     async def sessions(self, *, keyword: Optional[str] = None, limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -145,7 +152,7 @@ class WeChatWinAgent:
             body["account_id"] = account_id
         if login_session_id:
             body["login_session_id"] = login_session_id
-        return await self._call("POST", "/wa/v1/wechat/login/start", body=body)
+        return await self._call("POST", "/wa/v1/wechat/login/start", body=body, timeout_s=WECHAT_LOGIN_START_TIMEOUT_S)
 
     async def login_cancel(self) -> dict[str, Any]:
         """#32:取消登录会话(扫码超时/用户放弃);**微信已登进去的不登出**(05 §2.4.2.1 失败回滚原则)。"""
@@ -158,11 +165,11 @@ class WeChatWinAgent:
 
     async def logout(self) -> dict[str, Any]:
         """#34:登出(切换前置;P-31/05 §2.4.6:先 WM_CLOSE,10s 未退再结束进程)。"""
-        return await self._call("POST", "/wa/v1/wechat/logout", body={})
+        return await self._call("POST", "/wa/v1/wechat/logout", body={}, timeout_s=WECHAT_LOGOUT_TIMEOUT_S)
 
     async def key_retry(self) -> dict[str, Any]:
         """#35:手动重试取钥 → ``{ok, dll, error}``(05 §2.4.7 恢复路径)。"""
-        return await self._call("POST", "/wa/v1/wechat/key/retry", body={})
+        return await self._call("POST", "/wa/v1/wechat/key/retry", body={}, timeout_s=WECHAT_KEY_RETRY_TIMEOUT_S)
 
     async def send(self, *, session_name: str, text: Optional[str] = None, image_path: Optional[str] = None,
                    idempotency_key: str, confirm_timeout_ms: int = 10000) -> dict[str, Any]:
@@ -273,8 +280,10 @@ class FakeWeChatWinAgent:
                 self.countdown_s = frame.get("countdown_s", self.countdown_s)
                 if "wxid" in frame:
                     self.wechat["wxid"] = frame["wxid"]
+                self.state_code = frame.get("state_code")
             out: dict[str, Any] = {"phase": self.phase, "narrator": dict(self.narrator), "key": dict(self.key),
-                                   "countdown_s": self.countdown_s, "nickname": self.wechat.get("nickname")}
+                                   "countdown_s": self.countdown_s, "nickname": self.wechat.get("nickname"),
+                                   "state_code": getattr(self, "state_code", None)}   # R6-91:02 #33 补 state_code
             if self.phase in ("identified", "keytry", "ready"):
                 out["wxid"] = self.wechat.get("wxid")
                 out["account_id"] = self.bound.get(str(self.wechat.get("wxid")))

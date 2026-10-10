@@ -10,24 +10,44 @@
 """
 import os
 
+try:
+    from PyInstaller.utils.hooks import collect_all, collect_submodules
+except ImportError:                       # 仅测试在无 PyInstaller 的环境里执行本文件做静态检查;真打包时一定有
+    def collect_all(_pkg):                # type: ignore[no-redef]
+        return [], [], []
+
+    def collect_submodules(_pkg):         # type: ignore[no-redef]
+        return []
+
 block_cipher = None
 HERE = os.path.dirname(os.path.abspath(SPEC))                               # noqa: F821
 SRC = os.path.join(HERE, "..", "src")
+
+# R6-92:pyweixin(随包 wheel,必需)在包级 import 时就把 WeChatAuto 的全部依赖拉进来(pyautogui / pycaw /
+# sounddevice / soundfile / bs4 / emoji / markdownify …),而 win/ 里是延迟导入 —— PyInstaller 静态扫不到,
+# 漏一个 exe 里发送就 ImportError。soundfile / sounddevice 还带原生 DLL(libsndfile / portaudio),必须 collect_all。
+_datas, _binaries, _hidden = [], [], []
+for _pkg in ("pyweixin", "_soundfile_data", "_sounddevice_data", "soundfile", "sounddevice", "pycaw", "comtypes",
+             "pyautogui", "emoji", "markdownify", "bs4"):
+    _d, _b, _h = collect_all(_pkg)
+    _datas += _d
+    _binaries += _b
+    _hidden += _h
 
 a = Analysis(
     # 🔴 入口必须是**包外**薄壳(entry_user.py 文件头有原因);指向包内 main_user.py 会因相对导入启动即崩
     [os.path.join(HERE, "entry_user.py")],
     pathex=[SRC],
-    binaries=[],
-    datas=[],
+    binaries=_binaries,
+    datas=_datas,
     hiddenimports=[
         "win32api", "win32con", "win32file", "win32gui", "win32pipe", "win32process",
         "win32security", "win32ts", "pywintypes", "psutil", "winreg",
-        "pywinauto", "pywinauto.application", "pyweixin", "PIL", "PIL.ImageGrab",
+        "pywinauto", "pywinauto.application", "PIL", "PIL.ImageGrab",
         "qtrade_winagent.win.pipes", "qtrade_winagent.win.power", "qtrade_winagent.win.proc",
         "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat", "qtrade_winagent.win.sysinfo",
         "qtrade_winagent.main_user", "qtrade_winagent.fakes",
-    ],
+    ] + collect_submodules("pyweixin") + collect_submodules("pywinauto") + _hidden,
     hookspath=[],
     runtime_hooks=[],
     # ⚠️ 不能排除 fastapi/starlette:main_user 顶层 import main_svc(取 DEFAULT_ROOT 等),main_svc 顶层 import svc,

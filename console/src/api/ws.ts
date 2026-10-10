@@ -272,6 +272,11 @@ export class EventsClient {
 }
 
 export function defaultEventsUrl(): string {
+  // Electron 形态:preload 给出的 Agent 源优先(主进程只对它注入令牌;页面来源是 Vite/file://,不是 Agent)
+  const origin = typeof window !== 'undefined' ? window.qt?.endpoint?.agent : undefined
+  if (typeof origin === 'string' && /^https?:\/\/[^/]+$/.test(origin)) {
+    return origin.replace(/^http/, 'ws') + '/api/v1/events'
+  }
   if (typeof location !== 'undefined' && location.protocol.startsWith('http')) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     return `${proto}//${location.host}/api/v1/events`

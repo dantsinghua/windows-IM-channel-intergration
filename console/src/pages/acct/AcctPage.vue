@@ -8,6 +8,7 @@ import { useResourcesStore } from '@/stores/resources'
 import { useEventsStore } from '@/stores/events'
 import { useSessionStore } from '@/stores/session'
 import { accountsApi } from '@/api/client'
+import { ApiFailure } from '@/api/http'
 import StateDot from '@/components/StateDot.vue'
 import PageState from '@/components/PageState.vue'
 import { ACCOUNT_STATES, CHANNEL_TEXT, STATE_CODES, type Channel } from '@/i18n/zh-CN/codes'
@@ -38,6 +39,22 @@ function accountMemory(id: string): string {
   return value == null ? '—' : (value / 1024).toFixed(2) + ' GB'
 }
 function add(channel: Channel): void { void router.push({ path: '/acct/new', query: { ch: channel } }) }
+function canRemove(account: Account): boolean {
+  return !['provisioning', 'starting', 'logging_in', 'stopping'].includes(account.state)
+}
+async function removeAccount(account: Account): Promise<void> {
+  try {
+    await accountsApi.softDelete(account.id, account.label)
+  } catch (error) {
+    const alreadyGone = error instanceof ApiFailure && (error.status === 404 || error.code === 'TARGET_NOT_FOUND')
+    if (!alreadyGone) {
+      message.error(error instanceof Error ? error.message : String(error))
+      return
+    }
+  }
+  accounts.forget(account.id)
+  message.success('已从列表移除，聊天记录与登录态保留')
+}
 async function cancelPending(): Promise<void> {
   const target = slots.value?.pending
   const loginSessionId = resources.pendingLoginSessionId
@@ -85,7 +102,7 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
             <button class="account-identity" :data-testid="T.rowDetail(account.id)" @click="router.push('/acct/' + account.id)"><span class="account-avatar">{{ (account.self_nick || account.label || CHANNEL_TEXT[channel]).slice(0, 1) }}</span><span>{{ account.label || account.id }}<small>{{ account.self_nick || CHANNEL_TEXT[channel] + '账号' }}</small></span><span class="identity-arrow">↗</span></button>
             <div class="account-id">{{ account.wxid || account.self_uid || account.id }}</div>
             <div class="meta-row"><span>当前内存</span><b>{{ accountMemory(account.id) }}</b></div><div class="meta-row"><span>最近活动</span><span>{{ account.last_seen_at?.slice(5,16).replace('T',' ') ?? '—' }}</span></div>
-            <div class="card-actions"><a-button type="primary" @click="router.push('/acct/' + account.id)">进入工作台</a-button><a-button @click="router.push({ path: '/msg', query: { account_id: account.id } })">历史消息</a-button></div>
+            <div class="card-actions"><a-button type="primary" @click="router.push('/acct/' + account.id)">进入工作台</a-button><a-button @click="router.push({ path: '/msg', query: { account_id: account.id } })">历史消息</a-button><a-popconfirm :title="'从列表移除「' + (account.label || account.id) + '」？会先停止该账号，聊天记录与登录态保留。'" ok-text="移除" cancel-text="取消" ok-type="danger" @confirm="removeAccount(account)"><a-button danger :disabled="!canRemove(account)" :data-testid="T.rowDelete(account.id)">移除</a-button></a-popconfirm></div>
           </article>
           <div v-if="!rows(channel).length" class="empty-card"><a-empty :description="query ? '没有匹配的账号' : '还没有' + CHANNEL_TEXT[channel] + '账号'"><a-button v-if="!query" :data-testid="T.emptyAdd(channel)" :disabled="channel === 'wechat' && (session.wechatDisabled || resources.hasPending)" @click="add(channel)">添加{{ CHANNEL_TEXT[channel] }}</a-button></a-empty></div>
         </div>

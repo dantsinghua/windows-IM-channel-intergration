@@ -10,6 +10,7 @@
  *  - 以 `-` 开头的续写项按「与前一个 id 的尾部重叠」解析
  */
 import { describe, expect, it } from 'vitest'
+import { acctDetail } from '@/testids'
 import { collectSource, readDoc, section, splitRow, stripStrikethrough } from './doc-utils'
 
 const PLACEHOLDER_RE = '\\$\\{[^}]+\\}'
@@ -73,14 +74,15 @@ function resolveContinuation(prev: string, suffix: string): string[] {
   return [...out]
 }
 
-function parseSpecs(): Spec[] {
-  const doc = readDoc('01-控制台前端设计.md')
+function parseSpecs(doc = readDoc('01-控制台前端设计.md')): Spec[] {
   const sec = section(doc, '**全局外框(shell)**', /^## 5\. /)
   const specs: Spec[] = []
   let prev = ''
   for (const rawLine of sec.split('\n')) {
     if (!rawLine.trim().startsWith('|')) continue
     const cells = splitRow(rawLine)
+    // 只承认元素类型与要求两列同时明确退役；业务描述中的“退役”不得豁免现行元素。
+    if ((cells[2] ?? '').trim() === '历史按钮(退役)' && (cells[4] ?? '').trim() === '不再要求渲染') continue
     const first = stripStrikethrough(cells[1] ?? '')
     if (!first.trim()) continue
     const tokens = [...first.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim())
@@ -97,6 +99,17 @@ function parseSpecs(): Spec[] {
   return specs
 }
 
+function sourceWithDynamicActions(source: string): string {
+  // 单列的具体动作 ID 由既有工厂产生；同时要求页面真实绑定及该动作的处理分支。
+  if (!source.includes(':data-testid="T.stateCardAction(action)"') || !source.includes("case 'refresh-qr':")) return source
+  return source + '\n' + acctDetail.stateCardAction('refresh-qr')
+}
+
+function missingSpecs(specs: Spec[], source: string): string[] {
+  const emitted = sourceWithDynamicActions(source)
+  return specs.filter((s) => !s.regexes.some((r) => r.test(emitted))).map((s) => s.raw)
+}
+
 describe('01 §4 元素全表覆盖', () => {
   const specs = parseSpecs()
   const source = collectSource(['src', 'electron'])
@@ -106,7 +119,7 @@ describe('01 §4 元素全表覆盖', () => {
   })
 
   it('每个 testid 在源码里都出现', () => {
-    const missing = specs.filter((s) => !s.regexes.some((r) => r.test(source))).map((s) => s.raw)
+    const missing = missingSpecs(specs, source)
     expect(missing, `源码里找不到这些 01 §4 元素:\n${missing.join('\n')}`).toEqual([])
   })
 
@@ -125,5 +138,28 @@ describe('01 §4 元素全表覆盖', () => {
     // 只留固定说明 qt-set-autostop-note,不得有 qt-set-autostop 开关
     expect(/['"`]qt-set-autostop['"`]/.test(source)).toBe(false)
     expect(source).toContain('qt-set-autostop-note')
+  })
+
+  it('只有类型和要求两列同时标明退役才免除源码存在要求', () => {
+    const doc = '**全局外框(shell)**\n' +
+      '| `qt-retired-fixture` | 历史按钮(退役) | R6-81 | 不再要求渲染 |\n' +
+      '| `qt-live-fixture` | 按钮 | 附注提到历史退役项 | 始终显示 |\n' +
+      '| `qt-partial-fixture` | 历史按钮(退役) | 待裁 | 仍须显示 |\n## 5. 下一节'
+    const parsed = parseSpecs(doc)
+    expect(parsed.map(s => s.raw)).toEqual(['qt-live-fixture', 'qt-partial-fixture'])
+    expect(missingSpecs(parsed, '')).toEqual(['qt-live-fixture', 'qt-partial-fixture'])
+    expect(missingSpecs(parsed, "'qt-live-fixture' 'qt-partial-fixture'")).toEqual([])
+  })
+
+  it('refresh-qr 只有真实工厂、页面绑定、动作处理三者齐全才算覆盖', () => {
+    const id = 'qt-acct-detail-state-card-action-refresh-qr'
+    const dynamic = [{ raw: id, regexes: toRegexes(id) }]
+    const binding = ':data-testid="T.stateCardAction(action)"'
+    const handler = "case 'refresh-qr':"
+    expect(acctDetail.stateCardAction('refresh-qr')).toBe(id)
+    expect(missingSpecs(dynamic, binding + handler)).toEqual([])
+    expect(missingSpecs(dynamic, binding)).toEqual([id])
+    expect(missingSpecs(dynamic, handler)).toEqual([id])
+    expect(missingSpecs([{ raw: id + '-wrong', regexes: toRegexes(id + '-wrong') }], binding + handler)).toEqual([id + '-wrong'])
   })
 })

@@ -33,9 +33,7 @@ export const shell = {
 
 export const setup = {
   steps: 'qt-setup-steps',
-  noticeText: 'qt-setup-notice-text',
-  noticeFixed: 'qt-setup-notice-fixed',
-  noticeAck: 'qt-setup-notice-ack',
+  // R6-84(2026-10-10):`qt-setup-notice-text / -fixed / -ack` 随「阅读须知」步退役,01 §4 已标「不再要求渲染」
   next: 'qt-setup-next',
   prev: 'qt-setup-prev',
   cancel: 'qt-setup-cancel',
@@ -198,7 +196,6 @@ export const acctNew = {
   wxNarratorOpen: 'qt-acct-new-wx-narrator-open',
   wxNarratorTimer: 'qt-acct-new-wx-narrator-timer',
   wxNarratorRedo: 'qt-acct-new-wx-narrator-redo',
-  wxQrPreview: 'qt-acct-new-wx-qr-preview',
   wxRelaunch: 'qt-acct-new-wx-relaunch',
   wxCancel: 'qt-acct-new-wx-cancel',
   wxSessionHint: 'qt-acct-new-wx-session-hint',
@@ -287,8 +284,6 @@ export const screen = {
   degradeTag: 'qt-screen-degrade-tag',
   shotPreview: 'qt-screen-shot-preview',
   shotSave: 'qt-screen-shot-save',
-  wechatPreview: 'qt-screen-wechat-preview',
-  wechatNotready: 'qt-screen-wechat-notready',
   loginHint: 'qt-screen-login-hint',
   // R6-72 只读提示(R 令牌 4403 / 403);01 §4 P-SCREEN 已登记
   readonlyBanner: 'qt-screen-readonly-banner',

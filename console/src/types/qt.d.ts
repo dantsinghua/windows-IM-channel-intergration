@@ -32,6 +32,8 @@ export interface QtBridge {
   tray: { update(summary: Record<string, unknown>): Promise<void> }
   wa: { invoke(op: string, args?: Record<string, unknown>): Promise<unknown> }
   router: { onRoute(cb: (route: string) => void): () => void }
+  /** Agent 源(console.toml `[endpoint] agent`,如 `http://127.0.0.1:17600`);旧 preload 没有则为 undefined */
+  endpoint?: { agent: string }
 }
 
 declare global {

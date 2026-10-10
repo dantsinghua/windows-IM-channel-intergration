@@ -172,7 +172,9 @@ class HealthLoop:
             self.last["WECHAT"][aid] = {"state": state, "state_code": code, "checked_ms": now}
             if state != row["state"] or (code or "") != (row.get("state_code") or ""):
                 self._accounts.transition(aid, state, state_code=code, state_reason=reason)
-            if code == "KEY_FAIL":
+            # R6-91:只对「曾经取钥成功、跑起来过」的号自动试钥(self_uid 已回填)。首登没走完的号自动 key/retry 毫无意义
+            # (取钥要人重登),反而反复拆掉用户正在做的那一轮;它们由控制台「重新取钥」重跑登录流(含回填/绑定)。
+            if code == "KEY_FAIL" and row.get("self_uid"):
                 await self._wechat_key_retry(aid, now)
 
     async def _wechat_key_retry(self, account_id: str, now: int) -> None:

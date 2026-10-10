@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
+from .events import iso8601
+
 log = logging.getLogger("qtrade.pool_calibrate")
 
 POOL_CALIBRATION_DRIFT = "POOL_CALIBRATION_DRIFT"     # 02 §3.7:info / subject='pool' / 事件族 resource
@@ -334,13 +336,18 @@ class PoolCalibrator:
         wsl = self._store.pool_get("wsl") or {}
         quota = wsl.get("quota") or {}
         since = now - self.cfg.calibration_window_min * 60_000
+        sampled = 0
         for ch in ("qidian", "qq"):
             for account_id in self._running_accounts(ch):
-                budget += int(quota.get(ch, 0))
                 anon = self._col(self._samples(scope="container", subject=f"qtrade-{account_id}", since_ms=since), "mem_anon_mb")
-                if anon:
-                    actual += p95(anon) or 0.0
-        if budget <= 0:
+                if not anon:
+                    # 🔴 2026-10-10 真机:采样缺失(此前 cgroup 路径按容器名拼、恒找不到)时,把该账号的预算计进去而实占记 0,
+                    # 漂移恒 100% 必报。**没有读数 = 不能判**:该账号预算与实占都不计入,而不是当实占 0。
+                    continue
+                budget += int(quota.get(ch, 0))
+                actual += p95(anon) or 0.0
+                sampled += 1
+        if budget <= 0 or sampled == 0:
             self._drift_since_ms = None
             return None
         drift_pct = abs(budget - actual) / budget * 100
@@ -359,9 +366,13 @@ class PoolCalibrator:
         return self._emit_drift("firing", drift_pct, budget, actual, now)
 
     def _emit_drift(self, state: str, drift_pct: float, budget: int, actual: float, now_ms: int) -> dict[str, Any]:
+        # title/message 给人看的中文(此前恒 None,告警抽屉只能显示机器码与「其它建议动作:calibrate」)
+        title = "资源配额与实际占用偏差较大" if state == "firing" else "资源配额与实际占用已接近"
+        message = (f"运行中容器预算 {budget} MB,近 {self.cfg.calibration_window_min} 分钟实占 P95 约 {round(actual)} MB,"
+                   f"偏差 {round(drift_pct)}%(阈值 {self.cfg.calibration_drift_warn_pct}%);可到资源页重新校准配额")
         payload = {"code": POOL_CALIBRATION_DRIFT, "severity": "info", "state": state, "subject": "pool",
-                   "title": None, "message": None, "hint_actions": ["calibrate"],
-                   "first_seen_at": self._drift_since_ms, "last_seen_at": now_ms, "count": 1,
+                   "title": title, "message": message, "hint_actions": ["calibrate"],
+                   "first_seen_at": iso8601(self._drift_since_ms or now_ms), "last_seen_at": iso8601(now_ms), "count": 1,
                    "evidence": {"budget_mb": budget, "actual_mb": round(actual, 1), "drift_pct": round(drift_pct, 1),
                                 "threshold_pct": self.cfg.calibration_drift_warn_pct}}
         if self._events is not None:

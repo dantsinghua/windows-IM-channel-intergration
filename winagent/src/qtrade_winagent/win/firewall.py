@@ -9,16 +9,15 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from typing import Any, Optional
 
 from ..backends import FirewallRuleSpec
-from . import require_windows
+from . import require_windows, run_text
 from .netinfo import PS
 
 
 def _ps(script: str, timeout: int = 20) -> tuple[int, str, str]:
-    p = subprocess.run(PS + [script], capture_output=True, text=True, timeout=timeout)
+    p = run_text(PS + [script], timeout=timeout)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 

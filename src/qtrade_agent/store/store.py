@@ -998,7 +998,8 @@ class Store:
                       include_deleted: bool = False) -> list[dict[str, Any]]:
         sql = "SELECT a.*, r.app_version AS runtime_app_version, r.kind AS runtime_kind, r.container_name, r.adb_port, r.stream_port, r.frida_port, " \
               "r.adb_serial, r.ws_port, r.http_port, r.webui_port, r.wechat_version, r.wxkey_dll, r.error_since_ms AS runtime_error_since_ms, " \
-              "r.desired_state, r.data_dir, r.mem_limit_mb, r.container_id, r.last_started_ms, r.last_stopped_ms, r.last_boot_completed_ms " \
+              "r.desired_state, r.data_dir, r.mem_limit_mb, r.container_id, r.last_started_ms, r.last_stopped_ms, r.last_boot_completed_ms, " \
+              "r.container_mem_anon_mb " \
               "FROM accounts a LEFT JOIN account_runtime r ON r.account_id = a.id WHERE 1=1"
         params: list[Any] = []
         if not include_deleted:

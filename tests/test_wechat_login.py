@@ -107,6 +107,44 @@ async def test_key_failed_goes_degraded_releases_pending_and_never_binds(tmp_pat
     rig.store.close()
 
 
+async def test_lost_session_on_user_agent_restart_reissues_login_start(tmp_path):
+    """R6-91(2026-10-10 真机):会话代理重启后 #33 回 idle(会话丢了)⇒ 连续 3 轮后用同一 ls 重发 login/start,
+    之后照常推进;此前不处理,要等 qr_max_wait_s(30 min)才放弃。"""
+    rig = make_wechat_rig(tmp_path, state="stopped")
+    rig.slot.claim("wx01", "ls_A")
+    rig.fake.phases_script = [{"phase": "narrator"}, {"phase": "idle"}, {"phase": "idle"}, {"phase": "idle"},
+                              {"phase": "identified", "wxid": "wxid_lost"}, {"phase": "ready"}]
+    assert await make_flow(rig).run("wx01", "ls_A") == "running"
+    starts = [b for m, p, b in rig.fake.calls if p.endswith("/login/start")]
+    assert len(starts) == 2 and all((b or {}).get("login_session_id") == "ls_A" for b in starts)
+    rig.store.close()
+
+
+async def test_session_lost_repeatedly_gives_up_with_reason(tmp_path):
+    rig = make_wechat_rig(tmp_path, state="stopped")
+    rig.slot.claim("wx01", "ls_A")
+    rig.fake.phases_script = [{"phase": "idle"}] * 20
+    assert await make_flow(rig).run("wx01", "ls_A") == "stopped"
+    row = rig.store.get_account_full("wx01")
+    assert "丢失本次登录会话" in row["state_reason"]
+    assert len([1 for m, p, b in rig.fake.calls if p.endswith("/login/start")]) == 3     # 首发 + 重发 2 次
+    rig.store.close()
+
+
+async def test_ui_tree_exhausted_is_wait_ui_tree_not_key_fail(tmp_path):
+    """R6-91:仪式轮次用尽仍不可见(WinAgent `key_failed` + `state_code=WAIT_UI_TREE`)⇒ ``degraded(WAIT_UI_TREE)``,
+    不是 KEY_FAIL —— 后者把用户引去「重新取钥 / 重装微信」,方向全错。同样释放 pending、不进 bind。"""
+    rig = make_wechat_rig(tmp_path, state="stopped")
+    rig.slot.claim("wx01", "ls_A")
+    rig.fake.bound.clear()
+    rig.fake.phases_script = [{"phase": "narrator"}, {"phase": "key_failed", "state_code": "WAIT_UI_TREE", "key": {"ok": False}}]
+    assert await make_flow(rig).run("wx01", "ls_A") == "degraded"
+    row = rig.store.get_account_full("wx01")
+    assert row["state"] == "degraded" and row["state_code"] == "WAIT_UI_TREE"
+    assert rig.slot.view().pending == "" and rig.fake.bound == {}
+    rig.store.close()
+
+
 # ---------------------------------------------------------------------- 回填 / 合并 / bind 409
 async def test_new_wxid_is_backfilled_onto_temp_row(tmp_path):
     """05 §2.4.2.1 第 3 步 a):新 wxid ⇒ 回填 ``self_uid``/``wxid``,续走 bind。"""

@@ -525,11 +525,11 @@ def ui_rig():
 
 
 async def test_ui_preparation_enables_ime_and_restarts_without_credentials(ui_rig):
-    from tests.test_qidian_ui import LOGIN_TREE, acct, node, tree
+    from tests.test_qidian_ui import LOGIN_TREE, PKG, acct, node, tree
 
     ui, adb = ui_rig
     adb.ime_list = "com.android.inputmethod/.Ime\n"
-    adb.dumps = [tree(node(text="同意", bounds="[100,500][300,600]")), LOGIN_TREE]
+    adb.dumps = [tree(node(rid=f"{PKG}:id/dialogRightBtn", text="同意", bounds="[100,500][300,600]")), LOGIN_TREE]
     assert await ui.prepare_login(acct()) is True
 
     assert "ime enable com.android.adbkeyboard/.AdbIME" in adb.cmds

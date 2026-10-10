@@ -164,7 +164,7 @@ cd winagent
 | B1 | 两个 onedir 产物能在**没装 Python 的机器**上跑起来 | 隐藏导入漏了(`win/` 全是延迟导入,PyInstaller 静态扫不到) |
 | B2 | `sc create … start= delayed-auto obj= LocalSystem` + `sc failure` 恢复策略 | 服务挂了不自恢复(04 H02 指望 SCM) |
 | B3 | 计划任务以**登录用户身份、不提权**拉起会话代理 | 提权了 = C-02 的分权作废 |
-| B4 | `pyweixin` 不在公共源上,需按 03 的随包清单装本地 wheel | 微信发送整条不可用 |
+| B4 | `pyweixin`(R6-92 已解决):取上游 `github.com/Hello-Mr-Crab/pywechat` @`8589baa` 原始源码自建 wheel,随仓库放在 `vendor/pyweixin/`(附 LICENSE / SOURCE.txt),`build.ps1` 按钉死 sha256 强制安装并自检 `Messages/Files` 可导入,缺失或不符直接停止打包;spec 用 `collect_all` 把它与音频/自动化依赖的原生 DLL 一起冻结进 user exe | 仍需在 Windows 构建机上实跑一次 `build.ps1` + 冒烟,确认冻结后 `import pyweixin` 不缺件 |
 | B5 | 未签名 exe 在企业机上被 SmartScreen/EDR 拦 | 装不上(A-4:OV 证书起步) |
 
 ## 5. 与其它目录的边界

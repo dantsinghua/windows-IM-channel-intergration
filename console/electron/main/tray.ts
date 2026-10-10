@@ -4,6 +4,14 @@
  */
 import { app, Menu, nativeImage, Tray, type BrowserWindow } from 'electron'
 
+import { BRAND_ICON_PNG_DATA_URL } from './brand-icon'
+
+/** 托盘 / 窗口共用的品牌图标(南京银行花形标);托盘按 16px 显示 */
+export function brandIcon(size?: number): Electron.NativeImage {
+  const img = nativeImage.createFromDataURL(BRAND_ICON_PNG_DATA_URL)
+  return size ? img.resize({ width: size, height: size, quality: 'best' }) : img
+}
+
 export interface TraySummary {
   /** 每通道在线数 */
   online: Record<string, number>
@@ -17,30 +25,50 @@ export class TrayController {
   private tray: Tray | null = null
   private summary: TraySummary = { online: {}, unreadAlerts: 0, notifyPaused: false }
 
+  /**
+   * @param getWindow     取当前主窗口;**可能返回 null 或已销毁的窗口**
+   * @param onQuit        托盘「退出」
+   * @param onToggleNotify 暂停/恢复通知
+   * @param createWindow  窗口不存在时重建(2026-10-10 真机:`minimize_to_tray_on_close=false` 关窗后窗口已销毁,
+   *                      点托盘对死对象调 `isVisible()` ⇒ 主进程 `Object has been destroyed` 弹窗,再也打不开)
+   */
   constructor(
     private readonly getWindow: () => BrowserWindow | null,
     private readonly onQuit: () => void,
     private readonly onToggleNotify: (paused: boolean) => void,
+    private readonly createWindow: () => void = () => {},
   ) {}
 
   install(): void {
     if (this.tray) return
-    this.tray = new Tray(nativeImage.createEmpty())
+    this.tray = new Tray(brandIcon(16))           // 此前是 nativeImage.createEmpty():托盘里一个空白方块
     this.tray.setToolTip('QTrade 控制台')
     this.tray.on('click', () => this.toggleWindow())
     this.render()
   }
 
-  private toggleWindow(): void {
+  /** 活着的主窗口;null 表示要重建 */
+  private liveWindow(): BrowserWindow | null {
     const win = this.getWindow()
-    if (!win) return
+    return win && !win.isDestroyed() ? win : null
+  }
+
+  private toggleWindow(): void {
+    const win = this.liveWindow()
+    if (!win) {
+      this.createWindow()
+      return
+    }
     if (win.isVisible() && !win.isMinimized()) win.hide()
     else this.show()
   }
 
   show(): void {
-    const win = this.getWindow()
-    if (!win) return
+    const win = this.liveWindow()
+    if (!win) {
+      this.createWindow()
+      return
+    }
     if (win.isMinimized()) win.restore()
     win.show()
     win.focus()

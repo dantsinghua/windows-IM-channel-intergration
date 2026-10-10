@@ -20,6 +20,8 @@ export const useAccountsStore = defineStore('accounts', () => {
   const prompts = ref<Record<string, Prompt>>({})
   /** 当前登录尝试 id,按 account_id 存(N-3) */
   const loginSessions = ref<Record<string, string | null>>({})
+  const retiredLoginSessions = new Map<string, Set<string>>()
+  const promptRequests = new Map<string, number>()
 
   const byId = computed(() => Object.fromEntries(items.value.map((a) => [a.id, a])) as Record<string, Account>)
   const selected = computed(() => (selectedId.value ? byId.value[selectedId.value] ?? null : null))
@@ -62,6 +64,8 @@ export const useAccountsStore = defineStore('accounts', () => {
    */
   let headInflight: Promise<void> | null = null
   let headLoadedAt = 0
+  /** 已软删的号。后续「已停止」事件不许再把卡片加回来。 */
+  const gone = new Set<string>()
 
   async function load(more = false): Promise<void> {
     if (more) return loadOnce(true)
@@ -108,7 +112,9 @@ export const useAccountsStore = defineStore('accounts', () => {
         limit: PAGE_LIMIT,
         cursor: more ? nextCursor.value ?? undefined : undefined,
       })
-      items.value = more ? [...items.value, ...rows] : rows
+      for (const row of rows) if (gone.has(row.id) && row.deleted_ms == null) gone.delete(row.id)
+      const visible = rows.filter((row) => !gone.has(row.id) && row.deleted_ms == null)
+      items.value = more ? [...items.value.filter((row) => !gone.has(row.id)), ...visible] : visible
       nextCursor.value = nc
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
@@ -123,11 +129,34 @@ export const useAccountsStore = defineStore('accounts', () => {
     else items.value.push(a)
   }
 
+  /** 从列表拿掉,并挡住随后补来的「已停止」事件把它加回来。 */
+  function forget(id: string): void {
+    gone.add(id)
+    items.value = items.value.filter((row) => row.id !== id)
+    delete prompts.value[id]
+    delete loginSessions.value[id]
+  }
+
   /** `account_state` 事件归约:按真实 account_id 更新/合并 */
   function applyAccountState(ev: QtEvent<AccountStatePayload>): void {
     const id = ev.account_id
-    if (!id) return
+    if (!id || gone.has(id)) return
     const p = ev.payload
+    if (p.deleted_at) {
+      forget(id)
+      return
+    }
+    const incomingSession = p.login_session_id || null
+    const previousSession = loginSessions.value[id] || null
+    if (incomingSession && retiredLoginSessions.get(id)?.has(incomingSession)) return
+    const loginPhase = p.state === 'login_required' || p.state === 'logging_in'
+    if ((previousSession && (!loginPhase || (incomingSession && incomingSession !== previousSession)))
+        || (!loginPhase && incomingSession)) {
+      const retired = retiredLoginSessions.get(id) ?? new Set<string>()
+      if (previousSession) retired.add(previousSession)
+      if (!loginPhase && incomingSession) retired.add(incomingSession)
+      retiredLoginSessions.set(id, retired)
+    }
     const i = items.value.findIndex((x) => x.id === id)
     const patch: Partial<Account> = {
       state: p.state,
@@ -139,13 +168,14 @@ export const useAccountsStore = defineStore('accounts', () => {
       capabilities: p.capabilities ?? [],
       self_nick: p.self_nick,
     }
+    if (p.self_uid !== undefined) patch.self_uid = p.self_uid
     if (i >= 0) items.value[i] = { ...items.value[i], ...patch }
     else items.value.push({ id, channel: (ev.channel ?? 'qidian') as Channel, label: id, host: 'wsl',
       quota_mb: 0, deleted_ms: null, auto_recover: true, ...patch } as Account)
 
     if (p.prompt) prompts.value[id] = p.prompt
     else if (p.state !== 'login_required') delete prompts.value[id]
-    loginSessions.value[id] = p.login_session_id ?? null
+    loginSessions.value[id] = loginPhase ? incomingSession ?? previousSession : null
   }
 
   function bindEvents(): void {
@@ -154,7 +184,11 @@ export const useAccountsStore = defineStore('accounts', () => {
   }
 
   async function refreshPrompt(id: string): Promise<void> {
-    const p = await accountsApi.prompt(id, loginSessions.value[id] ?? undefined)
+    const session = loginSessions.value[id] ?? null
+    const request = (promptRequests.get(id) ?? 0) + 1
+    promptRequests.set(id, request)
+    const p = await accountsApi.prompt(id, session ?? undefined)
+    if ((loginSessions.value[id] ?? null) !== session || promptRequests.get(id) !== request) return
     if (p.kind) prompts.value[id] = p
     else delete prompts.value[id]
   }
@@ -173,6 +207,6 @@ export const useAccountsStore = defineStore('accounts', () => {
   return {
     items, nextCursor, loading, error, selectedId, prompts, loginSessions,
     byId, selected, byChannel, wechatProfiles, summary,
-    ops, load, loadFirst, upsert, applyAccountState, bindEvents, refreshPrompt, errorMinutes, errorSeconds,
+    ops, load, loadFirst, upsert, forget, applyAccountState, bindEvents, refreshPrompt, errorMinutes, errorSeconds,
   }
 })

@@ -156,6 +156,49 @@ async def test_sampler_writes_health_samples(tmp_path):
         close_rig(r)
 
 
+def _fake_cgroup(root, rel: str, *, anon_bytes: int, current_bytes: int) -> None:
+    d = root / rel
+    d.mkdir(parents=True)
+    (d / "memory.current").write_text(f"{current_bytes}\n", encoding="utf-8")
+    (d / "memory.max").write_text("3758096384\n", encoding="utf-8")
+    (d / "memory.stat").write_text(f"file 123\nanon {anon_bytes}\nkernel 9\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("layout", ["system.slice/docker-{id}.scope", "docker/{id}"])
+async def test_real_reader_finds_container_cgroup_by_full_id(tmp_path, layout):
+    """R6-92(2026-10-10 真机):dockerd 两种 cgroup 驱动(systemd / cgroupfs)都按**容器完整 ID** 命名目录;
+    此前按容器名拼路径,真机上一行容器样本都写不进去(FakeProcReader 按名字给数,把这个错误掩盖了)。
+    这里用**真实的** LinuxProcReader 读一棵按 ID 命名的假 cgroup 树,并核对回填 account_runtime.container_mem_anon_mb。"""
+    from qtrade_agent.monitor import LinuxProcReader
+    cid = "de697159ec0285622a681726b0e5e69797e072f7e183ea36083257d52cf2fcea"
+    cg = tmp_path / "cgroup"
+    _fake_cgroup(cg, layout.format(id=cid), anon_bytes=548081664, current_bytes=1137295360)
+    (tmp_path / "rig").mkdir()
+    r = make_rig(tmp_path / "rig")
+    try:
+        r.agent.sampler = Sampler(r.store, reader=LinuxProcReader(proc=str(tmp_path / "noproc"), cgroup_root=str(cg)),
+                                  data_dir=str(tmp_path), clock=r.clock, disk=r.disk)
+        r.store.ensure_account("qd01", "qidian", state="running", self_uid="3007373675")
+        r.store.upsert_runtime("qd01", kind="redroid", container_name="qtrade-qd01", container_id=cid)
+        await r.agent.sampler.sample_once()
+        row = r.store.con.execute("SELECT * FROM health_samples WHERE scope='container'").fetchone()
+        assert row is not None and row["subject"] == "qtrade-qd01"
+        assert round(row["mem_anon_mb"]) == 523 and round(row["mem_mb"]) == 1085
+        assert r.store.get_account_full("qd01")["container_mem_anon_mb"] == 522
+    finally:
+        close_rig(r)
+
+
+async def test_real_reader_by_name_only_is_last_resort(tmp_path):
+    """没有 container_id(老库 / 外部容器)时退回按名字找;都找不到就不写行,不写 0。"""
+    from qtrade_agent.monitor import LinuxProcReader
+    cg = tmp_path / "cgroup"
+    _fake_cgroup(cg, "docker/qtrade-qd01", anon_bytes=1048576 * 100, current_bytes=1048576 * 200)
+    reader = LinuxProcReader(proc=str(tmp_path / "noproc"), cgroup_root=str(cg))
+    assert reader.cgroup("qtrade-qd01")["mem_anon_mb"] == 100.0
+    assert reader.cgroup("qtrade-qd99", container_id="ffff") == {}
+
+
 async def test_sampler_skips_unreadable_items(tmp_path):
     """任何一项读不到就**跳过那一行**:不写 0、不抛(否则 scheduler 的任务会被一次读失败打红)。"""
     r = make_rig(tmp_path)
@@ -397,16 +440,47 @@ def _qq(rig, aid="qq01", state="running"):
 def test_webui_open_close_and_channel_guard(rig):
     """#97/#98:仅 QQ;``running`` 下开需重启容器 ⇒ 响应带 ``restart``;已是目标态 ⇒ no-op。"""
     aid = _qq(rig)
+    # R6-83: running 行必须对应已登记且确由此账号持有的假容器，初态 WebUI 已关闭。
+    account = rig.store.get_account_full(aid)
+    rig.client.portal.call(rig.agent.runtime.start, account)
+    rig.client.portal.call(rig.agent.runtime.set_napcat_webui, account, False)
     r = rig.client.post(f"/api/v1/accounts/{aid}/webui/open", headers=H(TOKEN_WRITE), json={"minutes": 10})
     assert r.status_code == 200 and r.json()["url"].endswith(":16301/") and r.json()["changed"] is True
     assert rig.store.get_runtime(aid)["webui_published_until_ms"] > rig.clock()
+    first_until = r.json()["until_ms"]
+    first_until_iso = r.json()["until"]
+    containers = rig.agent.runtime._containers
+    before_repeat = len(containers.calls)
+    rig.clock.advance(1500)
     again = rig.client.post(f"/api/v1/accounts/{aid}/webui/open", headers=H(TOKEN_WRITE), json={})
     assert again.json()["changed"] is False                                   # 已开:不白重启一次容器
+    assert again.json()["restart"] is False
+    assert again.json()["until_ms"] == first_until
+    assert again.json()["until"] == first_until_iso
+    assert rig.store.get_runtime(aid)["webui_published_until_ms"] == first_until
+    assert not [call for call in containers.calls[before_repeat:] if call[0] in {"stop", "start"}]
     assert rig.client.post(f"/api/v1/accounts/{aid}/webui/close", headers=H(TOKEN_WRITE)).json()["changed"] is True
     assert rig.store.get_runtime(aid)["webui_published_until_ms"] is None
     rig.store.ensure_account("qd01", "qidian", state="running", self_uid="300")
     bad = rig.client.post("/api/v1/accounts/qd01/webui/open", headers=H(TOKEN_WRITE), json={})
     assert bad.status_code == 409 and bad.json()["error"]["reason"] == "not_applicable"
+
+
+@pytest.mark.parametrize('wrong_owner', [False, True], ids=['missing-container', 'wrong-container-owner'])
+def test_webui_rejects_unowned_runtime_without_mutating_it(rig, wrong_owner):
+    aid = _qq(rig)
+    account = rig.store.get_account_full(aid)
+    if wrong_owner:
+        rig.client.portal.call(rig.agent.runtime.start, account)
+        rig.client.portal.call(rig.agent.runtime.set_napcat_webui, account, False)
+        rig.store.upsert_runtime(aid, kind='napcat', container_id='not-this-container')
+    containers = rig.agent.runtime._containers
+    before = len(containers.calls)
+    result = rig.client.post(f'/api/v1/accounts/{aid}/webui/open', headers=H(TOKEN_WRITE), json={'minutes': 10})
+    assert result.status_code == 503
+    assert result.json()['error']['reason'] == 'napcat_webui_unavailable'
+    assert rig.store.get_runtime(aid)['webui_published_until_ms'] is None
+    assert all(call[0] == 'inspect' for call in containers.calls[before:])
 
 
 async def test_export_identity_requires_stopped_and_makes_a_tar(rig, tmp_path):

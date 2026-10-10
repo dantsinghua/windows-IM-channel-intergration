@@ -33,8 +33,9 @@ BeforeAll {
 
 Describe 'PayloadMap:13 项必备,没有可选项(§2.2.1 + 安琳 2026-09-21 拍板)' {
 
-    It '13 项载荷齐全' {
-        $script:Map.Count | Should -Be 13
+    It 'all 16 payload items present (13 + R6-92 pyweixin wheel / LICENSE / SOURCE.txt)' {
+        # 2026-10-10: pyweixin is vendored from upstream source and required; "every item mandatory, none optional" still holds.
+        $script:Map.Count | Should -Be 16
     }
 
     It 'PayloadMap 里一个 Optional 项都没有' {
@@ -50,10 +51,11 @@ Describe 'PayloadMap:13 项必备,没有可选项(§2.2.1 + 安琳 2026-09-21 �
         ($i.ContainsKey('Optional') -and $i.Optional) | Should -BeFalse
     }
 
-    It '§2.2.1 标 critical:true 的恰好是那 5 项' {
+    It '§2.2.1 critical:true is exactly these 6 items (R6-92 adds the pyweixin wheel)' {
         $crit = @($script:Map | Where-Object { $_.Critical } | ForEach-Object { $_.Dest }) | Sort-Object
         $crit | Should -Be (@(
                 'kernel/bzImage-6.6'
+                'pkg/pyweixin/pywechat127-1.9.8-py3-none-any.whl'
                 'pkg/wechat/weixin_4.1.12.26.exe'
                 'wsl/kcheck-rootfs.tar'
                 'wsl/rootfs.tar'
@@ -73,6 +75,21 @@ Describe 'PayloadMap:13 项必备,没有可选项(§2.2.1 + 安琳 2026-09-21 �
     It '随包微信钉死了 sha256(B-1 / R2-6:两候选包 VersionInfo 相同,只能靠它分辨)' {
         $i = Get-QtItem -Dest 'pkg/wechat/weixin_4.1.12.26.exe'
         $i.PinnedSha256 | Should -Be '58997cfe4513ab71f107c2137bb570ade030f228115c14688544cec80e604053'
+    }
+
+    It 'pyweixin wheel is critical, pinned by sha256, and shipped with LICENSE + SOURCE.txt (R6-92)' {
+        $w = Get-QtItem -Dest 'pkg/pyweixin/pywechat127-1.9.8-py3-none-any.whl'
+        $w.Critical | Should -BeTrue
+        $w.PinnedSha256 | Should -Be 'a98ab028d284917099201a2cefbcbe1ba8c36a02ea136b4b2632539167e7792e'
+        (Get-QtItem -Dest 'pkg/pyweixin/LICENSE') | Should -Not -BeNullOrEmpty
+        (Get-QtItem -Dest 'pkg/pyweixin/SOURCE.txt') | Should -Not -BeNullOrEmpty
+    }
+
+    It 'the vendored pyweixin wheel in the repo matches the pinned sha256' {
+        $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $whl = Join-Path $repo 'winagent\vendor\pyweixin\pywechat127-1.9.8-py3-none-any.whl'
+        Test-Path -LiteralPath $whl | Should -BeTrue
+        (Get-FileHash -LiteralPath $whl -Algorithm SHA256).Hash.ToLowerInvariant() | Should -Be 'a98ab028d284917099201a2cefbcbe1ba8c36a02ea136b4b2632539167e7792e'
     }
 }
 

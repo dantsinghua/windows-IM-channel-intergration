@@ -241,6 +241,14 @@ class SendOutcome:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+#: 控件树落点(02 §2.2.4 E-19 / 05 §7:``uiautomator dump`` 落 ``/data/local/tmp``,停号时随临时数据一并清掉)。
+#: 🔴 2026-10-10 真机(redroid11_x86_64,adb 1.0.41 非 tty 会话):``uiautomator dump /dev/tty`` **只回一行
+#: 「UI hierchary dumped to: /dev/tty」、XML 根本不进 stdout**,解析恒为空 ⇒ 登录界面永远「准备不好」。
+#: 改为先落文件再 ``cat``,与 2026-09-19 参考实现在同款 redroid 上的实跑路径一致。
+UI_DUMP_PATH = "/data/local/tmp/qtrade-ui.xml"
+UI_DUMP_CMD = f"uiautomator dump {UI_DUMP_PATH} >/dev/null 2>&1 && cat {UI_DUMP_PATH}"
+
+
 def serial_of(account_id: str) -> str:
     """``qdNN`` → ``127.0.0.1:160NN``(02 §2.2.4 端口按序号推导,不查表)。"""
     m = _SEQ_RE.search(account_id or "")
@@ -358,7 +366,7 @@ class QidianUi:
         last = "未执行"
         for i in range(retries):
             try:
-                nodes = parse_ui_xml(await self._shell(acct, "uiautomator dump /dev/tty 2>/dev/null"))
+                nodes = parse_ui_xml(await self._shell(acct, UI_DUMP_CMD))
                 if nodes:
                     return nodes
                 last = "控件树为空"
@@ -527,7 +535,18 @@ class QidianUi:
         await self._tap_anchor(acct, p, "login_password", nodes)
         await self._clear_text(acct, p)
         await self._input_text(acct, p, secret or "")
-        return await self._tap_anchor(acct, p, "login_submit", nodes)   # 同一屏的控件用同一棵树,不重复 dump
+        if not await self._tap_anchor(acct, p, "login_submit", nodes):   # 同一屏的控件用同一棵树,不重复 dump
+            return False
+        # [实测 2026-10-10 企点 6.9.7] 登录页底部「我已阅读并同意…」未勾选时,点「登录」会再弹一次
+        # 「请阅读并同意相关协议」(取消/同意,与 ⑦ 同一套 dialogRightBtn)。不点掉它表单就永远停住、⑪ 只会超时。
+        # 与 ⑦ 同样只允许点一次;验证码/设备锁等其它弹窗不在此处理,仍由 ⑪ 的 markers 交人。
+        try:
+            after = await self._dump(acct, p)
+        except ValueError:
+            return True
+        if find_node(after, p.anchor("agree_button")) is not None:
+            await self._tap_anchor(acct, p, "agree_button", after)
+        return True
 
     async def _login_verdict(self, acct: Account, p: Profile, *, once: bool = False) -> Optional[LoginOutcome]:
         """⑪ 每 ``poll_interval_s`` 一轮、上限 ``login_s``:主界面 / 验证页 / 错误 toast 三类。超时回 ``None``。"""
@@ -602,7 +621,7 @@ class QidianUi:
                     return LoginOutcome(None, reason="foreground_not_main")
                 stage = "ui"
                 try:
-                    nodes = parse_ui_xml(await self._read_shell(acct, "uiautomator dump /dev/tty 2>/dev/null"))
+                    nodes = parse_ui_xml(await self._read_shell(acct, UI_DUMP_CMD))
                 except Exception:
                     nodes = None
                 if nodes is None:
@@ -796,13 +815,20 @@ class QidianUi:
 
 # ---------------------------------------------------------------------------- 节点查询
 def find_node(nodes: list[Node], anchor: dict[str, Any]) -> Optional[Node]:
-    """锚点命中:``id`` 全等 或 ``text_any`` 子串命中 或 ``desc_any`` 子串命中(取或);按文档序取第一个。"""
+    """锚点命中:``id`` 全等 或 ``text_any`` 子串命中 或 ``desc_any`` 子串命中(取或)。
+
+    **``id`` 全等优先于文本子串**,两类里各按文档序取第一个。2026-10-10 真机(企点 6.9.7)核对:协议弹窗的
+    正文 ``dialogText`` 与左键「不同意」在文档序上都排在右键「同意」之前、且都含子串「同意」,若按文档序
+    混排取第一个,``agree_button`` 会命中正文或「不同意」⇒ 点不掉协议、登录界面永远准备不好(UI_UNEXPECTED)。
+    """
     rid = anchor.get("id")
     texts = [str(t) for t in (anchor.get("text_any") or [])]
     descs = [str(t) for t in (anchor.get("desc_any") or [])]
+    if rid:
+        for n in nodes:
+            if n.rid == rid:
+                return n
     for n in nodes:
-        if rid and n.rid == rid:
-            return n
         if texts and any(t in n.text for t in texts):
             return n
         if descs and any(t in n.desc for t in descs):

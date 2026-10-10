@@ -10,12 +10,11 @@
 """
 from __future__ import annotations
 
-import subprocess
 import time
 from typing import Any, Optional
 
 from ..backends import ProcInfo
-from . import require_windows
+from . import require_windows, run_text
 
 REBOOT_KEYS = (
     (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending", None),
@@ -116,9 +115,9 @@ class WinSys:
         """R3-5:主机上次从睡眠/休眠唤醒的时刻。取系统日志 Kernel-Power 事件 ID 107(恢复)。"""
         require_windows("事件日志查询")
         try:
-            out = subprocess.run(
+            out = run_text(
                 ["wevtutil", "qe", "System", "/q:*[System[(EventID=107)]]", "/c:1", "/rd:true", "/f:text"],
-                capture_output=True, text=True, timeout=5).stdout
+                timeout=5).stdout
             for line in out.splitlines():
                 if "Date:" in line:
                     import datetime
@@ -130,7 +129,7 @@ class WinSys:
 
     def w32time(self) -> dict[str, Any]:
         require_windows("w32tm 查询")
-        out = subprocess.run(["w32tm", "/query", "/status"], capture_output=True, text=True, timeout=5).stdout
+        out = run_text(["w32tm", "/query", "/status"], timeout=5).stdout
         source, last = None, None
         for line in out.splitlines():
             low = line.lower()

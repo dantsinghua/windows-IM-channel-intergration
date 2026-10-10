@@ -113,6 +113,9 @@ class ApiConfig:
     http_sync_max_wait_ms: int = 25000          # 同步等待上限(P-10),超过转 202
     unauth_health_sources: tuple[str, ...] = ("127.0.0.1/32", "::1/128", "wsl_gateway")
     api_version: str = "1.0"                    # 只读,随代码(02 §3.8)
+    # R6-85:桌面壳渲染进程(file:// ⇒ Origin: null;开发期 Vite 回环源)跨源直连 Agent 的 CORS 放行表。
+    # 🔴 只是让浏览器把响应交给页面,**不是鉴权**:令牌仍由主进程注入,没令牌照样 401;非回环/非 null 的源不收。
+    console_origins: tuple[str, ...] = ("null",)
     public_ip_check_interval_s: int = 0         # E-3 公网出口探测周期;🔴 **默认 0 = 关**(§11.22 [SCOPE])
     public_ip_probe_urls: tuple[str, ...] = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
 
@@ -276,7 +279,7 @@ class AgentConfig:
             section = section or {}
             names = klass.__dataclass_fields__.keys()
             vals = {k: section[k] for k in names if k in section}
-            for tup_key in ("unauth_health_sources", "container_restart_backoff_s", "webhook_backoff_ms", "public_ip_probe_urls", "qidian_hosts"):
+            for tup_key in ("unauth_health_sources", "console_origins", "container_restart_backoff_s", "webhook_backoff_ms", "public_ip_probe_urls", "qidian_hosts"):
                 if tup_key in vals and isinstance(vals[tup_key], list):
                     vals[tup_key] = tuple(vals[tup_key])
             return klass(**vals)

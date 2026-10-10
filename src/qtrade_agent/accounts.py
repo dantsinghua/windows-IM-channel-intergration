@@ -231,7 +231,13 @@ class AccountService:
             raise ApiError(409, "NOT_APPLICABLE", "账号已停用,先 enable", reason="account_disabled")
         if self.busy(id):
             raise ApiError(409, "NOT_APPLICABLE", "账号正在切换状态", reason="busy")
-        if row["state"] not in STARTABLE:
+        # R6-91:微信首登卡在取钥 / UI 树(degraded + KEY_FAIL|WAIT_UI_TREE)⇒ 允许 start 重跑登录流(**不登出微信**,
+        # WinAgent 按「已登录」路径走:仪式可见即跳 → identified → 回填/绑定 → 取钥)。否则这类号只能删了重建。
+        wechat_relogin = (row["channel"] == "wechat" and row["state"] == "degraded"
+                          and (row.get("state_code") or "") in ("KEY_FAIL", "WAIT_UI_TREE", "WINAGENT_OFFLINE", "WINAGENT_USER_OFFLINE"))
+        # 微信已开着、登录会话却丢了(会话代理重启 / 停在讲述人):允许重跑取钥,不要求先停号
+        wechat_resume = row["channel"] == "wechat" and row["state"] in ("login_required", "logging_in", "degraded")
+        if row["state"] not in STARTABLE and not wechat_relogin and not wechat_resume:
             if row["state"] in ("login_required", "logging_in", "running", "degraded", "starting", "provisioning"):
                 return {"state": row["state"], "already": True}
             raise ApiError(409, "NOT_APPLICABLE", f"当前状态 {row['state']} 不可 start", reason="bad_state")
@@ -463,8 +469,10 @@ class AccountService:
             return
         ls = new_login_session_id()
         if not self._wechat_slot.claim(id, ls):
-            self.transition(id, "stopped", state_reason="微信槽位被占用", desired_state="stopped")
-            return
+            slot = self._wechat_slot.view()
+            if slot.pending != id and slot.holder != id:
+                self.transition(id, "stopped", state_reason="微信槽位被占用", desired_state="stopped")
+                return
         await self._wechat_login.run(id, ls)
 
     # ------------------------------------------------------------------ #97 / #98 QQ WebUI 临时开关(C-35)
@@ -479,7 +487,8 @@ class AccountService:
         try:
             currently_on = self._runtime.napcat_webui_enabled(row)
             target_until = until_ms if enable else None
-            if currently_on == enable and registered_until == target_until:
+            if ((enable and currently_on and registered_until is not None and registered_until > now)
+                    or (not enable and not currently_on and registered_until is None)):
                 return {"changed": False, "restart": False, "until_ms": registered_until}
             # 失败重试时配置可能已写成关闭，但上一进程尚未退出；登记保留即仍要核实重启。
             force_restart = not enable and registered_until is not None
@@ -635,6 +644,9 @@ class AccountService:
             self.transition(id, "error", state_code="BAD_CREDENTIAL", state_reason="账号或密码错误", login_session_id=ls)
         elif isinstance(result, str) and result.startswith("WAIT_"):
             self.transition(id, "login_required", state_code=result, login_session_id=ls, prompt={"kind": result, "text": "等待人在画面完成验证"})
+        elif row["channel"] == "wechat":
+            # 🔴 微信没有账密登录(00 §354):走到 else 是执行层/环境异常,判 degraded(KEY_FAIL) 让用户走取钥重试,绝不设 WAIT_PASSWORD
+            self.transition(id, "degraded", state_code="KEY_FAIL", state_reason="微信登录执行层未就绪,请重试取钥", login_session_id=ls)
         else:
             self.transition(id, "login_required", state_code="WAIT_PASSWORD", state_reason="登录执行层未接入", login_session_id=ls,
                             prompt={"kind": "WAIT_PASSWORD", "text": "请在画面完成登录"})
@@ -729,6 +741,14 @@ class AccountService:
             self._store.insert_audit(kind="system", transport="system", actor=actor, action="account.login", account_id=id,
                                      result_code="OK", detail={"mode": "qrcode", "login_session_id": ls}, now_ms=self._clock())
             return {"state": "logging_in", "login_session_id": ls}
+        if row["channel"] == "wechat":
+            # 🔴 微信 PC 没有账密登录(00 §354):「人发起登录」= 重跑取钥流(WechatLoginFlow),绝不进 _run_login/WAIT_PASSWORD。
+            # 此前缺这个分支,微信号落进企点通用账密流、login_fn 返回 None ⇒ 被错判成 WAIT_PASSWORD「请在画面完成登录」。
+            ls = new_login_session_id()
+            self._spawn(id, self._wechat_start(id))
+            self._store.insert_audit(kind="system", transport="system", actor=actor, action="account.login", account_id=id,
+                                     result_code="OK", detail={"mode": "wechat_keytry", "login_session_id": ls}, now_ms=self._clock())
+            return {"state": "starting", "login_session_id": ls}
         mode = body.get("mode") or row["login_mode"]
         if mode not in LOGIN_MODES:
             raise ApiError(400, "INVALID_ARGS", "mode 须为 password|qrcode|manual", reason="bad_login_mode", extra={"details": [{"pointer": "/mode"}]})

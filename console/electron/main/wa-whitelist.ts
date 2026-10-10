@@ -34,6 +34,7 @@ export const WA_WHITELIST: Record<string, WaOp> = {
   'wechat.settings.get': { method: 'GET', path: '/wa/v1/settings/wechat' },
   'wechat.settings.put': { method: 'PUT', path: '/wa/v1/settings/wechat' },
   'wechat.status': { method: 'GET', path: '/wa/v1/wechat/status' },
+  'wechat.version-match': { method: 'GET', path: '/wa/v1/wechat/version-match' },   // R6-86:步② 结论/处理/随包版本(只读)
   'wechat.update-block': { method: 'POST', path: '/wa/v1/wechat/update-block' },
   'wechat.key.retry': { method: 'POST', path: '/wa/v1/wechat/key/retry' },
   'wechat.reinstall': { method: 'POST', path: '/wa/v1/wechat/reinstall' },

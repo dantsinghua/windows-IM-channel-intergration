@@ -10,7 +10,7 @@ import os
 import subprocess
 from typing import Any
 
-from . import require_windows
+from . import require_windows, run_text
 
 CRYPTPROTECT_LOCAL_MACHINE = 0x4
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
@@ -77,7 +77,7 @@ class WinCrypto:
     def acl_is_tight(self, path: str) -> bool:
         """自检:除 SYSTEM / Administrators 外还有别的主体 ⇒ 判「已放宽」(→ ``VAULT_ENTROPY_MISSING``)。"""
         require_windows("ACL 自检")
-        out = subprocess.run(["icacls", path], capture_output=True, text=True).stdout
+        out = run_text(["icacls", path], timeout=30).stdout
         allowed = ("NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators", "SYSTEM", "Administrators")
         for line in out.splitlines()[1:]:
             line = line.strip()

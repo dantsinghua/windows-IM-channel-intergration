@@ -16,6 +16,7 @@
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:e2e-real": "vitest run --config tests/e2e-real/vitest.e2e.config.ts",
     "test:pw": "playwright test -c tests/e2e-pw"
   },
   "dependencies": {

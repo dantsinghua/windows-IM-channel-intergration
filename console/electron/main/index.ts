@@ -6,9 +6,9 @@
 import { app, BrowserWindow, dialog, ipcMain, Notification, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { patchConfig, readConfig } from './config'
-import { installNetGuard, openExternalAllowed } from './netguard'
+import { DEFAULT_AGENT_ORIGIN, DEFAULT_WINAGENT_ORIGIN, installNetGuard, normalizeLocalOrigin, openExternalAllowed } from './netguard'
 import { TokenHolder } from './token'
-import { TrayController } from './tray'
+import { TrayController, brandIcon } from './tray'
 import { openLogsDir, pickFile, saveAs } from './files'
 import { loadWindowState, recordCrash, saveWindowState, clearCrashes } from './window-state'
 import { resolvePath, WA_WHITELIST } from './wa-whitelist'
@@ -21,6 +21,9 @@ let tray: TrayController | null = null
 let quitting = false
 let notifyPaused = false
 let pendingRoute: string | null = null
+/** Agent / WinAgent 源:启动时从 console.toml `[endpoint]` 读一次(只认本机回环),netguard、preload、wa.invoke 共用同一份 */
+let agentOrigin = DEFAULT_AGENT_ORIGIN
+let winagentOrigin = DEFAULT_WINAGENT_ORIGIN
 
 /* ── 单实例锁:第二次启动只把已有窗口 show()+focus(),并把 --route= 转给它 ── */
 const gotLock = app.requestSingleInstanceLock()
@@ -43,11 +46,14 @@ function parseRoute(argv: string[]): string | null {
 async function bootstrap(): Promise<void> {
   await app.whenReady()
 
+  const cfg = readConfig()
+  agentOrigin = normalizeLocalOrigin(cfg.endpoint?.agent, DEFAULT_AGENT_ORIGIN)
+  winagentOrigin = normalizeLocalOrigin(cfg.endpoint?.winagent, DEFAULT_WINAGENT_ORIGIN)
+
   await tokens.refresh()
-  installNetGuard(tokens)
+  installNetGuard(tokens, undefined, { agentOrigin, winagentOrigin, devUrl: DEV_URL })
   registerIpc()
 
-  const cfg = readConfig()
   const startHidden = process.argv.includes('--hidden') && cfg.app?.start_hidden !== false
   pendingRoute = parseRoute(process.argv)
 
@@ -60,6 +66,7 @@ async function bootstrap(): Promise<void> {
     (paused) => {
       notifyPaused = paused
     },
+    () => createWindow(true),
   )
   tray.install()
 
@@ -88,10 +95,12 @@ function createWindow(show: boolean): void {
     minHeight: 720,
     show,
     title: 'QTrade 控制台',
+    icon: brandIcon(),                             // 任务栏 / 窗口左上角与托盘同一枚南银标
     autoHideMenuBar: true,
     backgroundColor: '#F5F6F8',
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.cjs'),
+      additionalArguments: [`--qt-agent-origin=${agentOrigin}`],   // preload 据此暴露 qt.endpoint.agent
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -120,6 +129,10 @@ function createWindow(show: boolean): void {
     }
     persistWindow(win)
   })
+  // 窗口真被销毁(minimize_to_tray_on_close=false / 退出)后不再留死引用;托盘与 IPC 都以 null 判「要重建」
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null
+  })
   win.on('resize', () => persistWindow(win))
   win.on('move', () => persistWindow(win))
   win.on('show', () => {
@@ -140,6 +153,7 @@ function createWindow(show: boolean): void {
       dialog.showErrorBox('控制台已多次崩溃', '已停在环境页(画面流关闭),建议在环境页导出诊断包。')
     }
     createWindow(true)
+    if (!win.isDestroyed()) win.destroy()          // 渲染进程已没了的旧壳不留着
   })
 
   loadRenderer(win)
@@ -191,7 +205,7 @@ function registerIpc(): void {
     saveAs(mainWindow, name, data))
   ipcMain.handle('qt:files.pickFile', (_e, accept?: string[]) => pickFile(mainWindow, accept))
 
-  ipcMain.handle('qt:auth.state', () => tokens.authState)
+  ipcMain.handle('qt:auth.state', () => tokens.ensureFresh())   // 到期先续签再回答,不让渲染进程先看到 no_token
   ipcMain.handle('qt:auth.refresh', () => tokens.refresh())
 
   ipcMain.handle('qt:config.read', () => readConfig())
@@ -230,8 +244,7 @@ function registerIpc(): void {
     }
     const { path, body } = resolvePath(def, args)
     const token = tokens.winagentToken
-    const base = String(readConfig().endpoint?.winagent ?? 'http://127.0.0.1:17610')
-    const res = await fetch(`${base}${path}`, {
+    const res = await fetch(`${winagentOrigin}${path}`, {
       method: def.method,
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),

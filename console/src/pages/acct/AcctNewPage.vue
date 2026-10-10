@@ -30,7 +30,11 @@ const session = useSessionStore()
 const settings = useSettingsStore()
 const AccountScreen = defineAsyncComponent(() => import('@/pages/screen/ScreenPage.vue'))
 const screenOpen = ref(false)
-const wxEnableError = ref('')
+/** 操作失败一律 3 秒 toast(安琳 2026-10-10:不在页面上留红字),成功/取消同样走 toast;只有「状态」才留在页面上 */
+const TOAST_S = 3
+function toastError(e: unknown): void {
+  message.error(e instanceof Error ? e.message : String(e), TOAST_S)
+}
 
 const channel = ref<Channel | null>((route.query.ch as Channel) ?? null)
 const step = ref(0)
@@ -73,11 +77,10 @@ const modalSecret = ref('')
 
 /* 微信流程 */
 const wxStatus = ref<Record<string, any> | null>(null)
+/** 02 #29 `GET /wa/v1/wechat/version-match` → `{match, action, current_version, bundled_version, dll, status}` */
+const wxVersionMatch = ref<Record<string, any> | null>(null)
 const wxPickIndex = ref(0)
 const wxReinstallCk = ref({ backup: false, autoupdate: false, confirm: false })
-const wxPreviewSrc = ref('')
-let wxPreviewTimer: ReturnType<typeof setInterval> | null = null
-
 const STEP_NAMES: Record<Channel, string[]> = {
   qidian: ['资源预检', '起名', '机型档案', '账号密码', '创建与登录', '完成'],
   qq: ['资源预检', '起名', '扫码', '完成'],
@@ -97,10 +100,19 @@ const canNavigateForm = computed(() => !busy.value && !restoreError.value && !cr
 const nextDisabled = computed(() => busy.value
   || (step.value === 0 && channel.value !== 'wechat' && canAddHere.value === 0)
   || (step.value === 1 && channel.value !== 'wechat' && labelInvalid.value)
-  || (channel.value === 'wechat' && step.value === 0 && (!wxStatus.value?.module_enabled || resources.hasPending)))
+  || (channel.value === 'wechat' && step.value === 0 && (!wxModuleEnabled.value || resources.hasPending)))
 
-const wxMatch = computed(() => (wxStatus.value?.match as string) ?? '')
-const wxAction = computed(() => (wxStatus.value?.action as string) ?? '')
+/**
+ * R6-86:步①/② 的数据来源以 02 为准 ——
+ * - 模块是否启用 = #28 `GET /wa/v1/wechat/status` 的 `enabled`;
+ * - 会话代理是否在线 = Agent `#72 /system/health` 的 `winagent.user_agent`(`session.userAgentOnline`),**不从 #28 取**;
+ * - 检测到的微信版本 = #28 `wechat.version`;结论/处理/随包版本 = #29 `GET /wa/v1/wechat/version-match`。
+ * 此前照 01 旧文读 `module_enabled/user_agent/match`,WinAgent 从不返回这些键 ⇒ 真机上永远「未启用 / 不在线」。
+ */
+const wxModuleEnabled = computed(() => wxStatus.value?.enabled === true)
+const wxDetected = computed(() => (wxStatus.value?.wechat as { installed?: boolean; version?: string | null } | null) ?? null)
+const wxMatch = computed(() => (wxVersionMatch.value?.match as string) ?? '')
+const wxAction = computed(() => (wxVersionMatch.value?.action as string) ?? '')
 const wxInstalls = computed(() => (wxStatus.value?.installed as { path: string; version: string }[]) ?? [])
 const holderBusy = computed(() => (resources.slots?.holder ?? '') !== '')
 
@@ -162,12 +174,15 @@ async function restorePendingFlow(): Promise<void> {
       if (p.kind) accounts.prompts[a.id] = p
       else delete accounts.prompts[a.id]
     } catch (e) {
-      if (flowActive) message.error(e instanceof Error ? e.message : String(e))
+      if (flowActive) toastError(e)
     }
   } catch (e) {
     if (!flowActive) return
     if (e instanceof ApiFailure && e.status === 404) clearPendingFlow()
-    else restoreError.value = e instanceof Error ? e.message : String(e)
+    else {
+      restoreError.value = e instanceof Error ? e.message : String(e)
+      toastError(`无法恢复创建进度:${restoreError.value}`)
+    }
   } finally {
     if (flowActive) busy.value = false
   }
@@ -213,7 +228,7 @@ async function finishCancellation(): Promise<void> {
     if (pageMounted) go('/acct')
   } catch (e) {
     cancelError.value = e instanceof Error ? e.message : String(e)
-    message.error(cancelError.value)
+    toastError(`取消失败:${cancelError.value}`)
   } finally {
     cancelling.value = false
     busy.value = false
@@ -256,23 +271,32 @@ async function loadWxStatus(): Promise<void> {
   } catch {
     wxStatus.value = null
   }
+  // #29 只在模块已启用时才有意义(关着时 WinAgent 没有可比对的安装信息);失败不挡步①
+  if (wxStatus.value?.enabled === true) {
+    try {
+      wxVersionMatch.value = (await window.qt?.wa.invoke('wechat.version-match', {})) as Record<string, unknown>
+    } catch {
+      wxVersionMatch.value = null
+    }
+  } else {
+    wxVersionMatch.value = null
+  }
 }
 
 async function enableWechatModule(): Promise<void> {
-  if (busy.value || wxStatus.value?.module_enabled) return
-  wxEnableError.value = ''
+  if (busy.value || wxModuleEnabled.value) return
   if (!window.qt?.wa || !session.winagentOnline) {
-    wxEnableError.value = '请在已连接 WinAgent 的桌面控制台启用微信模块。'
+    toastError('请在已连接 WinAgent 的桌面控制台启用微信模块。')
     return
   }
   busy.value = true
   try {
     await settings.saveWechatModule({ enabled: true })
     await loadWxStatus()
-    if (!wxStatus.value?.module_enabled) throw new Error('尚未确认微信模块已启用，请检查服务连接后重试。')
-    message.success('微信模块已启用')
+    if (!wxModuleEnabled.value) throw new Error('尚未确认微信模块已启用，请检查服务连接后重试。')
+    message.success('微信模块已启用', TOAST_S)
   } catch (e) {
-    wxEnableError.value = e instanceof Error ? e.message : String(e)
+    toastError(e)
   } finally {
     busy.value = false
   }
@@ -305,6 +329,7 @@ async function create(): Promise<void> {
     secretTimer = setTimeout(() => {
       clearFirstSecret()
       passwordError.value = '本次密码等待已超时,请重新输入密码登录。'
+      toastError(passwordError.value)
     }, 5 * 60 * 1000)
   }
   // 提交时就清表单,不等网络响应。
@@ -337,7 +362,7 @@ async function create(): Promise<void> {
       rejectInfo.value = { message: e.detail.message, alternatives: e.detail.alternatives ?? [] }
       step.value = 0
     } else {
-      message.error(e instanceof Error ? e.message : String(e))
+      toastError(e)
     }
   } finally {
     createPending = false
@@ -359,7 +384,7 @@ async function startCreatedAccount(): Promise<void> {
     clearFirstSecret()
     if (!flowActive) return
     startError.value = e instanceof Error ? e.message : String(e)
-    message.error(startError.value)
+    toastError(`启动失败:${startError.value}`)
   }
 }
 
@@ -387,7 +412,7 @@ async function submitFirstSecret(): Promise<void> {
     } else {
       clearFirstSecret()
       passwordError.value = e instanceof Error ? e.message : String(e)
-      message.error(passwordError.value)
+      toastError(passwordError.value)
     }
   } finally {
     if (flowActive && version === secretVersion) passwordBusy.value = false
@@ -417,8 +442,10 @@ watch(() => [account.value?.state, stateCode.value] as const, ([s, c]) => {
     step.value = channel.value === 'qq' ? 2 : 4
     void submitFirstSecret()
   }
-  if (channel.value === 'wechat') {
-    if (c === 'WAIT_NARRATOR') step.value = 3
+  if (channel.value === 'wechat' && s !== 'running') {
+    const open = wxOpen()
+    if (open.running && (c === 'WAIT_NARRATOR' || c === 'WAIT_UI_TREE')) step.value = open.loggedIn ? 5 : 4
+    else if (c === 'WAIT_NARRATOR' || c === 'WAIT_UI_TREE') step.value = 3
     else if (c === 'WAIT_QRCODE') step.value = 4
     else if (c === 'WAIT_KEY_IMG' || c === 'WAIT_KEY_RELOGIN' || c === 'KEY_FAIL') step.value = 5
   }
@@ -450,7 +477,7 @@ async function submitPassword(): Promise<void> {
   } catch (e) {
     if (!flowActive || version !== secretVersion) return
     passwordError.value = e instanceof Error ? e.message : String(e)
-    message.error(passwordError.value)
+    toastError(passwordError.value)
   } finally {
     if (flowActive && version === secretVersion) passwordBusy.value = false
   }
@@ -489,9 +516,53 @@ async function reinstall(): Promise<void> {
     await loadWxStatus()
     step.value = 1
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    toastError(e)
   } finally {
     busy.value = false
+  }
+}
+
+/**
+ * 步④ 的按钮此前没有任何处理(2026-10-10 安琳:「点了没反应」)。讲述人由 WinAgent 会话代理自动开启(05 §2.4.3),
+ * 控制台不能也不该去起它;这里只做一件诚实的事:读 #33 `login/status`(白名单③只读),把讲述人现状说清楚。
+ */
+const wxNarratorChecking = ref(false)
+function wxOpen(): { running: boolean; loggedIn: boolean } {
+  const w = (wxStatus.value?.wechat ?? {}) as { running?: boolean; logged_in?: boolean; pid?: number | null }
+  return { running: Boolean(w.running || w.pid), loggedIn: Boolean(w.logged_in) }
+}
+
+/** 微信已经在跑(前台、托盘、已登录)就不要停在讲述人。取钥不依赖讲述人。 */
+async function continuePastNarrator(): Promise<boolean> {
+  await loadWxStatus()
+  const open = wxOpen()
+  if (!open.running) return false
+  if (createdId.value) {
+    try { await accountsApi.start(createdId.value) } catch { /* 已在启动或状态不允许时,仍按检测到的微信往下走 */ }
+  }
+  step.value = open.loggedIn ? 5 : 4
+  message.success(open.loggedIn ? '已检测到微信已登录,跳过讲述人,进入取钥。' : '已检测到微信窗口,跳过讲述人,请在微信里完成登录。', TOAST_S)
+  return true
+}
+
+async function checkNarrator(): Promise<void> {
+  if (!window.qt?.wa) {
+    toastError('桌面控制台之外无法读取微信状态。请先打开本机微信。')
+    return
+  }
+  wxNarratorChecking.value = true
+  try {
+    if (await continuePastNarrator()) return
+    const st = (await window.qt.wa.invoke('wechat.login.status', {})) as { phase?: string; narrator?: { state?: string; remaining_s?: number | null; stop_pending?: boolean } }
+    const n = st.narrator ?? {}
+    if (st.phase === 'idle') toastError('没有检测到微信进程。请先打开微信(缩在托盘时先点开窗口),然后点「微信已打开,继续」。')
+    else if (n.stop_pending) message.info('正在关闭讲述人,请稍候。', TOAST_S)
+    else if (n.state === 'running') message.success('讲述人正在运行。微信取钥不需要等满 5 分钟。', TOAST_S)
+    else toastError('没有检测到微信进程。请先打开微信,然后点「微信已打开,继续」。')
+  } catch (e) {
+    toastError(e)
+  } finally {
+    wxNarratorChecking.value = false
   }
 }
 
@@ -502,18 +573,33 @@ async function startWechatFlow(): Promise<void> {
     const r = target ? await accountsApi.switchTo(target) : await accountsApi.switchNew()
     createdId.value = target ?? r.target
     await accounts.load()
-    step.value = 3
+    await loadWxStatus()
+    const open = wxOpen()
+    step.value = open.loggedIn ? 5 : open.running ? 4 : 3
+    if (open.running) message.success(open.loggedIn ? '微信已登录,直接进入取钥。' : '微信已打开,请在窗口里完成登录。', TOAST_S)
     armStallTimer()
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    toastError(e)
   } finally {
     busy.value = false
   }
 }
 
+/**
+ * R6-91:向导里的号还没走完绑定(wxid 未回填)——只调 WinAgent `key/retry` 就算取到钥也没人做回填/绑定,账号救不回来。
+ * 改为让 Agent 重跑这个号的登录流(#9 start;degraded(KEY_FAIL|WAIT_UI_TREE) 的微信号允许重跑,**不登出微信**)。
+ */
 async function keyRetry(): Promise<void> {
-  await window.qt?.wa.invoke('wechat.key.retry', {})
-  message.info('已请求重新取钥:将重走 起 hook → 打开图片 → 退出重登')
+  if (!createdId.value || busy.value) return
+  busy.value = true
+  try {
+    await accountsApi.start(createdId.value)
+    message.info('已重新发起取钥:装好 hook 后请按提示先打开一张图片,再退出微信并快捷登录', TOAST_S)
+  } catch (e) {
+    toastError(e)
+  } finally {
+    busy.value = false
+  }
 }
 
 /** 向导内「取消」也走 Agent 级取消(R4-4),不打 WinAgent 17610 */
@@ -524,36 +610,12 @@ async function cancelWechatLogin(): Promise<void> {
     if (r.stale) message.info('该次登录尝试已结束')
     else message.success('已取消本次登录')
   } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
+    toastError(e)
   } finally {
     await resources.load()
     go('/acct')
   }
 }
-
-async function pollWechatPreview(): Promise<void> {
-  if (!createdId.value) return
-  try {
-    const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
-    if (v && v.visible === false) { wxPreviewSrc.value = ''; return }
-    // #33 是二进制 + 响应头(媒体 id / sha256 在头里);这里只做预览,拿 blob 即可
-    const shot = await accountsApi.screenshot(createdId.value)
-    if (!shot.blob) { wxPreviewSrc.value = ''; return }
-    if (wxPreviewSrc.value) URL.revokeObjectURL(wxPreviewSrc.value)
-    wxPreviewSrc.value = URL.createObjectURL(shot.blob)
-  } catch {
-    wxPreviewSrc.value = ''
-  }
-}
-
-watch(step, (s) => {
-  if (channel.value === 'wechat' && s === 4) {
-    if (!wxPreviewTimer) wxPreviewTimer = setInterval(() => void pollWechatPreview(), 2000)
-  } else if (wxPreviewTimer) {
-    clearInterval(wxPreviewTimer)
-    wxPreviewTimer = null
-  }
-})
 
 watch(createdId, () => { screenOpen.value = false })
 
@@ -564,8 +626,6 @@ onMounted(async () => {
 onUnmounted(() => {
   pageMounted = false
   leaveFlow()
-  if (wxPreviewTimer) clearInterval(wxPreviewTimer)
-  if (wxPreviewSrc.value) URL.revokeObjectURL(wxPreviewSrc.value)
 })
 </script>
 
@@ -573,11 +633,10 @@ onUnmounted(() => {
   <div class="qt-page qt-stack account-wizard">
     <header class="qt-page-heading"><div><div class="qt-eyebrow">CONNECT AN ACCOUNT</div><h1>{{ channel ? `连接${CHANNEL_TEXT[channel]}账号` : '把新的账号，带入工作台' }}</h1><p>按步骤完成准备与登录，进度会随真实账号状态更新。</p></div><span class="wizard-security">凭据受控 · 账号独立</span></header>
     <section v-if="cancelError" class="qt-card box">
-      <p class="qt-danger">取消失败:{{ cancelError }}</p>
       <p>账号 {{ createdId }} 的进度已保留,可重试取消或刷新恢复。</p>
     </section>
     <section v-if="restoreError" class="qt-card box">
-      <p class="qt-danger">无法恢复创建进度:{{ restoreError }}</p>
+      <p>上次的创建进度还没读回来。</p>
       <a-button :loading="busy" :data-testid="T.retry" @click="restorePendingFlow">重新读取账号进度</a-button>
     </section>
     <!-- 入口:选分支 -->
@@ -709,7 +768,6 @@ onUnmounted(() => {
           <a-button :data-testid="T.qrRefresh" @click="refreshQr">刷新二维码</a-button>
           <a-button :data-testid="T.qrOpenWebui" @click="openWebui">在浏览器打开 NapCat WebUI</a-button>
         </div>
-        <p v-if="startError" class="qt-danger">启动失败:{{ startError }}</p>
         <div v-if="startError || ['created', 'stopped', 'error'].includes(account.state)" class="qt-row">
           <a-button :loading="busy" :data-testid="T.retry" @click="retryStart">重试启动</a-button>
           <a-button danger :disabled="busy" :data-testid="T.deleteBack" @click="deleteAndBack">删除并返回</a-button>
@@ -742,8 +800,6 @@ onUnmounted(() => {
           :disabled="busy || passwordBusy"
           @click="openPasswordModal"
         >输入密码登录</a-button>
-        <p v-if="passwordError" class="qt-danger">{{ passwordError }}</p>
-        <p v-if="startError" class="qt-danger">启动失败:{{ startError }}</p>
         <div v-if="startError || ['created', 'stopped', 'error'].includes(account.state)" class="qt-row">
           <a-button :loading="busy" :data-testid="T.retry" @click="retryStart">重试启动</a-button>
           <a-button danger :disabled="busy" :data-testid="T.deleteBack" @click="deleteAndBack">删除并返回</a-button>
@@ -755,15 +811,15 @@ onUnmounted(() => {
       <section v-if="channel === 'wechat' && step === 0" class="qt-card box">
         <div class="qt-section-title">检查模块与槽位</div>
         <div :data-testid="T.wxModuleStatus" class="qt-col">
-          <div>微信模块:{{ wxStatus?.module_enabled ? '已启用' : '未启用' }}</div>
-          <div>用户会话代理:{{ wxStatus?.user_agent ? '在线' : '不在线' }}</div>
+          <div>微信模块:{{ wxModuleEnabled ? '已启用' : '未启用' }}</div>
+          <div>用户会话代理:{{ session.userAgentOnline ? '在线' : '不在线' }}</div>
           <div>槽位:holder {{ resources.slots?.holder || '—' }} · pending {{ resources.slots?.pending || '—' }}</div>
         </div>
-        <a-popconfirm v-if="!wxStatus?.module_enabled" title="启用本机微信模块，以便继续添加微信账号？" @confirm="enableWechatModule">
+        <a-popconfirm v-if="!wxModuleEnabled" title="启用本机微信模块，以便继续添加微信账号？" @confirm="enableWechatModule">
           <a-button :data-testid="T.wxEnableModule" :loading="busy" :disabled="busy || !session.winagentOnline">启用微信模块</a-button>
         </a-popconfirm>
-        <p v-if="wxEnableError" role="alert" class="qt-danger">{{ wxEnableError }}</p>
-        <p v-if="!wxStatus?.user_agent" class="qt-warn" :data-testid="T.wxUserAgentHint">请先登录 Windows 桌面</p>
+        <p v-if="!session.winagentOnline" class="qt-warn" :data-testid="T.wxUserAgentHint">WinAgent 服务未运行:微信由 Windows 侧 WinAgent 承载,需先安装并启动 WinAgent 服务与会话代理,才能启用微信模块。</p>
+        <p v-else-if="!session.userAgentOnline" class="qt-warn" :data-testid="T.wxUserAgentHint">请先登录 Windows 桌面</p>
         <p v-if="resources.hasPending" class="qt-danger">另一次切换正在进行,不能继续。</p>
         <p v-else-if="holderBusy" class="qt-warn" :data-testid="T.wxHolderHint">
           当前 {{ resources.slots?.holder }} 在线,新增会先登出它;历史档案保留。
@@ -774,10 +830,10 @@ onUnmounted(() => {
       <section v-if="channel === 'wechat' && step === 1" class="qt-card box">
         <div class="qt-section-title">版本匹配</div>
         <div class="qt-card inner" :data-testid="T.wxMatch">
-          <div>检测到的版本:{{ (wxStatus?.installed as any[])?.[0]?.version ?? '—' }}</div>
+          <div>检测到的版本:{{ wxDetected?.version ?? wxVersionMatch?.current_version ?? (wxDetected?.installed === false ? '未安装' : '—') }}</div>
           <div>结论:<b>{{ WECHAT_MATCH[wxMatch] ?? wxMatch ?? '—' }}</b></div>
           <div>处理:{{ WECHAT_ACTION[wxAction] ?? wxAction ?? '—' }}</div>
-          <div class="qt-small qt-muted">随包版本 {{ wxStatus?.bundled_version ?? '—' }}</div>
+          <div class="qt-small qt-muted">随包版本 {{ wxVersionMatch?.bundled_version ?? '—' }}</div>
         </div>
         <div v-if="wxMatch === 'MULTIPLE_INSTALLS'" class="qt-col">
           <a-radio-group v-model:value="wxPickIndex">
@@ -829,11 +885,11 @@ onUnmounted(() => {
       <!-- 微信 ④ 讲述人仪式 -->
       <section v-if="channel === 'wechat' && step === 3" class="qt-card box">
         <div class="qt-section-title">讲述人仪式</div>
-        <p>pyweixin 需要讲述人先于微信登录开启并持续 ≥5 分钟;可静音,不要关闭讲述人。</p>
+        <p>取钥不需要讲述人,也不需要等 5 分钟。微信已经开着(包括缩在任务栏)会自动跳过这一步;没检测到时先打开微信,再点下面的按钮。</p>
         <PromptCard :prompt="prompt" :state-code="stateCode" :testid="T.promptCard" :timer-testid="T.wxNarratorTimer" />
         <div class="qt-row">
-          <a-button :data-testid="T.wxNarratorOpen">开启讲述人(Win + Ctrl + Enter)</a-button>
-          <a-button v-if="stateCode === 'WAIT_UI_TREE'" :data-testid="T.wxNarratorRedo">再做一次仪式</a-button>
+          <a-button type="primary" :loading="wxNarratorChecking" :data-testid="T.wxNarratorOpen" @click="checkNarrator">微信已打开,继续</a-button>
+          <a-button v-if="stateCode === 'WAIT_UI_TREE'" :data-testid="T.wxNarratorRedo" :loading="busy" @click="keyRetry">再做一次仪式</a-button>
           <a-button danger :data-testid="T.wxCancel" @click="cancelWechatLogin">取消</a-button>
         </div>
         <p class="qt-small qt-muted" :data-testid="T.wxSessionHint">
@@ -844,9 +900,8 @@ onUnmounted(() => {
       <!-- 微信 ⑤ 首次登录 -->
       <section v-if="channel === 'wechat' && step === 4" class="qt-card box">
         <div class="qt-section-title">首次登录(扫码 / 快捷登录均可)</div>
-        <p>请在微信 PC 窗口登录。微信没有取码接口,这里显示的是窗口截图预览。</p>
-        <img v-if="wxPreviewSrc" :data-testid="T.wxQrPreview" class="preview" :src="wxPreviewSrc" alt="微信窗口预览" />
-        <p v-else class="qt-warn" :data-testid="T.wxQrPreview">微信窗口不可见</p>
+        <!-- R6-94:不再拉微信窗口截图 —— 窗口就在本机桌面,直接在微信里扫码 / 快捷登录 -->
+        <p>请在本机的微信 PC 窗口完成登录(扫码或快捷登录均可);登录成功后这里会自动进入下一步。</p>
         <div class="qt-row">
           <a-button :data-testid="T.wxRelaunch" @click="startWechatFlow">重新发起</a-button>
           <a-button danger :data-testid="T.wxCancel" @click="cancelWechatLogin">取消</a-button>
@@ -905,6 +960,7 @@ onUnmounted(() => {
         <div :data-testid="T.doneSummary" class="qt-col">
           <div>账号 {{ createdId }} · {{ account?.label }}</div>
           <div>昵称 {{ account?.self_nick ?? '—' }}</div>
+          <div v-if="channel === 'qq'">QQ 号 {{ account?.self_uid ?? '—' }}</div>
           <div v-if="channel === 'qidian'">端口 adb{{ account?.runtime?.adb_port }} 流{{ account?.runtime?.stream_port }}</div>
           <div v-if="channel === 'qq'" class="qt-small qt-muted">设备指纹已存入 qq_data 卷,下次启动免扫码;请勿删除数据卷。</div>
           <div v-if="channel === 'wechat'" class="qt-small qt-muted">

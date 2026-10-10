@@ -273,8 +273,12 @@ export interface AlertCodeMeta {
  */
 export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   H01_AGENT_API_DOWN: { severity: 'crit', event: 'alert' },
-  H02_WINAGENT_API_DOWN: { severity: 'crit', event: 'alert' },
-  H03_DOCKERD_DOWN: { severity: 'crit', event: 'alert' },
+  // Agent 对 H02/H03 只发码不带 message(app.py 直接 alerts.firing),按 §2.9 约定 6 在此配中文,免得铃里甩出裸枚举。
+  H02_WINAGENT_API_DOWN: {
+    severity: 'crit', event: 'alert',
+    zh: 'WinAgent 服务不可达(连续 3 次 ping 失败):Windows 侧服务未运行或端口不通。微信模块、凭据保险库与整机内存读数在恢复前不可用。',
+  },
+  H03_DOCKERD_DOWN: { severity: 'crit', event: 'alert', zh: 'WSL 内 dockerd 未运行:企点/QQ 容器无法启动或巡检,请到环境页检查发行版与 Docker 状态。' },
   H04_CONTAINER_EXITED: { severity: 'crit', event: 'alert' },
   H05_BOOT_INCOMPLETE: { severity: 'crit', event: 'alert' },
   H06_ADB_OFFLINE: { severity: 'warn', event: 'alert' },
@@ -303,7 +307,7 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   ALERT_STORM: { severity: 'warn', event: 'alert' },
   WSLCONFIG_PENDING_RESTART: { severity: 'info', event: 'alert' },
   WSL_SUBNET_CHANGED: { severity: 'info', event: 'alert' },
-  POOL_CALIBRATION_DRIFT: { severity: 'info', event: 'resource' },
+  POOL_CALIBRATION_DRIFT: { severity: 'info', event: 'resource', zh: '资源配额与实际占用偏差较大,建议到资源页重新校准' },
   NET_STATE_CHANGED: { severity: 'info', event: 'net' },
 
   // ── MAIL_* 十四码(R6-33:一律用 02 §3.7 全集,小写 kind 名与 imap_fallback 作废)
@@ -387,6 +391,7 @@ export const HINT_ACTIONS: Record<string, string> = {
   open_env: '去环境页',
   wechat_reinstall_bundled: '用随包版本重装微信',
   fix_firewall: '修复防火墙规则',
+  calibrate: '去资源页校准',
   wechat_switch: '去切换微信账号',
   retry_key: '重试取钥',
   open_account: '去账号页',

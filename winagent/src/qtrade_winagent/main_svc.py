@@ -225,12 +225,15 @@ def expand(path: str, root: str) -> str:
 
 
 def read_toml(path: str) -> dict[str, Any]:
+    """读 ``winagent.toml``;不存在 ⇒ 空(全默认)。**容忍 UTF-8 BOM**:Windows 记事本 / PowerShell 5.1 ``Set-Content``
+    写出的文件常带 BOM,``tomllib.load`` 遇 BOM 直接 ``Invalid statement (line 1)`` ⇒ 服务起不来。"""
+    import tomllib
     try:
-        import tomllib
         with open(path, "rb") as f:
-            return tomllib.load(f)
+            raw = f.read()
     except FileNotFoundError:
         return {}
+    return tomllib.loads(raw.decode("utf-8-sig"))
 
 
 def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fake: bool = False) -> SvcDeps:
@@ -279,10 +282,15 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
     installer = InstallerOps(db, kernel_dir=place(cfg.wsl.kernel_dir, root),
                              wsl_backup_dir=place(cfg.wsl.backup_dir, root), package_version=__version__,
                              crypto=crypto, audit=audit, hub=hub)
+    narrator_killer = None
+    if not fake:
+        from .win.wechat import WinWeChat
+        narrator_killer = WinWeChat.kill_narrator_elevated                 # R6-89:讲述人只能由提权侧结束
     return SvcDeps(cfg=cfg, db=db, audit=audit, vault=vault, monitor=monitor, netprobe=netprobe,
                    power=Power(db, pwrb, sysb, cfg.wechat, audit=audit), hub=hub,
                    wechat_store=WeChatStore(db), hosts_block=WeChatHostsBlock(hostsb, cfg.wechat, cfg.probe),
-                   installer=installer, alerts=alerts, tokens=Tokens(), started_ms=int(time.time() * 1000))
+                   installer=installer, alerts=alerts, tokens=Tokens(), started_ms=int(time.time() * 1000),
+                   narrator_killer=narrator_killer)
 
 
 async def load_tokens(d: SvcDeps) -> None:
@@ -341,9 +349,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("--dev 必须显式给 --root(否则默认落进生产目录 %ProgramData%\\QTrade\\winagent);"
                  "照 README §3 的写法:--dev --root /tmp/wa-dev")
     root = args.root or DEFAULT_ROOT
-    cfg = load_cfg(read_toml(args.config or os.path.join(root, "winagent.toml")))
+    config_path = args.config or os.path.join(root, "winagent.toml")
+    cfg = load_cfg(read_toml(config_path))
     setup_logging(cfg.log.level, None if args.dev else os.path.join(root, "logs"))
     d = build_real_deps(cfg, root=root, install_user_sid=args.install_user_sid, fake=args.dev)
+    d.config_path = None if args.dev else config_path                    # R6-88:#43 写回真值;--dev 不落盘
     listeners = Listeners(cfg.api.port)
     tasks: set[asyncio.Task] = set()                                   # 留住后台任务引用,防被 GC
 

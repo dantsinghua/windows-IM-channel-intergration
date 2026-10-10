@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import subprocess
 from typing import Any, Optional
 
 from ..backends import Adapter, ProxyInfo
-from . import require_windows
+from . import require_windows, run_text
 
 PS = ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
 WSL_DESC = "Hyper-V Virtual Ethernet Adapter"
@@ -22,8 +21,7 @@ WSL_FALLBACK_NET = "172.16.0.0/12"
 
 
 def _ps_json(script: str, timeout: int = 15) -> Any:
-    out = subprocess.run(PS + [script + " | ConvertTo-Json -Depth 4 -Compress"],
-                         capture_output=True, text=True, timeout=timeout).stdout.strip()
+    out = run_text(PS + [script + " | ConvertTo-Json -Depth 4 -Compress"], timeout=timeout).stdout.strip()
     if not out:
         return []
     data = json.loads(out)
@@ -72,7 +70,7 @@ class WinNet:
     def proxy(self) -> ProxyInfo:
         require_windows("代理识别")
         winhttp = None
-        out = subprocess.run(["netsh", "winhttp", "show", "proxy"], capture_output=True, text=True, timeout=10).stdout or ""
+        out = run_text(["netsh", "winhttp", "show", "proxy"], timeout=10).stdout or ""
         for line in out.splitlines():
             if ":" in line and ("Proxy Server" in line or "代理服务器" in line):
                 v = line.split(":", 1)[1].strip()

@@ -1,4 +1,4 @@
-# R6-82 behavioral regressions. All WSL calls are mocked.
+﻿# R6-82 behavioral regressions. All WSL calls are mocked.
 #requires -Version 5.1
 BeforeAll {
     if (Test-Path -LiteralPath 'C:\ProgramData\QTrade') { throw 'Protected ProgramData root exists.' }

@@ -135,6 +135,8 @@ QTrade-Setup-<ver>.exe(≈3 GB,单文件,签名)
 | `pkg/scrcpy` | `third_party/scrcpy` | `QT_SRC_SCRCPY` | | |
 | `pkg/chatlog` | `third_party/chatlog` | `QT_SRC_CHATLOG` | | |
 | `pkg/wechat/weixin_4.1.12.26.exe` | `third_party/wechat/…` | `QT_SRC_WECHAT` | ✓ | ✓ |
+| `pkg/pyweixin/pywechat127-1.9.8-py3-none-any.whl` | `winagent/vendor/pyweixin/…`(仓库内;备选 `third_party/pyweixin/…`) | `QT_SRC_PYWEIXIN` | ✓ | ✓ |
+| `pkg/pyweixin/LICENSE`、`SOURCE.txt` | `winagent/vendor/pyweixin/…` | `QT_SRC_PYWEIXIN_LICENSE` / `_SOURCE` | | |
 | `pkg/vcredist/VC_redist.x64.exe` | `third_party/vcredist/…` | `QT_SRC_VCREDIST` | | ✓ |
 | `winagent/python` | `winagent/dist/python` | `QT_SRC_WA_PYTHON` | | |
 | `winagent/app` | `winagent/dist/qtrade-winagent-svc` **+** `winagent/dist/qtrade-winagent-user` | `QT_SRC_WA_APP` | | |

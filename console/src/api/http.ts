@@ -22,8 +22,19 @@ import type { Envelope, ApiError } from './types'
  */
 export const API_MIN_VERSION = '1.0'
 
-/** 渲染进程只连 Agent 17600;17610 被主进程 webRequest 阻断(R-07/§11.19) */
-export const AGENT_BASE = '/api/v1'
+/**
+ * Agent 源:浏览器形态(Vite dev / 真机 Edge 预览)用同源相对路径 `/api/v1`,由 dev 代理转发;
+ * Electron 形态由 preload 暴露 `qt.endpoint.agent`(来自 console.toml `[endpoint] agent`,主进程只对该源注入令牌、
+ * CSP 也只放行该源),渲染进程据此拼**绝对**地址。2026-10-10 真实链路实测:Electron 里若仍用相对路径,请求会落到
+ * 页面来源(Vite 5313 或 file://),被 CSP `connect-src` 整体拒绝,桌面壳一条 API 都发不出去。
+ * 17610 被主进程 webRequest 阻断(R-07/§11.19),这里永远不会拼它。
+ */
+export function agentOrigin(): string {
+  if (typeof window === 'undefined') return ''
+  const o = window.qt?.endpoint?.agent
+  return typeof o === 'string' && /^https?:\/\/[^/]+$/.test(o) ? o : ''
+}
+export const AGENT_BASE = `${agentOrigin()}/api/v1`
 
 export class ApiFailure extends Error {
   readonly code: string

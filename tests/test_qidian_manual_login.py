@@ -245,7 +245,7 @@ async def test_unproven_ui_or_identity_is_never_reported_running(scenario):
     elif scenario == "form-overlay":
         adb.dumps = [tree(node(rid=f"{PKG}:id/recent_chat_list"), node(rid=f"{PKG}:id/password"))]
     elif scenario == "agreement-overlay":
-        adb.dumps = [tree(node(rid=f"{PKG}:id/recent_chat_list"), node(text="同意"))]
+        adb.dumps = [tree(node(rid=f"{PKG}:id/recent_chat_list"), node(rid=f"{PKG}:id/dialogRightBtn", text="同意"))]
     elif scenario == "sms-overlay":
         adb.dumps = [tree(node(rid=f"{PKG}:id/recent_chat_list"), node(text="短信验证"))]
     elif scenario == "missing-uid":

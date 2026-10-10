@@ -1,9 +1,10 @@
+import { fileURLToPath, URL } from 'node:url'
 import process from 'node:process';
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 
-const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || '/home/anlin/work/qtrade-build/manual-20261008-a0stq5rk/console/node_modules', '__monitor_acceptance__.cjs'))
+const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || fileURLToPath(new URL('../../node_modules', import.meta.url)), '__monitor_acceptance__.cjs'))
 const { test, expect } = require('@playwright/test')
 const ORIGIN = process.env.QT_MONITOR_UI_URL || 'http://127.0.0.1:5273'
 const evidence = process.env.QT_MONITOR_EVIDENCE || path.resolve(import.meta.dirname, '../../../.codex/test-results/20261008-monitor-fix/acceptance')

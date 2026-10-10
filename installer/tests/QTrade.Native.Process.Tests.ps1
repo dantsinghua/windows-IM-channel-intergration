@@ -1,4 +1,4 @@
-# Native process behavior regressions. No WSL, service, or installer execution.
+﻿# Native process behavior regressions. No WSL, service, or installer execution.
 #requires -Version 5.1
 BeforeAll {
     $script:ProtectedRoot = 'C:\ProgramData\QTrade'

@@ -27,3 +27,5 @@ qb_tap.user.js
 # Codex/OMX 本机运行态；项目规范、skills 和迁移说明仍可入库。
 .omx/
 .codex/handoffs/
+.codex/
+.agents/

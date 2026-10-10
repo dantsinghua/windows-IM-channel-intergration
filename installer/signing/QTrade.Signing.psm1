@@ -285,6 +285,7 @@ function Get-QtNeverSignRule {
         [pscustomobject]@{ Prefix = 'pkg/scrcpy/'; Why = 'scrcpy,上游签名(§2.2.3:不动)' }
         [pscustomobject]@{ Prefix = 'pkg/chatlog/'; Why = 'chatlog / wx_key DLL,第三方件' }
         [pscustomobject]@{ Prefix = 'pkg/wechat/'; Why = '随包微信安装包,sha256 已钉死(R2-6),改一字节即 PAYLOAD_CORRUPT' }
+        [pscustomobject]@{ Prefix = 'pkg/pyweixin/'; Why = 'pyweixin wheel (third-party, sha256 pinned by R6-92); not a PE file' }
         [pscustomobject]@{ Prefix = 'pkg/vcredist/'; Why = '微软 VC++ 运行库,微软签名' }
         [pscustomobject]@{ Prefix = 'wsl/'; Why = 'wsl.msi(微软签名)/ rootfs.tar / bzImage / wheel:非 PE 或第三方' }
         [pscustomobject]@{ Prefix = 'kernel/'; Why = '自编内核 bzImage,非 PE,不可 Authenticode' }

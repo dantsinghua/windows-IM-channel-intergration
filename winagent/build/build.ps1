@@ -90,9 +90,17 @@ Invoke-Native "升级 pip/wheel" { & $py -m pip install --upgrade pip wheel }
 Invoke-Native "装 windows+dev 依赖与 pyinstaller" { & $py -m pip install -e ".[windows,dev]" pyinstaller }
 # 会话代理侧的 UI 自动化栈(不进 pyproject 的硬依赖:Linux 上装不了)
 Invoke-Native "装 pywinauto/pillow" { & $py -m pip install pywinauto pillow }
+# R6-92: pyweixin is REQUIRED (the WeChat send path). It is vendored in winagent/vendor/pyweixin as a wheel
+# built from upstream github.com/Hello-Mr-Crab/pywechat @ 8589baa; the sha256 below must match, otherwise stop.
+$pyweixinWheel = Join-Path $root "vendor\pyweixin\pywechat127-1.9.8-py3-none-any.whl"
+$pyweixinSha = "a98ab028d284917099201a2cefbcbe1ba8c36a02ea136b4b2632539167e7792e"
+if (-not (Test-Path -LiteralPath $pyweixinWheel)) { throw "pyweixin wheel missing: $pyweixinWheel (R6-92: required)" }
+$gotSha = (Get-FileHash -LiteralPath $pyweixinWheel -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($gotSha -ne $pyweixinSha) { throw "pyweixin wheel sha256 mismatch: expected $pyweixinSha, got $gotSha" }
+Invoke-Native "install pyweixin (vendored wheel + its deps)" { & $py -m pip install $pyweixinWheel }
 # 就地自检:第 3 步要用的东西现在就确认装到了**这个** venv 里,别等跑到第 3 步才发现缺件。
 Invoke-Native "自检 pytest/pyinstaller 可导入" { & $py -c "import pytest, PyInstaller" }
-Write-Host "    ⚠️ pyweixin 不在公共源上:按 03 的随包清单从本地 wheel 安装后再打包(缺它则微信发送不可用)" -ForegroundColor Yellow
+Invoke-Native "self-check: pyweixin send API importable" { & $py -W ignore -c "from pyweixin import Messages, Files; Messages.send_messages_to_friend; Files.send_files_to_friend" }
 
 Write-Host "[3/6] 跑单元测试(全假后端;不碰真系统状态)" -ForegroundColor Cyan
 & $py -m pytest -q

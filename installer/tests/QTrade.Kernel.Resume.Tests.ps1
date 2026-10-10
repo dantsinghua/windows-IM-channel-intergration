@@ -1,4 +1,4 @@
-# Execute only parsed dispatcher branches with fake boundaries, never run-step itself.
+﻿# Execute only parsed dispatcher branches with fake boundaries, never run-step itself.
 #requires -Version 5.1
 BeforeAll {
     if (Test-Path -LiteralPath 'C:\ProgramData\QTrade') { throw 'Protected ProgramData root exists.' }

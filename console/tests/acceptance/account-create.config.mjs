@@ -1,8 +1,9 @@
+import { fileURLToPath, URL } from 'node:url'
 import process from 'node:process';
 import { createRequire } from 'node:module'
 import path from 'node:path'
 
-const modules = process.env.QT_PW_NODE_MODULES || '/home/anlin/work/qtrade-build/manual-20261008-a0stq5rk/console/node_modules'
+const modules = process.env.QT_PW_NODE_MODULES || fileURLToPath(new URL('../../node_modules', import.meta.url))
 const require = createRequire(path.join(modules, '__acceptance__.cjs'))
 const { defineConfig } = require('@playwright/test')
 

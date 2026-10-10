@@ -14,7 +14,7 @@ BeforeAll {
     }
 }
 
-Describe 'B6:Resolve-QtKernelSwitchFailure —— 「与 QTrade 内核无关」只在原装内核也起不来时才说' {
+Describe 'R6-82: rollback diagnostics preserve uncertainty about other distributions' {
 
     It '回滚成功 + KERNEL_BOOT_FAILED → 说 QTrade 内核未能启动、已恢复原内核,保留原因码' {
         $ver = [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = 'QTrade 内核下 WSL2 未能正常启动(uname 输出不是版本串)' }
@@ -46,13 +46,14 @@ Describe 'B6:Resolve-QtKernelSwitchFailure —— 「与 QTrade 内核无关」�
         $f.Message | Should -Match '^切换失败\(KERNEL_NO_BINDER\),已恢复原内核'
     }
 
-    It '回滚后原装内核也起不来(Stage=verify)→ KERNEL_ROLLBACK_FAILED,此时才说与 QTrade 内核无关' {
+    It 'failed rollback probe reports unverified recovery without generalizing to other distributions' {
         $ver = [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_BOOT_FAILED'; Message = 'x' }
         $rb = [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'verify' }
         $f = Resolve-QtKernelSwitchFailure -Verify $ver -Rollback $rb
         $f.Reason | Should -Be 'KERNEL_ROLLBACK_FAILED'
         $f.ExitName | Should -Be 'E_INSTALL_KERNEL_ROLLBACK_FAILED'
-        $f.Message | Should -Match '与 QTrade 内核无关'
+        $f.Message | Should -Match 'Kernel recovery is unverified'
+        $f.Message | Should -Match 'does not establish whether other WSL distributions can start'
         $f.Message | Should -Match 'KERNEL_BOOT_FAILED'
     }
 
@@ -93,7 +94,7 @@ Describe 'B6 端到端(验证 → 回滚 → 文案),Invoke-QtWsl 打桩' {
         $f.Message | Should -Not -Match '与 QTrade 内核无关'
     }
 
-    It '回滚后原装内核 uname 也不像版本串 → Stage=verify,文案说与 QTrade 内核无关' {
+    It 'invalid uname after rollback keeps verify failure and does not claim the kernel is unrelated' {
         Mock -ModuleName QTrade.Kernel Invoke-QtWsl {
             if ($WslArgs -contains '--shutdown') { return (New-R) }
             return (New-R -Out $script:Hcs)
@@ -104,7 +105,8 @@ Describe 'B6 端到端(验证 → 回滚 → 文案),Invoke-QtWsl 打桩' {
         $rb.Stage | Should -Be 'verify'
         $f = Resolve-QtKernelSwitchFailure -Verify $ver -Rollback $rb
         $f.Reason | Should -Be 'KERNEL_ROLLBACK_FAILED'
-        $f.Message | Should -Match '与 QTrade 内核无关'
+        $f.Message | Should -Match 'Kernel recovery is unverified'
+        $f.Message | Should -Match 'does not establish whether other WSL distributions can start'
     }
 
     It '回滚 shutdown 超时 → Stage=shutdown' {
@@ -152,7 +154,8 @@ Describe '预演 #16:Save-QtKCheckDmesg' {
     It '超时不抛,文件里写明抓取超时' {
         Mock -ModuleName QTrade.Kernel Invoke-QtWsl { New-R -Code -1 -TimedOut $true }
         $p = Save-QtKCheckDmesg -Directory (Join-Path $TestDrive 'logs2') -Stamp 't'
-        [IO.File]::ReadAllText($p) | Should -Match '抓取超时'
+        [IO.File]::ReadAllText($p) | Should -Match 'collection timed out after 30 s'
+        [IO.File]::ReadAllText($p) | Should -Match 'timed_out=True'
     }
 
     It 'wsl 调用直接抛异常 → 回空串,不打断失败路径' {

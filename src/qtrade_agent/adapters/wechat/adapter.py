@@ -190,8 +190,14 @@ class WechatAdapter:
         except WeChatNotReady as e:
             return _with_trace(_not_ready(f"微信发送不可用({e.reason})", e.reason), trace)
         except WeChatCallFailed as e:
+            err = (e.body.get("error") or {}) if isinstance(e.body, dict) else {}
+            if e.status == 404:
+                # R6-92:找不到会话 / 显示名重名 ⇒ WinAgent **没有发**(重名拒发是防发错对象);不是 SEND_FAILED,不可盲重试
+                return CommandResult(ok=False, code="TARGET_NOT_FOUND", trace_id=trace, source="chatlog",
+                                     error=CommandError(str(err.get("message") or "微信会话不存在或无法唯一定位"),
+                                                        reason=str(err.get("reason") or "target_not_found"), retryable=False))
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog",
-                                 error=CommandError(f"WinAgent 发送失败 status={e.status}", retryable=True))
+                                 error=CommandError(str(err.get("message") or f"WinAgent 发送失败 status={e.status}"), retryable=True))
         if res.get("code") == "DELIVERED" and res.get("ext_msg_id"):
             self._ingest_readback(acct, native, str(res["ext_msg_id"]), cmd.args.get("text"), res.get("confirm_ms"))
             return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog",

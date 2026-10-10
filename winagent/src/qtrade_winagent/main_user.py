@@ -40,7 +40,9 @@ def build_user_agent(cfg: WinAgentConfig, *, session_id: str, user_sid: str, roo
         wsl = WinWsl(distro=cfg.wsl.distro)
         power = WinPower()
         wx = WinWeChat(exe_path=cfg.wechat.exe_path, chatlog_dir=os.path.expandvars(cfg.wechat.chatlog_dir),
-                       chatlog_port=cfg.wechat.chatlog_port, main_wnd_class=cfg.wechat.main_wnd_class,
+                       chatlog_port=cfg.wechat.chatlog_port,
+                       chatlog_work_dir=os.path.expandvars(cfg.wechat.chatlog_work_dir),
+                       main_wnd_class=cfg.wechat.main_wnd_class,
                        process_close_grace_s=cfg.wechat.process_close_grace_s)
     # `.wslconfig` 备份是会话代理这一侧唯一的写入落点;fake(``--dev``)时一律重基到 ``root`` 下,
     # 与服务侧 ``build_real_deps`` 同一条自包含口径(不靠「%ProgramData% 展不开」的巧合)。
@@ -65,6 +67,14 @@ async def run_forever(ua: UserAgent) -> int:
                 log.error("与服务主版本不一致,请整包升级", extra={"op": "pipe.hello", "code": VERSION_MISMATCH})
                 return 4
             log.warning("握手失败,5s 后重试", extra={"op": "pipe.hello", "code": e.code})
+            await asyncio.sleep(5)
+            continue
+        except Exception as e:                                      # noqa: BLE001
+            # 2026-10-10 真机实测:服务不在时 ``WinPipeBackend.connect`` 抛 ``pywintypes.error(2, 'CreateFile', …)``,
+            # 不是 ``WaError`` ⇒ 这里原本直接把会话代理整个进程炸掉,服务一回来也没人再连管道(health.user_agent 永远 false)。
+            # 任何连接期异常都按「服务暂不可达」处理:记日志、5s 后重试,不退出(退出只留给 FORBIDDEN / VERSION_MISMATCH)。
+            log.warning("连不上服务管道,5s 后重试", extra={"op": "pipe.hello", "code": "PIPE_UNAVAILABLE",
+                                                         "kv": {"err": type(e).__name__}})
             await asyncio.sleep(5)
             continue
         log.info("会话代理已上线", extra={"op": "pipe.hello", "code": "OK", "kv": {"ipc": welcome.get("ipc_version")}})

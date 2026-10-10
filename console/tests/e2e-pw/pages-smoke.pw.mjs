@@ -11,20 +11,17 @@ import { collectErrors, installQtStub } from './helpers.mjs'
 
 /** [路由, 该页必须出现的一段文字] */
 const ROUTES = [
-  ['/dash', '资源池'],
-  ['/res', '资源监控'],
-  ['/acct', '新增企点'],
-  ['/acct/new', '新增账号'],
-  ['/acct/qd01', '概览'],
-  ['/screen/qd01', '性能'],
-  ['/cmd', '能力'],
-  ['/flow', '工作流'],
-  ['/msg', '方向'],
-  ['/mail', '水位与健康'],
-  ['/env', '一键自检'],
-  ['/set', '保留期'],
-  ['/set/mail-templates', '出站模板'],
-  ['/log', '指令审计'],
+  ['/dash', '所有账号，一处掌握'],
+  ['/res', '看清资源，安心运行'],
+  ['/acct', '每个账号，都有自己的工作台'],
+  ['/acct/new', '把新的账号，带入工作台'],
+  ['/acct/qd01', '账号信息'],
+  ['/screen/qd01', '账号画面'],
+  ['/msg', '历史消息'],
+  ['/mail', '邮箱连接'],
+  ['/env', '让每个账号，稳定在线'],
+  ['/set', '偏好设置'],
+  ['/log', '日志与告警'],
 ]
 
 for (const [route, mustSee] of ROUTES) {
@@ -46,13 +43,16 @@ for (const [route, mustSee] of ROUTES) {
   })
 }
 
-test('左侧导航 11 个入口都能点开对应页面', async ({ page }) => {
+test('R6-81 的 8 个导航入口均可打开，退役入口不再显示', async ({ page }) => {
   const errors = collectErrors(page)
   await installQtStub(page)
   await page.goto('/#/dash')
-  for (const seg of ['dash', 'res', 'acct', 'screen', 'cmd', 'flow', 'msg', 'mail', 'env', 'set', 'log']) {
+  for (const seg of ['dash', 'res', 'acct', 'msg', 'mail', 'env', 'set', 'log']) {
     await page.getByTestId(`qt-shell-nav-${seg}`).click()
     await expect(page, `导航「${seg}」点不过去`).toHaveURL(new RegExp(`#\\/${seg}`))
+  }
+  for (const seg of ['screen', 'cmd', 'flow']) {
+    await expect(page.getByTestId(`qt-shell-nav-${seg}`)).toHaveCount(0)
   }
   expect(errors.filtered()).toEqual([])
 })
@@ -89,14 +89,14 @@ test('P-SET 合规块走 #86 GET /system/notice,不再调已废弃的 /settings/
     }),
   }))
   await page.goto('/#/set')
-  await expect(page.getByTestId('qt-set-compliance-version')).toBeVisible()
+  await expect(page.getByText('已确认当前版本的使用告知')).toBeVisible()
   await page.waitForTimeout(1500)
   expect(notFound, '不该再有 404').toEqual([])
   expect(paths.filter((x) => x.includes('/settings/compliance')), 'SetPage 不该再 loadGroup("compliance")').toEqual([])
   expect(paths.filter((x) => x === '/system/notice').length, '合规块必须真去拉 #86').toBeGreaterThan(0)
-  await expect(page.getByTestId('qt-set-compliance-version')).toContainText('pw-compliance-9')
-  // 确认时间优先 ISO 的 `acked_at`(00 §6)
-  await expect(page.getByTestId('qt-set-compliance-ack')).toContainText('2026-09-20')
+  await page.getByRole('button', { name: '查看使用告知' }).click()
+  await expect(page.locator('.notice-text')).toHaveText('合规告知')
+  await expect(page.getByTestId('qt-set-retention-save')).toHaveCount(0)
 })
 
 test('空数据不崩:四个列表端点都回空数组时,各页渲染空态且不报错', async ({ page }) => {
@@ -108,10 +108,21 @@ test('空数据不崩:四个列表端点都回空数组时,各页渲染空态且
       body: JSON.stringify({ ok: true, data: [], next_cursor: null, trace_id: 'pw' }),
     }))
   }
-  for (const route of ['/acct', '/msg', '/mail', '/log', '/flow', '/dash']) {
+  for (const route of ['/acct', '/msg', '/mail', '/log', '/dash']) {
     await page.goto(`/#${route}`)
     await page.waitForTimeout(1200)
-    await expect(page.locator('.content, .setup').first(), `${route} 空数据下白屏了`).toBeVisible()
+    await expect(page.locator('.qt-page').first(), `${route} 空数据下白屏了`).toBeVisible()
   }
   expect(errors.filtered()).toEqual([])
 })
+
+for (const [retired, target] of [['/cmd', '/dash'], ['/flow', '/dash'], ['/set/mail-templates', '/set']]) {
+  test(`R6-81 退役路由 ${retired} 重定向至 ${target}`, async ({ page }) => {
+    const errors = collectErrors(page)
+    await installQtStub(page)
+    await page.goto(`/#${retired}`)
+    await expect(page).toHaveURL(new RegExp(`#${target}$`))
+    await expect(page.locator('.qt-page').first()).toBeVisible()
+    expect(errors.filtered()).toEqual([])
+  })
+}

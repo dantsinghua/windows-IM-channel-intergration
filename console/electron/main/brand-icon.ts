@@ -1,0 +1,6 @@
+/**
+ * 托盘 / 窗口图标:南京银行花形标(安琳 2026-10-10 指定「跟 nanyin deposit 的 ico 一致」)。
+ * 来源:~/work/qtrade/ibquote/web/public/assets/favicon.ico(37x36 PNG,sha256 前缀 f40d81f541bf4f28)。
+ * 以 data URL 内嵌,不依赖打包时资源文件的落位(开发宿主与正式包都一定找得到)。
+ */
+export const BRAND_ICON_PNG_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACUAAAAkCAMAAAA5HAOUAAAAM1BMVEUAAADlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABLlABJDhB4bAAAAEHRSTlMAYBDQQIDAIPBQMOCgkG+wR+UCwQAAAXVJREFUOMuFlFmy4yAMRcUgMRms/a+2GSxkKkm/+5ECcjSCDJ/yAf5QqIW77vQ/yER+RPY3xCr3C/P8Fv2giA/5r1A+mNuEL8VlwCchoshuOPI+H0wrfA0qXn7ZWDCOeRyEHWocYKfucWR9PprSHmjub0AD4K+5canT7sHqpNaujCWyKLyw9GplBktnG2zk7eCxcLJSCoxuttv22dKyNgh5e42SrVuU2YYXeFmkBzIzbd/DEYR9pfIfymJW50dO4h8ltodboIG1ttpBcogPRQJpdX5dS7TdrqwS64AuZxXiFZxxPz6ENjwRO7uhCFAhRIKpFEdTQ4c61THDWjdCsvK4rpFpgEmpAsxzlfX+41H3aPNXlFAs6BgiOoYEmQvd9qCqfe5HKTHe11SStkOphWWAYPBC9AC2SjtEScLsWbCmyMTBVtSc0YwBqywycIRUxaBmBV5yb6pB+/4ZsC+sQo5nPMXw1QNZU1Zgl1WJMK2LbRfdqMw/JMkotYsq4KsAAAAASUVORK5CYII='

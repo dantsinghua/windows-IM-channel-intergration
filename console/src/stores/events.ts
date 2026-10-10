@@ -11,6 +11,16 @@ const RING_SIZE = 500
 
 export const alertKey = (a: Pick<AlertPayload, 'code' | 'subject'>) => `${a.code}\u0000${a.subject}`
 
+/** 告警时间 → 毫秒;ISO 字符串、毫秒数字、缺失都能比较(缺失记 0 排最后) */
+export function seenMs(v: unknown): number {
+  if (typeof v === 'number') return v
+  if (typeof v === 'string' && v) {
+    const t = Date.parse(v)
+    return Number.isNaN(t) ? 0 : t
+  }
+  return 0
+}
+
 /** 告警 → 应该跳哪一页(01 §2.8:由 subject 与 code 前缀推出;`source` 不是字段) */
 export function alertRoute(a: Pick<AlertPayload, 'code' | 'subject'>): string {
   const { code, subject } = a
@@ -58,7 +68,8 @@ export const useEventsStore = defineStore('events', () => {
   const firing = computed(() =>
     [...alerts.value.values()]
       .filter((a) => a.state === 'firing')
-      .sort((a, b) => sevRank(b.severity) - sevRank(a.severity) || b.last_seen_at.localeCompare(a.last_seen_at)),
+      // `last_seen_at` 规格是 ISO 字符串;防御:旧版 Agent 曾发毫秒整数 / 缺字段,一律转成可比较的时间值,不让排序抛错
+      .sort((a, b) => sevRank(b.severity) - sevRank(a.severity) || seenMs(b.last_seen_at) - seenMs(a.last_seen_at)),
   )
   const unreadCount = computed(() => firing.value.length)
   const connected = computed(() => status.value === 'open')

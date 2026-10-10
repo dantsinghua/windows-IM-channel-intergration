@@ -18,6 +18,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -41,6 +44,8 @@ WAIT_KEY_RELOGIN = "WAIT_KEY_RELOGIN"      # 等用户退出微信重新登录�
 KEY_FAIL = "KEY_FAIL"
 IMG_KEY_WINDOW_S = 60                      # 05 §2.4.4a 实测:img_key 内存扫描约 60 秒
 DATA_KEY_WINDOW_S = 30                     # 🔴 data_key 只在该轮**前 30 秒**内、且必须发生「登录」那一刻
+WECHAT_READY_POLLS = 40                    # 拉起微信后等窗口出现的轮数(×0.5 s ≈ 20 s)
+WINDOW_SHOW_POLLS = 10                     # 从托盘唤醒主窗口后等它可见的轮数(×0.5 s ≈ 5 s)
 
 # 基线 §8.6 版本匹配
 MATCH_SUPPORTED = "SUPPORTED"
@@ -53,6 +58,15 @@ MATRIX_SOURCE = ("bundled", "runtime", "manual")
 
 HOSTS_BLOCK_IP = "0.0.0.0"
 H21 = "H21_WECHAT_HOSTS_BLOCK_FAILED"
+
+
+def _sha256_file(path: str) -> str:
+    """随包安装包 250 MB 级,分块算;调用方放线程里。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------- 服务:三张表
@@ -291,6 +305,9 @@ class LoginSession:
     phase_started_ms: int = 0
     narrator_started_ms: Optional[int] = None
     narrator_rounds: int = 0
+    narrator_stop_pending: bool = False   # 会话代理停不掉讲述人(高完整性),等服务侧提权结束(#33 响应随带)
+    narrator_early_attempt: bool = False  # R6-90:本次关讲述人是「未满 min 的提前探测」(失败不扣轮次)
+    narrator_early_tried: bool = False    # R6-90:提前探测已试过一次,之后必须满 min 才关
     key_rounds: int = 0
     wxid: Optional[str] = None
     nickname: Optional[str] = None
@@ -310,6 +327,11 @@ class WeChatSession:
         self._clock = clock
         self.session: Optional[LoginSession] = None
 
+    # ---------------------------------------------------------------- 本机安装定位(服务侧 #29 的事实来源)
+    def locate(self) -> dict[str, Any]:
+        """``{installed, path, version, data_root, …}``(03 §2.9.2 三来源检测由后端做);模块关闭也可查,纯只读。"""
+        return dict(self._wx.locate() or {})
+
     # ---------------------------------------------------------------- #28 status
     def status(self, *, hosts_block: Optional[dict[str, Any]] = None, screen_locked: bool = False) -> dict[str, Any]:
         if not self._cfg.enabled:                              # 模块关闭时 enabled:false 其余 null(#28 逐字)
@@ -320,16 +342,20 @@ class WeChatSession:
         keys = self._wx.key_state()
         cl = self._wx.chatlog_status()
         s = self.session
+        wxid = self._wx.current_wxid()                         # 只算一次(内部还要再 locate 一遍)
+        # 2026-10-10 真机:微信没在跑时 pywinauto 两次 exists(timeout=2) + comtypes 首次生成 + 两趟 process_iter
+        # 把本方法拖过 10s ⇒ 服务侧 #28 恒 TIMEOUT。主窗口都不在,仪式自然没做完,不必再去问 UIA。
+        ritual_done = bool(win.get("exists")) and not self._wx.narrator_running() and self._wx.ui_tree_visible()
         return {"enabled": True,
                 "wechat": {"installed": loc.get("installed"), "version": loc.get("version"),
-                           "running": win.get("exists"), "logged_in": bool(self._wx.current_wxid()),
-                           "wxid": self._wx.current_wxid(), "nickname": s.nickname if s else None, "pid": win.get("pid"),
+                           "running": win.get("exists"), "logged_in": bool(wxid),
+                           "wxid": wxid, "nickname": s.nickname if s else None, "pid": win.get("pid"),
                            # R6-58 (at):经 main_window() 探测到的主窗口类名(未识别/窗口不存在为 None);
                            # 落库走 WeChatStore.record_main_wnd_class(该 wxid, 本值)——服务侧持有 DB,本类只探测
                            "main_wnd_class": win.get("class_name")},
                 "chatlog": {"running": cl.get("running"), "port": self._cfg.chatlog_port,
                             "key_ok": bool(keys.get("ok")), "dll": cl.get("dll")},
-                "ritual_done": not self._wx.narrator_running() and self._wx.ui_tree_visible(),
+                "ritual_done": ritual_done,
                 "screen_locked": screen_locked,
                 "login_session": self.login_status() if s else None,
                 "hosts_block": hosts_block}
@@ -362,8 +388,12 @@ class WeChatSession:
         s = LoginSession(login_session_id=login_session_id or new_login_session_id(now), account_id=account_id,
                          started_ms=now, phase_started_ms=now)
         self.session = s
-        # ② 仪式判定:ui_tree_visible() 为真直接跳过(05 §2.4.3「目标是 UI 树可见,讲述人只是手段」)
-        if self._cfg.narrator_ritual == "always" or (self._cfg.narrator_ritual == "auto" and not self._wx.ui_tree_visible()):
+        # ② R6-93(2026-10-10 安琳 + 真机):**取钥 / 读消息不依赖讲述人与 UI 树** —— chatlog 取钥是内存 hook + 内存扫描,
+        #    读走 chatlog server,都不碰 UI 自动化;UI 树只有**发送**(pyweixin 走界面)才需要。此前把取钥挡在讲述人仪式
+        #    之后:真机 4.1.12.26 上讲述人已无法让 UI 树可见(上游 Weixin4.0.md 实录,本机实测 descendants=1),
+        #    于是死等 2×5 分钟再判 WAIT_UI_TREE,永远到不了取钥。现在默认(auto)直接起 hook 取钥;
+        #    只有显式 narrator_ritual="always"(老版本 / 兜底)才走阻塞仪式。发送前另行检查 UI 树(见 send)。
+        if self._cfg.narrator_ritual == "always":
             await self._wx.narrator_start()
             s.narrator_started_ms = self._clock()
             s.narrator_rounds += 1
@@ -373,13 +403,131 @@ class WeChatSession:
         return {"login_session_id": s.login_session_id, "phase": s.phase}
 
     async def _start_hook_then_qrcode(self, s: LoginSession) -> None:
-        """🔴 a) **hook 必须先于登录动作装上** —— 被 hook 的函数只在「登录」那一刻被调用(05 §2.4.4a)。"""
+        """🔴 a) **hook 必须先于登录动作装上** —— 被 hook 的函数只在「登录」那一刻被调用(05 §2.4.4a)。
+
+        R6-96(安琳 2026-10-10):覆盖「微信没打开」与「微信在后台托盘」两种情形 —— 微信没进程时**先拉起**
+        (停在扫码页,不是登录动作),这样 ``chatlog key`` 能用 ``--pid`` 挂到真正的登录主进程;已在跑(含托盘已登录)
+        则不重复拉起,直接挂 hook。拉起微信 ≠ 登录动作,hook 仍先于用户的「扫码 / 退出重登」。"""
+        await self._ensure_wechat_running()
         dll = self._next_dll(s)
         await self._wx.chatlog_start(dll)
         s.dll = dll
         s.key_rounds += 1
         await self._wx.launch()
         self._set_phase(s, "qrcode", WAIT_QRCODE)
+
+    async def _ensure_wechat_running(self) -> None:
+        """微信没进程(没打开过 / 被关)时先拉起,给取钥提供可挂的登录主进程;已在跑(前台或托盘)直接返回。"""
+        if self._wx.wechat_running():
+            return
+        await self._wx.launch()
+        # 刚起的进程还没加载 Weixin.dll,这时挂 DLL 一样「模式匹配失败」⇒ 等窗口(扫码 / 主窗)出来再挂;等不到也继续,
+        # 本轮失败会由 keytry 的「key 进程已退出」分支自动重开一轮
+        for _ in range(WECHAT_READY_POLLS):
+            if self._wx.main_window().get("exists"):
+                return
+            await asyncio.sleep(0.5)
+
+    async def _serve(self, s: LoginSession) -> None:
+        """R6-91:两钥落盘 ⇒ 停 ``key`` 进程、起 ``chatlog server``(:5030)再进 ready。此前取钥成了也没人起 server,
+        读消息 / H09 / 发送读回全部失败,账号恒 KEY_FAIL。起不来不假装 ready,判 key_failed 并给出原因。"""
+        await self._wx.chatlog_stop()
+        try:
+            await self._wx.chatlog_serve()
+        except Exception as e:                                          # noqa: BLE001 —— 原因透给向导,不吞
+            s.key_error = f"已取到密钥,但 chatlog 读服务没起来:{e}"
+            self._set_phase(s, "key_failed", KEY_FAIL)
+            return
+        self._serve_tried_ms = self._clock()
+        self._set_phase(s, "ready", None)
+
+    async def ensure_server(self) -> bool:
+        """自愈:模块启用 + 两钥在 + 微信已登录 + chatlog 没在跑 ⇒ 拉起 server(30 s 节流)。覆盖开机 / 会话代理重启 /
+        chatlog 崩溃三种情形 —— 否则全新机器每次重启后账号都卡在 KEY_FAIL,只能人工重取钥。登录流进行中不插手。"""
+        if not self._cfg.enabled:
+            return False
+        s = self.session
+        if s is not None and not s.cancelled and s.phase not in ("ready", "idle", "key_failed"):
+            return False
+        if self._wx.chatlog_status().get("running") or not self._wx.key_state().get("ok"):
+            return False
+        if not self._wx.current_wxid():
+            return False
+        now = self._clock()
+        if now - getattr(self, "_serve_tried_ms", -10**12) < 30_000:
+            return False
+        self._serve_tried_ms = now
+        try:
+            await self._wx.chatlog_serve()
+        except Exception as e:                                          # noqa: BLE001
+            log.warning("自愈拉起 chatlog server 失败", extra={"op": "wechat.serve", "code": "SERVE_FAILED", "error": repr(e)})
+            return False
+        return True
+
+    async def _after_narrator_stopped(self, s: LoginSession) -> None:
+        """05 §2.4.3 ④:讲述人已关 ⇒ 重新探可见性;可见进取钥,不可见按轮次上限再做一次或判 WAIT_UI_TREE。
+
+        R6-90:提前探测(未满 min 就关)失败**不扣轮次**——重开讲述人、标记已试过提前,下次必须满 min 才关,
+        免得「开着可见 → 关了不可见」在几秒内把 narrator_max_rounds 耗光。"""
+        if self._wx.ui_tree_visible():
+            await self._start_hook_then_qrcode(s)
+        elif s.narrator_early_attempt:
+            s.narrator_early_tried, s.narrator_early_attempt = True, False
+            await self._wx.narrator_start()
+            s.narrator_started_ms = self._clock()                  # 重开后按满 min 重新计时(轮次不变)
+        elif s.narrator_rounds >= self._cfg.narrator_max_rounds:
+            self._set_phase(s, "key_failed", "WAIT_UI_TREE")
+        else:
+            await self._wx.narrator_start()
+            s.narrator_started_ms = self._clock()
+            s.narrator_rounds += 1
+
+    async def _rearm_data_key_hook(self, s: LoginSession, reason: Optional[str]) -> None:
+        """重开一轮只为等「退出并重新登录」。同一把 DLL;轮次用尽才 KEY_FAIL,并写明要立刻重登。"""
+        if reason and s.key_rounds >= self._cfg.key_retry_per_hour:
+            s.key_error = reason + "。请点重新取钥,看到倒计时 30 秒时立刻退出微信并重新登录"
+            self._set_phase(s, "key_failed", KEY_FAIL)
+            return
+        await self._wx.chatlog_stop()
+        await self._ensure_wechat_running()
+        dll = s.dll or self._next_dll(s)
+        await self._wx.chatlog_start(dll)
+        s.dll = dll
+        if reason:
+            s.key_rounds += 1
+            s.key_error = reason
+        self._set_phase(s, "keytry", WAIT_KEY_RELOGIN)
+
+    async def _next_key_round(self, s: LoginSession, reason: str) -> None:
+        """本轮作废:未到 ``key_retry_per_hour`` 就重装 hook(换下一把 DLL)重开一轮,到了判 KEY_FAIL 并留原因。"""
+        if s.key_rounds >= self._cfg.key_retry_per_hour:
+            s.key_error = reason
+            self._set_phase(s, "key_failed", KEY_FAIL)
+            return
+        await self._wx.chatlog_stop()
+        await self._ensure_wechat_running()
+        dll = self._next_dll(s)
+        await self._wx.chatlog_start(dll)
+        s.dll = dll
+        s.key_rounds += 1
+        s.key_error = reason                           # 上一轮为什么没成,随状态带给向导
+        self._set_phase(s, "keytry", WAIT_KEY_IMG)
+
+    async def _ensure_main_window(self) -> None:
+        """pyweixin 要操作可见的主窗口:缩在托盘时窗口是隐藏的,UIA 找不到,会被误判成「UI 树不可见」。
+        没开就拉起;开着但隐藏 / 最小化就再运行一次 ``Weixin.exe``(单实例,只唤醒已有窗口,同用户双击图标)。"""
+        if not self._wx.wechat_running():
+            await self._ensure_wechat_running()
+            return
+        win = self._wx.main_window()
+        if win.get("exists") and win.get("visible") and not win.get("minimized"):
+            return
+        await self._wx.launch()
+        for _ in range(WINDOW_SHOW_POLLS):
+            win = self._wx.main_window()
+            if win.get("exists") and win.get("visible") and not win.get("minimized"):
+                return
+            await asyncio.sleep(0.5)
 
     def _next_dll(self, s: LoginSession) -> str:
         dlls = self._cfg.wxkey_dlls or ("wx_key2.dll",)
@@ -399,18 +547,25 @@ class WeChatSession:
         was_ready = s.phase == "ready"
         now = self._clock()
         if s.phase == "narrator":
-            # 自讲述人启动起满 narrator_min_seconds 且微信已登录 ⇒ 关讲述人 → 重新探可见性(05 §2.4.3 ④)
+            # 05 §2.4.3:**目标是「UI 树可见」,讲述人只是手段** —— R6-90(安琳 2026-10-10):每轮都探可见性,
+            # 一旦可见立即关讲述人进下一步,不必死等 narrator_min_seconds;该值退化为「可见性迟迟不出现」的保底上限。
             elapsed = (now - (s.narrator_started_ms or now)) / 1000
-            if elapsed >= self._cfg.narrator_min_seconds and self._wx.current_wxid():
-                await self._wx.narrator_stop()
-                if self._wx.ui_tree_visible():
-                    await self._start_hook_then_qrcode(s)
-                elif s.narrator_rounds >= self._cfg.narrator_max_rounds:
-                    self._set_phase(s, "key_failed", "WAIT_UI_TREE")
+            if s.narrator_stop_pending:
+                # 上一轮会话代理停不掉(高完整性进程),已把 stop_pending 带给服务去提权结束;这里只看它停了没
+                if not self._wx.narrator_running():
+                    s.narrator_stop_pending = False
+                    await self._after_narrator_stopped(s)
+            elif self._wx.current_wxid() and (
+                    (not s.narrator_early_tried and elapsed >= self._cfg.narrator_probe_min_seconds
+                     and self._wx.ui_tree_visible())
+                    or elapsed >= self._cfg.narrator_min_seconds):
+                # 🔴 讲述人开着时 UI 树本就可见(它正是解屏蔽手段),真判据是「**关掉之后**仍可见」——只能关了再探。
+                # 已登录 + 已可见 + 满短驻留 ⇒ 提前试一次关(成了就省掉剩下的等待);没成则重开、本次按满 min 兜底。
+                s.narrator_early_attempt = elapsed < self._cfg.narrator_min_seconds
+                if await self._wx.narrator_stop() or not self._wx.narrator_running():
+                    await self._after_narrator_stopped(s)
                 else:
-                    await self._wx.narrator_start()
-                    s.narrator_started_ms = self._clock()
-                    s.narrator_rounds += 1
+                    s.narrator_stop_pending = True
             elif not self._wx.main_window().get("exists"):
                 await self._wx.launch()                        # 仪式期间把登录窗摆出来,扫码由人做(D-2)
         elif s.phase == "qrcode":
@@ -423,22 +578,22 @@ class WeChatSession:
             self._set_phase(s, "keytry", WAIT_KEY_IMG)         # b) 先引导打开任意图片取 img_key
         elif s.phase == "keytry":
             keys = self._wx.key_state()
+            running = self._wx.chatlog_status().get("running")
             if keys.get("ok"):
-                self._set_phase(s, "ready", None)
-            elif keys.get("img_key") and s.state_code == WAIT_KEY_IMG:
-                self._set_phase(s, "keytry", WAIT_KEY_RELOGIN)  # c) 再引导退出重登取 data_key(该轮前 30s 内)
-            elif s.state_code == WAIT_KEY_RELOGIN and (now - s.phase_started_ms) / 1000 > DATA_KEY_WINDOW_S:
-                # 超时本轮作废 ⇒ **循环重装 hook 再来**,不能一次失败就判 KEY_FAIL(05 §2.4.4a)
-                if s.key_rounds >= self._cfg.key_retry_per_hour:
-                    s.key_error = keys.get("error") or "两把钥未在同一轮内同时取到"
-                    self._set_phase(s, "key_failed", KEY_FAIL)
+                await self._serve(s)
+            elif s.state_code == WAIT_KEY_RELOGIN and (not running or (now - s.phase_started_ms) / 1000 > DATA_KEY_WINDOW_S):
+                err = keys.get("error") or ""
+                if "模式匹配" in err or "未登录的微信" in err:
+                    await self._next_key_round(s, err)
                 else:
-                    await self._wx.chatlog_stop()
-                    dll = self._next_dll(s)
-                    await self._wx.chatlog_start(dll)
-                    s.dll = dll
-                    s.key_rounds += 1
-                    self._set_phase(s, "keytry", WAIT_KEY_IMG)
+                    # 30 秒到了还没重登:同一把 DLL 再开一轮。数据库钥只在这 30 秒里的登录动作上产生。
+                    await self._rearm_data_key_hook(s, err or "这 30 秒里没有重新登录,数据库密钥没取到")
+            elif not running:
+                # key 进程已退出(DLL 没挂上 / 本轮扫描到点)而两钥没落盘。停在「请打开图片」会让用户白开。
+                await self._next_key_round(s, keys.get("error") or "本轮取钥已结束,两把钥未在同一轮内同时取到")
+            elif keys.get("img_key") and s.state_code == WAIT_KEY_IMG:
+                # 图片钥已在手。前面的扫描已经把 30 秒花掉了,重新装 hook,倒计时从「请立刻退出重登」出现时再算。
+                await self._rearm_data_key_hook(s, None)
         out = self.login_status()
         # R6-58 (au) 跟进:record_login 只应在「本轮取钥刚成功、相位刚进 ready」那一次触发,不能每次轮询都记一遍
         # login_count(轮询是高频的);服务侧看这个一次性标记决定要不要调 WeChatStore.record_login(05 §2.4.4 ⑤⑥)
@@ -464,10 +619,13 @@ class WeChatSession:
         return {"login_session_id": s.login_session_id, "phase": s.phase, "state_code": s.state_code,
                 "wxid": s.wxid, "account_id": s.account_id, "nickname": s.nickname, "countdown_s": countdown,
                 "narrator": {"state": "running" if self._wx.narrator_running() else "stopped",
-                             "remaining_s": narrator_remaining, "rounds": s.narrator_rounds},
+                             "remaining_s": narrator_remaining, "rounds": s.narrator_rounds,
+                             "stop_pending": s.narrator_stop_pending},       # 服务侧见此即提权结束讲述人
                 "key": {"ok": bool(keys.get("ok")), "dll": s.dll, "error": s.key_error,
                         "data_key": bool(keys.get("data_key")), "img_key": bool(keys.get("img_key")),
-                        "rounds": s.key_rounds}}
+                        "rounds": s.key_rounds,
+                        # 02 #33 R6-58 (ak):两个取钥阶段的**唯一辨别手段**;此前缺这个键,Agent 恒判 img,永远不提示「退出重登」
+                        "stage": "relogin" if s.state_code == WAIT_KEY_RELOGIN else "img"}}
 
     # ---------------------------------------------------------------- #32 login/cancel
     async def login_cancel(self, *, login_session_id: Optional[str] = None) -> dict[str, Any]:
@@ -482,10 +640,11 @@ class WeChatSession:
         if login_session_id and login_session_id != s.login_session_id:
             return {"cancelled": False, "reason": "stale_login_session_id", "current": s.login_session_id}
         s.cancelled = True
+        stop_pending = False
         if self._wx.narrator_running():
-            await self._wx.narrator_stop()
+            stop_pending = not await self._wx.narrator_stop() and self._wx.narrator_running()
         self._set_phase(s, "idle", None)
-        return {"cancelled": True, "login_session_id": s.login_session_id}
+        return {"cancelled": True, "login_session_id": s.login_session_id, "narrator_stop_pending": stop_pending}
 
     # ---------------------------------------------------------------- #34 logout
     async def logout(self) -> dict[str, Any]:
@@ -503,13 +662,20 @@ class WeChatSession:
         """手动重试取钥 → ``{ok, dll, error}``。已登录场景直接 a)→b)→c),c) 用「退出重登」触发(05 §2.4.4a)。"""
         s = self.session or LoginSession(login_session_id=new_login_session_id(self._clock()), account_id=None,
                                          started_ms=self._clock(), phase_started_ms=self._clock())
+        # R6-91 幂等:本轮取钥正在进行(keytry + key 进程在跑)⇒ 不拆掉重来。2026-10-10 真机:Agent 巡检每 10 s 调一次
+        # key/retry,每次都 stop+start,把用户正在「打开图片 / 重登」的那一轮直接杀掉。
+        if s.phase == "keytry" and not s.cancelled and self._wx.chatlog_status().get("running"):
+            keys = self._wx.key_state()
+            return {"ok": bool(keys.get("ok")), "dll": s.dll, "error": keys.get("error"), "in_progress": True}
         self.session = s
         await self._wx.chatlog_stop()
+        await self._ensure_wechat_running()          # 微信没开(托盘被关 / 从没登过)时先拉起,否则 hook 没进程可挂
         dll = self._next_dll(s)
         await self._wx.chatlog_start(dll)
         s.dll = dll
         s.key_rounds += 1
         s.key_error = None
+        await self._ensure_main_window()             # 用户要在微信里开图片 / 重登:缩在托盘时把主窗口唤出来
         self._set_phase(s, "keytry", WAIT_KEY_IMG)
         keys = self._wx.key_state()
         return {"ok": bool(keys.get("ok")), "dll": dll, "error": keys.get("error")}
@@ -526,6 +692,12 @@ class WeChatSession:
         if not text and not image_path:
             raise WaError(INVALID_ARGS, "text 与 image_path 至少给一个", reason="empty_payload")
         self._require_key()
+        await self._ensure_main_window()
+        # 图片/文件仍要控件树。纯文本在树不可见时改走快捷键(Ctrl+F 搜索、Alt+S 发送),不依赖讲述人。
+        if image_path and not await asyncio.to_thread(self._wx.ui_tree_visible):
+            raise WaError(NOT_READY,
+                          "微信界面控件树不可见,图片发送不可用;文字发送改走快捷键,读消息与取钥不受影响",
+                          reason="ui_tree_invisible")
         out = await self._wx.send(session_name=session_name, text=text, image_path=image_path,
                                   confirm_timeout_ms=confirm_timeout_ms or self._cfg.confirm_timeout_ms)
         return {"ok": bool(out.get("ok")), "code": out.get("code"), "ext_msg_id": out.get("ext_msg_id"),
@@ -559,5 +731,34 @@ class WeChatSession:
     # ---------------------------------------------------------------- #37 reinstall(管道半)
     async def reinstall(self, *, installer: Optional[str] = None) -> dict[str, Any]:
         """#37 的 ``user`` 半 = UI 引导;备份/安装的提权半在服务。**每步用户确认**(00 §11.8 [WXVER]),
-        卸载**不走静默**(B-3:NSIS ``/S`` = 连聊天数据一起删)。"""
-        return await self._wx.reinstall(installer or self._cfg.bundled_installer)
+        卸载**不走静默**(B-3:NSIS ``/S`` = 连聊天数据一起删)。
+
+        拉起前两道门(R6-87),任何一道不过都是**能照着做的 404**,不拉起任何进程:
+        ① 文件在位 —— 缺 = 安装器没落包 / 被清理,提示重跑安装程序修复或在 toml 指路径;
+        ② sha256 = 钉死值(R2-6:另一候选包外层版本号完全相同、装出来却是 4.1.12.55,只能靠 sha256 分辨)。
+        调用方显式传 ``installer`` 时同样校验 —— 传进来的也必须是那一个包。"""
+        path = os.path.expandvars(installer or self._cfg.bundled_installer or "")
+        if not path or not os.path.isfile(path):
+            raise WaError(TARGET_NOT_FOUND,
+                          f"随包微信安装包不在位:{path or '(未配置)'};请重新运行 QTrade 安装程序修复,"
+                          f"或在 winagent.toml [wechat] bundled_installer 指定 weixin_{self._cfg.bundled_version}.exe 的路径",
+                          reason="bundled_installer_missing")
+        want = (self._cfg.bundled_sha256 or "").strip().lower()
+        if want:
+            got = await asyncio.to_thread(_sha256_file, path)
+            if got != want:
+                raise WaError(TARGET_NOT_FOUND,
+                              f"随包微信安装包校验不符:{path} sha256={got[:12]}…,应为 {want[:12]}…(钉死的 "
+                              f"weixin_{self._cfg.bundled_version}.exe);文件可能被替换或损坏,请重新运行 QTrade 安装程序修复",
+                              reason="bundled_installer_sha_mismatch")
+        return await self._wx.reinstall(path)
+
+    def warmup(self) -> None:
+        """会话代理上线/模块启用时在线程里预热后端(pywinauto/comtypes 首次导入在全新机器上可达十几秒,
+        不预热就会让第一次 #28 `status` 撞 10s 超时)。失败只记日志,不影响任何功能。"""
+        fn = getattr(self._wx, "warmup", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:                                   # noqa: BLE001
+                log.warning("微信后端预热失败(忽略)", extra={"op": "wechat.warmup", "code": "WARMUP_FAILED", "error": repr(e)})

@@ -20,14 +20,20 @@ class WinProc:
         await asyncio.to_thread(subprocess.run, args, capture_output=True)
 
     def find(self, name: str) -> list[ProcInfo]:
+        """按映像名找进程。🔴 只按 ``name`` 扫全表,``memory_info``/``create_time`` 只对命中的几条取:
+        Windows 上对几百个进程逐个开句柄取内存要 1~2 s,#28 `status` 一次要扫两遍,原写法直接把它推到 10 s 超时边缘。"""
         import psutil
+        want = name.lower()
         out: list[ProcInfo] = []
-        for p in psutil.process_iter(["pid", "name", "memory_info", "create_time"]):
-            if (p.info.get("name") or "").lower() != name.lower():
+        for p in psutil.process_iter(["pid", "name"]):
+            if (p.info.get("name") or "").lower() != want:
                 continue
-            mi = p.info.get("memory_info")
-            out.append(ProcInfo(p.info["pid"], p.info["name"], (mi.rss / 1e6) if mi else 0.0, 0.0,
-                                int((p.info.get("create_time") or 0) * 1000)))
+            try:
+                mi = p.memory_info()
+                created = int(p.create_time() * 1000)
+            except (psutil.Error, OSError):
+                mi, created = None, 0
+            out.append(ProcInfo(p.info["pid"], p.info["name"], (mi.rss / 1e6) if mi else 0.0, 0.0, created))
         return out
 
     async def close_window(self, pid: int) -> bool:

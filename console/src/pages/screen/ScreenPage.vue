@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * `P-SCREEN` 画面(01 §2.7.4):企点 WebCodecs 内嵌流 + 事件回注;微信窗口截图预览(只看不点);QQ 无画面。
+ * `P-SCREEN` 画面(01 §2.7.4):企点 WebCodecs 内嵌流 + 事件回注;QQ 与微信无画面(R6-94:微信窗口就在本机桌面)。
  * `login_required` 下画面注入照常可用(R-06),但发消息类不在画面里。
  * 降档:硬解 → 软解(thumb)→ 静态预览(每 2 s #33 截图 + #35 REST 注入);自动降、不自动升。
  */
@@ -32,8 +32,6 @@ const degradeMsg = ref('')
 const streamClosed = ref<StreamClosed | null>(null)
 const shotUrl = ref('')
 const shotOpen = ref(false)
-const wechatSrc = ref('')
-const wechatNotReady = ref(false)
 const staticSrc = ref('')
 /**
  * R6-72:画面注入是 W 级。R 令牌注入 ⇒ #34 以 4403 关 WS、#35 回 403。
@@ -49,8 +47,10 @@ let visibilityOff: (() => void) | undefined
 let hidden = false
 let active = true
 
-const streamable = computed(() => accounts.items.filter((a) => a.channel !== 'qq'))
+/** R6-94(2026-10-10 安琳):画面只给企点。微信窗口就在本机桌面上,截图轮询纯属多余(还白占 #33 带宽与 WinAgent) */
+const streamable = computed(() => accounts.items.filter((a) => a.channel === 'qidian'))
 const qqAccounts = computed(() => accounts.items.filter((a) => a.channel === 'qq'))
+const wechatAccounts = computed(() => accounts.items.filter((a) => a.channel === 'wechat'))
 const focus = computed(() => (focusId.value ? accounts.byId[focusId.value] ?? null : null))
 const isWechat = computed(() => focus.value?.channel === 'wechat')
 const loginPhase = computed(() => focus.value?.state === 'login_required')
@@ -96,14 +96,7 @@ async function startFocus(): Promise<void> {
   closeIme()
   const a = focus.value
   if (!a) return
-  if (a.channel === 'qq') return
-  if (a.channel === 'wechat') {
-    if (['stopped', 'disabled', 'created'].includes(a.state)) return
-    // 微信:2s 一帧窗口截图,不接收任何输入
-    previewTimer = setInterval(() => void pollWechat(), 2000)
-    void pollWechat()
-    return
-  }
+  if (a.channel === 'qq' || a.channel === 'wechat') return     // R6-94:QQ / 微信都不拉画面
   if (!['running', 'degraded', 'login_required', 'starting'].includes(a.state)) return
   streamClosed.value = null
   const s = new ScreenStream(a.id, PROFILE_OF[ui.perfProfile] ?? 'focus', {
@@ -163,31 +156,12 @@ async function pollStatic(): Promise<void> {
   } catch { /* 下一轮再试 */ }
 }
 
-async function pollWechat(): Promise<void> {
-  if (!active || !focus.value || hidden) return
-  const accountId = focus.value.id
-  try {
-    const v = (await window.qt?.wa.invoke('wechat.ui-visible', {})) as { visible?: boolean } | undefined
-    if (v && v.visible === false) { wechatNotReady.value = true; return }
-    if (!active || focus.value?.id !== accountId) return
-    const shot = await accountsApi.screenshot(accountId)
-    if (!active || focus.value?.id !== accountId) return
-    if (!shot.blob) { wechatNotReady.value = true; return }
-    wechatNotReady.value = false
-    if (wechatSrc.value) URL.revokeObjectURL(wechatSrc.value)
-    wechatSrc.value = URL.createObjectURL(shot.blob)
-  } catch {
-    wechatNotReady.value = true
-  }
-}
-
 /** 窗口可见性:隐藏 → pause,恢复 → resume(§2.7.4 规格策略) */
 function applyVisibility(visible: boolean): void {
   hidden = !visible
   if (visible) {
     stream?.resume()
-    if (isWechat.value) void pollWechat()
-    else if (isStatic.value) void pollStatic()
+    if (isStatic.value) void pollStatic()
   } else {
     relay.releaseAll()
     stream?.pause()
@@ -412,7 +386,6 @@ onUnmounted(() => {
   visibilityOff?.()
   visibilityOff = undefined
   if (shotUrl.value) URL.revokeObjectURL(shotUrl.value)
-  if (wechatSrc.value) URL.revokeObjectURL(wechatSrc.value)
   if (staticSrc.value) URL.revokeObjectURL(staticSrc.value)
 })
 </script>
@@ -432,7 +405,7 @@ onUnmounted(() => {
       >
         <StateDot :state="a.state" :reason="a.state_reason" />
         <span class="qt-grow">{{ a.label || a.id }}<small class="thumb-id">{{ a.id }}</small></span>
-        <span class="qt-small qt-muted">{{ a.channel === 'wechat' ? '截图 2s' : '540p@5fps' }}</span>
+        <span class="qt-small qt-muted">540p@5fps</span>
         <a-button
           v-if="['stopped', 'created', 'disabled'].includes(a.state)"
           size="small"
@@ -448,6 +421,14 @@ onUnmounted(() => {
         @click="router.push(`/acct/${a.id}`)"
       >
         {{ a.label || a.id }} · 打开 QQ 工作台
+      </div>
+      <div
+        v-for="a in wechatAccounts"
+        :key="a.id"
+        class="thumb qq"
+        @click="router.push(`/acct/${a.id}`)"
+      >
+        {{ a.label || a.id }} · 微信在本机窗口直接操作
       </div>
     </aside>
 
@@ -476,19 +457,11 @@ onUnmounted(() => {
           <a-button type="primary" @click="router.push(`/acct/${focus.id}`)">打开账号详情</a-button>
         </a-empty>
 
-        <!-- 微信:只看不点 -->
-        <template v-else-if="isWechat">
-          <p v-if="wechatNotReady" :data-testid="T.wechatNotready" class="qt-warn">微信窗口不可见</p>
-          <img
-            v-else-if="wechatSrc"
-            class="wxpreview"
-            :data-testid="T.wechatPreview"
-            :src="wechatSrc"
-            title="微信画面仅预览;操作请在微信窗口进行"
-            alt="微信窗口预览"
-          />
+        <!-- R6-94:微信不提供画面 —— 窗口就在本机桌面,直接在微信里操作 -->
+        <a-empty v-else-if="isWechat" description="微信在本机 Windows 窗口里运行,请直接在微信中操作;收发记录在消息中心查看">
+          <a-button type="primary" @click="router.push(`/acct/${focus.id}`)">打开账号详情</a-button>
           <p v-if="focus.state_code === 'SCREEN_LOCKED'" class="qt-danger">系统已锁屏,发送不可用</p>
-        </template>
+        </a-empty>
 
         <!-- 企点:WebCodecs canvas + 事件回注;静态预览为第三档降级 -->
         <template v-else>

@@ -188,16 +188,24 @@ def test_zero_account_for_5min_triggers_auto_recalibration(store, clock):
 
 
 # ---------------------------------------------------------------- 漂移告警
+def _fresh(store, at_ms: int, *, qd: float, qq: float) -> None:
+    """在 ``at_ms`` 之前的 10 min 窗口里铺样本 —— 真机 Sampler 每 10 s 一批,任何检查时刻窗口里都有新读数。
+    (R6-92:此前用例只在开头铺一次,+61 min 时窗口为空,靠「没样本 = 实占 0」的缺陷才「通过」。)"""
+    for i in range(11):
+        _sample(store, ts_ms=at_ms - i * MIN_MS, scope="container", subject="qtrade-qd01", mem_mb=qd + 100, anon=qd)
+        _sample(store, ts_ms=at_ms - i * MIN_MS, scope="container", subject="qtrade-qq03", mem_mb=qq + 50, anon=qq)
+
+
 def test_drift_fires_only_after_one_hour_and_resolves(store, clock):
     _pools(store, clock)
     events = Events(store)
     now = clock()
-    for i in range(11):
-        _sample(store, ts_ms=now - i * MIN_MS, scope="container", subject="qtrade-qd01", mem_mb=600, anon=500)
-        _sample(store, ts_ms=now - i * MIN_MS, scope="container", subject="qtrade-qq03", mem_mb=200, anon=150)
+    _fresh(store, now, qd=500, qq=150)
     cal = _cal(store, clock, events=events)
     assert cal.check_drift(now_ms=now) is None                         # 第一次只记起点
+    _fresh(store, now + 59 * MIN_MS, qd=500, qq=150)
     assert cal.check_drift(now_ms=now + 59 * MIN_MS) is None            # 不足 1 h 不发
+    _fresh(store, now + 61 * MIN_MS, qd=500, qq=150)
     fired = cal.check_drift(now_ms=now + 61 * MIN_MS)
     assert fired["code"] == POOL_CALIBRATION_DRIFT and fired["severity"] == "info"
     assert fired["subject"] == "pool" and fired["state"] == "firing"
@@ -210,6 +218,41 @@ def test_drift_fires_only_after_one_hour_and_resolves(store, clock):
         _sample(store, ts_ms=now + 70 * MIN_MS - i * MIN_MS, scope="container", subject="qtrade-qq03", mem_mb=650, anon=600)
     assert cal.check_drift(now_ms=now + 70 * MIN_MS) is None
     assert store.list_events(event="resource")[-1]["payload"]["state"] == "resolved"
+
+
+def test_drift_without_any_container_sample_is_not_judged(store, clock):
+    """R6-92(2026-10-10 真机):采样缺失时此前把预算计入、实占记 0 ⇒ 漂移恒 100%,满 1 h 必报。没有读数 = 不能判。"""
+    _pools(store, clock)
+    events = Events(store)
+    cal = _cal(store, clock, events=events)
+    now = clock()
+    for t in (now, now + 61 * MIN_MS, now + 125 * MIN_MS):
+        assert cal.check_drift(now_ms=t) is None
+    assert not [e for e in store.list_events(event="resource") if e["payload"].get("code") == POOL_CALIBRATION_DRIFT]
+
+
+def test_drift_ignores_unsampled_account_instead_of_counting_zero(store, clock):
+    """只有部分容器有样本时,没样本的那个不计入预算也不计入实占(否则把预算白白拉大、漂移被夸大)。"""
+    _pools(store, clock)
+    now = clock()
+    for t in (now, now + 61 * MIN_MS):
+        for i in range(11):
+            _sample(store, ts_ms=t - i * MIN_MS, scope="container", subject="qtrade-qd01", mem_mb=2600, anon=2500)
+    cal = _cal(store, clock, events=Events(store))
+    cal.check_drift(now_ms=now)
+    assert cal.check_drift(now_ms=now + 61 * MIN_MS) is None          # qd01 2500/2560 在阈值内;qq03 无样本不计
+
+
+def test_drift_payload_has_chinese_title_and_numbers(store, clock):
+    _pools(store, clock)
+    now = clock()
+    _fresh(store, now, qd=500, qq=150)
+    cal = _cal(store, clock, events=Events(store))
+    cal.check_drift(now_ms=now)
+    _fresh(store, now + 61 * MIN_MS, qd=500, qq=150)
+    fired = cal.check_drift(now_ms=now + 61 * MIN_MS)
+    assert fired["title"] == "资源配额与实际占用偏差较大"
+    assert "3174 MB" in fired["message"] and "资源页" in fired["message"] and fired["hint_actions"] == ["calibrate"]
 
 
 def test_drift_without_running_accounts_is_noop(store, clock):

@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 import socket
 import ssl
-import subprocess
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Optional
 
 from ..backends import ProbeStep
+from . import run_text
 
 
 def _ms(t0: float) -> int:
@@ -126,9 +126,9 @@ def _is_local(ip: str) -> bool:
 def _reverse(ip: str) -> Optional[str]:
     """DNS 客户端缓存正查优先于 PTR(04 §2.8.4:腾讯 IP 的 PTR 多为空或 CDN 泛名)。"""
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                              f"(Get-DnsClientCache | Where-Object {{$_.Data -eq '{ip}'}} | Select-Object -First 1).Entry"],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
+        out = run_text(["powershell", "-NoProfile", "-Command",
+                        f"(Get-DnsClientCache | Where-Object {{$_.Data -eq '{ip}'}} | Select-Object -First 1).Entry"],
+                       timeout=5).stdout.strip()
         if out:
             return out
     except Exception:

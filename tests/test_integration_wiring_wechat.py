@@ -221,8 +221,9 @@ async def test_screen_locked_degrades_and_unlock_recovers(rig):
 
 
 async def test_key_fail_degrades_and_retries_key_at_most_three_times_per_hour(rig):
-    """chatlog 挂、微信在线 ⇒ ``degraded(KEY_FAIL)`` 且自动试钥(``key_retry_per_hour=3``);超限停在 degraded 并 alert(error)。"""
-    _wechat(rig, state="running")
+    """chatlog 挂、微信在线 ⇒ ``degraded(KEY_FAIL)`` 且自动试钥(``key_retry_per_hour=3``);超限停在 degraded 并 alert(error)。
+    (R6-91:前提是「跑起来过的号」—— 运行中的微信号必然已回填 wxid,夹具按真实前提带上。)"""
+    _wechat(rig, state="running", wxid="wxid_running")
     rig.wechat.chatlog = {**rig.wechat.chatlog, "key_ok": False}
     for _ in range(5):
         await rig.agent.scheduler.run_once("health_wechat")
@@ -231,6 +232,32 @@ async def test_key_fail_degrades_and_retries_key_at_most_three_times_per_hour(ri
     assert rig.wechat.key_retry_calls == 3
     sev = [e["payload"]["severity"] for e in rig.events_of("alert") if e["payload"]["code"] == "ACCOUNT_OFFLINE"]
     assert "error" in sev
+
+
+async def test_key_fail_on_never_completed_first_login_is_not_auto_retried(rig):
+    """R6-91(2026-10-10 真机):首登卡在取钥(未回填 wxid)的号,巡检**不**自动 key/retry ——
+    取钥要人重登,自动重试只会每 10 s 把用户正在做的那一轮拆掉;这类号由控制台「重新取钥」重跑登录流。"""
+    _wechat(rig, state="degraded")
+    rig.store.con.execute("UPDATE accounts SET state_code='KEY_FAIL' WHERE id='wx01'")
+    rig.wechat.chatlog = {**rig.wechat.chatlog, "key_ok": False}
+    for _ in range(3):
+        await rig.agent.scheduler.run_once("health_wechat")
+    assert rig.wechat.key_retry_calls == 0
+
+
+@pytest.mark.parametrize("code", ["KEY_FAIL", "WAIT_UI_TREE"])
+def test_degraded_first_login_wechat_can_be_restarted(rig, code):
+    """R6-91:首登卡在取钥 / UI 树的微信号(degraded,未回填 wxid)允许 #9 start 重跑登录流(不登出微信),
+    否则只能删号重建;其它 degraded 码维持「already」不重跑。"""
+    _wechat(rig, state="degraded")
+    rig.store.con.execute("UPDATE accounts SET state_code=? WHERE id='wx01'", (code,))
+    r = rig.client.post("/api/v1/accounts/wx01/start", headers=H(), json={})
+    assert r.status_code == 202, r.text
+    assert r.json().get("already") is not True
+    _wechat(rig, "wx02", state="degraded")
+    rig.store.con.execute("UPDATE accounts SET state_code='SCREEN_LOCKED' WHERE id='wx02'")
+    r2 = rig.client.post("/api/v1/accounts/wx02/start", headers=H(), json={})
+    assert r2.status_code == 200 and r2.json().get("already") is True
 
 
 def _record(bucket: list[str], value: str):

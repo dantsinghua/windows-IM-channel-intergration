@@ -1,15 +1,16 @@
 /**
- * P-SETUP 首启向导(console-fix-5-wizard):
+ * P-SETUP 首启向导(console-fix-5-wizard;R6-84 四步):
  * ① 「向导已完成」的持久化落点(`console.toml [setup] done`,无 `window.qt` 时本机镜像兜底);
- * ② 步骤存 store(组件重挂不回第 1 步,01 §2.7.1 步 4「完成后回到本步」);
- * ③ 路由守卫的首登窄例外(D-D)与告知改版重勾(05 §6.1);
+ * ② 步骤存 store(组件重挂不回第 1 步,01 §2.7.1 步 3「完成后回到本步」);
+ * ③ 路由守卫的首登窄例外(D-D);告知改版重勾随「阅读须知」步退役(R6-84,2026-10-10);
  * ④ 自检行聚合:`SKIPPED` 灰、不计红黄,说明列走中文(C-18 / 01 §2.7.9 / M4-7)。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, shallowMount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import SetupPage from '@/pages/setup/SetupPage.vue'
-import { useSetupStore } from '@/stores/setup'
+import { SETUP_LAST_STEP, useSetupStore } from '@/stores/setup'
+import { useSessionStore } from '@/stores/session'
 import { setupRedirect } from '@/router'
 import { selftestRows, type SelftestRun } from '@/api/types'
 
@@ -92,52 +93,36 @@ describe('向导完成后不再从向导进', () => {
     expect(localStorage.getItem('qt.setup.done')).toBe('true')
   })
 
-  it('「重新运行向导」把 done 置回 false,并重置滚动判定', async () => {
+  it('「重新运行向导」把 done 置回 false,并回到第 1 步', async () => {
     const store = useSetupStore()
     await store.finish(true, true)
-    store.scrolledToBottom = true
-    store.step = 3
+    store.step = SETUP_LAST_STEP
 
     await store.rerun()
     expect(store.done).toBe(false)
     expect(localStorage.getItem('qt.setup.done')).toBe('false')
     expect(store.step).toBe(0)
-    expect(store.scrolledToBottom).toBe(false)
   })
 })
 
-describe('告知改版要重新勾(05 §6.1)', () => {
-  it('acked_version 落后 ⇒ reackRequired,并回到告知页', async () => {
+describe('R6-84:向导没有「阅读须知」步,告知改版不再打断已完成向导的机器', () => {
+  it('store 不再暴露重勾态;告知版本落后也不会把 step 拉回/把 done 置假', async () => {
     stubFetch(NOTICE_STALE)
     const store = useSetupStore()
     store.done = true
-    store.step = 4
-    await store.refreshAck()
-    expect(store.reackRequired).toBe(true)
-    expect(store.step).toBe(0)
+    store.step = SETUP_LAST_STEP
+    await store.loadNotice()
+    expect(store.acked).toBe(false)                        // 事实照记(偏好页「查看使用告知」会用)
+    expect(store.done).toBe(true)
+    expect(store.step).toBe(SETUP_LAST_STEP)
+    expect('reackRequired' in store).toBe(false)
+    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} }, { done: true })).toBeNull()
   })
 
-  it('这一版已勾过 ⇒ 不打扰', async () => {
-    const store = useSetupStore()
-    store.done = true
-    await store.refreshAck()
-    expect(store.reackRequired).toBe(false)
-  })
-
-  it('#86 拉不到 ⇒ 不判(不把人锁在告知页)', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')))
-    const store = useSetupStore()
-    store.done = true
-    await store.refreshAck()
-    expect(store.reackRequired).toBe(false)
-  })
-
-  it('没完成过向导 ⇒ 本判定不参与(本来就要走向导)', async () => {
-    stubFetch(NOTICE_STALE)
-    const store = useSetupStore()
-    store.done = false
-    await store.refreshAck()
-    expect(store.reackRequired).toBe(false)
+  it('刷新时存下的旧五步序号(4)不再合法,回到第 1 步', () => {
+    sessionStorage.setItem('qt.setup.step', '4')
+    setActivePinia(createPinia())
+    expect(useSetupStore().step).toBe(0)
   })
 })
 
@@ -150,7 +135,7 @@ const ANTD_STUBS = Object.fromEntries(
 describe('向导步骤存 store(D-B)', () => {
   it('组件重挂后回到原来的步,不退回第 1 步', async () => {
     const store = useSetupStore()
-    store.step = 3
+    store.step = 2                                          // R6-84:添加账号是第 3 步(下标 2)
     const first = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
     expect(first.find('[data-testid="qt-setup-login-qidian-add"]').exists()).toBe(true)
@@ -158,7 +143,7 @@ describe('向导步骤存 store(D-B)', () => {
     first.unmount()
     const again = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
-    expect(store.step).toBe(3)
+    expect(store.step).toBe(2)
     expect(again.find('[data-testid="qt-setup-login-qidian-add"]').exists()).toBe(true)
     again.unmount()
   })
@@ -173,100 +158,37 @@ describe('向导步骤存 store(D-B)', () => {
     expect(fresh.step).toBe(2)
   })
 
-  it('页面推进步骤写回 store', async () => {
+  it('第 1 步就是连接服务:服务连上即可下一步,不再要求勾告知', async () => {
     const store = useSetupStore()
+    const session = useSessionStore()
+    session.authState = 'ok'
+    session.agentReachable = true
     const w = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
-    store.acked = true
-    await w.vm.$nextTick()
+    expect(w.find('[data-testid="qt-setup-conn-agent"]').exists()).toBe(true)
+    expect(w.find('[data-testid="qt-setup-notice-ack"]').exists()).toBe(false)
+    // `a-button` 桩把布尔 prop 原样序列化成 "true"/"false" 字符串
+    expect(w.find('[data-testid="qt-setup-next"]').attributes('disabled')).toBe('false')
     await w.find('[data-testid="qt-setup-next"]').trigger('click')
     expect(store.step).toBe(1)
     w.unmount()
   })
-})
 
-/**
- * R-1:告知改版那一路「只重勾一次即进主页、不重走五步」(05 §6.1 / §8b.6 U1 / 01:350)。
- * #86 先回旧版(acked_version 落后),#87 成功后 #86 回新版已勾;`ackFails` 时 #87 回 500。
- */
-function stubNoticeFlow(opts: { ackFails?: boolean } = {}): void {
-  let acked = false
-  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
-    const u = String(url)
-    if (u.includes('/system/notice/ack')) {
-      if (opts.ackFails) {
-        return new Response(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: '落库失败' } }), { status: 500 })
-      }
-      acked = true
-      return new Response(JSON.stringify({ ok: true, data: { ok: true } }))
-    }
-    if (u.includes('/system/notice') && (init?.method ?? 'GET') === 'GET') {
-      return new Response(JSON.stringify({ ok: true, data: acked ? { ...NOTICE_STALE, acked_version: 'v3' } : NOTICE_STALE }))
-    }
-    return new Response(JSON.stringify({ ok: true, data: {} }))
-  }))
-}
-
-describe('告知改版:只重勾一次即进主页(R-1)', () => {
-  async function mountReack() {
-    const store = useSetupStore()
-    store.done = true
-    await store.refreshAck()
-    expect(store.reackRequired).toBe(true)
-    // 按钮文字要看得见:换一个渲染插槽的按钮桩(`true` 桩不渲染默认插槽)
-    const stubs = { ...ANTD_STUBS, 'a-button': { template: '<button><slot /></button>' } }
-    const w = shallowMount(SetupPage, { global: { stubs } })
+  it('第 1 步服务没连上 ⇒ 下一步禁用', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('agent down')))   // 挂载时的 pingAgent 也要失败
+    const session = useSessionStore()
+    session.authState = 'ok'
+    session.agentReachable = false
+    const w = shallowMount(SetupPage, { global: { stubs: ANTD_STUBS } })
     await flushPromises()
-    return { store, w }
-  }
-
-  it('勾完后按钮仍是「确认并进入控制台」,点了直进 /dash、不进第 2 步', async () => {
-    stubNoticeFlow()
-    const { store, w } = await mountReack()
-    await store.ack()
-    await flushPromises()
-    expect(store.acked).toBe(true)
-    const next = w.find('[data-testid="qt-setup-next"]')
-    expect(next.text()).toBe('确认并进入控制台')
-    await next.trigger('click')
-    expect(routerSpy.replace).toHaveBeenCalledWith('/dash')
-    expect(store.step).toBe(0)
-    // 进主页之后守卫不再把人打回 /setup
-    expect(store.reackRequired).toBe(false)
-    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} },
-      { done: store.done, needsReack: store.reackRequired })).toBeNull()
+    expect(session.agentReachable).toBe(false)
+    expect(w.find('[data-testid="qt-setup-next"]').attributes('disabled')).toBe('true')
     w.unmount()
-  })
-
-  it('#87 失败 ⇒ 不算勾过、按钮禁用、仍按在 /setup', async () => {
-    stubNoticeFlow({ ackFails: true })
-    const { store, w } = await mountReack()
-    await expect(store.ack()).rejects.toBeTruthy()
-    await flushPromises()
-    expect(store.acked).toBe(false)
-    expect(store.reackRequired).toBe(true)
-    expect(w.find('[data-testid="qt-setup-next"]').attributes('disabled')).toBeDefined()
-    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} },
-      { done: store.done, needsReack: store.reackRequired })).toEqual({ path: '/setup' })
-    w.unmount()
-  })
-
-  it('勾完未点按钮就刷新 ⇒ 以 Agent 为准已勾过,直接放行不再重勾', async () => {
-    stubNoticeFlow()
-    const { store, w } = await mountReack()
-    await store.ack()
-    w.unmount()
-    // 刷新 = 新 store 重新核对(fetch 桩保留「已勾」状态,等同 Agent 已落库)
-    setActivePinia(createPinia())
-    const fresh = useSetupStore()
-    fresh.done = true
-    await fresh.refreshAck()
-    expect(fresh.reackRequired).toBe(false)
   })
 })
 
 describe('路由守卫:未完成向导时的窄例外(D-D)', () => {
-  const NOT_DONE = { done: false, needsReack: false }
+  const NOT_DONE = { done: false }
 
   it('向导首登步「现在添加」放行进 P-ACCT-NEW', () => {
     expect(setupRedirect(
@@ -286,18 +208,9 @@ describe('路由守卫:未完成向导时的窄例外(D-D)', () => {
   })
 
   it('向导已完成 ⇒ 全部放行,不再被按回 /setup', () => {
-    const done = { done: true, needsReack: false }
+    const done = { done: true }
     expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} }, done)).toBeNull()
     expect(setupRedirect({ path: '/setup', name: 'P-SETUP', query: {} }, done)).toBeNull()
-  })
-
-  it('告知改版待重勾 ⇒ 按回 /setup,但不借首登例外溜走', () => {
-    const reack = { done: true, needsReack: true }
-    expect(setupRedirect({ path: '/dash', name: 'P-DASH', query: {} }, reack)).toEqual({ path: '/setup' })
-    expect(setupRedirect(
-      { path: '/acct/new', name: 'P-ACCT-NEW', query: { from: 'setup' } },
-      reack,
-    )).toEqual({ path: '/setup' })
   })
 })
 

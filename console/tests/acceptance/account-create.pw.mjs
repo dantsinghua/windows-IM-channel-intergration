@@ -1,9 +1,10 @@
+import { fileURLToPath, URL } from 'node:url'
 import process from 'node:process';
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || '/home/anlin/work/qtrade-build/manual-20261008-a0stq5rk/console/node_modules', '__acceptance__.cjs'))
+const require = createRequire(path.join(process.env.QT_PW_NODE_MODULES || fileURLToPath(new URL('../../node_modules', import.meta.url)), '__acceptance__.cjs'))
 const { test, expect } = require('@playwright/test')
 const SECRET = `AcceptOnly-${randomUUID()}`
 const ACCOUNT = 'acceptance@example.invalid'

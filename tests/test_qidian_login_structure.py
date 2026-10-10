@@ -89,7 +89,7 @@ async def test_partial_hidden_or_other_activity_structure_cannot_confirm_login(c
 
 @pytest.mark.parametrize("xml", [
     LOGIN_TREE,
-    tree(node(text="同意")),
+    tree(node(rid=f"{PKG}:id/dialogRightBtn", text="同意")),
     tree(node(text="短信验证")),
 ])
 async def test_a_valid_xml_login_or_verification_page_is_not_overruled_by_fallback(xml):

@@ -54,6 +54,8 @@ class Events:
     def __init__(self, store, *, queue_max: int = 10000, on_emit=None):
         self._store = store
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
+        self._live_qr: dict[str, tuple[int, str]] = {}
+        self._live_qr_limit = max(1, queue_max)
         self.dropped = 0
         self.on_emit = on_emit
 
@@ -70,6 +72,14 @@ class Events:
         seq = self._store.insert_outbox_event(event_id=event_id, target="ws", event=event, trace_id=trace_id,
                                               account_id=account_id, channel=channel,
                                               payload_json=json.dumps(durable_payload, ensure_ascii=False), now_ms=now_ms)
+        if event == "account_state" and account_id:
+            self._live_qr.pop(account_id, None)
+            prompt = payload.get("prompt")
+            qr = prompt.get("qrcode_png_b64") if isinstance(prompt, dict) else None
+            if isinstance(qr, str) and qr and payload.get("state") == "login_required":
+                self._live_qr[account_id] = (seq, qr)
+                if len(self._live_qr) > self._live_qr_limit:
+                    self._live_qr.pop(next(iter(self._live_qr)))
         if self.on_emit is not None:
             try:
                 self.on_emit(event_id=event_id, event=event, payload=durable_payload, account_id=account_id,
@@ -93,6 +103,23 @@ class Events:
 
     async def next_frame(self) -> dict[str, Any]:
         return await self._queue.get()
+
+    def live_payload(self, frame: dict[str, Any], *, subscribed_after: int) -> dict[str, Any]:
+        """Supply the latest in-memory QR only to events newer than this subscription.
+
+        The durable payload remains the authority for the event. A reconnect's
+        historical rows never receive an image, even while its bytes are still
+        present in this process. Account transitions invalidate the image.
+        """
+        payload = frame["payload"]
+        current = self._live_qr.get(frame.get("account_id"))
+        if (frame.get("event") != "account_state" or not current
+                or frame["seq"] <= subscribed_after or current[0] != frame["seq"]):
+            return payload
+        result = copy.deepcopy(payload)
+        if isinstance(result.get("prompt"), dict):
+            result["prompt"]["qrcode_png_b64"] = current[1]
+        return result
 
     def replay(self, since_seq: int, limit: int = 1000) -> list[dict[str, Any]]:
         return self._store.replay_outbox(since_seq, limit)

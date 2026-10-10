@@ -34,6 +34,19 @@ describe('events store', () => {
     expect(s.alerts.get(alertKey(base))?.count).toBe(2)
   })
 
+  it('告警时间是数字/缺失时排序不抛错,按时间新者在前(2026-10-10 真机:Agent 曾发毫秒整数,告警铃整体崩)', () => {
+    const s = useEventsStore()
+    const mk = (subject: string, last: unknown): AlertPayload => ({
+      code: 'POOL_CALIBRATION_DRIFT', severity: 'info', state: 'firing', subject,
+      title: 't', message: 'm', hint_actions: [], first_seen_at: 'x', last_seen_at: last as string, count: 1,
+    })
+    s.pushAlert(mk('a', Date.parse('2026-10-10T21:46:00+08:00')))
+    s.pushAlert(mk('b', '2026-10-10T22:00:00+08:00'))
+    s.pushAlert(mk('c', undefined))
+    expect(() => s.firing.map((x) => x.subject)).not.toThrow()
+    expect(s.firing.map((x) => x.subject)).toEqual(['b', 'a', 'c'])
+  })
+
   it('resolved 从未读移出', () => {
     const s = useEventsStore()
     const a: AlertPayload = {
@@ -128,6 +141,18 @@ describe('accounts store', () => {
     expect(ops.read).toBe(true)
     expect(ops.write).toBe(false)
     expect(ops.screen).toBe(true)
+  })
+
+  it('软删后的停止事件不能把账号加回列表', () => {
+    const s = useAccountsStore()
+    s.applyAccountState(ev('account_state', payload({ state: 'stopped' }), 1, 'wx01'))
+    expect(s.byId.wx01.state).toBe('stopped')
+    s.forget('wx01')
+    expect(s.byId.wx01).toBeUndefined()
+    s.applyAccountState(ev('account_state', payload({ state: 'stopped' }), 2, 'wx01'))
+    s.applyAccountState(ev('account_state', payload({ state: 'stopped', deleted_at: '2026-10-10T23:49:00+08:00' }), 3, 'wx02'))
+    expect(s.byId.wx01).toBeUndefined()
+    expect(s.byId.wx02).toBeUndefined()
   })
 
   it('微信档案 = channel=wechat 且 stopped/disabled 的行(C-01)', () => {

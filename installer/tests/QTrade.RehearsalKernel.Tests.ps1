@@ -18,7 +18,7 @@ Describe '预演:uname 不是版本串' {
         $r = Invoke-QtKernelVerify -ManifestVersion $script:Ver -ShutdownConfirmed $true -SkipShutdown
         $r.Reason | Should -Not -Be 'KERNEL_NO_BINDER'
         $r.Reason | Should -Be 'KERNEL_BOOT_FAILED'
-        $r.Message | Should -Match 'QTrade 内核下 WSL2 未能正常启动'
+        $r.Message | Should -Match 'qtrade-kcheck did not return a valid kernel version after the switch'
         # B6:原装内核好不好要等回滚复验才知道,验证段不得先把锅甩给「本机 WSL2」
         $r.Message | Should -Not -Match '与 QTrade 内核无关'
     }

@@ -67,6 +67,21 @@ $PayloadMap = @(
         PinnedSha256 = '58997cfe4513ab71f107c2137bb570ade030f228115c14688544cec80e604053'
         Hint = '🔴 R2-6:另一候选包 WeChatWin_4.1.12.exe 装出来是 4.1.12.55,两包外层 VersionInfo **完全相同**,只能靠 sha256 分辨;官方 CDN 只有当前版,历史版本走 B-1 的法务确认渠道' }
 
+    # R6-92: pyweixin (WeChat 4.x UI automation; the send path of the user agent). Upstream source
+    # https://github.com/Hello-Mr-Crab/pywechat @ 8589baa049bb91d3a500602c167f07b2f8397a13, built into a
+    # pure-python wheel and vendored in winagent/vendor/pyweixin. Critical like the bundled WeChat installer:
+    # without it every WeChat send fails. LGPL: the wheel itself carries the full source; LICENSE + SOURCE.txt ship next to it.
+    @{ Dest = 'pkg/pyweixin/pywechat127-1.9.8-py3-none-any.whl'; Sources = @('winagent/vendor/pyweixin/pywechat127-1.9.8-py3-none-any.whl', 'third_party/pyweixin/pywechat127-1.9.8-py3-none-any.whl'); Kind = 'file'; Critical = $true; Packed = $true
+        Purpose = 'pyweixin wheel (pywechat127 1.9.8, upstream commit 8589baa) - WeChat 4.x send automation, frozen into qtrade-winagent-user.exe'; EnvVar = 'QT_SRC_PYWEIXIN'
+        PinnedSha256 = 'a98ab028d284917099201a2cefbcbe1ba8c36a02ea136b4b2632539167e7792e'
+        Hint = 'Rebuild: pip wheel <pywechat-src>/src --no-deps (commit 8589baa); a different sha256 means a different upstream snapshot' }
+
+    @{ Dest = 'pkg/pyweixin/LICENSE'; Sources = @('winagent/vendor/pyweixin/LICENSE', 'third_party/pyweixin/LICENSE'); Kind = 'file'; Critical = $false; Packed = $false
+        Purpose = 'pyweixin upstream license (LGPL)'; EnvVar = 'QT_SRC_PYWEIXIN_LICENSE' }
+
+    @{ Dest = 'pkg/pyweixin/SOURCE.txt'; Sources = @('winagent/vendor/pyweixin/SOURCE.txt', 'third_party/pyweixin/SOURCE.txt'); Kind = 'file'; Critical = $false; Packed = $false
+        Purpose = 'pyweixin upstream URL / commit / fetch time'; EnvVar = 'QT_SRC_PYWEIXIN_SOURCE' }
+
     @{ Dest = 'pkg/vcredist/VC_redist.x64.exe'; Sources = @('third_party/vcredist/VC_redist.x64.exe'); Kind = 'file'; Critical = $false; Packed = $true
         Purpose = 'VC++ 2015-2022 运行库(wx_key.dll/chatlog 依赖 MSVCP140/VCRUNTIME140)'; EnvVar = 'QT_SRC_VCREDIST'
         Hint = '微软官方 VC_redist.x64.exe' }
@@ -214,7 +229,7 @@ foreach ($c in $copied) {
         $entry['size'] = [long](Get-Item -LiteralPath $c.Dest).Length
         # B-1 / R2-6:随包微信必须与钉死的 sha256 一致,否则会装成 4.1.12.55(两包外层 VersionInfo 完全相同)
         if ($item.ContainsKey('PinnedSha256') -and $entry['sha256'] -ne $item.PinnedSha256) {
-            throw ('随包微信 sha256 不符(期望 {0},实得 {1});两候选包外层 VersionInfo 相同,只能靠 sha256 分辨(R2-6)' -f $item.PinnedSha256, $entry['sha256'])
+            throw ('Pinned sha256 mismatch for {0}: expected {1}, got {2} (R2-6 / R6-92: pinned third-party payloads are identified by sha256 only)' -f $item.Dest, $item.PinnedSha256, $entry['sha256'])
         }
     } else {
         # 目录/通配条目在 manifest 里按 `<dest>/*` 登记(§2.2.1 的 `pkg/adb/*` 写法)

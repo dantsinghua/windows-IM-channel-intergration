@@ -4,7 +4,12 @@
  */
 import { contextBridge, ipcRenderer } from 'electron'
 
+/** 主进程经 `webPreferences.additionalArguments` 传入的 Agent 源(只读、与 netguard 注入令牌/CSP 的源同一份) */
+const agentOrigin = (process.argv.find((a) => a.startsWith('--qt-agent-origin=')) ?? '').slice('--qt-agent-origin='.length)
+  || 'http://127.0.0.1:17600'
+
 const qt = {
+  endpoint: { agent: agentOrigin },
   app: {
     version: () => ipcRenderer.invoke('qt:app.version'),
     minimizeToTray: () => ipcRenderer.invoke('qt:app.minimizeToTray'),

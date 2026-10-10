@@ -14,7 +14,7 @@ from tests.test_qidian_apk_preparation import KEYBOARD, QIDIAN, SERIAL, _wait_fo
 from tests.test_qidian_ui import LOGIN_TREE, PKG, Clk, UiFakeAdb, acct, node, tree
 
 
-AGREEMENT = tree(node(text="同意", bounds="[200,700][520,760]"))
+AGREEMENT = tree(node(rid=f"{PKG}:id/dialogRightBtn", text="同意", bounds="[200,700][520,760]"))
 
 
 class InitializationAdb(UiFakeAdb):
@@ -91,7 +91,7 @@ async def test_protocol_overlay_after_prepared_cannot_receive_credentials():
     ui = QidianUi(adb=adb, clock=clock, sleep=sleep)
     adb.dumps = [LOGIN_TREE]
     assert await ui.prepare_login(acct()) is True
-    adb.dumps = [tree(node(text="同意", bounds="[200,700][520,760]"),
+    adb.dumps = [tree(node(rid=f"{PKG}:id/dialogRightBtn", text="同意", bounds="[200,700][520,760]"),
                       node(rid=f"{PKG}:id/account"), node(rid=f"{PKG}:id/password"),
                       node(rid=f"{PKG}:id/login", text="登录"))]
 

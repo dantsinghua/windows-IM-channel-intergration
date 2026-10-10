@@ -527,12 +527,26 @@ class FakeWeChat:
         self.narrator_pid = 5202
         return self.narrator_pid
 
-    async def narrator_stop(self) -> None:
+    narrator_unkillable: bool = False     # 2026-10-10 真机:高完整性进程,普通用户 taskkill 拒绝访问 ⇒ 服务侧提权结束
+
+    async def narrator_stop(self) -> bool:
         self.calls.append("narrator_stop")
+        if self.narrator_unkillable:
+            return False
         self.narrator_pid = None
+        return True
+
+    def kill_narrator_elevated(self) -> bool:
+        """服务侧(提权)结束讲述人的假实现。"""
+        self.calls.append("narrator_kill_elevated")
+        self.narrator_pid = None
+        return True
 
     def narrator_running(self) -> bool:
         return self.narrator_pid is not None
+
+    def wechat_running(self) -> bool:
+        return self.running_pid is not None
 
     async def chatlog_start(self, dll: str) -> int:
         self.calls.append(f"chatlog_start:{dll}")
@@ -542,6 +556,15 @@ class FakeWeChat:
     async def chatlog_stop(self) -> None:
         self.calls.append("chatlog_stop")
         self.chatlog_pid = None
+
+    serve_fails: bool = False             # R6-91:模拟「取到钥但 chatlog server 起不来」
+
+    async def chatlog_serve(self) -> int:
+        self.calls.append("chatlog_serve")
+        if self.serve_fails:
+            raise RuntimeError("找不到微信消息库目录")
+        self.chatlog_pid = 5304
+        return self.chatlog_pid
 
     def chatlog_status(self) -> dict[str, Any]:
         return {"running": self.chatlog_pid is not None, "http_ok": self.chatlog_http_ok, "dll": self.chatlog_dll}

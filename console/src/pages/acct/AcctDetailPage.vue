@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { acctDetail as T } from '@/testids'
@@ -26,8 +26,10 @@ const prompt = computed(() => accounts.prompts[id.value] ?? null)
 const ops = computed(() => accounts.ops(a.value))
 const stateCode = computed(() => a.value?.state_code ?? '')
 const codeMeta = computed(() => STATE_CODES[stateCode.value])
-const stateActions = computed(() => (codeMeta.value?.actions ?? []).map((action) =>
-  a.value?.channel === 'qq' && action === 'goto-screen' ? 'refresh-qr' : action))
+const stateActions = computed(() => (codeMeta.value?.actions ?? [])
+  .map((action) => (a.value?.channel === 'qq' && action === 'goto-screen' ? 'refresh-qr' : action))
+  // R6-94:微信没有账号画面(窗口就在本机桌面),状态卡里不出「查看账号画面」
+  .filter((action) => !(a.value?.channel === 'wechat' && (action === 'goto-screen' || action === 'password' || action === 'cred-update'))))
 const showStateCard = computed(() => !!a.value && ['login_required', 'degraded', 'error'].includes(a.value.state) && stateCode.value !== 'RATE_LIMITED')
 const readDegraded = computed(() => events.firing.find((alert) => (QIDIAN_READ_DEGRADED_CODES as readonly string[]).includes(alert.code) && alert.subject === 'account:' + id.value) ?? null)
 const resSnapshot = computed(() => resources.metrics?.ours.accounts.find((item) => item.id === id.value) ?? resources.pool?.accounts?.find((item) => item.id === id.value) ?? null)
@@ -37,6 +39,8 @@ const accountError = ref('')
 const screenOpen = ref(false)
 const editLabel = ref(false)
 const editingLabel = ref('')
+const labelInput = ref<HTMLInputElement | null>(null)
+let labelSaving = false
 const pwModal = ref(false)
 const pwSecret = ref('')
 const pwRemember = ref(false)
@@ -71,8 +75,30 @@ async function act(fn: () => Promise<unknown>, okText: string): Promise<boolean>
   catch (error) { message.error(errorText(error)); return false }
   finally { busy.value = false }
 }
+/** 名称就地编辑:点名称/编辑 icon 进入输入框,失焦(或回车)即保存并恢复展示;Esc 放弃。 */
+async function startEditLabel(): Promise<void> {
+  if (!a.value || editLabel.value) return
+  editingLabel.value = a.value.label
+  editLabel.value = true
+  await nextTick()
+  labelInput.value?.focus()
+  labelInput.value?.select()
+}
+function cancelEditLabel(): void {
+  editingLabel.value = a.value?.label ?? ''
+  editLabel.value = false
+}
 async function saveLabel(): Promise<void> {
-  if (await act(() => accountsApi.patch(id.value, { label: editingLabel.value }), '账号名称已更新')) editLabel.value = false
+  if (!editLabel.value || labelSaving) return
+  labelSaving = true
+  try {
+    const next = editingLabel.value.trim()
+    const current = a.value?.label ?? ''
+    if (!next || next === current) { cancelEditLabel(); return }
+    editingLabel.value = next
+    await act(async () => accounts.upsert(await accountsApi.patch(id.value, { label: next })), '账号名称已更新')
+    editLabel.value = false                              // 失败时 message 已提示,展示恢复为库里的原名
+  } finally { labelSaving = false }
 }
 function closePassword(): void { pwSecret.value = ''; pwModal.value = false; passwordPurpose.value = 'login' }
 async function submitPassword(): Promise<void> {
@@ -86,7 +112,10 @@ async function submitPassword(): Promise<void> {
 }
 async function runStateAction(action: string): Promise<void> {
   switch (action) {
-    case 'login': await act(() => accountsApi.login(id.value, {}), '已重新发起登录'); break
+    case 'login':
+      if (a.value?.channel === 'wechat') await act(() => accountsApi.start(id.value), '已重新发起微信登录与取钥')
+      else await act(() => accountsApi.login(id.value, {}), '已重新发起登录')
+      break
     case 'password': passwordPurpose.value = 'login'; pwModal.value = true; break
     case 'goto-screen': screenOpen.value = true; break
     case 'refresh-qr':
@@ -97,7 +126,9 @@ async function runStateAction(action: string): Promise<void> {
       finally { busy.value = false }
       break
     case 'key-retry':
-      if (!window.qt?.wa) message.info('请在桌面控制台重新取钥')
+      // R6-91:没回填过 wxid 的号(首登没走完)要重跑登录流才能回填/绑定;跑起来过的号才单独重取钥
+      if (!a.value?.self_uid && !a.value?.wxid) await act(() => accountsApi.start(id.value), '已重新发起微信登录与取钥')
+      else if (!window.qt?.wa) message.info('请在桌面控制台重新取钥')
       else await act(() => window.qt!.wa.invoke('wechat.key.retry', {}), '已请求重新取钥')
       break
     case 'reinstall': void router.push({ path: '/acct/new', query: { ch: 'wechat', step: 'reinstall' } }); break
@@ -106,7 +137,8 @@ async function runStateAction(action: string): Promise<void> {
     case 'restart': await act(() => accountsApi.restart(id.value), '已请求重启'); break
     case 'open-env': void router.push('/env'); break
     case 'open-logs': void router.push({ path: '/log', query: { account_id: id.value } }); break
-    case 'narrator-redo': message.info('请按 Win + Ctrl + Enter 开启讲述人，再完成微信登录'); break
+    // R6-91:degraded(WAIT_UI_TREE) 允许 start 重跑登录流 = 真正「再做一次仪式」(讲述人由 WinAgent 自动开)
+    case 'narrator-redo': await act(() => accountsApi.start(id.value), '已重新发起讲述人仪式'); break
     default: break
   }
 }
@@ -128,7 +160,11 @@ async function closeWebui(): Promise<void> {
 }
 async function doSoftDelete(): Promise<void> {
   if (!a.value) return
-  if (await act(() => accountsApi.softDelete(id.value, a.value!.label), '账号已从列表移除，数据与登录态保留')) void router.push('/acct')
+  const removed = await act(() => accountsApi.softDelete(id.value, a.value!.label), '账号已从列表移除，数据与登录态保留')
+  if (removed) {
+    accounts.forget(id.value)
+    void router.push('/acct')
+  }
 }
 function openMessages(): void { void router.push({ path: '/msg', query: { account_id: id.value } }) }
 function startAccount(): void {
@@ -149,42 +185,49 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
       <header class="account-heading qt-glass">
         <div class="account-avatar">{{ CHANNEL_TEXT[a.channel].slice(0, 1) }}</div>
         <div class="account-title"><div class="qt-eyebrow">{{ CHANNEL_TEXT[a.channel] }} / 账号工作台</div>
-          <template v-if="!editLabel"><h1>{{ a.label || a.self_nick || a.id }}</h1><span class="qt-small qt-muted">{{ a.self_nick || '尚未取得昵称' }} · {{ a.wxid || a.self_uid || a.id }}</span></template>
-          <div v-else class="qt-row"><a-input v-model:value="editingLabel" :maxlength="20" /><a-button type="primary" :loading="busy" :data-testid="T.labelSave" @click="saveLabel">保存</a-button><a-button @click="editLabel = false">取消</a-button></div>
+          <h1 v-if="!editLabel" class="label-display" title="点击修改名称" tabindex="0" @click="startEditLabel" @keydown.enter.prevent="startEditLabel">
+            <span class="label-text">{{ a.label || a.self_nick || a.id }}</span>
+            <span class="label-edit-icon" role="button" aria-label="修改名称" :data-testid="T.labelEdit" @click.stop="startEditLabel">✎</span>
+          </h1>
+          <input v-else ref="labelInput" v-model="editingLabel" class="label-input" type="text" maxlength="20" :disabled="busy" :data-testid="T.labelSave"
+                 @blur="saveLabel" @keydown.enter.prevent="labelInput?.blur()" @keydown.esc.prevent="cancelEditLabel">
+          <span class="qt-small qt-muted">{{ a.self_nick || '尚未取得昵称' }} · {{ a.wxid || a.self_uid || a.id }}</span>
         </div>
-        <a-button v-if="!editLabel" size="small" :data-testid="T.labelEdit" @click="editLabel = true">改名</a-button>
-        <span class="account-state-text"><StateDot :state="a.state" :reason="a.state_reason" />{{ ACCOUNT_STATES[a.state]?.zh || '状态未知' }}</span>
+        <div class="account-heading-side">
+          <span class="account-state-text"><StateDot :state="a.state" :reason="a.state_reason" />{{ ACCOUNT_STATES[a.state]?.zh || '状态未知' }}</span>
+          <div class="qt-toolbar account-toolbar">
+            <a-button type="primary" size="small" @click="openMessages">查询历史消息</a-button>
+            <a-button v-if="ops.start" size="small" :loading="busy" :disabled="a.channel === 'wechat' && resources.hasPending" :data-testid="T.op('start')" @click="startAccount">{{ a.channel === 'wechat' ? '登录此微信' : '启动账号' }}</a-button>
+            <a-popconfirm v-if="ops.stop" title="停止当前账号？消息采集与正在进行的任务会受影响。" @confirm="act(() => accountsApi.stop(a!.id), '已请求停止')"><a-button size="small" :disabled="busy" :data-testid="T.op('stop')">停止账号</a-button></a-popconfirm>
+            <a-popconfirm v-if="ops.restart" title="重启当前账号？连接和正在进行的任务会暂时中断。" @confirm="act(() => accountsApi.restart(a!.id), '已请求重启')"><a-button size="small" :disabled="busy" :data-testid="T.op('restart')">重启</a-button></a-popconfirm>
+            <a-button size="small" class="back-link" @click="router.push('/acct')">全部账号 ↗</a-button>
+          </div>
+        </div>
       </header>
 
-      <div class="qt-toolbar account-toolbar">
-        <a-button type="primary" @click="openMessages">查询历史消息</a-button>
-        <a-button v-if="ops.start" :loading="busy" :disabled="a.channel === 'wechat' && resources.hasPending" :data-testid="T.op('start')" @click="startAccount">{{ a.channel === 'wechat' ? '登录此微信' : '启动账号' }}</a-button>
-        <a-popconfirm v-if="ops.stop" title="停止当前账号？消息采集与正在进行的任务会受影响。" @confirm="act(() => accountsApi.stop(a!.id), '已请求停止')"><a-button :disabled="busy" :data-testid="T.op('stop')">停止账号</a-button></a-popconfirm>
-        <a-popconfirm v-if="ops.restart" title="重启当前账号？连接和正在进行的任务会暂时中断。" @confirm="act(() => accountsApi.restart(a!.id), '已请求重启')"><a-button :disabled="busy" :data-testid="T.op('restart')">重启</a-button></a-popconfirm>
-        <a-button class="back-link" @click="router.push('/acct')">全部账号 ↗</a-button>
-      </div>
-
       <div v-if="readDegraded" class="warnbar" :data-testid="T.readDegraded">{{ ALERT_CODES[readDegraded.code]?.zh ?? readDegraded.message }}<small>系统每 5 分钟自动重试；也可按需重启当前账号。</small></div>
-      <section v-if="showStateCard" class="qt-card state-guide" :data-testid="T.stateCard">
-        <div class="qt-row"><strong>{{ stateCardTitle(stateCode) }}</strong><span v-if="codeMeta?.group === 'wait'" class="workspace-label" :data-testid="T.stateCardLoginPhase">{{ LOGIN_PHASE_TITLE }}</span></div>
-        <p v-if="stateCardSubtitle(stateCode)" class="qt-muted">{{ stateCardSubtitle(stateCode) }}</p><p>{{ prompt?.text || codeMeta?.zh || a.state_reason }}</p>
-        <PromptCard :prompt="prompt" :state-code="stateCode" />
-        <div class="qt-row wrap"><a-button v-for="action in stateActions" :key="action" type="primary" :disabled="busy" :data-testid="T.stateCardAction(action)" @click="runStateAction(action)">{{ ({ login: '重新登录', password: '输入密码登录', 'goto-screen': '查看账号画面', 'refresh-qr': '刷新二维码', 'key-retry': '重新取钥', reinstall: '修复微信', unlock: '解锁 Windows', 'cred-update': '更新登录密码', restart: '重试启动', 'open-env': '检查环境', 'open-logs': '查看日志', 'narrator-redo': '重新准备登录' } as Record<string,string>)[action] ?? action }}</a-button></div>
-      </section>
 
       <div class="account-layout">
         <section class="qt-glass account-workspace">
-          <header class="workspace-heading"><div><div class="qt-eyebrow">{{ a.channel === 'qq' ? 'NAPCAT / ONEBOT' : a.channel === 'wechat' ? 'WECHAT / WINDOWS' : 'QIDIAN / ANDROID' }}</div><h2>{{ a.channel === 'qq' ? 'QQ 工作台' : a.channel === 'wechat' ? '微信账号画面' : '企点操作画面' }}</h2></div><span class="workspace-label">{{ a.channel === 'qq' ? '本机受控入口' : a.channel === 'wechat' ? '只读预览' : '实时画面' }}</span></header>
-          <template v-if="a.channel === 'qq'">
+          <header class="workspace-heading"><div><div class="qt-eyebrow">{{ a.channel === 'qq' ? 'NAPCAT / ONEBOT' : a.channel === 'wechat' ? 'WECHAT / WINDOWS' : 'QIDIAN / ANDROID' }}</div><h2>{{ a.channel === 'qq' ? 'QQ 工作台' : a.channel === 'wechat' ? '微信账号' : '企点操作画面' }}</h2></div><span class="workspace-label">{{ a.channel === 'qq' ? '本机受控入口' : a.channel === 'wechat' ? '本机窗口' : '实时画面' }}</span></header>
+          <!-- R6-94(2026-10-10 安琳):微信不需要画面 —— 窗口就在本机桌面,直接在微信里操作 -->
+          <div v-if="a.channel === 'wechat'" class="channel-preview"><div class="preview-orbit">微</div><h3>{{ a.self_nick || a.label }}</h3><p>微信在本机 Windows 窗口里运行,登录、取钥时按右侧提示直接在微信里操作即可;收发记录在消息中心查看。</p><a-button type="primary" @click="openMessages">查看消息</a-button></div>
+          <template v-else-if="a.channel === 'qq'">
             <div class="channel-preview"><div class="preview-orbit">QQ</div><h3>{{ a.self_nick || a.label }}</h3><p>通过 NapCat 管理当前账号，收发记录可在消息中心查询。</p><a-popconfirm title="临时开放本机 NapCat 工作台 10 分钟并在浏览器打开？" @confirm="openWebui"><a-button type="primary" :disabled="session.draining || busy" :data-testid="T.webuiOpen">打开 NapCat 工作台</a-button></a-popconfirm><div v-if="webuiLeft" class="webui-timer"><span :data-testid="T.webuiCountdown">临时入口剩余 {{ webuiLeft }} 秒</span><a-button size="small" :data-testid="T.webuiClose" @click="closeWebui">提前关闭</a-button></div></div>
           </template>
           <AccountScreen v-else-if="screenOpen" :key="a.id" embedded :account-id="a.id" />
-          <div v-else class="channel-preview"><div class="preview-orbit">{{ a.channel === 'wechat' ? '微' : '企' }}</div><h3>{{ a.channel === 'wechat' ? '查看当前微信窗口' : '打开专属账号画面' }}</h3><p>{{ a.channel === 'wechat' ? '窗口每 2 秒更新一次。操作请在 Windows 中的微信窗口完成。' : '按需连接实时画面，完成登录、验证码与日常操作。' }}</p><a-button type="primary" :data-testid="T.op('screen')" @click="screenOpen = true">{{ a.channel === 'wechat' ? '查看微信画面' : '连接企点画面' }}</a-button></div>
+          <div v-else class="channel-preview"><div class="preview-orbit">企</div><h3>打开专属账号画面</h3><p>按需连接实时画面，完成登录、验证码与日常操作。</p><a-button type="primary" :data-testid="T.op('screen')" @click="screenOpen = true">连接企点画面</a-button></div>
         </section>
         <aside class="account-sidebar">
+          <section v-if="showStateCard" class="qt-card state-guide" :data-testid="T.stateCard">
+            <div class="qt-row"><strong>{{ stateCardTitle(stateCode) }}</strong><span v-if="codeMeta?.group === 'wait'" class="workspace-label" :data-testid="T.stateCardLoginPhase">{{ LOGIN_PHASE_TITLE }}</span></div>
+            <p v-if="stateCardSubtitle(stateCode)" class="qt-muted">{{ stateCardSubtitle(stateCode) }}</p><p>{{ prompt?.text || codeMeta?.zh || a.state_reason }}</p>
+            <PromptCard :prompt="prompt" :state-code="stateCode" />
+            <div class="qt-row wrap"><a-button v-for="action in stateActions" :key="action" type="primary" :disabled="busy" :data-testid="T.stateCardAction(action)" @click="runStateAction(action)">{{ ({ login: '重新登录', password: '输入密码登录', 'goto-screen': '查看账号画面', 'refresh-qr': '刷新二维码', 'key-retry': '重新取钥', reinstall: '修复微信', unlock: '解锁 Windows', 'cred-update': '更新登录密码', restart: '重试启动', 'open-env': '检查环境', 'open-logs': '查看日志', 'narrator-redo': '重新准备登录' } as Record<string,string>)[action] ?? action }}</a-button></div>
+          </section>
           <section class="qt-card facts-card"><div class="qt-eyebrow">ACCOUNT PROFILE</div><h2>账号信息</h2><div class="kv"><span>通道</span><b>{{ CHANNEL_TEXT[a.channel] }}</b></div><div class="kv"><span>标识</span><b>{{ a.wxid || a.self_uid || a.id }}</b></div><div class="kv"><span>最近活动</span><b>{{ a.last_seen_at?.slice(5,19).replace('T',' ') || '—' }}</b></div><p v-if="a.state_reason" class="qt-small qt-muted">{{ a.state_reason }}</p></section>
           <section class="qt-card facts-card"><div class="qt-eyebrow">RESOURCE USAGE</div><h2>当前占用</h2><div class="resource-value" :data-testid="T.resField('current')">{{ memoryText(memoryMb) }}</div><div class="kv"><span>CPU</span><b :data-testid="T.resField('cpu')">{{ resSnapshot?.cpu_pct == null ? '—' : resSnapshot.cpu_pct + '%' }}</b></div><a-button block @click="router.push('/res')">查看资源监控 ↗</a-button></section>
-          <div class="remove-account"><a-popconfirm title="从列表移除该账号？账号将停用，数据与登录态保留。" @confirm="doSoftDelete"><a-button type="text" :disabled="!ops.del || busy" :data-testid="T.delete">移除账号</a-button></a-popconfirm></div>
+          <div class="remove-account"><a-popconfirm title="从列表移除该账号？会先停止该账号，数据与登录态保留。" @confirm="doSoftDelete"><a-button type="text" :disabled="busy || ['provisioning','starting','logging_in','stopping'].includes(a.state)" :data-testid="T.delete">移除账号</a-button></a-popconfirm></div>
         </aside>
       </div>
     </template>
@@ -198,13 +241,21 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
 </template>
 
 <style scoped>
-.account-heading { display: flex; align-items: center; margin-bottom: 22px; padding: 28px; border: 1px solid rgba(117,71,168,.12); border-radius: 26px; gap: 18px; }
-.account-state-text { display: inline-flex; align-items: center; gap: 8px; color: var(--qt-text-secondary); font-size: 13px; }
-.account-title { flex: 1; min-width: 0; }
+.account-heading { display: flex; align-items: center; margin-bottom: 18px; padding: 22px 28px; border: 1px solid rgba(117,71,168,.12); border-radius: 26px; gap: 18px; }
+.account-state-text { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; color: var(--qt-text-secondary); font-size: 13px; }
+.account-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .account-title h1 { margin: 4px 0; font-size: 28px; letter-spacing: -.8px; }
+/* 名称就地编辑:悬停/聚焦时露出编辑 icon;点击后同一位置换成输入框,失焦即保存 */
+.label-display { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; cursor: text; border-radius: 10px; outline: none; }
+.label-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.label-edit-icon { flex-shrink: 0; font-size: 15px; line-height: 1; color: var(--qt-primary); opacity: 0; transition: opacity .15s ease; cursor: pointer; }
+.label-display:hover .label-edit-icon, .label-display:focus-visible .label-edit-icon { opacity: 1; }
+.label-display:focus-visible { box-shadow: 0 0 0 2px rgba(117,71,168,.25); }
+.label-input { margin: 4px 0; padding: 0 2px; max-width: 420px; font: inherit; font-size: 28px; font-weight: 600; letter-spacing: -.8px; color: inherit; background: transparent; border: 0; border-bottom: 2px solid var(--qt-primary); outline: none; }
 .account-avatar { display: grid; place-items: center; flex-shrink: 0; width: 64px; height: 64px; border: 1px solid rgba(255,255,255,.8); border-radius: 22px; color: var(--qt-primary); background: linear-gradient(135deg,#eee5fa,#fff6de); font-size: 26px; }
-.account-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
-.back-link { margin-left: auto; }
+.account-heading-side { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; flex-shrink: 0; }
+.account-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.back-link { margin-left: 4px; }
 .account-layout { display: grid; grid-template-columns: minmax(0,1fr) 285px; gap: 22px; }
 .account-workspace { border: 1px solid rgba(117,71,168,.12); border-radius: 26px; padding: 26px; min-width: 0; }
 .workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -224,11 +275,13 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
 .resource-value { font-size: 31px; margin: 12px 0; letter-spacing: -1px; }
 .facts-card .ant-btn { margin-top: 18px; }
 .remove-account { text-align: center; }
-.state-guide { padding: 24px; margin-bottom: 22px; }
+.state-guide { padding: 22px; }
+.state-guide .qt-row { flex-wrap: wrap; gap: 8px; }
 .wrap { flex-wrap: wrap; gap: 8px; }
 .warnbar { background: #fff5df; color: var(--qt-sev-warn); padding: 18px 22px; border-radius: 16px; margin-bottom: 20px; }
 .warnbar small { display: block; margin-top: 6px; }
 .mt { margin-top: 18px; }
 @media(max-width: 1000px) { .account-layout { grid-template-columns: 1fr; } .account-sidebar { display: grid; grid-template-columns: 1fr 1fr; } }
-@media(max-width: 760px) { .account-heading { padding: 20px; flex-wrap: wrap; } .account-workspace { padding: 18px; } .account-avatar { width: 48px; height: 48px; } .account-sidebar { display: flex; } .account-title h1 { font-size: 23px; } .back-link { margin-left: 0; } }
+@media(max-width: 1000px) { .account-heading-side { align-items: flex-start; } .account-toolbar { justify-content: flex-start; } }
+@media(max-width: 760px) { .account-heading { padding: 20px; flex-wrap: wrap; } .account-heading-side { width: 100%; } .account-workspace { padding: 18px; } .account-avatar { width: 48px; height: 48px; } .account-sidebar { display: flex; } .account-title h1, .label-input { font-size: 23px; } .back-link { margin-left: 0; } }
 </style>

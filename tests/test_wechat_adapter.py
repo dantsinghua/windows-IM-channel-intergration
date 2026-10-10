@@ -78,6 +78,21 @@ async def test_write_refused_under_key_fail_with_exact_message(tmp_path):
     rig.store.close()
 
 
+async def test_send_404_is_target_not_found_not_send_failed(tmp_path):
+    """R6-92:WinAgent 回 404(会话不存在 / 显示名重名拒发)= **根本没发**,结果码 TARGET_NOT_FOUND、不可盲重试。"""
+    from qtrade_agent.adapters.wechat.client import WeChatCallFailed
+    rig = make_wechat_rig(tmp_path)
+
+    async def refuse(**_kw):
+        raise WeChatCallFailed(404, {"error": {"message": "会话「张三」在通讯录里不唯一", "reason": "display_name_ambiguous"}},
+                               "/wa/v1/wechat/send")
+    rig.adapter._client.send = refuse                                    # noqa: SLF001
+    res = await rig.adapter.send(rig.account(), cmd("send_text", session="wx01:p", text="x"))
+    assert res.ok is False and res.code == "TARGET_NOT_FOUND"
+    assert res.error.reason == "display_name_ambiguous" and res.error.retryable is False and "不唯一" in res.error.message
+    rig.store.close()
+
+
 async def test_read_also_refused_under_key_fail(tmp_path):
     """05 §2.4.7 读那一条:chatlog 拿不到 Data Key ⇒ ``read_messages`` 不可用。"""
     rig = make_wechat_rig(tmp_path)

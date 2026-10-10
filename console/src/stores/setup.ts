@@ -1,10 +1,11 @@
 /**
- * `setup` store:首次向导进度;合规确认**以 Agent 为准**(01-P3)。
+ * `setup` store:首次向导进度 + 使用告知的只读视图。
  *
  * 🔴 端点更正:`/settings/compliance` 在 02 #88 的 `group` 枚举里**不存在**(真后端 404)。
  * 告知文案与「勾过没有」都走 #86 `GET /system/notice`(它回 `{notice_version, text, ack_ms,
  * acked_at, acked_version}`),勾选走 #87 `POST /system/notice/ack {notice_version}`。
- * 判据仍**以 Agent 为准**:`acked_version === notice_version` 才算这一版勾过(05 §6.1)。
+ * 🔴 R6-84(2026-10-10 安琳):向导里的「阅读须知」步整步删除,**向导与路由守卫不再以告知确认为门**;
+ * 告知只在偏好设置里按需查看(`loadNotice` / `ack` 保留给那条入口),改版重勾(原 05 §6.1 末句)一并退役。
  */
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
@@ -36,10 +37,13 @@ const DONE_MIRROR_KEY = 'qt.setup.done'
  */
 const STEP_KEY = 'qt.setup.step'
 
+/** 向导共四步(R6-84):0 连接服务 · 1 检查环境 · 2 添加账号 · 3 准备完成 */
+export const SETUP_LAST_STEP = 3
+
 function readStep(): number {
   try {
     const n = Number(globalThis.sessionStorage?.getItem(STEP_KEY))
-    if (Number.isInteger(n) && n >= 0 && n <= 4) return n
+    if (Number.isInteger(n) && n >= 0 && n <= SETUP_LAST_STEP) return n
   } catch {
     // 隐私模式 / 站点数据被禁:退回第 1 步,不让读存储把向导整页打断
   }
@@ -73,17 +77,14 @@ function writeDoneMirror(v: boolean): void {
 export const useSetupStore = defineStore('setup', () => {
   const done = ref(true)
   /**
-   * 向导当前步(0..4)。组件重挂靠这份 store(01 §2.7.1 步 4「完成后回到本步」);
+   * 向导当前步(0..3)。组件重挂靠这份 store(01 §2.7.1 步 3「完成后回到本步」);
    * 整页刷新靠 `STEP_KEY`,只放内存时刷新必回第 1 步。
    */
   const step = ref(readStep())
   // sync:刷新可能紧跟在改步之后,等下一拍再写就来不及
   watch(step, writeStep, { flush: 'sync' })
-  /** 告知页改版 ⇒ 已完成向导的机器重启后也要重新勾(05 §6.1 末句 / §8b.6 U1) */
-  const reackRequired = ref(false)
   const noticeText = ref('')
   const noticeVersion = ref('')
-  const scrolledToBottom = ref(false)
   const acked = ref(false)
   const ackMs = ref<number | null>(null)
   const loading = ref(false)
@@ -121,31 +122,10 @@ export const useSetupStore = defineStore('setup', () => {
     }
   }
 
+  /** 偏好设置里按需确认当前版本的告知(#87);以 Agent 为准,写完重读一次,不让界面记住一个服务端没落下的勾 */
   async function ack(): Promise<void> {
     await systemApi.noticeAck(noticeVersion.value)
-    // 以 Agent 为准:写完重读一次,别让界面记住一个服务端没落下的勾
     await loadNotice()
-    /**
-     * 🔴 这里**不清** `reackRequired`(R-1):勾完就清会让页面的 `reackOnly` 立刻变 false,
-     * 按钮变回「下一步」、点了进第 2 步 = 重走五步。重勾态由 `SetupPage.goNext()` 在
-     * 「直进主页」那一刻清掉(清完再跳,守卫 `needsReack` 才不把人打回)。
-     * #87 失败会在上面抛出,`acked` 不变 ⇒ 按钮禁用、守卫照旧按住 `/setup`;
-     * 勾完没点按钮就刷新 ⇒ `refreshAck()` 以 Agent 的 `acked_version` 重判,已勾即放行。
-     */
-  }
-
-  /**
-   * 启动时核对「这一版告知勾过没有」。
-   * 只在**已完成向导**时有意义(没完成本来就要走向导);#86 拉不到(后端未就绪)时**不判**,
-   * 否则会把人锁死在告知页 —— 判据以 Agent 为准,取不到就不是「没勾」。
-   */
-  async function refreshAck(): Promise<void> {
-    if (!done.value) return
-    await loadNotice()
-    if (error.value) return
-    reackRequired.value = !acked.value
-    // 要重勾就从告知页开始(勾完直接进控制台,不重走五步)
-    if (reackRequired.value) step.value = 0
   }
 
   async function finish(autoLaunch: boolean, trayOnClose: boolean): Promise<void> {
@@ -169,16 +149,10 @@ export const useSetupStore = defineStore('setup', () => {
     done.value = false
     writeDoneMirror(false)
     step.value = 0
-    /**
-     * 01 §2.7.1「每步『上一步』可退,但告知页勾选不重置」说的是**向导内**退步;
-     * 「重新运行向导」是重走一遍,滚动判定要重来,否则告知区一进去就是解锁态(等于没这道门)。
-     * 「已确认」本身不由这里定 —— 仍以 Agent 的 `acked_version` 为准(`loadNotice()` 回填)。
-     */
-    scrolledToBottom.value = false
   }
 
   return {
-    done, step, reackRequired, noticeText, noticeVersion, scrolledToBottom, acked, ackMs, loading, error,
-    loadConfig, loadNotice, refreshAck, ack, finish, rerun,
+    done, step, noticeText, noticeVersion, acked, ackMs, loading, error,
+    loadConfig, loadNotice, ack, finish, rerun,
   }
 })

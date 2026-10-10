@@ -8,7 +8,35 @@ BeforeAll {
     $script:Iss = Join-Path (Split-Path -Parent $PSScriptRoot) 'engine\qtrade-setup-engine.iss'
     $script:Src = [IO.File]::ReadAllText($script:Iss)
     $script:PsExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $script:RealWsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $script:FakeWsl = Join-Path $TestDrive ('fake-wsl-' + [Guid]::NewGuid().ToString('N') + '.exe')
+    $script:PreviousFakeMode = $env:QT_FAKE_WSL_MODE
+    $script:PreviousFakePid = $env:QT_FAKE_WSL_PID_FILE
+    $fakeSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Threading;
+public static class FakeWsl {
+    public static int Main(string[] args) {
+        if (String.Join("|", args) != "--list|--running|--quiet") return 19;
+        if (Environment.GetEnvironmentVariable("QT_FAKE_WSL_MODE") == "hang") {
+            File.WriteAllText(Environment.GetEnvironmentVariable("QT_FAKE_WSL_PID_FILE"), Process.GetCurrentProcess().Id.ToString());
+            Thread.Sleep(30000);
+            return 18;
+        }
+        string text = "fixture-alpha\r\nfixture-beta\r\n";
+        Encoding encoding = Environment.GetEnvironmentVariable("WSL_UTF8") == "1" ? new UTF8Encoding(false) : Encoding.Unicode;
+        byte[] bytes = encoding.GetBytes(text);
+        Stream output = Console.OpenStandardOutput();
+        output.Write(bytes, 0, bytes.Length);
+        output.Flush();
+        return 0;
+    }
+}
+'@
+    Add-Type -TypeDefinition $fakeSource -OutputAssembly $script:FakeWsl -OutputType ConsoleApplication
+    $env:QT_FAKE_WSL_MODE = 'list'
     $script:PrevUtf8 = $env:WSL_UTF8
     $env:WSL_UTF8 = $null   # 测试进程自己不带,免得对照组被环境「帮」成 UTF-8
 
@@ -81,6 +109,8 @@ BeforeAll {
 
 AfterAll {
     $env:WSL_UTF8 = $script:PrevUtf8
+    $env:QT_FAKE_WSL_MODE = $script:PreviousFakeMode
+    $env:QT_FAKE_WSL_PID_FILE = $script:PreviousFakePid
 }
 
 Describe 'B7:GetRunningDistros 命令的形状(静态)' {
@@ -98,59 +128,40 @@ Describe 'B7:GetRunningDistros 命令的形状(静态)' {
     }
 }
 
-Describe 'B7:在本机 Windows PowerShell 上实跑' {
-
-    It '① 挂住的进程在 3 s 超时后被杀掉,退出码 1' {
-        $tag = 'qt-hang-' + [Guid]::NewGuid().ToString('N')
-        $hang = Join-Path $TestDrive ($tag + '.cmd')
-        # 忽略参数、挂 30 s 的假 wsl
-        [IO.File]::WriteAllText($hang, "@ping -n 31 127.0.0.47 >nul`r`n", (New-Object Text.ASCIIEncoding))
-        $out = Join-Path $TestDrive 'hang-out.txt'
+Describe 'B7: real PS5.1 orchestration with an isolated synthetic executable' {
+    It 'terminates the exact synthetic child after the three-second deadline' {
+        $pidFile = Join-Path $TestDrive 'hang-child.pid'
+        $env:QT_FAKE_WSL_MODE = 'hang'
+        $env:QT_FAKE_WSL_PID_FILE = $pidFile
         try {
-            $r = Invoke-Detect -WslExe $hang -OutFile $out
+            $r = Invoke-Detect -WslExe $script:FakeWsl -OutFile (Join-Path $TestDrive 'hang-out.txt')
             $r.ExitCode | Should -Be 1
             $r.Ms | Should -BeGreaterOrEqual 2800
             $r.Ms | Should -BeLessThan 20000
-            Start-Sleep -Milliseconds 500
-            $alive = @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($tag) })
-            $alive.Count | Should -Be 0
+            (Test-Path -LiteralPath $pidFile) | Should -BeTrue
+            $childId = [int]([IO.File]::ReadAllText($pidFile))
+            @(Get-Process -Id $childId -ErrorAction SilentlyContinue).Count | Should -Be 0
         } finally {
-            Get-CimInstance Win32_Process -Filter "Name='cmd.exe' OR Name='PING.EXE' OR Name='ping.exe'" |
-                Where-Object { $_.CommandLine -and ($_.CommandLine.Contains($tag) -or $_.CommandLine.Contains('127.0.0.47')) } |
-                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            $env:QT_FAKE_WSL_MODE = 'list'
         }
     }
 
-    It '② 正常路径:输出是 UTF-8、无 NUL、能按行读,且与 wsl.exe 直接列出的一致' {
-        if (-not (Test-Path -LiteralPath $script:RealWsl)) { Set-ItResult -Skipped -Because '本机没有 wsl.exe'; return }
-        # 参照:直接跑 wsl.exe(未设 WSL_UTF8 → UTF-16LE),按 Unicode 解码
-        $psi = New-Object Diagnostics.ProcessStartInfo($script:RealWsl, '--list --running --quiet')
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.StandardOutputEncoding = [Text.Encoding]::Unicode
-        $p = [Diagnostics.Process]::Start($psi)
-        $refText = $p.StandardOutput.ReadToEnd()
-        [void]$p.WaitForExit(30000)
-        $expected = @($refText -split "`r?`n" | ForEach-Object { $_.Trim([char]0, ' ', "`t") } | Where-Object { $_ -ne '' })
-
-        $out = Join-Path $TestDrive 'real-out.txt'
-        $r = Invoke-Detect -WslExe $script:RealWsl -OutFile $out
+    It 'returns the exact fixture lines as UTF8 without NUL bytes' {
+        $out = Join-Path $TestDrive 'utf8-out.txt'
+        $r = Invoke-Detect -WslExe $script:FakeWsl -OutFile $out
         $r.ExitCode | Should -Be 0
-        Test-Path -LiteralPath $out | Should -BeTrue
+        (Test-Path -LiteralPath $out) | Should -BeTrue
         $bytes = [IO.File]::ReadAllBytes($out)
         @($bytes | Where-Object { $_ -eq 0 }).Count | Should -Be 0
-        $lines = Read-Lines -Path $out
-        ($lines -join '|') | Should -Be ($expected -join '|')
+        ((Read-Lines -Path $out) -join '|') | Should -Be 'fixture-alpha|fixture-beta'
     }
 
-    It '③ 反向对照:去掉 WSL_UTF8 那一句,重定向输出带 NUL(UTF-16LE)' {
-        if (-not (Test-Path -LiteralPath $script:RealWsl)) { Set-ItResult -Skipped -Because '本机没有 wsl.exe'; return }
-        $out = Join-Path $TestDrive 'ctrl-out.txt'
-        $r = Invoke-Detect -WslExe $script:RealWsl -OutFile $out -DropUtf8
+    It 'detects the same encoding regression when WSL_UTF8 is removed' {
+        $out = Join-Path $TestDrive 'control-out.txt'
+        $r = Invoke-Detect -WslExe $script:FakeWsl -OutFile $out -DropUtf8
         $r.ExitCode | Should -Be 0
         $bytes = [IO.File]::ReadAllBytes($out)
-        if ($bytes.Length -eq 0) { Set-ItResult -Skipped -Because '本机此刻没有运行中的发行版,对照组无输出可比'; return }
+        $bytes.Length | Should -BeGreaterThan 0
         @($bytes | Where-Object { $_ -eq 0 }).Count | Should -BeGreaterThan 0
     }
 }

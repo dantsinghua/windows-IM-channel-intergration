@@ -143,6 +143,8 @@ class WechatConfig:
     """02 §7.2 ``[wechat]``(配置文件的家在 02,R3-37)+ 04 §7(keep-awake / hosts 屏蔽的**行为 owner**)+ 05 §7(05 独有键)。"""
     enabled: bool = False                                               # 🔴 全系统唯一真值(C-43)
     chatlog_dir: str = PROGRAMDATA + "\\pkg\\chatlog"                   # 目录而非 exe(DLL 复制需要目录)
+    # R6-90:chatlog 只认 `<cwd>/lib/windows_x64/wx_key.dll`;会话代理是普通用户、pkg 只读 ⇒ 选中的 DLL 落到用户可写目录作 cwd
+    chatlog_work_dir: str = "%LOCALAPPDATA%\\QTrade\\chatlog"
     chatlog_port: int = 5030
     wxkey_dlls: tuple[str, ...] = ("wx_key2.dll", "wx_key1.dll")        # 试钥顺序(C-43 采 05;矩阵有 verified 时优先该 DLL)
     poll_interval_s: int = 5
@@ -150,8 +152,15 @@ class WechatConfig:
     page_limit: int = 200
     confirm_poll_interval_ms: int = 1000                                # 发送后加速轮询
     confirm_timeout_ms: int = 10000                                     # 微信 10s 读回确认
-    bundled_installer: str = PROGRAMDATA + "\\pkg\\WeChatSetup.exe"
-    narrator_min_seconds: int = 300                                     # 讲述人仪式最短时长(C-43)
+    # R6-87:默认值 = 安装器实际落包的位置(03 §2.9.3 / collect-payload `pkg/wechat/weixin_4.1.12.26.exe`);
+    # 此前写 `pkg\WeChatSetup.exe`,安装器又从不写本键 ⇒ 全新机器装完「重装」必缺文件。
+    bundled_installer: str = PROGRAMDATA + "\\pkg\\wechat\\weixin_4.1.12.26.exe"
+    bundled_version: str = "4.1.12.26"                                  # 随包微信版本(B-1;03 §2.9.3 钉死)
+    # 🔴 R2-6:另一候选包 WeChatWin_4.1.12.exe 外层 VersionInfo 与之完全相同、装出来却是 4.1.12.55 —— 只能靠 sha256 分辨。
+    # 空串 = 不校验(仅限明确知道自己在干什么的测试环境)。
+    bundled_sha256: str = "58997cfe4513ab71f107c2137bb570ade030f228115c14688544cec80e604053"
+    narrator_min_seconds: int = 300                                     # 讲述人仪式保底时长(C-43;R6-90 起为上限兜底)
+    narrator_probe_min_seconds: int = 60                                # R6-90:已登录且可见时,满此值即提前试一次「关讲述人→复探」
     keep_awake_mode: str = "powercfg"                                   # request|powercfg|off(默认 powercfg,C-6)
     update_check_min: int = 10                                          # H20
     # ---- 04 §7 [wechat](行为 owner=04)
@@ -233,6 +242,91 @@ def load(data: dict[str, Any]) -> WinAgentConfig:
             vals[k] = v
         kw[name] = cls(**vals)
     return WinAgentConfig(**kw)
+
+
+def _toml_scalar(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def write_toml_keys(path: str, section: str, values: dict[str, Any]) -> str:
+    """R6-88:把 ``[section]`` 下的若干**标量**键写回 ``winagent.toml``,其余内容逐字不动。
+
+    只做本项目需要的最小事(行级编辑,不是通用 TOML 序列化):
+    - 段已存在 ⇒ 段内同名键整行替换(保留行尾注释前的内容不保证,注释丢弃是可接受的);缺的键追加在段末;
+    - 段不存在 ⇒ 文件末尾追加 ``[section]`` 与各键;
+    - 文件不存在 ⇒ 新建;
+    - 原文件的 BOM 与换行风格(CRLF/LF)原样保留;先写同目录临时文件再 ``os.replace``,中途失败不留半截。
+    返回写入后的文本(便于测试断言)。
+    """
+    import os
+    import re
+    import tempfile
+
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = b""
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    text = raw[3:].decode("utf-8") if bom else raw.decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split("\n")
+    lines = [ln.rstrip("\r") for ln in lines]
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    sec_re = re.compile(r"^\s*\[([^\]]+)\]\s*(#.*)?$")
+    start = end = None
+    for i, ln in enumerate(lines):
+        m = sec_re.match(ln)
+        if m is None:
+            continue
+        if start is not None:
+            end = i
+            break
+        if m.group(1).strip() == section:
+            start = i
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"[{section}]")
+        start, end = len(lines) - 1, len(lines)
+    if end is None:
+        end = len(lines)
+
+    pending = dict(values)
+    key_re = re.compile(r"^\s*([A-Za-z0-9_\-]+)\s*=")
+    for i in range(start + 1, end):
+        m = key_re.match(lines[i])
+        if m and m.group(1) in pending:
+            lines[i] = f"{m.group(1)} = {_toml_scalar(pending.pop(m.group(1)))}"
+    insert_at = end
+    while insert_at > start + 1 and not lines[insert_at - 1].strip():   # 追加在段内最后一个非空行之后
+        insert_at -= 1
+    for k, v in pending.items():
+        lines.insert(insert_at, f"{k} = {_toml_scalar(v)}")
+        insert_at += 1
+
+    out = nl.join(lines) + nl
+    data = (b"\xef\xbb\xbf" if bom else b"") + out.encode("utf-8")
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".winagent-toml-", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return out
 
 
 def wsl_memory_gb(physical_gb: int, *, cfg: WslConfig, wechat_on: bool) -> int:

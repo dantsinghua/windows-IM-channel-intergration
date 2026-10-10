@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import time
 from dataclasses import dataclass, field
@@ -23,9 +24,9 @@ from . import API_VERSION, __version__
 from . import alerts as A
 from .alerts import AlertBuffer
 from .audit import ACTOR_AGENT, ACTOR_CONSOLE, ACTOR_INSTALLER, Audit
-from .config import WinAgentConfig
+from .config import WinAgentConfig, write_toml_keys
 from .db import Db
-from .errors import FORBIDDEN, INVALID_ARGS, TARGET_NOT_FOUND, UNAUTHORIZED, WaError, user_agent_offline
+from .errors import FORBIDDEN, INTERNAL, INVALID_ARGS, TARGET_NOT_FOUND, UNAUTHORIZED, WaError, user_agent_offline
 from .ids import trace_id as new_trace_id
 from .installer_ops import InstallerOps
 from .logfmt import get_logger
@@ -45,7 +46,9 @@ ACTOR_BY_ROLE = {ROLE_AGENT: ACTOR_AGENT, ROLE_CONSOLE: ACTOR_CONSOLE, ROLE_INST
 
 # 02 §2.5「超时」(Agent 侧的期望值;服务侧据此给管道 deadline_ms = 本值 − 1s)
 TIMEOUT_S = {"ping": 2.0, "health": 2.0, "time": 3.0, "vault": 3.0, "metrics": 3.0, "alerts": 3.0, "net": 3.0,
-             "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0, "wechat_send": 15.0,
+             "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0,
+             # 快捷键发送约数秒,再加上 10s 读回确认。15s 时消息已经发出,读回还没返回,服务就把会话代理判超时。
+             "wechat_send": 45.0,
              "wechat_login_start": 60.0}
 
 
@@ -92,6 +95,12 @@ class SvcDeps:
     clock: Callable[[], int] = field(default=lambda: int(time.time() * 1000))
     listen: tuple[str, ...] = ("127.0.0.1",)
     started_ms: int = 0
+    #: `winagent.toml` 的落点(R6-88:#43 受控子集改动要写回这里 —— C-43「enabled 全系统唯一真值在 toml」,
+    #: 此前只改内存 + DB 快照,服务一重启就丢;None = 不落盘(测试 / --dev)
+    config_path: Optional[str] = None
+    #: R6-89:服务侧(提权/SYSTEM)结束讲述人。讲述人跑在高完整性级别,会话代理 taskkill 它是拒绝访问;
+    #: #33 响应带 `narrator.stop_pending=true` / cancel 带 `narrator_stop_pending=true` 时由服务调用。None = 不具备(测试默认)
+    narrator_killer: Optional[Callable[[], bool]] = None
 
 
 def _client_host(request: Request) -> Optional[str]:
@@ -156,6 +165,16 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         """纯 ``user`` 端点:一一映射下发管道(02 §2.4.1「帧格式」行)。离线 → 503 NOT_READY。"""
         return await d.hub.call(method, params, timeout_s=timeout_s,
                                 trace_id=getattr(request.state, "trace_id", None), target=target)
+
+    async def _sync_wechat_module_on_holder(s) -> None:                    # type: ignore[no-untyped-def]
+        """R6-88:会话代理一上线就把服务侧的微信模块开关(C-43 真值)推过去。
+        否则会话代理只认它自己启动时读到的 toml:用户登录桌面前控制台已经启用过模块、或服务/会话代理任一方重启过,
+        两边就各说各话 —— 控制台看到「微信模块:未启用 / 尚未确认已启用」,而服务 health 又说 enabled。"""
+        await d.hub.call("wechat.module", {"enabled": d.cfg.wechat.enabled}, timeout_s=TIMEOUT_S["wsl"], trace_id=None)
+
+    if _sync_wechat_module_on_holder not in d.hub.on_holder:
+        d.hub.on_holder.append(_sync_wechat_module_on_holder)
+    d.hub.welcome_extras = lambda: {"wechat_enabled": d.cfg.wechat.enabled}   # 握手即对齐(主路径);上面的推送是兜底
 
     # ================================================================== #1 ping(—,svc)
     @app.get("/wa/v1/ping")
@@ -574,7 +593,26 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
             auth(request, (ROLE_AGENT, ROLE_CONSOLE, ROLE_INSTALLER), action="wechat.version_match")
         except WaError as e:
             return fail(e, request)
-        return d.wechat_store.version_match(bundled_version=_bundled_version(d), wxkey_dlls=d.cfg.wechat.wxkey_dlls)
+        # R6-86 承接 —— 事实来源 = **本机当前实际安装**(会话代理按 03 §2.9.1 三来源定位),`wechat_install` 只是上次记档:
+        #   · 全新机器 / 安装器没跑过检测:行为空,原逻辑恒 NOT_INSTALLED,把装着 4.1.12.26 的机器也引去「重装」;
+        #   · 用户事后自己升级或卸载了微信:行是陈旧的,按行判会放过不该放的版本;
+        #   · 会话代理不在线(没登录桌面):没有事实来源,只能按记档判,不猜。
+        installed = d.wechat_store.install()
+        if d.hub.user_agent_online:
+            try:
+                loc = await via_pipe("wechat.locate", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+            except WaError:
+                loc = None                                            # 探测失败 ⇒ 退回记档,不把错误抛给向导
+            if isinstance(loc, dict):
+                if loc.get("installed") and loc.get("version"):
+                    d.wechat_store.put_install(path=loc.get("path"), version=loc.get("version"),
+                                               exe_version=loc.get("version"), data_root=loc.get("data_root"),
+                                               data_dir=loc.get("data_dir"), appdata_dir=loc.get("appdata_dir"))
+                    installed = d.wechat_store.install()
+                elif loc.get("installed") is False:
+                    installed = {}                                    # 本机确实没装(含事后卸载):旧行不作数(空 dict ≠ None,不回退查表)
+        return d.wechat_store.version_match(bundled_version=_bundled_version(d), installed=installed,
+                                            wxkey_dlls=d.cfg.wechat.wxkey_dlls)
 
     @app.get("/wa/v1/wechat/profiles")
     async def wechat_profiles(request: Request):                                  # type: ignore[no-untyped-def]
@@ -607,15 +645,28 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         try:
             auth(request, (ROLE_AGENT,), action="wechat.login_cancel")
             body = await _json(request)
-            return await via_pipe("wechat.login.cancel", {"login_session_id": body.get("login_session_id")},
-                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
+            out = await via_pipe("wechat.login.cancel", {"login_session_id": body.get("login_session_id")},
+                                 timeout_s=TIMEOUT_S["wechat_read"], request=request)
         except WaError as e:
             return fail(e, request)
+        if isinstance(out, dict) and out.pop("narrator_stop_pending", False):
+            await _kill_narrator_from_service(request)
+        return out
+
+    async def _kill_narrator_from_service(request: Request) -> bool:
+        """R6-89:会话代理停不掉讲述人 ⇒ 服务(提权)结束;记审计。没有 killer(测试/--dev)直接 False。"""
+        if d.narrator_killer is None:
+            return False
+        ok = await asyncio.to_thread(d.narrator_killer)
+        d.audit.record(actor="system", action="wechat.narrator_stop", result="OK" if ok else "FAILED",
+                       trace_id=getattr(request.state, "trace_id", None))
+        return ok
 
     @app.get("/wa/v1/wechat/login/status")
     async def wechat_login_status(request: Request):                              # type: ignore[no-untyped-def]
         try:
-            auth(request, (ROLE_AGENT,), action="wechat.login_status")
+            # 01 §2.5 白名单③ / 05 §3.2 R6-5:登录流只读状态控制台可直调(向导刷新/步④ 讲述人状态);写动作仍只 A
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.login_status")
             out = await via_pipe("wechat.login.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
         except WaError as e:
             return fail(e, request)
@@ -624,6 +675,9 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         # 由服务落库;会话代理不碰 DB)。两个内部字段用完即弹出,不进 #33 的公开响应形状。
         just_became_ready = out.pop("just_became_ready", False)
         wechat_version = out.pop("wechat_version", None)
+        if (out.get("narrator") or {}).get("stop_pending"):
+            if await _kill_narrator_from_service(request):
+                out["narrator"] = {**out["narrator"], "state": "stopped", "stop_pending": False}
         if just_became_ready and out.get("wxid") and out.get("account_id"):
             d.wechat_store.record_login(wxid=out["wxid"], account_id=out["account_id"],
                                         wechat_version=wechat_version, wxkey_dll=(out.get("key") or {}).get("dll"))
@@ -677,7 +731,7 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
     @app.post("/wa/v1/wechat/key/retry")
     async def wechat_key_retry(request: Request):                                 # type: ignore[no-untyped-def]
         try:
-            auth(request, (ROLE_AGENT,), action="wechat.key_retry")
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.key_retry")      # 01 §2.5 ③:人工动作,控制台可调
             return await via_pipe("wechat.key.retry", {}, timeout_s=TIMEOUT_S["wechat_login_start"], request=request)
         except WaError as e:
             return fail(e, request)
@@ -685,7 +739,7 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
     @app.get("/wa/v1/wechat/ui-visible")
     async def wechat_ui_visible(request: Request):                                # type: ignore[no-untyped-def]
         try:
-            auth(request, (ROLE_AGENT,), action="wechat.ui_visible")
+            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.ui_visible")     # 01 §2.5 ③:只读,控制台可调
             return await via_pipe("wechat.ui-visible", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
         except WaError as e:
             return fail(e, request)
@@ -779,6 +833,12 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
             was = d.cfg.wechat.enabled
             d.cfg = d.cfg.with_wechat(**body)
             d.db.put_setting("wechat.enabled_snapshot", d.cfg.wechat.enabled, updated_by="console")
+            if d.config_path:                                                      # R6-88:真值写回 toml,重启不丢
+                try:
+                    await asyncio.to_thread(write_toml_keys, d.config_path, "wechat",
+                                            {k: getattr(d.cfg.wechat, k) for k in body})
+                except OSError as e:
+                    raise WaError(INTERNAL, f"winagent.toml 写回失败:{e}", reason="config_write_failed") from e
             if was != d.cfg.wechat.enabled:
                 if not d.cfg.wechat.enabled:
                     d.power.restore()                                              # 关模块即还原电源计划(04 §2.5.1)
@@ -824,4 +884,4 @@ async def _json(request: Request) -> dict[str, Any]:
 
 def _bundled_version(d: SvcDeps) -> str:
     """随包微信版本(B-1:4.1.12.26,来源与 sha256 由 03 维护);这里从 ``settings`` 取,缺省用 03 记档值。"""
-    return str(d.db.get_setting("wechat.bundled_version") or "4.1.12.26")
+    return str(d.db.get_setting("wechat.bundled_version") or d.cfg.wechat.bundled_version)

@@ -38,12 +38,14 @@ KEY_RELOGIN_WINDOW_S = 30           # 05 §2.4.4a:data_key 远程 hook 只在「
 RETRY_INTERVAL_S = 5.0              # 05 §2.4.2.1:回填/bind 失败每 5 s 重试
 BIND_RETRY_MAX = 12                 # 05 §2.4.2.1 第 4 步 bind_retry_max 默认 12
 STATUS_INTERVAL_S = 1.0             # 轮询 #33 的节拍(Agent 侧;05 未钉死具体值,取 1 s 与倒计时同粒度)
+IDLE_STREAK_MAX = 3                 # R6-91:login/start 后连续 3 轮 idle ⇒ 判会话代理丢了会话
+SESSION_RESTARTS_MAX = 2            # R6-91:最多重发 2 次 login/start,再丢就 stopped 并给出原因
 
 PROMPTS = {
     "WAIT_NARRATOR": "讲述人仪式进行中,约 5 分钟,可以静音,不要关闭讲述人",
     "WAIT_QRCODE": "请用手机扫描微信窗口里的二维码",
     "WAIT_KEY_IMG": "请在微信里打开任意一张图片(取图片密钥,约 60 秒内完成)",
-    "WAIT_KEY_RELOGIN": "请退出微信登录并立刻重新登录(快捷登录即可,无需扫码;须在 30 秒内完成)",
+    "WAIT_KEY_RELOGIN": "倒计时从现在开始。请立刻退出微信并重新登录(快捷登录即可)。必须在这 30 秒内完成,晚了数据库密钥就取不到",
 }
 
 
@@ -79,6 +81,8 @@ class WechatLoginFlow:
         last_code: Optional[str] = None
         bound_to: Optional[str] = None                 # 已 bind 成功的最终 account_id(合并时可能是老 id)
         bind_attempts = 0
+        idle_streak = 0
+        session_restarts = 0
         while True:
             if self._clock() > deadline:
                 # 会话代理不可达 / 人一直没扫:超 qr_max_wait_s 转 stopped、释放 pending(05 §2.4.2.1「断连期间的规则」)
@@ -91,6 +95,25 @@ class WechatLoginFlow:
                 await self._sleep(self._status_interval_s)
                 continue
             phase = str(st.get("phase") or "idle")
+
+            # R6-91:login/start 成功后又回 idle ⇒ 会话代理丢了这次登录会话(崩溃 / 被杀 / 升级重启;用户取消走
+            # accounts.login_cancel,会先结束本任务,不会落到这里)。此前不处理,傻等 qr_max_wait_s(30 min)。
+            # 连续 IDLE_STREAK_MAX 轮 idle ⇒ 用同一个 login_session_id 重发 login/start,最多 SESSION_RESTARTS_MAX 次。
+            if phase == "idle":
+                idle_streak += 1
+                if idle_streak >= IDLE_STREAK_MAX:
+                    if session_restarts >= SESSION_RESTARTS_MAX:
+                        return await self._fail_stopped(aid, ls, "WinAgent 会话代理多次丢失本次登录会话(可能反复重启),请检查会话代理后重试")
+                    session_restarts += 1
+                    idle_streak = 0
+                    log.warning("微信登录会话在会话代理侧丢失,重发 login/start account=%s ls=%s 第 %d 次", aid, ls, session_restarts)
+                    try:
+                        await self._client.login_start(account_id=aid, login_session_id=ls)
+                    except (WeChatNotReady, WeChatCallFailed) as e:
+                        log.warning("重发 login/start 失败 account=%s: %s", aid, e)
+                await self._sleep(self._status_interval_s)
+                continue
+            idle_streak = 0
 
             if phase == "key_failed":
                 return await self._key_failed(aid, ls, st)
@@ -244,6 +267,13 @@ class WechatLoginFlow:
     async def _key_failed(self, aid: str, ls: str, st: dict[str, Any]) -> str:
         """05 §2.4.7:只拿到一把 / 全 DLL 失败 ⇒ 整轮作废、`degraded(KEY_FAIL)`、**失败即同步释放 pending**、不进 bind。"""
         err = (st.get("key") or {}).get("error")
+        if st.get("state_code") == "WAIT_UI_TREE":
+            # 05 §2.4.3 ④:仪式轮次用尽仍不可见 ⇒ degraded(WAIT_UI_TREE)「再做一次仪式」,**不是**取钥失败;
+            # 此前统一判 KEY_FAIL,向导引导用户去「重新取钥 / 重装微信」,方向全错。
+            await self._slot.release_pending(aid, reason="ui_tree", actor="system:wechat_login")
+            self._transition(aid, "degraded", state_code="WAIT_UI_TREE",
+                             state_reason="讲述人仪式后微信界面仍不可自动化,请再做一次仪式", login_session_id=ls)
+            return "degraded"
         await self._slot.release_pending(aid, reason="key_fail", actor="system:wechat_login")
         self._transition(aid, "degraded", state_code="KEY_FAIL",
                          state_reason=f"取钥失败({err or '两钥未同轮落盘'}),读写都拒", login_session_id=ls)

@@ -215,7 +215,7 @@ describe.each(channels)('%s 完成页由账号真实状态驱动', (channel) => 
   it('创建请求失败可见且连续导航不能伪装完成', async () => {
     vi.mocked(accountsApi.create).mockRejectedValueOnce(new Error('测试创建失败'))
     await submitCreate(channel)
-    expect(notices.error).toHaveBeenCalledWith(expect.stringContaining('测试创建失败'))
+    expect(notices.error).toHaveBeenCalledWith(expect.stringContaining('测试创建失败'), 3)   // 2026-10-10:操作失败 = 3 秒 toast
     expect(accountsApi.start).not.toHaveBeenCalled()
     for (let i = 0; i < 3; i++) await clickNextIfAvailable()
     expect(find(T.doneSummary).exists()).toBe(false)

@@ -25,31 +25,32 @@ export const router = createRouter({ history: createWebHashHistory(), routes })
 
 /**
  * ① `setup.done===false` 一律重定向 `/setup`,**只有一条窄例外**(见下);
- * ② 告知页改版(`needsReack()`)时同样按住 `/setup`(05 §6.1「告知页文本改版则要求重新勾选」);
- * ③ `qt.auth.state()!=='ok'` **显示门禁覆盖层而不是跳页**(保留原路由,恢复后原地继续)。
+ * ② `qt.auth.state()!=='ok'` **显示门禁覆盖层而不是跳页**(保留原路由,恢复后原地继续)。
+ * 🔴 R6-84(2026-10-10 安琳):原「告知页改版按住 `/setup` 重勾」(05 §6.1 末句)随「阅读须知」步一起退役,
+ * 守卫不再看告知确认。
  *
- * 🔴 窄例外:向导步 4「首登」的「现在添加」要进 `P-ACCT-NEW`(01 §2.7.1 步 4,**完成后回到本步**)。
+ * 🔴 窄例外:向导步 3「首登」的「现在添加」要进 `P-ACCT-NEW`(01 §2.7.1 步 3,**完成后回到本步**)。
  * 不开例外则这个按钮被本守卫静默打回 `/setup`(同址导航、无报错)= 死按钮,首登引导只剩「跳过」。
  * 例外**只**认「未完成向导 + 目标恰是 `P-ACCT-NEW` + 来自向导(`?from=setup`)」三条同时成立,
  * 借它进别的页一概不放行;建号页上的「返回列表 / 取消」跳 `/acct` 时照旧被打回 `/setup`,
- * 而向导步存在 store 里(`stores/setup.ts` 的 `step`)⇒ 回去就是原来的第 4 步。
+ * 而向导步存在 store 里(`stores/setup.ts` 的 `step`)⇒ 回去就是原来的第 3 步。
  */
 /** 守卫判据本体(纯函数,便于单测):返回 `null` = 放行,否则是重定向目标 */
 export function setupRedirect(
   to: { path: string; name?: unknown; query: Record<string, unknown> },
-  gate: { done: boolean; needsReack: boolean },
+  gate: { done: boolean },
 ): { path: string } | null {
-  if (gate.done && !gate.needsReack) return null
+  if (gate.done) return null
   if (to.path === '/setup') return null
-  if (!gate.done && to.name === 'P-ACCT-NEW' && to.query.from === 'setup') return null
+  if (to.name === 'P-ACCT-NEW' && to.query.from === 'setup') return null
   return { path: '/setup' }
 }
 
-export function installGuards(isSetupDone: () => boolean, needsReack: () => boolean = () => false): void {
+export function installGuards(isSetupDone: () => boolean): void {
   router.beforeEach((to) => {
     const target = setupRedirect(
       { path: to.path, name: to.name, query: to.query as Record<string, unknown> },
-      { done: isSetupDone(), needsReack: needsReack() },
+      { done: isSetupDone() },
     )
     return target ?? true
   })
