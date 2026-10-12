@@ -1028,7 +1028,7 @@ class Store:
                 c.execute(f"UPDATE account_runtime SET {k}=? WHERE account_id=?", (v, account_id))
 
     def list_sessions(self, *, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
-                      limit: int = 100) -> list[dict[str, Any]]:
+                      limit: Optional[int] = 100) -> list[dict[str, Any]]:
         sql, params = "SELECT * FROM sessions WHERE 1=1", []
         if account_id:
             sql += " AND account_id=?"; params.append(account_id)
@@ -1036,8 +1036,10 @@ class Store:
             sql += " AND kind=?"; params.append(kind)
         if keyword:
             sql += " AND (name LIKE ? OR native_id LIKE ?)"; params += [f"%{keyword}%", f"%{keyword}%"]
-        sql += " ORDER BY COALESCE(last_msg_ms, 0) DESC, id LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY COALESCE(last_msg_ms, 0) DESC, id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         return [dict(r) for r in self.con.execute(sql, params).fetchall()]
 
     def query_messages(self, *, account_id: Optional[str] = None, session_id: Optional[str] = None, dir: Optional[str] = None,

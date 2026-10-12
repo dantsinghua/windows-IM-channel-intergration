@@ -44,6 +44,8 @@ from .monitor import JobsReclaimer, ProcReader, PublicEndpointProbe, Sampler
 from .mail.backends import ImapLibBackend, PopLibBackend, SmtpLibBackend
 from .mail.route_secrets import migrate_plaintext as migrate_mail_route_secrets
 from .mail.service import MailService
+from .ossbox.bridge import POLL_INTERVAL_SEC
+from .ossbox.inbox import XunjiaInbox
 from .pool import Pool
 from .pool_calibrate import PoolCalibrator
 from .pressure import MemoryWatermark
@@ -356,6 +358,14 @@ class AgentApp:
         self.scheduler.register("jobs_reclaimer", self.cfg.jobs.reclaim_interval_s, self.reclaimer.reclaim_once)               # 02 §3.1 R6-16
         self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
         self.scheduler.register("media_fetch", 5, self.media_tick)                                                             # 02 §2.8.2
+        # 询价下行：环境变量不齐则 inbox 为 None，本轮空转，不连 OSS、不发企点。
+        self.xunjia_inbox = XunjiaInbox.from_env(self.store, sender, clock=self.clock)
+        self.scheduler.register("xunjia_inbox", POLL_INTERVAL_SEC, self.xunjia_inbox_tick, run_immediately=True)
+        from .ossbox.catalog_publish import CatalogPublisher
+        self.catalog_publisher = CatalogPublisher.from_env(
+            self.store, os.path.join(self.data_dir, "catalog-publish.json"),
+        )
+        self.scheduler.register("catalog_publish", 60, self.catalog_publish_tick)
         return self
 
     async def _wa_media_raw(self, path: str) -> bytes:
@@ -373,6 +383,23 @@ class AgentApp:
             log.warning("微信截图落 media 失败 account=%s: %s", acct.id, e)
             return {}
         return {k: out[k] for k in ("media_id", "sha256") if out.get(k) is not None}
+
+    async def catalog_publish_tick(self) -> None:
+        """上传变了的总索引和按账号文件。未装配时直接返回。不写 catalog.json。"""
+        publisher = getattr(self, "catalog_publisher", None)
+        if publisher is None:
+            return
+        try:
+            await asyncio.to_thread(publisher.publish_once)
+        except Exception:
+            log.exception("目录分片上传失败")
+
+    async def xunjia_inbox_tick(self) -> None:
+        """拉 ``in/xunjia`` 指令。未装配时直接返回。正在跑的进程要下次启动才走这里。"""
+        inbox = getattr(self, "xunjia_inbox", None)
+        if inbox is None:
+            return
+        await inbox.poll()
 
     async def media_tick(self) -> None:
         """02 §2.8.2:把 ``messages.media_json`` 里新出现的引用建成 ``media`` 行,再把 ``policy=eager`` 的下下来。
