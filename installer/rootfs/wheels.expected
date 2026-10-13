@@ -4,10 +4,13 @@ aiosqlite 0.22.1 aiosqlite-0.22.1-py3-none-any.whl 21c002eb13823fad740196c5a2e9d
 annotated-doc 0.0.5 annotated_doc-0.0.5-py3-none-any.whl 117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101
 annotated-types 0.8.0 annotated_types-0.8.0-py3-none-any.whl f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
 anyio 4.15.1 anyio-4.15.1-py3-none-any.whl 6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101
+cffi 2.1.1 cffi-2.1.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf
 click 8.5.0 click-8.5.0-py3-none-any.whl 255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360
+cryptography 50.0.2 cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl 9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079
 fastapi 0.141.1 fastapi-0.141.1-py3-none-any.whl bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3
 h11 0.16.0 h11-0.16.0-py3-none-any.whl 63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 idna 3.20 idna-3.20-py3-none-any.whl ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+pycparser 3.11 pycparser-3.11-py3-none-any.whl 51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80
 pydantic 2.13.5 pydantic-2.13.5-py3-none-any.whl 346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73
 pydantic-core 2.46.5 pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2
 starlette 1.6.0 starlette-1.6.0-py3-none-any.whl a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c
