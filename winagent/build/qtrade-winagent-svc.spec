@@ -28,15 +28,15 @@ a = Analysis(
         "uvicorn.protocols.websockets.auto", "uvicorn.protocols.websockets.websockets_impl",
         "uvicorn.lifespan.on", "websockets",
         # Windows 专有(win/ 里是**函数内延迟导入**,PyInstaller 静态扫不到,必须在这里点名)
-        "win32api", "win32con", "win32file", "win32gui", "win32pipe", "win32process",
-        "win32security", "win32service", "win32serviceutil", "win32ts", "winerror", "pywintypes",
+        "win32api", "win32con", "win32file", "win32event", "win32gui", "win32pipe", "win32process",
+        "win32security", "win32service", "win32serviceutil", "servicemanager", "win32ts", "winerror", "pywintypes",
         "psutil", "winreg",
         # 本包里被 main_svc 按需导入的模块
         "qtrade_winagent.win.dpapi", "qtrade_winagent.win.firewall", "qtrade_winagent.win.hosts",
         "qtrade_winagent.win.netinfo", "qtrade_winagent.win.pipes", "qtrade_winagent.win.power",
         "qtrade_winagent.win.probe", "qtrade_winagent.win.proc", "qtrade_winagent.win.sysinfo",
         "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat",
-        "qtrade_winagent.main_svc", "qtrade_winagent.fakes",
+        "qtrade_winagent.main_svc", "qtrade_winagent.service_host", "qtrade_winagent.console_pipe", "qtrade_winagent.fakes",
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -47,6 +47,9 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+# Installer provenance can contain the build machine's local wheel path.
+a.datas = [row for row in a.datas
+           if not row[0].replace("\\", "/").lower().endswith(".dist-info/direct_url.json")]
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)                        # noqa: F821
 exe = EXE(                                                                   # noqa: F821
     pyz, a.scripts, [],

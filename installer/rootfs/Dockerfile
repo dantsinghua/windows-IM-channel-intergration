@@ -95,6 +95,7 @@ COPY payload/platform-tools/ /opt/qtrade/platform-tools/
 COPY payload/scrcpy-server   /opt/qtrade/scrcpy/scrcpy-server
 COPY payload/frida-server    /opt/qtrade/frida/
 COPY payload/ADBKeyboard.apk /opt/qtrade/apk/ADBKeyboard.apk
+COPY payload/qidian.apk /opt/qtrade/apk/qidian.apk
 # 🔴 落点 = docs/05 §7 `[device_profiles] library` 的那一个(裁决 00 §15g R6-62 Ⅶ②:
 #    以 05 §7 为准、文档不改)。Agent 侧的配置默认值 `src/qtrade_agent/config.py`
 #    `DeviceProfilesConfig.library` 与它逐字同值;落错目录 ⇒ Agent 按默认路径读不到、
@@ -208,7 +209,17 @@ COPY files/etc/wsl.conf              /etc/wsl.conf
 COPY files/opt/qtrade/bin/           /opt/qtrade/bin/
 COPY files/systemd/                  /etc/systemd/system/
 
-RUN chmod 0755 /opt/qtrade/bin/*.sh && chmod 0644 /etc/systemd/system/qtrade-*.service
+RUN chmod -R u=rwX,go=rX /opt/qtrade \
+    && find /opt/qtrade -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' \
+        -o -name '*.lock' -o -name '*.expected' -o -name '*.apk' -o -name '*.whl' \
+        -o -name '*.py' -o -name '*.pyc' -o -name '*.so*' \) -exec chmod 0644 {} + \
+    && chmod 0755 /opt/qtrade/bin/*.sh \
+        /etc/systemd/system/docker.service.d /etc/systemd/system/docker.socket.d \
+    && chmod 0644 /etc/wsl.conf /etc/systemd/system/qtrade-*.service \
+        /etc/systemd/system/docker.service.d/qtrade.conf \
+        /etc/systemd/system/docker.socket.d/qtrade.conf \
+        /opt/qtrade/scrcpy/scrcpy-server /opt/qtrade/platform-tools/mke2fs.conf \
+        /opt/qtrade/platform-tools/source.properties /opt/qtrade/platform-tools/NOTICE.txt
 
 # 🔴 §2.7.3 R5-9 的核心:`qtrade-docker-config.service` 必须在 dockerd **首次启动之前**
 #    把选定的地址池写进 /etc/docker/daemon.json,否则 dockerd 用默认 172.17 起过、
@@ -227,5 +238,10 @@ RUN systemctl enable qtrade-docker-config.service \
 # /etc/qtrade/contents.json(G-10)由 build-rootfs.sh 在 export 之后写入 —— 它要含
 # 镜像 tar 的 sha256,而那两个 tar 这时候还没进来。这里只留一个人眼可读的版本串。
 RUN echo "$ROOTFS_VERSION" > /etc/qtrade/rootfs-version
+
+# A distributed filesystem must acquire its machine identity on the target.
+RUN truncate -s 0 /etc/machine-id \
+    && unlink /var/lib/dbus/machine-id \
+    && ln -s /etc/machine-id /var/lib/dbus/machine-id
 
 # 明确不设 CMD:见文件头,这棵树是给 `wsl --import` 的,不是给 `docker run` 的。

@@ -49,7 +49,7 @@ a = Analysis(
         "qtrade_winagent.main_user", "qtrade_winagent.fakes",
     ] + collect_submodules("pyweixin") + collect_submodules("pywinauto") + _hidden,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=[os.path.join(HERE, "rthook_comtypes.py")],
     # ⚠️ 不能排除 fastapi/starlette:main_user 顶层 import main_svc(取 DEFAULT_ROOT 等),main_svc 顶层 import svc,
     #    svc 顶层 import fastapi —— 排掉它 exe 一启动就 ModuleNotFoundError。uvicorn 在 main_svc.main() 里才导入,可排。
     excludes=["tkinter", "uvicorn", "pytest", "matplotlib"],
@@ -58,6 +58,15 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+# Generated wrappers contain the build host's typelib path and timestamp.
+# Keep the namespace itself; the runtime hook generates its children in memory.
+a.pure = [row for row in a.pure if not row[0].startswith("comtypes.gen.")]
+a.datas = [row for row in a.datas
+           if not row[0].replace("\\", "/").startswith("comtypes/gen/")
+           or row[0].replace("\\", "/") == "comtypes/gen/__init__.py"]
+# Installer provenance can contain the build machine's local wheel path.
+a.datas = [row for row in a.datas
+           if not row[0].replace("\\", "/").lower().endswith(".dist-info/direct_url.json")]
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)                        # noqa: F821
 exe = EXE(                                                                   # noqa: F821
     pyz, a.scripts, [],
