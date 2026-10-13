@@ -88,7 +88,7 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
 
 <template>
   <div class="qt-page qt-stack">
-    <header class="qt-page-heading"><div><div class="qt-eyebrow">CONNECTED ACCOUNTS</div><h1>每个账号，都有自己的工作台</h1><p>选择账号，查看画面、连接状态与历史消息。</p></div><a-button type="primary" @click="router.push('/acct/new')">＋ 添加账号</a-button></header>
+    <header class="qt-page-heading"><div><div class="qt-eyebrow">CONNECTED ACCOUNTS</div><h1>每个账号，都在机器人采集终端里</h1><p>选择账号，查看画面、连接状态与历史消息。</p></div><a-button type="primary" @click="router.push('/acct/new')">＋ 添加账号</a-button></header>
     <div class="qt-toolbar account-search"><a-input v-model:value="query" allow-clear placeholder="搜索账号、昵称或标识" /><span class="qt-small qt-muted">{{ accounts.items.filter((a) => a.deleted_ms == null).length }} 个已加载账号</span></div>
     <div v-if="!events.connected" class="banner" :data-testid="T.staleBanner">实时状态已断开，显示的是 {{ events.disconnectedAt ? Math.round((now - events.disconnectedAt) / 1000) : 0 }} 秒前的数据。</div>
     <PageState :loading="accounts.loading && !accounts.items.length" :error="accounts.error" @retry="accounts.load()">
@@ -102,7 +102,7 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
             <button class="account-identity" :data-testid="T.rowDetail(account.id)" @click="router.push('/acct/' + account.id)"><span class="account-avatar">{{ (account.self_nick || account.label || CHANNEL_TEXT[channel]).slice(0, 1) }}</span><span>{{ account.label || account.id }}<small>{{ account.self_nick || CHANNEL_TEXT[channel] + '账号' }}</small></span><span class="identity-arrow">↗</span></button>
             <div class="account-id">{{ account.wxid || account.self_uid || account.id }}</div>
             <div class="meta-row"><span>当前内存</span><b>{{ accountMemory(account.id) }}</b></div><div class="meta-row"><span>最近活动</span><span>{{ account.last_seen_at?.slice(5,16).replace('T',' ') ?? '—' }}</span></div>
-            <div class="card-actions"><a-button type="primary" @click="router.push('/acct/' + account.id)">进入工作台</a-button><a-button @click="router.push({ path: '/msg', query: { account_id: account.id } })">历史消息</a-button><a-popconfirm :title="'从列表移除「' + (account.label || account.id) + '」？会先停止该账号，聊天记录与登录态保留。'" ok-text="移除" cancel-text="取消" ok-type="danger" @confirm="removeAccount(account)"><a-button danger :disabled="!canRemove(account)" :data-testid="T.rowDelete(account.id)">移除</a-button></a-popconfirm></div>
+            <div class="card-actions"><a-button type="primary" @click="router.push('/acct/' + account.id)">进入终端</a-button><a-button @click="router.push({ path: '/msg', query: { account_id: account.id } })">历史消息</a-button><a-popconfirm :title="'从列表移除「' + (account.label || account.id) + '」？会先停止该账号，聊天记录与登录态保留。'" ok-text="移除" cancel-text="取消" ok-type="danger" @confirm="removeAccount(account)"><a-button danger :disabled="!canRemove(account)" :data-testid="T.rowDelete(account.id)">移除</a-button></a-popconfirm></div>
           </article>
           <div v-if="!rows(channel).length" class="empty-card"><a-empty :description="query ? '没有匹配的账号' : '还没有' + CHANNEL_TEXT[channel] + '账号'"><a-button v-if="!query" :data-testid="T.emptyAdd(channel)" :disabled="channel === 'wechat' && (session.wechatDisabled || resources.hasPending)" @click="add(channel)">添加{{ CHANNEL_TEXT[channel] }}</a-button></a-empty></div>
         </div>

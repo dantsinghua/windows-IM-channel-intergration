@@ -44,6 +44,17 @@ BUSY_RETRY_S = 30                        # 02 §2.4.1:非持有者每 30s 重试
 FORBIDDEN_REASON = "仅安装用户可控 WSL"   # 逐字
 
 
+def _pipe_disconnected(error: Exception) -> bool:
+    if isinstance(error, ConnectionError):
+        return True
+    if isinstance(error, OSError) or type(error).__module__ == "pywintypes":
+        code = getattr(error, "winerror", None)
+        if code is None and error.args:
+            code = error.args[0]
+        return code in (6, 109, 232, 233, 995)
+    return False
+
+
 def method_for_path(path: str) -> str:
     """``/wa/v1/wsl/start`` ⇒ ``wsl.start``(02 §2.4.1「与 /wa/v1 一一映射」;只对**纯 user 端点**成立)。
 
@@ -123,12 +134,16 @@ class PipeHub:
         self._accept_task = asyncio.create_task(self._accept_loop(), name="pipe-accept")
 
     async def stop(self) -> None:
+        tasks = list(self._hook_tasks)
         if self._accept_task:
-            self._accept_task.cancel()
+            tasks.append(self._accept_task)
         for s in list(self.sessions.values()):
             if s.reader:
-                s.reader.cancel()
+                tasks.append(s.reader)
             await s.conn.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.sessions.clear()
         self.holder_session_id = None
 
@@ -136,10 +151,12 @@ class PipeHub:
         while True:
             conn = await self._backend.serve(self._pipe_name, allow_sid=self._install_user_sid or None)
             try:
-                await self.handshake(conn)
+                await asyncio.wait_for(self.handshake(conn), timeout=5)
             except asyncio.CancelledError:
+                await conn.close()
                 raise
             except Exception:                                  # 单个连接出问题不影响下一个
+                await conn.close()
                 log.exception("握手失败")
 
     async def handshake(self, conn: PipeConn) -> Optional[UserSession]:
@@ -149,11 +166,10 @@ class PipeHub:
             await conn.close()
             return None
         p = frame.params
-        sid = str(p.get("user_sid") or conn.peer_sid or "")
         session_id = str(p.get("session_id") or "")
         # ① 安全校验在前(R3-12):对端进程 SID 必须 == 安装用户 SID
-        peer = conn.peer_sid or sid
-        if peer != self._install_user_sid:
+        peer = conn.peer_sid or ""
+        if not self._install_user_sid or not peer or peer != self._install_user_sid:
             self.rejected.append((FORBIDDEN, peer))
             await conn.send(PipeFrame(id=frame.id, ok=False, error={"code": FORBIDDEN, "reason": FORBIDDEN_REASON,
                                                                     "message": FORBIDDEN_REASON}))
@@ -231,6 +247,7 @@ class PipeHub:
             log.exception("管道读循环异常")
         finally:
             self._drop(s)
+            await s.conn.close()
 
     def _drop(self, s: UserSession) -> None:
         """持有者断开后下一位接管(仲裁的「接管」半;本实现里下一位是 ``sessions`` 里最早连上的那个)。"""
@@ -337,14 +354,16 @@ class UserAgentLink:
         没有入站帧时才写心跳。
 
         ``stop()`` 把 ``conn`` 置 ``None`` ⇒ 本循环在下一轮检查时退出;对端断开(``recv`` 回 ``None``)
-        或探测入站本身抛错(句柄已断)一律按断开处理,正常返回。
+        时正常返回;已识别的探测断链也正常返回,其它错误交由会话代理处理。
         """
         next_hb = self._clock()
         while (conn := self.conn) is not None:
             try:
                 ready = conn.inbound_ready()
-            except Exception:                                     # 句柄已断(真后端 Peek 抛 pywintypes.error)
-                log.warning("管道入站探测失败,按断开处理", extra={"op": "pipe.run", "code": "DISCONNECTED"})
+            except Exception as e:
+                if not _pipe_disconnected(e):
+                    raise
+                log.warning("管道入站探测断链", extra={"op": "pipe.run", "code": "DISCONNECTED"})
                 return
             if ready:
                 frame = await conn.recv()
@@ -363,12 +382,17 @@ class UserAgentLink:
 
     async def stop(self) -> None:
         """取消在途请求、关连接并置 ``conn=None``,``run()`` 随之退出。"""
-        for t in list(self._tasks):
-            t.cancel()
-        self._tasks.clear()
         conn, self.conn = self.conn, None
-        if conn is not None:
-            await conn.close()
+        tasks = list(self._tasks)
+        for t in tasks:
+            t.cancel()
+        self._tasks.difference_update(tasks)
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if conn is not None:
+                await conn.close()
 
     async def _dispatch(self, conn: PipeConn, frame: PipeFrame) -> None:
         h = self.handlers.get(frame.method or "")
@@ -388,6 +412,10 @@ class UserAgentLink:
                                       error={"code": e.code, "message": e.message, "reason": e.reason}))
             return
         except Exception as e:                                    # 任何未预期异常都要变成一帧,不能把管道读死
+            # 🔴 必须打完整 traceback:否则 handler 的 INTERNAL 只以 repr 回传给服务、会话代理侧日志空白,
+            # 真机排障时根本看不到是哪一步(2026-10-11 微信 login/start 恒 500 即卡在此)。
+            log.exception("会话代理 handler 抛未预期异常", extra={"op": "pipe.dispatch", "code": INTERNAL,
+                                                                "method": frame.method})
             await conn.send(PipeFrame(id=frame.id, ok=False, error={"code": INTERNAL, "message": repr(e)}))
             return
         await conn.send(PipeFrame(id=frame.id, ok=True, result=result))

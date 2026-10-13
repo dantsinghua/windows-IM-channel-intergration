@@ -10,6 +10,7 @@ param(
     [string] $OptionsJson = '{}',
     [string] $OptionsPath = '',
     [string] $Root = '',
+    [string] $StageRoot = '',
     [string] $LogStamp = ''
 )
 
@@ -20,7 +21,7 @@ $modulesDir = Join-Path $PSScriptRoot 'modules'
 foreach ($m in @('QTrade.Log', 'QTrade.Native', 'QTrade.Exit', 'QTrade.State', 'QTrade.Payload',
         'QTrade.Preflight', 'QTrade.Wsl', 'QTrade.Kernel', 'QTrade.Distro', 'QTrade.WinAgent',
         'QTrade.Console', 'QTrade.WeChat', 'QTrade.Firewall', 'QTrade.Acl', 'QTrade.Selftest',
-        'QTrade.Upgrade', 'QTrade.Diag', 'QTrade.Uninstall')) {
+        'QTrade.Upgrade', 'QTrade.Diag', 'QTrade.Uninstall', 'QTrade.Stage')) {
     Import-Module (Join-Path $modulesDir ($m + '.psm1')) -DisableNameChecking
 }
 
@@ -50,16 +51,82 @@ function Write-QtStepResult {
 
 $paths = Get-QtPaths -Root $Root
 $opt = @{}
-if ($OptionsPath -and (Test-Path -LiteralPath $OptionsPath)) {
-    # Inno 侧经临时文件传选项(JSON 里的双引号穿命令行会被弄坏,同 W7 的教训)
-    $OptionsJson = [IO.File]::ReadAllText($OptionsPath)
+try {
+    if ($OptionsPath) {
+        if (-not (Test-Path -LiteralPath $OptionsPath -PathType Leaf)) { throw 'Options file is missing.' }
+        $OptionsJson = [IO.File]::ReadAllText($OptionsPath)
+    }
+    if ([string]::IsNullOrWhiteSpace($OptionsJson) -or -not $OptionsJson.TrimStart().StartsWith('{')) {
+        throw 'Options must be a JSON object.'
+    }
+    $opt = ($OptionsJson | ConvertFrom-Json -ErrorAction Stop)
+    if ($null -eq $opt -or $opt -isnot [pscustomobject]) { throw 'Options must be a JSON object.' }
+} catch {
+    Write-QtStepResult -Ok $false -State '' -Reason 'OPTIONS_INVALID' -ExitName 'E_INSTALL_INTERNAL' `
+        -Message 'Installer options are missing or invalid. No installation state was changed.'
 }
-try { $opt = ($OptionsJson | ConvertFrom-Json) } catch { $opt = [pscustomobject]@{} }
 
 function Get-QtOpt {
     param([string] $Name, $Default = $null)
     if (Test-QtHasProperty -Object $opt -Name $Name) { return $opt.$Name }
     return $Default
+}
+
+function Remove-QtStepKCheck {
+    # All step cleanup paths must consume a failed ownership check or unregister.
+    $cleanup = Remove-QtKCheck -Directory $paths.KCheck
+    if (-not $cleanup.Ok) {
+        $failedStep = if ($Step -eq 'KERNEL_STAGED') { 'KERNEL_STAGED' } else { 'KERNEL_VERIFIED' }
+        Set-QtState -State $state -To (New-QtFailedState -Step $failedStep -Reason 'KCHECK_IMPORT_FAILED') | Out-Null
+        Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+        Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $cleanup.Reason `
+            -ExitName 'E_INSTALL_KCHECK_IMPORT_FAILED' -Message 'The kernel check distribution could not be safely removed.' -Data $cleanup.Records
+    }
+}
+
+# Initial validation and consent must not write into an existing installation.
+if ($StageRoot) {
+    try {
+        $stageIdentity = Get-QtStageIdentity -StageRoot $StageRoot -LiveRoot $paths.Root
+        $expectedStageParent = Join-Path (Get-QtEnvironmentPath -Name 'ProgramData') 'QTrade-Staging'
+        if ((Split-Path -Parent $stageIdentity.StageRoot) -ne $expectedStageParent -or
+            (Split-Path -Leaf $stageIdentity.StageRoot) -notmatch '\A[0-9a-fA-F-]{32,36}\z') {
+            throw 'STAGE_LOCATION_INVALID'
+        }
+        $stageAcl = Set-QtInstallRootAcl -Path $stageIdentity.StageRoot
+        if (-not $stageAcl.Ok) { throw 'STAGE_ACL_FAILED' }
+        if ($Step -in @('bootstrap', 'PRECHECK', 'PAYLOAD_STAGED', 'clean-reinstall', 'wechat-detect', 'diag')) {
+            $paths.StateFile = Join-Path $stageIdentity.StageRoot 'install\stage-state.json'
+        }
+        $paths.Logs = Join-Path $stageIdentity.StageRoot 'logs'
+    } catch {
+        Write-QtStepResult -Ok $false -Reason 'STAGE_INVALID' -ExitName 'E_INSTALL_INTERNAL' -Message $_.Exception.Message
+    }
+}
+
+if (-not $StageRoot -and $Step -eq 'bootstrap') {
+    $resumeState = Read-QtInstallState -Path $paths.StateFile
+    $resumeMode = [string](Get-QtOpt 'mode' 'install')
+    if ($resumeMode -in @('install', 'upgrade') -or $null -eq $resumeState) {
+        Write-QtStepResult -Ok $false -Reason 'FULL_INSTALLER_REQUIRED' -ExitName 'E_INSTALL_WAIT_USER' `
+            -Message 'Run the complete installer. An installed engine is only for resuming its own interrupted installation.'
+    }
+    if (-not (Test-QtHasProperty $resumeState 'env') -or
+        -not (Test-QtHasProperty $resumeState.env 'install_user_sid') -or
+        $resumeState.env.install_user_sid -ne (Get-QtCurrentUserSid)) {
+        Write-QtStepResult -Ok $false -Reason 'INSTALL_OWNERSHIP_UNKNOWN' -ExitName 'E_INSTALL_WAIT_USER' `
+            -Message 'The installation does not belong to the current Windows user.'
+    }
+    if ($resumeMode -in @('resume', 'verify-kernel')) {
+        if ($resumeState.state -eq 'DONE' -or
+            $resumeState.package_version -ne [string](Get-QtOpt 'package_version' '0.0.0') -or
+            -not (Test-QtHasProperty $resumeState 'package_manifest_sha256') -or
+            -not (Test-QtPath -Path $paths.Manifest) -or
+            $resumeState.package_manifest_sha256 -ne (Get-QtFileHash -Path $paths.Manifest)) {
+            Write-QtStepResult -Ok $false -Reason 'RESUME_IDENTITY_MISMATCH' -ExitName 'E_INSTALL_WAIT_USER' `
+                -Message 'Only an unfinished installation from this exact package can be resumed.'
+        }
+    }
 }
 
 Initialize-QtLog -Directory $paths.Logs -Prefix 'install' -Stamp $LogStamp | Out-Null
@@ -83,7 +150,7 @@ try {
             #    本进程跑完这一步就退出,互斥体随之释放,等于没保护。
             #    它由长驻的引擎进程在 .iss 的 InitializeSetup 里持有(退出码 29)。
             # §2.6.6 不变量②:引擎启动时顺手清理残留 kcheck
-            Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+            # Cleanup is owned by the verified clean-reinstall transaction.
             $next = Get-QtResumeStep -State ([string]$state.state)
             # §2.13 首句:新版本 EXE 检测到 `install_state.state=DONE` 且 `package_version <` 自身即进 upgrade 模式;
             # `>` 则拒绝降级(122)。这里只**建议**模式,真正切换由 .iss 决定。
@@ -91,9 +158,9 @@ try {
             $cmp = Compare-QtPackageVersion -Installed ([string]$state.package_version) -Package $selfVersion
             $recommended = 'install'
             if ([string]$state.state -eq 'DONE') {
-                if ($cmp.Kind -eq 'UPGRADE') { $recommended = 'upgrade' }
+                if ($cmp.Kind -eq 'UPGRADE') { $recommended = 'clean-reinstall' }
                 elseif ($cmp.Kind -eq 'DOWNGRADE') { $recommended = 'downgrade-refused' }
-                else { $recommended = 'repair' }
+                else { $recommended = 'clean-reinstall' }
             } elseif ([string]$state.state -ne 'PRECHECK') { $recommended = 'resume' }
             Write-QtLog -Message ('上次状态 {0}(更新于 {1});本次从 {2} 继续;建议模式 {3}' -f $state.state, $state.updated_at, $next, $recommended)
             Write-QtStepResult -Ok $true -State ([string]$state.state) -Message '引擎就绪' -Data ([ordered]@{
@@ -122,6 +189,16 @@ try {
 
         # ── PAYLOAD_STAGED(§2.2.1 / §2.1):外壳已解压,这里只做 sha256 复核 ─
         'PAYLOAD_STAGED' {
+            if ($StageRoot) {
+                $manifestPath = Join-Path $StageRoot 'install\manifest.json'
+                $manifest = Read-QtManifest -Path $manifestPath
+                $v = Invoke-QtPayloadVerify -Manifest $manifest -StageRoot $StageRoot -DestinationRoot $paths.Root
+                if (-not $v.Ok -or -not (Test-QtManifestCoredumpL2 -Manifest $manifest)) {
+                    Write-QtStepResult -Ok $false -Reason 'PAYLOAD_CORRUPT' -ExitName 'E_INSTALL_PAYLOAD_CORRUPT' `
+                        -Message 'Staged payload verification failed. The existing installation was not changed.'
+                }
+                Write-QtStepResult -Ok $true -State 'PAYLOAD_STAGED' -Message 'Staged payload verified.'
+            }
             <#  🔴 裁决 11:收紧安装根 ACL —— 引擎落地后的**第一个**动作。
                 位置在 sha256 复核**之前**、也在「已完成就跳过」之前,理由有三:
                   1. 安装根是引擎进程的当前目录(自编存根 SetCurrentDir + 子进程继承),
@@ -270,14 +347,14 @@ try {
             }
             $imp = Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar')
             if (-not $imp.Ok) {
-                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Remove-QtStepKCheck
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason 'KCHECK_IMPORT_FAILED') | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'KCHECK_IMPORT_FAILED' -ExitName 'E_INSTALL_KCHECK_IMPORT_FAILED' -Message 'qtrade-kcheck import failed; the kernel configuration was not changed.' -Data $imp.Records
             }
             $baseline = Test-QtKCheckBaseline
             if (-not $baseline.Ok) {
-                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Remove-QtStepKCheck
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason $baseline.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $baseline.Reason -ExitName ('E_INSTALL_' + $baseline.Reason) `
@@ -320,7 +397,7 @@ try {
             # R6-82: recheck a resumed stage before changing the kernel configuration.
             $baseline = Test-QtKCheckBaseline
             if (-not $baseline.Ok) {
-                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Remove-QtStepKCheck
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_STAGED' -Reason $baseline.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $baseline.Reason -ExitName ('E_INSTALL_' + $baseline.Reason) `
@@ -397,7 +474,7 @@ try {
                     -Message $fail.Message -Data ([ordered]@{ official_kernel = $rb.OfficialKernel; verify_reason = $ver.Reason; dmesg = $dmesgFile; records = $ver.Records; rollback_records = $rb.Records })
             }
 
-            Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+            Remove-QtStepKCheck
             Clear-QtRunOnce -State $state | Out-Null
             Write-QtKernelPointer -Path $paths.KernelPtr -KernelPath $kernelPath -Sha256 ([string]$k.sha256) `
                 -Version ([string]$k.version) -Line (Get-QtKernelLine) -VerifiedAt (Get-QtIso8601) | Out-Null
@@ -420,7 +497,7 @@ try {
             # 断电保险后续跑:kcheck 可能已被清,先在当前内核上补导一次
             $imp = Import-QtKCheck -Directory $paths.KCheck -TarPath (Join-Path $paths.Wsl 'kcheck-rootfs.tar')
             if (-not $imp.Ok) {
-                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Remove-QtStepKCheck
                 Set-QtState -State $state -To (New-QtFailedState -Step 'KERNEL_VERIFIED' -Reason $imp.Reason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $imp.Reason -ExitName ('E_INSTALL_' + $imp.Reason) `
@@ -429,7 +506,7 @@ try {
             $ver = Invoke-QtKernelVerify -ManifestVersion ([string]$k.version) -ShutdownConfirmed $true `
                 -CustomKernelPolicyPresent $policy.CustomKernelForbidden -SkipShutdown
             if ($ver.Ok) {
-                Remove-QtKCheck -Directory $paths.KCheck | Out-Null
+                Remove-QtStepKCheck
                 Clear-QtRunOnce -State $state | Out-Null
                 Set-QtState -State $state -To 'KERNEL_VERIFIED' -Note 'verify-kernel resume' | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
@@ -456,94 +533,64 @@ try {
             $rf = @($manifest.files | Where-Object { ([string]$_.path) -eq 'wsl/rootfs.tar' })
             if ($rf.Count -gt 0 -and (Test-QtHasProperty -Object $rf[0] -Name 'version')) { $rootfsVersion = [string]$rf[0].version }
 
-            # ── §2.7.1 同名冲突判定 ─────────────────────────────────────────
+            # An interrupted import is resumed only from this package and this install user.
             $listed = Invoke-QtWsl -WslArgs @('--list', '--quiet') -TimeoutSec 60
+            if ($listed.TimedOut -or $listed.ExitCode -ne 0) {
+                Write-QtStepResult -Ok $false -Reason 'IMPORT_FAILED' -ExitName 'E_INSTALL_IMPORT_FAILED' `
+                    -Message 'Could not enumerate WSL distributions. No import was attempted.'
+            }
             $exists = ($listed.StdOut -match ('(?m)^\s*' + [regex]::Escape($name) + '\s*$'))
             if ($exists) {
-                $reg = @(Get-QtRegisteredDistro | Where-Object { $_.name -eq $name })
+                $allDistros = Get-QtRegisteredDistro
+                $reg = @($allDistros | Where-Object { $_.name -eq $name })
                 $basePath = ''
-                if ($reg.Count -gt 0) { $basePath = [string]$reg[0].base_path }
-                $marker = Read-QtImportedMarker -DistroName $name
-                $markerVer = ''
-                if ($null -ne $marker -and (Test-QtHasProperty -Object $marker -Name 'rootfs_version')) { $markerVer = [string]$marker.rootfs_version }
-                $conflict = Resolve-QtDistroConflict -Exists $true `
-                    -HasStateRecord ([bool]$state.distro.imported_at) -BasePath $basePath -ExpectedBasePath $paths.Distro `
-                    -ImportedRootfsVersion $markerVer -PackageRootfsVersion $rootfsVersion
-
-                switch ($conflict.Kind) {
-                    'REUSE' {
-                        Set-QtSubstate -State $state -Substate 'skip' | Out-Null
-                        Set-QtState -State $state -To 'DISTRO_IMPORTED' -Note 'skip (already imported, same rootfs_version)' | Out-Null
-                        Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                        Write-QtStepResult -Ok $true -State 'DISTRO_IMPORTED' -Message 'qtrade 已存在且版本一致,跳过导入' -Data ([ordered]@{ conflict = 'REUSE' })
-                    }
-                    'UPGRADE' {
-                        # 🔴 §2.7.1:**不在首装流程里静默换 rootfs** —— 只跳过并要求走 §2.13 升级路径
-                        Write-QtLog -Level 'WARN' -Message ('已存在的 qtrade 的 rootfs 版本低于本包({0} < {1}),请以 /QT_MODE=upgrade 运行' -f $markerVer, $rootfsVersion)
-                        Set-QtSubstate -State $state -Substate 'skip' | Out-Null
-                        Set-QtState -State $state -To 'DISTRO_IMPORTED' -Note 'skip (needs upgrade)' | Out-Null
-                        Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                        Write-QtStepResult -Ok $true -State 'DISTRO_IMPORTED' -Message '已存在的发行版版本较低,需要走升级流程' -Data ([ordered]@{ conflict = 'UPGRADE'; needs_upgrade = $true })
-                    }
-                    'FOREIGN' {
-                        # 停下问用户(§2.7.1):【注销它并重新导入】/【取消安装】;**不改名绕过**
-                        $choice = [string](Get-QtOpt -Name 'distro_conflict_choice' -Default '')
-                        if ($choice -eq 'cancel') {
-                            Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason 'DISTRO_NAME_CONFLICT_DECLINED') | Out-Null
-                            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'DISTRO_NAME_CONFLICT_DECLINED' -ExitName 'E_INSTALL_DISTRO_NAME_CONFLICT_DECLINED' `
-                                -Message ('发现已存在名为 {0} 的 WSL 发行版(位置 {1}),用户选择取消安装' -f $name, $basePath)
-                        }
-                        if ($choice -ne 'unregister') {
-                            Set-QtParked -State $state -Step 'DISTRO_IMPORTED' -Reason 'WAIT_DISTRO_CONFLICT' | Out-Null
-                            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WAIT_DISTRO_CONFLICT' -ExitName 'E_INSTALL_WAIT_USER' `
-                                -Message ('发现已存在名为 {0} 的 WSL 发行版(位置 {1}),不是本安装程序创建的或记录已丢失,需要用户选择如何处理' -f $name, $basePath) `
-                                -Data ([ordered]@{ conflict = 'FOREIGN'; base_path = $basePath; reason = $conflict.Reason })
-                        }
-                        # 🔴 先导出再注销;**导出失败则不注销**(验收 M1-13)
-                        $exp = Export-QtDistroBackup -DistroName $name -WslDir $paths.Wsl
-                        if (-not $exp.Ok) {
-                            Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason 'IMPORT_FAILED') | Out-Null
-                            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'IMPORT_FAILED' -ExitName 'E_INSTALL_IMPORT_FAILED' `
-                                -Message '导出已有同名发行版失败,已放弃注销(不会动你的数据)'
-                        }
-                        Write-QtLog -Message ('已导出同名发行版到 {0},即将注销后重新导入' -f $exp.TarPath)
-                        Unregister-QtDistro -Name $name | Out-Null
-                    }
+                if ($reg.Count -eq 1) {
+                    $basePath = ([string]$reg[0].base_path).TrimEnd('\')
+                    if ($basePath.StartsWith('\\?\')) { $basePath = $basePath.Substring(4) }
                 }
-            }
-
-            $imp = Import-QtDistro -Name $name -Directory $paths.Distro -TarPath $tar
-            if (-not $imp.Ok) {
-                $reason = $imp.Reason
-                Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason $reason) | Out-Null
+                $ours = $reg.Count -eq 1 -and $basePath -eq $paths.Distro -and
+                    $state.distro.dir -eq $paths.Distro -and $state.distro.imported_at -and
+                    $state.env.install_user_sid -eq (Get-QtCurrentUserSid) -and
+                    (Test-QtHasProperty $state 'package_manifest_sha256') -and
+                    $state.package_manifest_sha256 -eq (Get-QtFileHash -Path $paths.Manifest)
+                if (-not $ours) {
+                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'DISTRO_NAME_CONFLICT_DECLINED' `
+                        -ExitName 'E_INSTALL_DISTRO_NAME_CONFLICT_DECLINED' `
+                        -Message 'The existing WSL distribution is not owned by this installation. No distribution was removed.'
+                }
+            } else {
+                $imp = Import-QtDistro -Name $name -Directory $paths.Distro -TarPath $tar
+                if (-not $imp.Ok) {
+                    $reason = $imp.Reason
+                    Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason $reason) | Out-Null
+                    Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $reason -ExitName ('E_INSTALL_' + $reason) -Message 'WSL import failed.'
+                }
+                # Persist ownership before any guest bootstrap that may fail or time out.
+                $state.distro.dir = $paths.Distro
+                $state.distro.imported_at = Get-QtIso8601
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $reason -ExitName ('E_INSTALL_' + $reason) -Message '发行版导入失败'
             }
-            $sysd = Wait-QtDistroSystemd -Name $name
-            if (-not $sysd.Ok) {
-                Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason 'SYSTEMD_NOT_READY') | Out-Null
+            $boot = Initialize-QtDistroBootstrap -Name $name -InstallEnvPath (Join-Path $paths.Install 'install.env') `
+                -PackageVersion ([string]$state.package_version) `
+                -DockerCidr ([string](Get-QtOpt 'docker_cidr' '')) -ApkUrl ([string](Get-QtOpt 'apk_url' '')) `
+                -Candidates @(Get-QtOpt 'docker_pool_candidates' @('10.213.0.0/16', '10.231.0.0/16', '10.247.0.0/16', '10.199.0.0/16')) `
+                -OccupiedPrefixes @(Get-QtOpt 'occupied_prefixes' @())
+            if (-not $boot.Ok) {
+                $bootExit = switch ([string]$boot.Reason) {
+                    'DOCKER_CIDR_EXHAUSTED' { 'E_INSTALL_DOCKER_CIDR_EXHAUSTED' }
+                    'SYSTEMD_NOT_READY' { 'E_INSTALL_SYSTEMD_NOT_READY' }
+                    default { 'E_INSTALL_INTERNAL' }
+                }
+                $bootStateReason = $bootExit -replace '^E_INSTALL_', ''
+                Set-QtState -State $state -To (New-QtFailedState -Step 'DISTRO_IMPORTED' -Reason $bootStateReason) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'SYSTEMD_NOT_READY' -ExitName 'E_INSTALL_SYSTEMD_NOT_READY' -Message '发行版首启未就绪'
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $boot.Reason `
+                    -ExitName $bootExit -Message 'Guest bootstrap failed. Product services remain gated.'
             }
-            # 🔴 R5-9:选段锚在「导入完成、首起 dockerd 前」,**不以 .imported 为前置**
-            $cidr = [string](Get-QtOpt -Name 'docker_cidr' -Default '')
-            if (-not $cidr) {
-                $candidates = @(Get-QtOpt -Name 'docker_pool_candidates' -Default @('10.213.0.0/16', '10.231.0.0/16', '10.247.0.0/16', '10.199.0.0/16'))
-                $occupied = @(Get-QtOpt -Name 'occupied_prefixes' -Default @())
-                $pick = Select-QtDockerPool -Candidates $candidates -OccupiedPrefixes $occupied
-                $cidr = $pick.Cidr
-                if ($pick.AllConflict) { Write-QtLog -Level 'WARN' -Message ('docker 地址池候选全冲突,取第一个 {0}({1})' -f $cidr, $pick.Warn) }
-            }
-            # 🔴 R5-9:选段结果必须在**首起 dockerd 之前**就位 —— 写 install.env,
-            #    发行版里的 `qtrade-docker-config.service`(Before=docker.service)据此写 daemon.json
-            Write-QtInstallEnv -Path (Join-Path $paths.Install 'install.env') -DockerCidr $cidr `
-                -ApkUrl ([string](Get-QtOpt -Name 'apk_url' -Default '')) | Out-Null
-            $state.env.docker_cidr = $cidr
-            $state.distro.dir = $paths.Distro
-            $state.distro.imported_at = Get-QtIso8601
+            $cidr = [string]$boot.Cidr
+            $sysd = $boot.Systemd
+            $state.env | Add-Member -NotePropertyName docker_cidr -NotePropertyValue $cidr -Force
             Set-QtState -State $state -To 'DISTRO_IMPORTED' -Note ('docker_cidr ' + $cidr) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
             Write-QtStepResult -Ok $true -State 'DISTRO_IMPORTED' -Message ('qtrade 已导入(docker 网段 {0})' -f $cidr) -Data ([ordered]@{ docker_cidr = $cidr; systemd = $sysd.Status })
@@ -559,7 +606,8 @@ try {
             }
             $names = Get-QtWinAgentNames
             $svcExe = Join-Path $paths.WinAgent ('app\' + $names.svc_exe)
-            $svc = Install-QtWinAgentService -ExePath $svcExe -Name $names.service_name -DisplayName $names.display_name
+            $svc = Install-QtWinAgentService -ExePath $svcExe -Name $names.service_name -DisplayName $names.display_name `
+                -Root $paths.WinAgent -InstallUserSid ([string]$state.env.install_user_sid)
             if (-not $svc.Ok) {
                 Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason 'SERVICE_INSTALL_FAILED') | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
@@ -568,64 +616,61 @@ try {
             Register-QtWinAgentUserTask -UserExePath (Join-Path $paths.WinAgent ('app\' + $names.user_exe)) `
                 -InstallUserSid ([string]$state.env.install_user_sid) -StartNow | Out-Null
             Invoke-QtSc -ScArgs @('start', $names.service_name) | Out-Null
-            $h = Wait-QtWinAgentHealthy -BaseUrl $names.base_url -TimeoutSec 30
+            $tokens = Get-QtBootstrapTokens -TimeoutSec 30
+            if (-not $tokens.Ok) {
+                Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason $tokens.Reason) | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $tokens.Reason -ExitName 'E_INSTALL_WINAGENT_NOT_READY' `
+                    -Message 'Local bootstrap credentials could not be obtained.'
+            }
+            $h = Wait-QtWinAgentHealthy -BaseUrl $names.base_url -Token $tokens.ConsoleToken -TimeoutSec 30
             if (-not $h.Ok) {
                 Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason 'WINAGENT_NOT_READY') | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
                 Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WINAGENT_NOT_READY' -ExitName 'E_INSTALL_WINAGENT_NOT_READY' -Message '服务启动失败或 30 秒内未就绪'
             }
-            $fw = Invoke-QtFirewallEnsure -BaseUrl $names.base_url
+            $waToken = Write-QtWinAgentToken -Token $tokens.WinAgentToken -DistroName ([string]$state.distro.name)
+            if (-not $waToken.Ok -or -not (Set-QtAgentConsoleToken -Token $tokens.ConsoleToken -DistroName ([string]$state.distro.name))) {
+                Write-QtStepResult -Ok $false -Reason 'TOKEN_BOOTSTRAP_FAILED' -ExitName 'E_INSTALL_WINAGENT_NOT_READY' `
+                    -Message 'Credential binding failed. Product firstboot was not started.'
+            }
+            $firstboot = Start-QtDistroFirstboot -Name ([string]$state.distro.name) `
+                -PackageVersion ([string]$state.package_version) -TimeoutSec 1800
+            if (-not $firstboot.Ok) {
+                Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason $firstboot.Reason) | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $firstboot.Reason `
+                    -ExitName 'E_INSTALL_AGENT_NOT_READY' -Message 'Product firstboot did not complete.'
+            }
+            $fw = Invoke-QtFirewallEnsure -BaseUrl $names.base_url -Token $tokens.ConsoleToken
+            if (-not $fw.Ok) {
+                Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason 'WINAGENT_NOT_READY') | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $fw.Reason `
+                    -ExitName 'E_INSTALL_WINAGENT_NOT_READY' -Message $fw.Message
+            }
             $state.firewall_rules = [string]$fw.Action
             if ($fw.Blocked) { Write-QtLog -Level 'WARN' -Message $fw.Message }
             Set-QtState -State $state -To 'WINAGENT_INSTALLED' -Note ('firewall ' + $fw.Action) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
             # 🔴 R3-16:user_agent:false 属正常态,不判失败
             $msg = if ($h.UserAgent) { '服务已启动;会话代理已上线' } else { '服务已启动。首次使用需登录 Windows 桌面(可锁屏,不要注销),账号才会运行' }
-            Write-QtStepResult -Ok $true -State 'WINAGENT_INSTALLED' -Message $msg -Data ([ordered]@{ user_agent = $h.UserAgent; firewall = $fw.Action; firewall_blocked = $fw.Blocked })
+            if ($fw.Blocked) { $msg += (' ' + $fw.Message) }
+            Write-QtStepResult -Ok $true -State 'WINAGENT_INSTALLED' -Message $msg -Data ([ordered]@{ user_agent = $h.UserAgent; firewall = $fw.Action; firewall_blocked = $fw.Blocked; firewall_message = $fw.Message })
         }
 
         # ── 卸载 `/QT_MODE=uninstall`(§2.14)────────────────────────────────
         'uninstall' {
-            $keepData = [bool](Get-QtOpt -Name 'keep_data' -Default $true)
-            $plan = Get-QtUninstallPlan -State $state -KeepData $keepData -Root $Root
-            $stamp = Get-QtTimestamp
-            $data = Invoke-QtUninstallData -KeepData $keepData -WslDir $paths.Wsl -Stamp $stamp
-            Invoke-QtUninstallDistro -KCheckDir $paths.KCheck | Out-Null
-            Invoke-QtUninstallWslConfig -WslConfigPath ([string]$state.env.wslconfig_path) -BackupDir $paths.Wsl `
-                -KeysAdded $plan.WslConfig.RemoveKeys -Stamp $stamp | Out-Null
-            # 顺序:防火墙 → hosts → 服务(两者都必须在删服务之前,§2.14 第 5/6 步)
-            $fw = Invoke-QtFirewallDelete -FallbackRuleNames (Get-QtFirewallRuleNames)
-            $hosts = Invoke-QtWeChatUpdateBlock -Enable $false
-            Uninstall-QtWinAgent | Out-Null
-            Stop-QtConsole | Out-Null
-            Clear-QtRunOnce -State $state | Out-Null
-            Remove-QtShortcuts | Out-Null
-            $orphan = Get-QtOrphanQtbakDirs -SearchRoots @()
-            $rm = Remove-QtInstallFiles -Plan $plan
-            Write-QtStepResult -Ok $true -State 'DONE' -Message '卸载完成' -Data ([ordered]@{
-                    backup_tar    = $data.BackupTar
-                    firewall      = $fw.Via
-                    hosts_block   = $hosts.HostsBlock
-                    removed_count = $rm.Removed.Count
-                    kept          = $rm.Kept
-                    qtbak_orphans = $orphan
-                })
+            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'UNINSTALL_DISABLED' `
+                -ExitName 'E_INSTALL_WAIT_USER' -Message 'This legacy uninstall entry is disabled. Run the complete installer for verified clean reinstall.'
         }
-
 
         # ── IMAGES_LOADED(§2.7.3 末 / §2.2.1 G-10)──────────────────────────
         'IMAGES_LOADED' {
             $manifest = Read-QtManifest -Path $paths.Manifest
             $name = [string]$state.distro.name
             $expected = Get-QtExpectedImageRefs -Manifest $manifest
-            $ctx = [pscustomobject]@{ DistroName = $name; ExpectedImages = $expected }
-            if ($expected.Count -gt 0 -and (Test-QtStepComplete -Step 'IMAGES_LOADED' -Context $ctx)) {
-                Set-QtSubstate -State $state -Substate 'skip' | Out-Null
-                Set-QtState -State $state -To 'IMAGES_LOADED' -Note 'skip' | Out-Null
-                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $true -State 'IMAGES_LOADED' -Message '镜像与 Agent 已就绪(跳过)'
-            }
-
+            # Re-entry repeats read-only integrity and network checks; it never reloads images.
             # 首启 oneshot 由发行版内的 systemd 做(§2.7.3 双 unit);引擎只等结果、只判判据。
             $present = Get-QtDockerImages -DistroName $name
             if ($present.Count -eq 0) {
@@ -660,7 +705,11 @@ try {
             $bridge = Get-QtDockerBridgeSubnet -DistroName $name
             $poolOk = Test-QtDockerPoolApplied -BridgeSubnet $bridge -SelectedCidr ([string]$state.env.docker_cidr)
             if (-not $poolOk) {
-                Write-QtLog -Level 'WARN' -Message ('docker bridge 子网 {0} 不在选定段 {1} 内(R5-9:选段可能晚于 dockerd 首启)' -f $bridge, $state.env.docker_cidr)
+                Set-QtState -State $state -To (New-QtFailedState -Step 'IMAGES_LOADED' -Reason 'DOCKER_NOT_READY') | Out-Null
+                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'DOCKER_NOT_READY' `
+                    -ExitName 'E_INSTALL_DOCKER_NOT_READY' -Message 'Docker bridge does not match the selected installation network.' `
+                    -Data ([ordered]@{ bridge_subnet = $bridge; docker_pool_applied = $false })
             }
             Set-QtState -State $state -To 'IMAGES_LOADED' -Note ('images ok, bridge ' + $bridge) | Out-Null
             Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
@@ -774,10 +823,13 @@ try {
             $apkUrl = [string](Get-QtOpt -Name 'apk_url' -Default '')
             if ($apkUrl) {
                 $agentBase = Get-QtAgentBaseUrl
+                $tokens = Get-QtBootstrapTokens -TimeoutSec 30
+                if (-not $tokens.Ok) { throw 'TOKEN_BOOTSTRAP_FAILED' }
                 $r = Invoke-QtHttp -Uri ($agentBase + '/api/v1/settings/runtime') -Method PATCH `
+                    -Headers @{ Authorization = ('Bearer ' + $tokens.ConsoleToken) } `
                     -Body (@{ apk_url = $apkUrl } | ConvertTo-Json -Compress) -TimeoutSec 30
                 if ($r.Ok) {
-                    $pr = Invoke-QtProbe -Targets @('apk_url') -Trigger 'install' -Detail 'clients'
+                    $pr = Invoke-QtProbe -Targets @('apk_url') -Trigger 'install' -Detail 'clients' -ConsoleToken $tokens.ConsoleToken
                     if ($pr.Results.Count -gt 0) { $apkProbe = [string]$pr.Results[0].result }
                 }
             }
@@ -837,7 +889,9 @@ try {
             $refs = Get-QtExpectedImageRefs -Manifest $manifest
             if ($refs.Count -ge 2) { $napcatRef = $refs[1] }
 
-            $st = Invoke-QtSelftest -AgentBaseUrl $agentBase -WinAgentBaseUrl $waBase `
+            $tokens = Get-QtBootstrapTokens -TimeoutSec 30
+            if (-not $tokens.Ok) { throw 'TOKEN_BOOTSTRAP_FAILED' }
+            $st = Invoke-QtSelftest -AgentBaseUrl $agentBase -WinAgentBaseUrl $waBase -ConsoleToken $tokens.ConsoleToken `
                 -DistroName ([string]$state.distro.name) -NapcatImageRef $napcatRef `
                 -SkipNapcat:(-not [bool](Get-QtOpt -Name 'napcat_check' -Default $true))
 
@@ -887,6 +941,11 @@ try {
             if (Test-QtPath -Path $paths.KernelPtr) {
                 try { $summary.kernel_version = [string]((Read-QtTextFile -Path $paths.KernelPtr | ConvertFrom-Json).version) } catch { }
             }
+            $firewallMessage = ''
+            if ($state.firewall_rules -eq 'blocked_by_policy') {
+                $firewallMessage = 'Policy blocked inbound port 17610. The Agent may be unable to reach WinAgent. Ask IT to allow the required rule.'
+                $summary.notes += (' ' + $firewallMessage)
+            }
             Write-QtInstallSummary -Path $paths.SummaryFile -Summary $summary | Out-Null
 
             Set-QtState -State $state -To 'DONE' -Note 'done' | Out-Null
@@ -895,123 +954,62 @@ try {
                     shortcuts    = $shortcuts.Created
                     rootfs_freed = $freed.FreedBytes
                     summary      = $paths.SummaryFile
+                    firewall_message = $firewallMessage
                 })
         }
 
         # ── 升级 `/QT_MODE=upgrade`(§2.13)────────────────────────────────────
+        'clean-reinstall' {
+            if (-not $StageRoot) {
+                Write-QtStepResult -Ok $false -Reason 'FULL_INSTALLER_REQUIRED' -ExitName 'E_INSTALL_WAIT_USER' `
+                    -Message 'Run the complete installer to clean and reinstall QTrade.'
+            }
+            if (-not (Test-QtHasProperty $state.env 'install_user_sid') -or
+                $state.env.install_user_sid -ne (Get-QtCurrentUserSid)) {
+                Write-QtStepResult -Ok $false -Reason 'PRECHECK_REQUIRED' -ExitName 'E_INSTALL_WAIT_USER' `
+                    -Message 'Complete preflight with the installing Windows user before clean reinstall.'
+            }
+            $cleanConsent = Get-QtOpt 'accept_clean_reinstall' $false
+            $r = Invoke-QtCleanReinstall -StageRoot $StageRoot -LiveRoot $paths.Root `
+                -PackageVersion ([string](Get-QtOpt 'package_version' '0.0.0')) `
+                -AcceptCleanReinstall ($cleanConsent -is [bool] -and $cleanConsent)
+            if (-not $r.Ok) {
+                $exitName = if ($r.RequiresConsent) { 'E_INSTALL_WAIT_USER' } else { 'E_INSTALL_INTERNAL' }
+                Write-QtStepResult -Ok $false -Reason $r.Reason -ExitName $exitName `
+                    -Message 'Clean reinstall was not completed. Account settings, login state and collected records in QTrade will be deleted only after explicit confirmation.' `
+                    -Data ([ordered]@{ requires_consent = $r.RequiresConsent })
+            }
+            $livePaths = Get-QtPaths -Root $paths.Root
+            if (-not $r.Resumed) {
+                $r.State.env = $state.env
+                $r.State.state = 'PAYLOAD_STAGED'
+                Write-QtInstallState -State $r.State -Path $livePaths.StateFile | Out-Null
+            }
+            Write-QtStepResult -Ok $true -State ([string]$r.State.state) -Message 'Verified payload is ready for installation.' `
+                -Data ([ordered]@{ resumed = $r.Resumed })
+        }
+
         'upgrade' {
-            $selfVersion = [string](Get-QtOpt -Name 'package_version' -Default '0.0.0')
-            $cmp = Compare-QtPackageVersion -Installed ([string]$state.package_version) -Package $selfVersion
-            if ($cmp.Kind -eq 'DOWNGRADE') {
-                # 🔴 §2.13 兼容矩阵:**不支持降级**,文案指向卸载再装
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'DOWNGRADE_REFUSED' -ExitName 'E_INSTALL_DOWNGRADE_REFUSED' `
-                    -Message ('本机已装 {0},高于本包 {1};不支持降级,请先卸载再安装' -f $state.package_version, $selfVersion)
-            }
-
-            # 升级前按同一硬门槛复检磁盘(§2.13 末「磁盘(E-18)」)
-            $free = Get-QtDriveFreeBytes -DriveLetter ($paths.Root.Substring(0, 1))
-            $disk = Test-QtDiskThreshold -FreeBytes $free
-            if (-not $disk.Ok) {
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'DISK_FULL' -ExitName 'E_INSTALL_DISK_FULL' `
-                    -Message $disk.Message
-            }
-
-            $manifest = Read-QtManifest -Path $paths.Manifest
-            $breaking = $false
-            if (Test-QtHasProperty -Object $manifest -Name 'schema_breaking') { $breaking = [bool]$manifest.schema_breaking }
-            $prompt = Get-QtSchemaBreakingPrompt -SchemaBreaking $breaking
-            if ($prompt.RequireConfirm -and -not [bool](Get-QtOpt -Name 'accept_schema_breaking' -Default $false)) {
-                Set-QtParked -State $state -Step 'DONE' -Reason 'WAIT_SCHEMA_BREAKING_CONFIRM' | Out-Null
-                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WAIT_SCHEMA_BREAKING_CONFIRM' -ExitName 'E_INSTALL_WAIT_USER' `
-                    -Message $prompt.Text
-            }
-
-            # 第 1 步 drain(红线 6:会中断账号,须明示确认)
-            $confirmed = [bool](Get-QtOpt -Name 'accept_shutdown' -Default $false)
-            if (-not $confirmed) {
-                Set-QtParked -State $state -Step 'DONE' -Reason 'WAIT_SHUTDOWN_CONFIRM' | Out-Null
-                Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WAIT_SHUTDOWN_CONFIRM' -ExitName 'E_INSTALL_WAIT_USER' `
-                    -Message '升级会停掉所有账号容器,需要你确认时机(静默模式带 /QT_ACCEPT_SHUTDOWN=1)'
-            }
-            Invoke-QtDrain -Confirmed $true | Out-Null
-
-            # 第 3~6 步:变了才做
-            $plan = Get-QtUpgradePlan -Current ([pscustomobject](Get-QtOpt -Name 'current_fingerprint' -Default ([pscustomobject]@{}))) `
-                -Next ([pscustomobject](Get-QtOpt -Name 'next_fingerprint' -Default ([pscustomobject]@{})))
-            Write-QtLog -Message ('升级计划:' + ($plan.Steps -join ' → '))
-
-            $backupTar = ''
-            if ($plan.Rootfs -or $prompt.RequireConfirm) {
-                $bk = Backup-QtAgentData -WslDir $paths.Wsl -DistroName ([string]$state.distro.name)
-                if (-not $bk.Ok) {
-                    # 🔴 没备份成功绝不 --unregister
-                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'UPGRADE_DATA_BACKUP_FAILED' -ExitName 'E_INSTALL_UPGRADE_DATA_BACKUP_FAILED' `
-                        -Message '升级前的数据备份失败,已中止(未动发行版)'
-                }
-                $backupTar = $bk.TarPath
-            }
-
-            # 第 7 步 G-01:停 → 覆盖 → 起(顺序固定)
-            $stopped = Stop-QtTriad
-            if ($plan.Rootfs) {
-                Unregister-QtDistro -Name ([string]$state.distro.name) | Out-Null
-                $imp = Import-QtDistro -Name ([string]$state.distro.name) -Directory $paths.Distro -TarPath (Join-Path $paths.Wsl 'rootfs.tar')
-                if (-not $imp.Ok) {
-                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $imp.Reason -ExitName ('E_INSTALL_' + $imp.Reason) `
-                        -Message ('升级导入新 rootfs 失败;可用 /QT_MODE=repair --restore-data {0} 恢复' -f $backupTar)
-                }
-                Wait-QtDistroSystemd -Name ([string]$state.distro.name) | Out-Null
-                if ($backupTar) { Restore-QtAgentData -TarPath $backupTar -DistroName ([string]$state.distro.name) | Out-Null }
-            } elseif ($plan.AgentCode) {
-                Update-QtAgentCode -AgentTarPath (Join-Path $paths.Wsl 'agent\agent.tar') -DistroName ([string]$state.distro.name) | Out-Null
-            }
-
-            # §2.13 第 6 步:新镜像 tar 变了 → docker load(🔴 **旧镜像保留**,逐账号升级归 Agent)
-            $imagesLoaded = @()
-            if ($plan.Images) {
-                $mf = Read-QtManifest -Path $paths.Manifest
-                $li = Invoke-QtDockerLoadImages -Manifest $mf -DistroName ([string]$state.distro.name) `
-                    -TarOverrideDir (Join-Path $paths.Wsl 'images')
-                $imagesLoaded = @($li.Loaded | ForEach-Object { $_.ref })
-                if (-not $li.Ok) {
-                    Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'IMAGE_LOAD_FAILED' -ExitName 'E_INSTALL_IMAGE_LOAD_FAILED' `
-                        -Message '升级期加载新镜像失败' -Data ([ordered]@{ failed = $li.Failed; backup_tar = $backupTar })
-                }
-            }
-            $started = Start-QtTriad -ConsoleExePath (Join-Path $paths.Console (Get-QtConsoleNames).exe)
-
-            $state.package_version = $selfVersion
-            Add-QtHistory -State $state -From 'DONE' -To 'DONE' -Note ('upgrade from ' + $cmp.Reason) | Out-Null
-            Set-QtState -State $state -To 'DONE' -Note ('upgrade to ' + $selfVersion) | Out-Null
-            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-            Write-QtStepResult -Ok $true -State 'DONE' -Message ('已升级到 {0}' -f $selfVersion) -Data ([ordered]@{
-                    plan          = $plan.Steps
-                    backup_tar    = $backupTar
-                    console_killed = $stopped.ConsoleKilled
-                    user_agent    = $started.UserAgent
-                    images_loaded = $imagesLoaded
-                })
+            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'FULL_INSTALLER_REQUIRED' `
+                -ExitName 'E_INSTALL_WAIT_USER' -Message 'In-place upgrade is disabled. Run the complete installer and confirm clean reinstall.'
         }
 
         # ── 修复 `/QT_MODE=repair`(§5.2)─────────────────────────────────────
         'repair' {
-            $r = Invoke-QtRepair -DistroDir $paths.Distro -RootfsTar (Join-Path $paths.Wsl 'rootfs.tar') `
-                -WslDir $paths.Wsl -DistroName ([string]$state.distro.name) `
-                -RestoreDataTar ([string](Get-QtOpt -Name 'restore_data' -Default ''))
-            if (-not $r.Ok) {
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $r.Reason -ExitName 'E_INSTALL_IMPORT_FAILED' -Message '修复失败'
-            }
-            Add-QtHistory -State $state -From ([string]$state.state) -To ([string]$state.state) -Note 'repair' | Out-Null
-            Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-            Write-QtStepResult -Ok $true -State ([string]$state.state) -Message '修复完成' `
-                -Data ([ordered]@{ restored = $r.Restored; backup_used = $r.BackupUsed })
+            Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'REPAIR_DISABLED' `
+                -ExitName 'E_INSTALL_WAIT_USER' -Message 'WSL repair is disabled because its recovery path cannot guarantee data safety. Use the complete installer for a confirmed clean reinstall.'
         }
 
         # ── 诊断包(§5.3;失败页【导出诊断信息】)────────────────────────────
         'diag' {
-            $d = New-QtDiagBundle -Root $Root -IncludeDmesg ([bool](Get-QtOpt -Name 'diag_include_dmesg' -Default $true)) `
+            $diagRoot = if ($StageRoot) { $StageRoot } else { $Root }
+            if ($StageRoot) {
+                $liveStateFile = (Get-QtPaths -Root $Root).StateFile
+                if (Test-QtPath -Path $liveStateFile) {
+                    Copy-Item -LiteralPath $liveStateFile -Destination (Join-Path $StageRoot 'install\install_state.json') -Force
+                }
+            }
+            $d = New-QtDiagBundle -Root $diagRoot -IncludeDmesg ([bool](Get-QtOpt -Name 'diag_include_dmesg' -Default $true)) `
                 -DistroName ([string]$state.distro.name)
             Write-QtStepResult -Ok $d.Ok -State ([string]$state.state) -Message ('诊断包:' + $d.ZipPath) `
                 -Data ([ordered]@{ zip = $d.ZipPath; included = $d.Included; skipped = $d.Skipped; blocked = $d.Blocked })

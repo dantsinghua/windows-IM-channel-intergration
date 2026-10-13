@@ -103,7 +103,7 @@ def is_self_event(event: dict[str, Any]) -> bool:
 
 
 def to_message(account_id: str, event: dict[str, Any], *, raw_ref: Optional[str] = None,
-               self_uid: Optional[str] = None) -> Message:
+               self_uid: Optional[str] = None, self_nick: Optional[str] = None) -> Message:
     """一条 OneBot ``message`` / ``message_sent`` 事件 → ``Message``(00 §7.4)。调用方负责 ``store.ingest`` 与发事件。
 
     我方消息落 ``dir='out'``、``state='DELIVERED'``:未命中出向 ``SENDING`` 行时它就是「非本系统发出的我方消息」
@@ -116,6 +116,8 @@ def to_message(account_id: str, event: dict[str, Any], *, raw_ref: Optional[str]
     sid, sname = sender_of(event)
     if is_self and self_uid:
         sid = self_uid                      # 出向行两侧 sender 取同一口径,保证 fingerprint 可比(06 §2.9.2)
+    if is_self and not sname and self_nick:
+        sname = str(self_nick).strip() or None
     group_name = (event.get("group_name") or "") if kind == "group" else ""
     return Message(
         account_id=account_id,

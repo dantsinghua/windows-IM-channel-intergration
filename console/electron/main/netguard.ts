@@ -9,12 +9,12 @@
 import { session, shell, type Session } from 'electron'
 import type { TokenHolder } from './token'
 
-import { DEFAULT_AGENT_ORIGIN, DEFAULT_WINAGENT_ORIGIN, buildCsp, normalizeLocalOrigin } from './origins'
+import { DEFAULT_AGENT_ORIGIN, DEFAULT_WINAGENT_ORIGIN, buildCsp, normalizeLocalOrigin, normalizeTrustedAgentOrigin } from './origins'
 
 export { DEFAULT_AGENT_ORIGIN, DEFAULT_WINAGENT_ORIGIN, buildCsp, normalizeLocalOrigin }
 
-/** openExternal 只放行本机 NapCat WebUI `http://127.0.0.1:163NN/` */
-export const EXTERNAL_ALLOW_RE = /^http:\/\/127\.0\.0\.1:163\d{2}\/?$/
+/** 本机 NapCat 工作台：16300 段任意路径都可以打开，不再卡令牌参数或有效期。 */
+export const EXTERNAL_ALLOW_RE = /^http:\/\/127\.0\.0\.1:163\d{2}(?:\/\S*)?$/
 
 export const CSP = buildCsp(DEFAULT_AGENT_ORIGIN)
 
@@ -26,7 +26,7 @@ export interface NetGuardOptions {
 
 export function installNetGuard(tokens: TokenHolder, sess: Session = session.defaultSession,
                                 opts: NetGuardOptions = {}): void {
-  const agentOrigin = normalizeLocalOrigin(opts.agentOrigin, DEFAULT_AGENT_ORIGIN)
+  const agentOrigin = normalizeTrustedAgentOrigin(opts.agentOrigin) ?? normalizeLocalOrigin(opts.agentOrigin, DEFAULT_AGENT_ORIGIN)
   const winagentOrigin = normalizeLocalOrigin(opts.winagentOrigin, DEFAULT_WINAGENT_ORIGIN)
   const agentHeaderUrls = [`${agentOrigin}/api/v1/*`, `${agentOrigin.replace(/^http/, 'ws')}/api/v1/*`]
   // 17610 永远阻断;配置的 WinAgent 源若不是默认端口也一并阻断
@@ -38,12 +38,17 @@ export function installNetGuard(tokens: TokenHolder, sess: Session = session.def
   sess.webRequest.onBeforeSendHeaders({ urls: agentHeaderUrls }, (details, cb) => {
     const token = tokens.agentToken
     const requestHeaders = { ...details.requestHeaders }
-    if (token) requestHeaders.Authorization = `Bearer ${token}`
+    if (token && (!tokens.agentBaseUrl || tokens.agentBaseUrl === agentOrigin)) requestHeaders.Authorization = `Bearer ${token}`
     cb({ requestHeaders })
   })
 
-  // (b) 渲染进程发往 WinAgent 的一切请求直接阻断
-  sess.webRequest.onBeforeRequest({ urls: winagentUrls }, (_details, cb) => cb({ cancel: true }))
+  // (b) WinAgent 永远阻断;Agent 未完成可信发现/令牌交接时,占位源不能承接业务请求。
+  sess.webRequest.onBeforeRequest({ urls: [...winagentUrls, ...agentHeaderUrls] }, (details, cb) => {
+    const url = new URL(details.url)
+    const isAgent = url.origin.replace(/^ws/, 'http') === agentOrigin
+    cb({ cancel: !isAgent || tokens.authState !== 'ok' || !tokens.agentToken ||
+      (!!tokens.agentBaseUrl && tokens.agentBaseUrl !== agentOrigin) })
+  })
 
   // (c) 统一挂 CSP
   sess.webRequest.onHeadersReceived((details, cb) => {

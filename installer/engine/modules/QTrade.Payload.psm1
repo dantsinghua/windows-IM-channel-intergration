@@ -49,30 +49,54 @@ function Test-QtManifestEntry {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $File,
-        [Parameter(Mandatory)][string] $StageRoot
+        [Parameter(Mandatory)][string] $StageRoot,
+        [string] $DestinationRoot = ''
     )
-    $relPath = [string]$File.path
+    $relPath = ''
+    if (Test-QtHasProperty -Object $File -Name 'path') { $relPath = [string]$File.path }
     $critical = $false
     if (Test-QtHasProperty -Object $File -Name 'critical') { $critical = [bool]$File.critical }
     $expected = ''
     if (Test-QtHasProperty -Object $File -Name 'sha256') { $expected = ([string]$File.sha256).ToLowerInvariant() }
-    $abs = Expand-QtPayloadPath -File $File -StageRoot $StageRoot
-
-    $result = [ordered]@{ path = $relPath; dest = $abs; critical = $critical; status = 'Ok'; actual = ''; expected = $expected }
-
-    # 通配条目(如 `pkg/adb/*`)只验目录存在:逐文件 sha256 由 CI 在打包期锁,安装期不展开通配
-    if ($relPath -like '*`**' -or $relPath.Contains('*')) {
-        $dir = Split-Path -Parent $abs
-        if (-not (Test-QtPath -Path $dir)) { $result.status = 'Missing' } else { $result.status = 'SkippedGlob' }
+    $result = [ordered]@{ path = $relPath; dest = ''; critical = $critical; status = 'InvalidManifest'; actual = ''; expected = $expected }
+    $normalized = $relPath -replace '\\', '/'
+    $parts = @($normalized -split '/')
+    # Only exact relative file paths and full hashes are valid in new packages.
+    if ([string]::IsNullOrWhiteSpace($relPath) -or [IO.Path]::IsPathRooted($relPath) -or
+        [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($relPath) -or
+        $relPath.Contains(':') -or $relPath -match '[\x00-\x1f]' -or
+        @($parts | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]$' }).Count -gt 0 -or
+        $expected -notmatch '\A[0-9a-f]{64}\z') {
         return [pscustomobject]$result
     }
+    try {
+        if (-not $DestinationRoot) { $DestinationRoot = $StageRoot }
+        $declared = [IO.Path]::GetFullPath((Expand-QtPayloadPath -File $File -StageRoot $DestinationRoot))
+        $required = [IO.Path]::GetFullPath([IO.Path]::Combine($DestinationRoot, ($normalized -replace '/', '\')))
+        if (-not [string]::Equals($declared, $required, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]$result
+        }
+        $abs = [IO.Path]::GetFullPath([IO.Path]::Combine($StageRoot, ($normalized -replace '/', '\')))
+    } catch { return [pscustomobject]$result }
+    $result.dest = $abs
     if (-not (Test-QtPath -Path $abs)) { $result.status = 'Missing'; return [pscustomobject]$result }
-    if ([string]::IsNullOrWhiteSpace($expected) -or $expected -like '*…*') {
-        $result.status = 'SkippedNoHash'
+    try {
+        $info = Get-Item -LiteralPath $abs -Force -ErrorAction Stop
+        if ($info.PSIsContainer -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            return [pscustomobject]$result
+        }
+        if (Test-QtHasProperty -Object $File -Name 'size') {
+            $size = [long]$File.size
+            if ($size -lt 0) { return [pscustomobject]$result }
+            if ($info.Length -ne $size) { $result.status = 'HashMismatch'; return [pscustomobject]$result }
+        }
+        $actual = Get-QtFileHash -Path $abs
+    } catch {
+        $result.status = 'ReadError'
         return [pscustomobject]$result
     }
-    $actual = Get-QtFileHash -Path $abs
     $result.actual = $actual
+    $result.status = 'Ok'
     if ($actual -ne $expected) { $result.status = 'HashMismatch' }
     return [pscustomobject]$result
 }
@@ -87,19 +111,31 @@ function Invoke-QtPayloadVerify {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $Manifest,
-        [Parameter(Mandatory)][string] $StageRoot
+        [Parameter(Mandatory)][string] $StageRoot,
+        [string] $DestinationRoot = ''
     )
     $entries = @()
-    foreach ($f in $Manifest.files) { $entries += (Test-QtManifestEntry -File $f -StageRoot $StageRoot) }
+    $seen = @{}
+    if (Test-QtHasProperty -Object $Manifest -Name 'files') {
+        foreach ($f in $Manifest.files) {
+            $entry = Test-QtManifestEntry -File $f -StageRoot $StageRoot -DestinationRoot $DestinationRoot
+            $key = $entry.path -replace '\\', '/'
+            if ($seen.ContainsKey($key)) { $entry.status = 'InvalidManifest' }
+            $seen[$key] = $true
+            $entries += $entry
+        }
+    }
     $missing = @($entries | Where-Object { $_.status -eq 'Missing' })
     $mismatch = @($entries | Where-Object { $_.status -eq 'HashMismatch' })
-    $criticalFailed = @($entries | Where-Object { $_.critical -and $_.status -in @('Missing', 'HashMismatch') })
+    $invalid = @($entries | Where-Object { $_.status -in @('InvalidManifest', 'ReadError') })
+    $criticalFailed = @($entries | Where-Object { $_.critical -and $_.status -ne 'Ok' })
     $verified = @($entries | Where-Object { $_.status -eq 'Ok' })
     return [pscustomobject]@{
-        Ok             = (($missing.Count -eq 0) -and ($mismatch.Count -eq 0))
+        Ok             = (($entries.Count -gt 0) -and ($verified.Count -eq $entries.Count))
         Entries        = $entries
         Missing        = $missing
         Mismatched     = $mismatch
+        Invalid        = $invalid
         CriticalFailed = $criticalFailed
         VerifiedCount  = $verified.Count
     }

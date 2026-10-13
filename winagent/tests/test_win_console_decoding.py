@@ -48,6 +48,7 @@ async def test_user_agent_retries_when_pipe_backend_raises_non_waerror(monkeypat
     class FlakyAgent:
         def __init__(self):
             self.calls = 0
+            self.stop_calls = 0
 
         async def start(self):
             self.calls += 1
@@ -57,6 +58,9 @@ async def test_user_agent_retries_when_pipe_backend_raises_non_waerror(monkeypat
 
         async def run(self):                                        # pragma: no cover
             raise AssertionError("not reached")
+
+        async def stop(self):
+            self.stop_calls += 1
 
     slept: list[float] = []
 
@@ -70,6 +74,7 @@ async def test_user_agent_retries_when_pipe_backend_raises_non_waerror(monkeypat
     except asyncio.CancelledError:
         pass
     assert ua.calls == 2 and slept == [5]
+    assert ua.stop_calls == 1
 
 
 def test_no_text_true_subprocess_left_in_win_backends():

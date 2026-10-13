@@ -28,7 +28,7 @@ Describe '预演:uname 不是版本串' {
             if ($WslArgs -contains '--shutdown') { return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
             return [pscustomobject]@{ ExitCode = 0; StdOut = $script:Hcs; StdErr = ''; TimedOut = $false; DurationMs = 1 }
         }
-        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { }
+        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
         Mock -ModuleName QTrade.Kernel Test-QtPath { $false }
         $cfg = Join-Path $TestDrive 'none.wslconfig'
         $r = Invoke-QtKernelRollback -WslConfigPath $cfg -ShutdownConfirmed $true -KCheckDirectory (Join-Path $TestDrive 'k')

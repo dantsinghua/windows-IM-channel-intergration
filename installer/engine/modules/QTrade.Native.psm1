@@ -611,6 +611,28 @@ function Invoke-QtHttp {
     }
 }
 
+function Get-QtOccupiedNetworkPrefixes {
+    [CmdletBinding()]
+    param()
+    try {
+        $prefixes = @(
+            Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { [string]$_.DestinationPrefix }
+            Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { '{0}/{1}' -f $_.IPAddress, $_.PrefixLength }
+        ) | Where-Object { $_ -and $_ -ne '0.0.0.0/0' } | Sort-Object -Unique
+        return [pscustomobject]@{ Ok = $true; Prefixes = @($prefixes) }
+    } catch { return [pscustomobject]@{ Ok = $false; Prefixes = @() } }
+}
+
+function Get-QtServiceProcessId {
+    [CmdletBinding()]
+    param([string] $Name = 'QTradeWinAgent')
+    try {
+        $service = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq $Name }
+        if ($service -and $service.State -eq 'Running') { return [int]$service.ProcessId }
+    } catch { }
+    return 0
+}
+
 function Start-QtSleep {
     [CmdletBinding()]
     param([Parameter(Mandatory)][int] $Seconds)

@@ -14,13 +14,14 @@ import sys
 
 SELFCHECK_MODULES = (
     "qtrade_winagent.main_svc", "qtrade_winagent.svc", "qtrade_winagent.fakes",
+    "qtrade_winagent.service_host", "qtrade_winagent.console_pipe", "servicemanager",
     "qtrade_winagent.win.dpapi", "qtrade_winagent.win.firewall", "qtrade_winagent.win.hosts",
     "qtrade_winagent.win.netinfo", "qtrade_winagent.win.pipes", "qtrade_winagent.win.power",
     "qtrade_winagent.win.probe", "qtrade_winagent.win.proc", "qtrade_winagent.win.sysinfo",
     "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat",
     "uvicorn", "uvicorn.loops.asyncio", "uvicorn.protocols.http.h11_impl",
     "uvicorn.protocols.websockets.websockets_impl", "uvicorn.lifespan.on",
-    "win32api", "win32service", "win32serviceutil", "win32security", "pywintypes", "psutil",
+    "win32api", "win32service", "win32serviceutil", "win32security", "win32event", "pywintypes", "psutil",
 )
 
 

@@ -22,6 +22,7 @@ class Job:
     interval_s: float
     fn: TaskFn
     run_immediately: bool = False
+    timeout_s: float = 300.0
     runs: int = 0
     skipped: int = 0            # 上一轮没跑完就到点 ⇒ 跳过并计数(02 §2.2.11:同名任务不重入)
     errors: int = 0
@@ -40,10 +41,10 @@ class Scheduler:
         self._clock = clock
         self._started = False
 
-    def register(self, name: str, interval_s: float, fn: TaskFn, *, run_immediately: bool = False) -> Job:
+    def register(self, name: str, interval_s: float, fn: TaskFn, *, run_immediately: bool = False, timeout_s: float = 300.0) -> Job:
         if name in self.jobs:
             raise ValueError(f"scheduler job already registered: {name}")
-        job = Job(name=name, interval_s=interval_s, fn=fn, run_immediately=run_immediately)
+        job = Job(name=name, interval_s=interval_s, fn=fn, run_immediately=run_immediately, timeout_s=timeout_s)
         self.jobs[name] = job
         if self._started:
             self._spawn(job)
@@ -91,10 +92,15 @@ class Scheduler:
         job._running = True
         job.last_started_ms = self._clock()
         try:
-            await job.fn()
+            await asyncio.wait_for(job.fn(), timeout=job.timeout_s)
             job.runs += 1
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            # 一轮卡死就不能占着名字不放。否则后面每一轮都跳过，重启和画面都排在它后面。
+            job.errors += 1
+            job.last_error = "timeout"
+            log.warning("scheduler 任务 %s 超过 %.0fs，本轮作废", job.name, job.timeout_s)
         except Exception as e:                      # 单轮异常不杀任务
             job.errors += 1
             job.last_error = repr(e)

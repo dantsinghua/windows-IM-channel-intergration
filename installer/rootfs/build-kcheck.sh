@@ -44,8 +44,9 @@ done
 
 [ -n "$OUT" ] || { echo "必须给 --out <kcheck-rootfs.tar 路径>" >&2; exit 2; }
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d -t qtrade-kcheck-build.XXXXXXXX)"
+# Keep the owned workspace for inspection; never recursively clean a variable path.
+trap 'echo "Build workspace retained: $WORK"' EXIT
 
 # ── 1. 取 busybox ───────────────────────────────────────────────────────────
 BB="$WORK/busybox"
@@ -86,7 +87,9 @@ cp -f "$BB" "$R/bin/busybox"
 for applet in $("$BB" --list); do
     ln -sf /bin/busybox "$R/bin/$applet"
 done
-ln -sf /bin/busybox "$R/init"
+# /init belongs to WSL. Older MountInit follows links before chroot;
+# an image-provided /init link can mount/truncate the wrong executable.
+# Leave the path absent so WSL creates its own mount point.
 
 # ── 3. 配置文件 ─────────────────────────────────────────────────────────────
 echo "[3/4] 写 /etc/wsl.conf 等配置"

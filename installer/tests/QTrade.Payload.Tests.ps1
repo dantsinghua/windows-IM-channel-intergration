@@ -6,7 +6,7 @@ BeforeAll {
     }
 
     function New-QtTestStage {
-        $root = Join-Path ([IO.Path]::GetTempPath()) ('qt-pl-' + [Guid]::NewGuid().ToString('N'))
+        $root = Join-Path $TestDrive ('qt-pl-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $root 'kernel') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $root 'wsl') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $root 'install') -Force | Out-Null
@@ -54,18 +54,22 @@ Describe 'manifest 逐文件 sha256(§2.1「两层都过才算 PAYLOAD_STAGED」
         $r.Missing.Count | Should -Be 1
     }
 
-    It '通配条目(pkg/adb/*)只验目录存在,不展开逐文件' {
+    It 'rejects a legacy wildcard entry even when its directory exists' {
         New-Item -ItemType Directory -Path (Join-Path $script:Stage 'pkg\adb') -Force | Out-Null
         $m = [pscustomobject]@{ files = @([pscustomobject]@{ path = 'pkg/adb/*' }) }
         $r = Invoke-QtPayloadVerify -Manifest $m -StageRoot $script:Stage
-        $r.Entries[0].status | Should -Be 'SkippedGlob'
-        $r.Ok | Should -BeTrue
+        $r.Entries[0].status | Should -Be 'InvalidManifest'
+        $r.Ok | Should -BeFalse
+        $r.VerifiedCount | Should -Be 0
     }
 
-    It '无 sha256(或文档里的省略号占位)→ SkippedNoHash,不误判失败' {
+    It 'rejects a legacy hash placeholder instead of skipping verification' {
         Set-QtTestFile -Path (Join-Path $script:Stage 'wsl\wsl.msi') -Content 'msi' | Out-Null
-        $m = [pscustomobject]@{ files = @([pscustomobject]@{ path = 'wsl/wsl.msi'; sha256 = '…' }) }
-        (Invoke-QtPayloadVerify -Manifest $m -StageRoot $script:Stage).Entries[0].status | Should -Be 'SkippedNoHash'
+        $m = [pscustomobject]@{ files = @([pscustomobject]@{ path = 'wsl/wsl.msi'; sha256 = ([string][char]0x2026) }) }
+        $r = Invoke-QtPayloadVerify -Manifest $m -StageRoot $script:Stage
+        $r.Entries[0].status | Should -Be 'InvalidManifest'
+        $r.Ok | Should -BeFalse
+        $r.VerifiedCount | Should -Be 0
     }
 
     It '🔴 §2.1 失败清理:只删 sha 不一致的,已一致的留着(重跑按 sha 跳过)' {

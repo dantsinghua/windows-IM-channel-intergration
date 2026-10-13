@@ -8,11 +8,28 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import shlex
 from typing import Any, Optional, Protocol
 
 log = logging.getLogger("qtrade.screen.adb")
+
+#: R6-99:scrcpy ``INJECT_TEXT`` 与 ``adb shell input text`` 都只认 ASCII(前者按 KeyCharacterMap 合成按键、后者直接
+#: NPE);含任何非 ASCII 的文本一律整段走 ADBKeyboard 的 ``ADB_INPUT_B64`` 广播(与企点适配器发消息同一条路,
+#: base64 不经 shell 转义,中文/表情/换行原样送达;整段一起走,中英混排顺序不乱)。
+IME_BROADCAST_ACTION = "ADB_INPUT_B64"
+
+
+def needs_ime(text: str) -> bool:
+    """文本里只要有一个非 ASCII 字符就得走输入法广播。"""
+    return not text.isascii()
+
+
+async def ime_input_text(adb: "AdbRunner", serial: str, text: str, *, timeout: float = 10.0) -> tuple[int, bytes]:
+    """``am broadcast -a ADB_INPUT_B64 --es msg <base64>``(05 §2.1.1 ⑥;要求 ADBKeyboard 已是默认输入法)。"""
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return await shell(adb, serial, ["am", "broadcast", "-a", IME_BROADCAST_ACTION, "--es", "msg", b64], timeout=timeout)
 
 #: 键名 → Android KEYCODE_*(REST 与 WS 共用;数字 keycode 直接用)
 KEYCODES: dict[str, int] = {
@@ -140,6 +157,12 @@ async def adb_input(adb: AdbRunner, serial: str, msg: dict[str, Any]) -> dict[st
         text = str(msg.get("text") or "")
         if not text:
             return {"ok": True, "skipped": "empty_text"}
+        if needs_ime(text):
+            # R6-99:``input text`` 对非 ASCII 直接 NullPointerException ⇒ 走 ADBKeyboard 广播
+            rc, out = await ime_input_text(adb, serial, text)
+            if rc != 0:
+                raise RuntimeError(f"ADBKeyboard 广播失败 rc={rc}: {out.decode('utf-8', 'replace')[:200]}")
+            return {"ok": True, "via": "ime"}
         argv = ["input", "text", text]                   # shlex.join 里逐参数 shlex.quote
     else:
         raise ValueError(f"不支持的注入类型:{kind!r}")

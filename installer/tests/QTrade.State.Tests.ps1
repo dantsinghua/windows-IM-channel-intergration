@@ -9,7 +9,7 @@ BeforeAll {
 Describe 'install_state —— schema 与原子写' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-state-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-state-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
         $script:StateFile = Join-Path $script:Tmp 'install_state.json'
     }

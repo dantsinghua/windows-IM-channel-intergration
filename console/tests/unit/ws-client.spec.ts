@@ -149,7 +149,7 @@ describe('seq 去重与续传(G-08)', () => {
     ws.open()
     ws.recv({ replay: 'truncated', from_seq: 900 })
     expect(h.truncated).toEqual([900])
-    expect(h.client.lastSeq).toBe(900)
+    expect(h.client.lastSeq).toBe(899) // from_seq 是首条可回放事件；尚未收到时不得标为已消费。
     // 正常重放不触发
     ws.recv({ event: 'message', seq: 901, ts: 'x', payload: {} })
     expect(h.truncated).toHaveLength(1)

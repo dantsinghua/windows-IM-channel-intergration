@@ -190,14 +190,36 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default="/etc/qtrade/agent.toml")
     ap.add_argument("--db", default=None)
     ap.add_argument("--log-level", default="INFO")
+    ap.add_argument("--bootstrap-runtime-contents", default=None,
+                    help="Validate bundled assets and write runtime configuration, then exit.")
+    ap.add_argument("--bootstrap-console-token-stdin", action="store_true",
+                    help="Bind the installer console credential from stdin, then exit.")
     ap.add_argument("--init-db", action="store_true",
                     help="只建 agent.db 并把 schema 迁到最新就退出(幂等;不起 HTTP、不起调度器、不连外部依赖)。"
                          "首启用,见 docs/03 §2.7.3。退出码:0 成功 / 3 库损坏或不是 SQLite / "
                          "4 库 schema_version 高于本版支持上限 / 5 其它建库失败")
     args = ap.parse_args(argv)
+    if sum((args.init_db, args.bootstrap_console_token_stdin, bool(args.bootstrap_runtime_contents))) > 1:
+        ap.error("bootstrap operations are mutually exclusive")
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)-5s %(name)-24s %(message)s")
+    if args.bootstrap_runtime_contents:
+        from .installer_bootstrap import configure_runtime
+        try:
+            configure_runtime(args.bootstrap_runtime_contents, args.config)
+            return EXIT_OK
+        except Exception:
+            log.error("Bundled runtime configuration failed; no services started")
+            return EXIT_INIT_FAILED
     has_cfg = os.path.exists(args.config)
     cfg = load_config(args.config if has_cfg else None)
+    if args.bootstrap_console_token_stdin:
+        from .installer_bootstrap import bind_console_token
+        try:
+            bind_console_token(cfg, args.db, sys.stdin.read(4097))
+            return EXIT_OK
+        except Exception:
+            log.error("Console credential bootstrap failed; no services started")
+            return EXIT_INIT_FAILED
     if args.init_db:
         # `--config` 只用来取 `[db] path` 等建库参数;`[api]`/`[scheduler]` 这类运行期配置本次一律不生效。
         return init_db(cfg, args.db)

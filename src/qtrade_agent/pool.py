@@ -45,9 +45,20 @@ class Pool:
         store.ensure_pools(quota={"qidian": cfg.pool.quota_qidian_mb, "qq": cfg.pool.quota_qq_mb, "wechat": cfg.pool.quota_wechat_mb},
                            wsl_total_mb=total, wsl_reserved_mb=cfg.pool.wsl_reserved_mb, windows_total_mb=windows_total_mb,
                            windows_reserved_mb=cfg.pool.windows_reserved_mb, now_ms=clock())
+        # R6-98:02 §2.2.5 的 wsl.total_mb 镜像 = `.wslconfig memory=` 落地值,真值就在 VM 内的 MemTotal,每次启动刷新
+        # (安装器 B-5 改过 .wslconfig 后重启即生效);只有运维手工定的 `manual` 不动。
+        self._refresh_wsl_total(total)
 
-    # ---- 输入(WinAgent 快照 / 手动)
-    def set_wsl_total(self, total_mb: int, *, source: str = "winagent") -> None:
+    def _refresh_wsl_total(self, total_mb: int) -> None:
+        if total_mb <= 0:
+            return
+        row = self._store.pool_get("wsl")
+        if row is None or row["source"] == "manual" or int(row["total_mb"]) == int(total_mb):
+            return
+        self._store.pool_set("wsl", total_mb=int(total_mb), source="default", now_ms=self._clock())
+
+    # ---- 输入(手动 / 校准;R6-98 起 WinAgent 的 host.wsl_vm_mb 是 vmmem 实占,不再当 total 用)
+    def set_wsl_total(self, total_mb: int, *, source: str = "manual") -> None:
         self._store.pool_set("wsl", total_mb=int(total_mb), source=source, now_ms=self._clock())
 
     def set_windows(self, *, total_mb: Optional[int] = None, wechat_enabled: Optional[bool] = None, available_mb: Optional[int] = None,

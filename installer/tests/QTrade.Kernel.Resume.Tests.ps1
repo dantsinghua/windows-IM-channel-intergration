@@ -13,6 +13,8 @@ BeforeAll {
     $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw 'Dispatcher parser failed.' }
+    $helper = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-QtStepKCheck' }, $true))
+    if ($helper.Count) { . ([scriptblock]::Create($helper[0].Extent.Text)) }
     $script:Dispatcher = @($ast.FindAll({
         param($node)
         $node -is [Management.Automation.Language.SwitchStatementAst] -and $node.Condition.Extent.Text -eq '$Step'
@@ -27,6 +29,7 @@ BeforeAll {
         function script:Test-QtKCheckBaseline { throw 'BASELINE_NOT_IMPLEMENTED' }
     }
     function script:Invoke-IsolatedStep([string] $Name) {
+        $script:Step = $Name
         $clause = @($script:Dispatcher.Clauses | Where-Object { $_.Item1.Value -eq $Name })[0]
         $body = $clause.Item2.Extent.Text
         try {
@@ -61,7 +64,7 @@ Describe 'Kernel dispatcher stop conditions with isolated paths' {
         Mock Set-QtRunOnce { }
         Mock Clear-QtRunOnce { }
         Mock Write-QtLog { }
-        Mock Remove-QtKCheck { }
+        Mock Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
         Mock -ModuleName QTrade.Native Invoke-QtProcess { throw 'FORBIDDEN_NATIVE_PROCESS' }
         Mock Backup-QtWslConfig { throw 'FORBIDDEN_CONFIG_WRITE' }
         Mock Write-QtUtf8NoBom { throw 'FORBIDDEN_CONFIG_WRITE' }
@@ -94,4 +97,19 @@ Describe 'Kernel dispatcher stop conditions with isolated paths' {
         Should -Invoke Invoke-QtKernelRollback -Times 0 -Exactly
         Should -Invoke Clear-QtRunOnce -Times 0 -Exactly
     }
+    It 'keeps cleanup failure visible in live action <Action> without configuration or shutdown' -ForEach @(
+        @{ Action = 'KERNEL_SWITCH' }, @{ Action = 'verify-kernel' }
+    ) {
+        Mock Remove-QtKCheck { [pscustomobject]@{ Ok = $false; Reason = 'KCHECK_OWNERSHIP_UNKNOWN'; Records = @() } }
+        Invoke-IsolatedStep $Action
+        $script:StepResult.Ok | Should -BeFalse
+        $script:StepResult.Reason | Should -Be 'KCHECK_OWNERSHIP_UNKNOWN'
+        $script:StepResult.ExitName | Should -Be 'E_INSTALL_KCHECK_IMPORT_FAILED'
+        Should -Invoke Remove-QtKCheck -Times 1 -Exactly
+        Should -Invoke Backup-QtWslConfig -Times 0 -Exactly
+        Should -Invoke Write-QtUtf8NoBom -Times 0 -Exactly
+        Should -Invoke Invoke-QtKernelVerify -Times 0 -Exactly
+        Should -Invoke Invoke-QtWsl -Times 0 -Exactly
+    }
+
 }

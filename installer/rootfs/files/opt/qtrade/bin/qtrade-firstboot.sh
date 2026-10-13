@@ -16,7 +16,9 @@ IMAGES_DIR=/var/lib/qtrade/images
 CONTENTS=/etc/qtrade/contents.json
 IMPORTED=/etc/qtrade/.imported
 LOADED_MARK="$IMAGES_DIR/.image-loaded"
-ENV_FILE=/mnt/c/ProgramData/QTrade/install/install.env
+ENV_FILE=/etc/qtrade/install.env
+AGENT_CONFIG=/etc/qtrade/agent.toml
+WINAGENT_TOKEN=/etc/qtrade/winagent.token
 AGENT_PY=/opt/qtrade/agent/venv/bin/python
 AGENT_DB=/var/lib/qtrade/agent.db
 LOG='logger -t qtrade-firstboot --'
@@ -125,10 +127,9 @@ init_db_and_start_agent() {
 #    172.17 早被占走、选段白做)。所以这一步在最后。
 write_imported() {
     local pkg_ver rootfs_ver
-    pkg_ver='unknown'
-    [ -r "$ENV_FILE" ] && pkg_ver="$(grep -E '^package_version=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '\r\n "')"
-    [ -n "$pkg_ver" ] || pkg_ver='unknown'
-    rootfs_ver="$(cat /etc/qtrade/rootfs-version 2>/dev/null || echo unknown)"
+    pkg_ver="$PACKAGE_VERSION"
+    rootfs_ver="$(cat /etc/qtrade/rootfs-version)" || die "Missing rootfs version"
+    [ -n "$rootfs_ver" ] && [ "$rootfs_ver" != unknown ] || die "Invalid rootfs version"
 
     jq -n --arg p "$pkg_ver" --arg r "$rootfs_ver" --arg t "$(date -Is)" \
         '{package_version:$p, rootfs_version:$r, imported_at:$t}' > "$IMPORTED"
@@ -138,6 +139,13 @@ write_imported() {
 
 main() {
     log "首启开始"
+    [ -r "$ENV_FILE" ] || die "Missing target install environment"
+    [ -s "$WINAGENT_TOKEN" ] || die "Missing WinAgent bootstrap credential"
+    [ "$(grep -c '^QTRADE_PACKAGE_VERSION=' "$ENV_FILE")" = 1 ] || die "Missing or duplicate package version"
+    PACKAGE_VERSION="$(sed -n 's/^QTRADE_PACKAGE_VERSION=//p' "$ENV_FILE" | tr -d '\r')"
+    [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "Invalid package version"
+    "$AGENT_PY" -m qtrade_agent.main --bootstrap-runtime-contents "$CONTENTS" --config "$AGENT_CONFIG" \
+        || die "Bundled runtime assets or configuration invalid"
     # dockerd 刚被 systemd 拉起时,socket 可能还没准备好接客;等一小会儿再 load。
     for i in $(seq 1 30); do
         docker info >/dev/null 2>&1 && break

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -27,14 +29,18 @@ def _run_spec(name: str) -> dict[str, Any]:
 
     def analysis(scripts: list[str], **kw: Any) -> Any:
         captured["scripts"], captured["kw"] = scripts, kw
-        return SimpleNamespace(scripts=scripts, pure=None, zipped_data=None, binaries=None, zipfiles=None, datas=None)
+        return SimpleNamespace(scripts=scripts, pure=[], zipped_data=None, binaries=None, zipfiles=None, datas=[])
 
     def stub(*_a: Any, **_k: Any) -> None:
         return None
 
     ns = {"SPEC": path, "Analysis": analysis, "PYZ": stub, "EXE": stub, "COLLECT": stub, "__name__": "__spec__"}
     with open(path, encoding="utf-8") as f:
-        exec(compile(f.read(), path, "exec"), ns)                              # noqa: S102 —— 只执行本仓库的 spec
+        # Keep native Windows runs fake too: SDK discovery may import UI modules
+        # or spawn PyInstaller helpers if the real build package is installed.
+        with patch.dict(sys.modules, {"PyInstaller.utils.hooks": SimpleNamespace(
+                collect_all=lambda _pkg: ([], [], []), collect_submodules=lambda _pkg: [])}):
+            exec(compile(f.read(), path, "exec"), ns)                          # noqa: S102 —— 只执行本仓库的 spec
     return captured
 
 

@@ -41,7 +41,7 @@ class ContainerInfo:
 
 def docker_run_argv(spec: ContainerSpec) -> list[str]:
     """``docker run`` 参数(02 §2.2.4):必带 ``--ulimit core=0``(§2.8.8 L1);端口只绑 127.0.0.1;``restart=no``(H04 由 Agent 自己退避重拉)。"""
-    argv = ["docker", "run", "-d", "--name", spec.name, "--restart", "no", "--ulimit", "core=0", "--memory", f"{spec.mem_limit_mb}m"]
+    argv = ["docker", "run", "--pull=never", "-d", "--name", spec.name, "--restart", "no", "--ulimit", "core=0", "--memory", f"{spec.mem_limit_mb}m"]
     if spec.privileged:
         argv.append("--privileged")
     if spec.mac:
@@ -160,6 +160,10 @@ class DockerCliBackend:
 
     async def exec(self, name: str, cmd: str) -> str:
         _rc, out = await _run([self._bin, "exec", name, "sh", "-c", cmd], timeout_s=60)
+        return out
+
+    async def logs(self, name: str, *, tail: int = 400) -> str:
+        _rc, out = await _run([self._bin, "logs", "--tail", str(tail), name], timeout_s=20)
         return out
 
     async def ping(self) -> bool:

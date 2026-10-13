@@ -5,6 +5,9 @@ Documentation=file:///opt/qtrade/agent
 # 账号恢复延后 —— 所以是 After= 而不是 Requires=。
 After=network-online.target docker.service
 Wants=network-online.target
+ConditionPathExists=/etc/qtrade/install.env
+ConditionPathExists=/etc/qtrade/winagent.token
+ConditionPathExists=/etc/qtrade/agent.toml
 # 迁移失败时 Agent 主动拒绝启动(02 §2.1 第 4 步：数据安全高于可用性)。
 # 那是 exit≠0 的正常路径，Restart=always 会重试 —— 由 StartLimit 把它挡成「失败」
 # 而不是无限重启刷日志。

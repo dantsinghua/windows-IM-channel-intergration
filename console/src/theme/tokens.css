@@ -30,6 +30,108 @@
   --qt-shadow-1: 0 4px 24px rgba(61,38,85,.035);  --qt-shadow-2: 0 12px 36px rgba(61,38,85,.09);
   /* 布局 */
   --qt-nav-w: 220px; --qt-nav-w-collapsed: 72px; --qt-header-h: 88px;
+  /* 光大理财外壳：紫 + 黄 */
+  --qt-shell-bg: radial-gradient(ellipse at 85% 4%, #f4d68d30 0, transparent 38%), radial-gradient(ellipse at 30% 18%, #ccb2ed29 0, transparent 46%), #f5f4f7;
+  --qt-nav-bg: rgba(251,250,253,.65);
+  --qt-nav-border: #e8e3ef;
+  --qt-nav-text: #766b80;
+  --qt-nav-hover: #eee7f5;
+  --qt-nav-active: linear-gradient(115deg,#885fb3,#6d419f);
+  --qt-nav-active-shadow: 0 6px 14px #6d419f28;
+  --qt-workspace-bg: linear-gradient(110deg,#ebe2f7,#fbf2df);
+  --qt-avatar-bg: #ebe4f3;
+  --qt-focus: #a080c9;
+  --qt-table-head: #f6f4f9;
+  --qt-table-hover: #fcfaff;
+  --qt-toolbar-bg: #faf9fc;
+  --qt-tint: #e9def4;
+  --qt-tint-fg: #7b55a0;
+  --qt-tint-qq: #eae1f7;
+  --qt-tint-wechat: #faedce;
+  --qt-tint-wechat-fg: #ac812b;
+  --qt-glow: #c3a3e842;
+  --qt-glow-wechat: #f3d59c4f;
+  --qt-glow-qq: #c5ace247;
+  --qt-card-hover: #bb9fd6;
+  --qt-primary-shadow: #7547a81c;
+  --qt-primary-shadow-soft: #7547a813;
+  --qt-primary-shadow-tab: #7547a82b;
+  --qt-grad-soft: linear-gradient(135deg,#e9e1f4,#f7f3fc);
+  --qt-grad-strong: linear-gradient(110deg,#8960b5,#704a9e);
+  --qt-icon: #967db0;
+  --qt-icon-soft: #eae0f4;
+  --qt-icon-fg: #9265b5;
+  --qt-node-border: #c2a6d8;
+  --qt-node-shadow: #7547a817;
+  --qt-node-focus: #8e66ae;
+  --qt-node-strong-shadow: #7547a824;
+  --qt-usage: linear-gradient(90deg,#b899d9,#7547a8);
+  --qt-usage-accent: linear-gradient(90deg,#f9d88c,#f2ad38);
+  --qt-badge: #f3b849;
+  --qt-badge-fg: #4d3516;
+  --qt-msg-hover: #fcfaff;
+  --qt-scroll-thumb: rgba(117, 71, 168, .45);
+  --qt-scroll-thumb-hover: #7547A8;
+  --qt-scroll-track: rgba(117, 71, 168, .08);
+}
+
+/* 南银理财：红 + 金 */
+:root[data-brand="ny"] {
+  --qt-primary: #B01C24;
+  --qt-primary-strong: #87141A;
+  --qt-primary-soft: #F8EBE8;
+  --qt-accent: #C4A574;
+  --qt-accent-soft: #F8F1E4;
+  --qt-bg: #F6F1EC;
+  --qt-bg-elevated: #FFFFFF;
+  --qt-border: #E7DCD4;
+  --qt-text: #2B2320;
+  --qt-text-secondary: #6E6258;
+  --qt-text-disabled: #A8988C;
+  --qt-shadow-1: 0 4px 24px rgba(90,32,28,.04);
+  --qt-shadow-2: 0 12px 36px rgba(90,32,28,.1);
+  --qt-shell-bg: radial-gradient(ellipse at 85% 4%, #e7c99a33 0, transparent 38%), radial-gradient(ellipse at 30% 18%, #e7b2aa29 0, transparent 46%), #f6f1ec;
+  --qt-nav-bg: rgba(255,250,246,.72);
+  --qt-nav-border: #eadfd6;
+  --qt-nav-text: #6E6258;
+  --qt-nav-hover: #F8EBE8;
+  --qt-nav-active: linear-gradient(135deg,#C2333B,#8E1620);
+  --qt-nav-active-shadow: 0 6px 14px #b01c2428;
+  --qt-workspace-bg: linear-gradient(110deg,#F8EBE8,#F8F1E4);
+  --qt-avatar-bg: #F8EBE8;
+  --qt-focus: #C47A74;
+  --qt-table-head: #F8F1EA;
+  --qt-table-hover: #FBF6F1;
+  --qt-toolbar-bg: #FBF7F3;
+  --qt-tint: #F8EBE8;
+  --qt-tint-fg: #B01C24;
+  --qt-tint-qq: #F3E4E1;
+  --qt-tint-wechat: #F8F1E4;
+  --qt-tint-wechat-fg: #8A6A32;
+  --qt-glow: #e7b2aa55;
+  --qt-glow-wechat: #e7c99a55;
+  --qt-glow-qq: #e7b2aa40;
+  --qt-card-hover: #d4a8a4;
+  --qt-primary-shadow: #b01c241c;
+  --qt-primary-shadow-soft: #b01c2413;
+  --qt-primary-shadow-tab: #b01c242b;
+  --qt-grad-soft: linear-gradient(135deg,#f8ebe8,#fbf6f1);
+  --qt-grad-strong: linear-gradient(135deg,#C2333B,#8E1620);
+  --qt-icon: #C2333B;
+  --qt-icon-soft: #F8EBE8;
+  --qt-icon-fg: #B01C24;
+  --qt-node-border: #e0b4ae;
+  --qt-node-shadow: #b01c2417;
+  --qt-node-focus: #C2333B;
+  --qt-node-strong-shadow: #b01c2424;
+  --qt-usage: linear-gradient(90deg,#C2333B,#8E1620);
+  --qt-usage-accent: linear-gradient(90deg,#e7d3a8,#C4A574);
+  --qt-badge: #C4A574;
+  --qt-badge-fg: #3d2e16;
+  --qt-msg-hover: #F8E6E4;
+  --qt-scroll-thumb: rgba(176, 28, 36, .42);
+  --qt-scroll-thumb-hover: #B01C24;
+  --qt-scroll-track: rgba(176, 28, 36, .08);
 }
 
 /* 深色留 M5;状态色深浅同值(状态灯是跨页面的语义信号) */
@@ -40,6 +142,26 @@
 }
 
 * { box-sizing: border-box; }
+
+html, body, #app, .content, .nav-menu {
+  scrollbar-width: thin;
+  scrollbar-color: var(--qt-scroll-thumb) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+*::-webkit-scrollbar-track { background: var(--qt-scroll-track); border-radius: 999px; margin: 10px 3px; }
+*::-webkit-scrollbar-thumb {
+  background-color: var(--qt-scroll-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--qt-scroll-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner { background: transparent; }
 
 html, body, #app { height: 100%; margin: 0; }
 
@@ -69,20 +191,20 @@ body {
 .qt-page-heading h1, .qt-page-heading h2 { margin: 0; font-size: 28px; line-height: 1.4; letter-spacing: -.8px; font-weight: 650; }
 .qt-page-heading p { color: var(--qt-text-secondary); margin: 8px 0 0; }
 .qt-eyebrow { display: block; font-size: 12px; font-weight: 600; letter-spacing: 1.6px; color: var(--qt-primary); margin-bottom: 8px; }
-.qt-glass { background: rgba(255,255,255,.66); border: 1px solid rgba(255,255,255,.94); box-shadow: 0 6px 24px #49316c08, inset 0 1px 0 #fff; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-radius: var(--qt-radius-lg); }
+.qt-glass { background: rgba(255,255,255,.66); border: 1px solid rgba(255,255,255,.94); box-shadow: var(--qt-shadow-1), inset 0 1px 0 #fff; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-radius: var(--qt-radius-lg); }
 .qt-surface { background: white; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-lg); padding: 24px; }
-.qt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 18px; background: #faf9fc; border: 1px solid var(--qt-border); border-radius: 16px; }
+.qt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 18px; background: var(--qt-toolbar-bg); border: 1px solid var(--qt-border); border-radius: 16px; }
 .qt-stat { font-size: 32px; font-weight: 600; letter-spacing: -1.5px; }
 button, a, input, select, summary { -webkit-tap-highlight-color: transparent; }
 button { font: inherit; }
-button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 3px solid #a080c9; outline-offset: 3px; }
+button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 3px solid var(--qt-focus); outline-offset: 3px; }
 a { color: var(--qt-primary); }
 summary { cursor: pointer; }
 .content .tbl { background: white; border-radius: 16px; overflow: hidden; }
-.content .tbl thead { background: #f6f4f9; color: var(--qt-text-secondary); }
+.content .tbl thead { background: var(--qt-table-head); color: var(--qt-text-secondary); }
 .content .tbl th { font-weight: 500; }
 .content .tbl th, .content .tbl td { padding: 14px 16px; line-height: 1.65; border-bottom: 1px solid #efedf2; }
-.content .tbl tbody tr:hover { background: #fcfaff; }
+.content .tbl tbody tr:hover { background: var(--qt-table-hover); }
 .content .qt-card.box { padding: 24px; }
 .content .ant-collapse { border-color: var(--qt-border); }
 .content .ant-tabs-nav::before { border-bottom-color: var(--qt-border); }

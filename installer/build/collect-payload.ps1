@@ -148,6 +148,8 @@ function Copy-QtPayloadItem {
                 New-Item -ItemType Directory -Path $dst -Force | Out-Null
                 $children = @(Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue)
                 if ($children.Count -eq 0) { continue }
+                $sourceFiles = @(Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction Stop)
+                if ($sourceFiles.Count -eq 0) { continue }
                 foreach ($c in $children) {
                     Copy-Item -LiteralPath $c.FullName -Destination $dst -Recurse -Force
                 }
@@ -232,8 +234,28 @@ foreach ($c in $copied) {
             throw ('Pinned sha256 mismatch for {0}: expected {1}, got {2} (R2-6 / R6-92: pinned third-party payloads are identified by sha256 only)' -f $item.Dest, $item.PinnedSha256, $entry['sha256'])
         }
     } else {
-        # 目录/通配条目在 manifest 里按 `<dest>/*` 登记(§2.2.1 的 `pkg/adb/*` 写法)
-        $entry['path'] = $item.Dest + '/*'
+        # Enumerate the final merged directory, after all payload signing.
+        $tree = @(Get-ChildItem -LiteralPath $c.Dest -Recurse -Force -ErrorAction Stop)
+        if (@($tree | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -gt 0) {
+            throw ('Payload directory contains a reparse point: {0}' -f $item.Dest)
+        }
+        $leaves = @($tree | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName)
+        if ($leaves.Count -eq 0) { throw ('Payload directory contains no files: {0}' -f $item.Dest) }
+        $treeRoot = [IO.Path]::GetFullPath($c.Dest).TrimEnd('\') + '\'
+        foreach ($leaf in $leaves) {
+            $relative = $leaf.FullName.Substring($treeRoot.Length) -replace '\\', '/'
+            $path = $item.Dest + '/' + $relative
+            $child = [ordered]@{
+                path = $path
+                dest = ('%ProgramData%\QTrade\' + ($path -replace '/', '\'))
+                purpose = $item.Purpose
+                sha256 = Get-QtSha256 -Path $leaf.FullName
+                size = [long]$leaf.Length
+            }
+            if ($item.Critical) { $child['critical'] = $true }
+            $files += $child
+        }
+        continue
     }
     if ($item.Critical) { $entry['critical'] = $true }
     if ($item.Dest -eq 'kernel/bzImage-6.6') {
@@ -249,15 +271,25 @@ foreach ($c in $copied) {
 }
 
 # 引擎自身(由 build.ps1 编译后放进 stage 再调本脚本的 -Rescan,或此处若已存在则登记)
-$enginePath = Join-Path $Stage 'install\engine\qtrade-setup-engine.exe'
-if (Test-Path -LiteralPath $enginePath) {
-    $files += [ordered]@{
-        path    = 'install/engine/qtrade-setup-engine.exe'
-        dest    = '%ProgramData%\QTrade\install\engine\qtrade-setup-engine.exe'
-        purpose = '无载荷引擎(续跑/升级/修复/卸载)'
-        version = $PackageVersion
-        sha256  = (Get-QtSha256 -Path $enginePath)
-        size    = [long](Get-Item -LiteralPath $enginePath).Length
+$engineRoot = Join-Path $Stage 'install\engine'
+if (Test-Path -LiteralPath $engineRoot) {
+    $engineItems = @(Get-ChildItem -LiteralPath $engineRoot -Recurse -Force -ErrorAction Stop)
+    if (@($engineItems | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -gt 0) {
+        throw 'Engine payload contains a reparse point'
+    }
+    $enginePrefix = [IO.Path]::GetFullPath($engineRoot).TrimEnd('\') + '\'
+    foreach ($leaf in @($engineItems | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName)) {
+        $relative = $leaf.FullName.Substring($enginePrefix.Length) -replace '\\', '/'
+        $path = 'install/engine/' + $relative
+        $files += [ordered]@{
+            path = $path
+            dest = ('%ProgramData%\QTrade\' + ($path -replace '/', '\'))
+            purpose = 'Installer runtime and resume support'
+            version = $PackageVersion
+            critical = $true
+            sha256 = Get-QtSha256 -Path $leaf.FullName
+            size = [long]$leaf.Length
+        }
     }
 }
 

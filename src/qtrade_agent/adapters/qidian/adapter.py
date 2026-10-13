@@ -35,7 +35,16 @@ class QidianAdapter:
 
     @staticmethod
     def _view(acct: Account) -> QidianAccountView:
-        return QidianAccountView(acct.id, acct.state, acct.self_uid, acct.app_version)
+        return QidianAccountView(acct.id, acct.state, acct.self_uid, acct.app_version, self_nick=acct.self_nick)
+
+    def write_guard(self, acct: Account) -> Optional[CommandResult]:
+        """不在线就不进 UI。登录阶段仍由总线登录门先回 LOGIN_REQUIRED。"""
+        if acct.state in ("running", "degraded"):
+            return None
+        return CommandResult(
+            ok=False, code="NOT_READY", trace_id="", source="ui",
+            error=CommandError(f"账号当前 {acct.state},不在线", reason="offline", retryable=False, needs_human=True),
+        )
 
     async def start(self, acct: Account) -> None:      # 建连/拉起在 runtime;本期无
         return None

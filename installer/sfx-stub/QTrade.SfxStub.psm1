@@ -449,6 +449,12 @@ function Test-QtSfxStubBinary {
         $problems.Add('导入了 MSVCRT.dll —— 那是 Windows 自带的旧版 CRT(不是部署风险),但说明这不是 -MT 静态构建')
     }
 
+    # A legacy patched stub can pass all old gates and still overwrite live data.
+    $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
+    if (-not $utf16.Contains('QTRADE_UNIQUE_STAGE_V1')) {
+        $problems.Add('Missing QTRADE_UNIQUE_STAGE_V1 secure staging behavior marker.')
+    }
+
     # --- RT_MANIFEST(资源 id 1,类型 24)
     $manifestLevel = Get-QtPeManifestLevel -Path $Path
     if (-not $manifestLevel) {

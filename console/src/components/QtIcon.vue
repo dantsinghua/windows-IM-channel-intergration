@@ -11,6 +11,7 @@ const paths: Record<string, string> = {
   cmd: 'M4 5l6 6-6 6 M13 18h7',
   flow: 'M4 3h6v6H4z M14 15h6v6h-6z M7 9v9h7 M17 3v8 M14 8l3 3 3-3',
   mail: 'M3 5h18v14H3z M3 5l9 8 9-8',
+  link: 'M9 12a4 4 0 0 0 4 4h3a4 4 0 0 0 0-8h-1 M15 12a4 4 0 0 0-4-4H8a4 4 0 0 0 0 8h1',
   set: 'M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z M12 2v3 M12 19v3 M2 12h3 M19 12h3 M5 5l2 2 M17 17l2 2 M5 19l2-2 M17 7l2-2',
   bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9 M10 21h4',
   more: 'M5 12h.01 M12 12h.01 M19 12h.01',

@@ -1,16 +1,17 @@
 <script setup lang="ts">
-/** P-MAIL: read, review and track mail without transport configuration. */
+/** 网络联通：公网上报认证配置和既有邮件中转。 */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { mail as T } from '@/testids'
 import { useMailStore } from '@/stores/mail'
-import { useSettingsStore } from '@/stores/settings'
+import { scopeToWire, useSettingsStore } from '@/stores/settings'
 import { useEventsStore } from '@/stores/events'
-import { mailApi } from '@/api/client'
+import { mailApi, settingsApi } from '@/api/client'
 import { ApiFailure } from '@/api/http'
 import PageState from '@/components/PageState.vue'
 import QtIcon from '@/components/QtIcon.vue'
+import OssboxConfig from './OssboxConfig.vue'
 import {
   ALERT_CODES, ARGS_DIGEST_MISMATCH_TEXT, MAIL_BANNER_CODES, MAIL_INBOX_STATUS,
   capabilityText, mailInboxStatusText, mailRouteText,
@@ -28,6 +29,13 @@ const busy = ref(false)
 const tamperModal = ref({ open: false, traceId: '' })
 let tick: ReturnType<typeof setInterval> | null = null
 const enabled = computed(() => store.status?.enabled ?? settings.mailEnabled)
+const mailNote = ref('')
+const mailTesting = ref(false)
+const mailbox = ref({
+  host: '', port: '993', ssl: true, user: '', pass: '',
+  smtpHost: '', smtpPort: '465', smtpFrom: '',
+})
+const channel = ref<'' | 'oss' | 'imap'>('')
 const banner = computed(() => events.firing.find(a => (MAIL_BANNER_CODES as readonly string[]).includes(a.code)) ?? null)
 const routeOptions = computed(() => [...new Set((store.status?.routes ?? []).map(r => r.scope))]
   .map(value => ({ value, label: mailRouteText(value) })))
@@ -117,7 +125,94 @@ function openBanner(): void {
   if (banner.value?.subject.startsWith('endpoint:')) void router.push('/env')
   else void router.push({ path: '/log', query: { tab: 'alerts' } })
 }
-onMounted(() => {
+
+function fillForms(): void {
+  const scope = settings.mailScopes.wechat
+  if (scope) {
+    mailbox.value.host = scope.host || ''
+    mailbox.value.port = scope.port ? String(scope.port) : '993'
+    mailbox.value.ssl = scope.ssl
+    mailbox.value.user = scope.user || ''
+    mailbox.value.smtpHost = scope['smtp-host'] || ''
+    mailbox.value.smtpPort = scope['smtp-port'] ? String(scope['smtp-port']) : '465'
+    mailbox.value.smtpFrom = scope['smtp-from'] || ''
+  }
+  try {
+    // 旧版本的 qtrade.ossbox 仅为浏览器草稿，不作为服务器生效配置。
+    const selected = localStorage.getItem('qtrade.transport')
+    if (selected === 'oss' || selected === 'imap') channel.value = selected
+  } catch { /* 浏览器存储不可用不影响服务器配置 */ }
+}
+
+function rememberTransport(transport: 'oss' | 'imap'): void {
+  channel.value = transport
+  try { localStorage.setItem('qtrade.transport', transport) } catch { /* 仅记住页面选择 */ }
+}
+
+async function saveMailbox(): Promise<boolean> {
+  if (!mailbox.value.host.trim() || !mailbox.value.user.trim()) {
+    mailNote.value = '先填写收信服务器和邮箱账号'
+    message.warning(mailNote.value)
+    return false
+  }
+  busy.value = true
+  mailNote.value = ''
+  try {
+    const scope = settings.mailScopes.wechat
+    scope.override = true
+    scope.enabled = true
+    scope.proto = 'imap'
+    scope.host = mailbox.value.host.trim()
+    scope.port = Number(mailbox.value.port) || 993
+    scope.ssl = mailbox.value.ssl
+    scope.user = mailbox.value.user.trim()
+    scope.pass = mailbox.value.pass
+    scope['smtp-host'] = mailbox.value.smtpHost.trim()
+    scope['smtp-port'] = Number(mailbox.value.smtpPort) || 465
+    scope['smtp-from'] = mailbox.value.smtpFrom.trim() || mailbox.value.user.trim()
+    scope['template-id'] = 'ibquote-163-v1'
+    await settingsApi.put('mail', {
+      enabled: true,
+      require_signature: settings.requireSignature,
+      template_version: settings.mailTemplateVersion,
+      scopes: { wechat: scopeToWire(scope) },
+    })
+    mailbox.value.pass = ''
+    rememberTransport('imap')
+    mailNote.value = '邮件中转已保存。密码只进凭据库，页面不再显示。'
+    message.success('邮箱已保存')
+    await store.reloadAll()
+    return true
+  } catch (e) {
+    mailNote.value = e instanceof ApiFailure ? e.message : (e instanceof Error ? e.message : '保存失败')
+    message.error(mailNote.value)
+    return false
+  } finally {
+    busy.value = false
+  }
+}
+
+async function testMailbox(): Promise<void> {
+  const saved = await saveMailbox()
+  if (!saved) return
+  mailTesting.value = true
+  try {
+    const result = await mailApi.test('inbound')
+    const imap = result.imap_ok ? 'IMAP 已连通' : 'IMAP 未连通'
+    const pop3 = result.pop3_ok ? 'POP3 已连通' : 'POP3 未连通'
+    mailNote.value = `${imap}，${pop3}。这一步只登录邮箱，不会发信。`
+    message.success('邮箱测试完成')
+  } catch (e) {
+    mailNote.value = e instanceof ApiFailure ? e.message : (e instanceof Error ? e.message : '测试失败')
+    message.error(mailNote.value)
+  } finally {
+    mailTesting.value = false
+  }
+}
+
+onMounted(async () => {
+  await settings.loadAll().catch(() => undefined)
+  fillForms()
   void store.reloadAll()
   store.startPolling()
   tick = setInterval(() => {
@@ -134,15 +229,48 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
 <template>
   <div class="qt-page mail-page">
     <header class="qt-page-heading">
-      <div><span class="qt-eyebrow">MAIL CENTER</span><h1>邮件</h1><p>查收邮件、跟踪发送，把需要你确认的操作集中在一起。</p></div>
+      <div><span class="qt-eyebrow">NETWORK LINKS</span><h1>网络联通</h1><p>配置公网上报或邮件中转，连接测试与业务启用状态分别显示。</p></div>
       <a-button :data-testid="T.refresh" :loading="store.loading" @click="store.reloadAll()"><template #icon><QtIcon name="refresh" :size="16" /></template>刷新</a-button>
     </header>
+    <section class="mode-choice qt-glass">
+      <span>配置方式</span>
+      <label><input v-model="channel" type="radio" value="oss" />公网上报</label>
+      <label><input v-model="channel" type="radio" value="imap" />邮件中转</label>
+    </section>
+    <section class="link-grid">
+      <article v-if="channel === 'imap'" class="link-card qt-glass">
+        <div class="qt-eyebrow">MAIL</div>
+        <h2>邮件中转</h2>
+        <p>存款系统按现有模板接收「微信群聊消息通知」。机器人采集终端用同一邮箱发信。</p>
+        <label>收信服务器<input v-model="mailbox.host" autocomplete="off" placeholder="imap.example.com" /></label>
+        <div class="link-row">
+          <label>端口<input v-model="mailbox.port" inputmode="numeric" /></label>
+          <label class="check"><input v-model="mailbox.ssl" type="checkbox" />使用加密连接</label>
+        </div>
+        <label>邮箱账号<input v-model="mailbox.user" autocomplete="username" placeholder="name@example.com" /></label>
+        <label>邮箱密码<input v-model="mailbox.pass" type="password" autocomplete="new-password" placeholder="留空表示不修改已保存的密码" /></label>
+        <label>发信服务器<input v-model="mailbox.smtpHost" autocomplete="off" placeholder="smtp.example.com" /></label>
+        <div class="link-row">
+          <label>发信端口<input v-model="mailbox.smtpPort" inputmode="numeric" /></label>
+          <label>发件地址<input v-model="mailbox.smtpFrom" autocomplete="off" placeholder="与邮箱账号相同可留空" /></label>
+        </div>
+        <div class="qt-row wrap">
+          <a-button type="primary" :loading="busy" @click="saveMailbox">保存邮件中转</a-button>
+          <a-button :loading="mailTesting" @click="testMailbox">测试邮件中转</a-button>
+        </div>
+        <p class="qt-small qt-muted">{{ mailNote || (enabled ? '邮件服务已启用。' : '保存后才会开始收信。模板固定为 ibquote-163-v1。') }}</p>
+      </article>
+      <OssboxConfig v-if="channel === 'oss'" @saved="rememberTransport('oss')" />
+      <article class="link-card qt-glass is-future">
+        <div class="qt-eyebrow">LATER</div>
+        <h2>其他连接</h2>
+        <p>以后新增的连接方式也放在这一页，配置和测试都在这里完成，不再另开入口。</p>
+      </article>
+    </section>
     <PageState :loading="store.loading && !store.status" :error="store.error" @retry="store.reloadAll()">
-      <section v-if="!enabled" class="mail-empty qt-glass">
-        <span class="empty-icon"><QtIcon name="mail" :size="32" /></span>
-        <h2 :data-testid="T.disabledHint">邮件服务尚未启用</h2>
-        <p>启用并连接邮箱后，收件记录与待确认操作会显示在这里。</p>
-        <a-button @click="router.push('/dash')">回到账号首页</a-button>
+      <section v-if="!enabled" class="link-pending qt-glass">
+        <h2 :data-testid="T.disabledHint">邮件往来还没开始</h2>
+        <p>上面保存并启用邮箱之后，收件、发件和待确认会显示在这里。</p>
       </section>
       <template v-else>
         <button v-if="banner" class="mail-banner" :data-testid="T.errorBanner" @click="openBanner">
@@ -206,7 +334,7 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
           </div>
 
           <div v-else id="mail-panel-pending" role="tabpanel" aria-labelledby="mail-tab-pending" :data-testid="T.block('danger')">
-            <div class="pending-note" :data-testid="T.dangerNote"><QtIcon name="shield" :size="20" /><span>危险操作只能在本机控制台确认，不能回邮件确认。请核对发件人、目标账号与操作内容。</span></div>
+            <div class="pending-note" :data-testid="T.dangerNote"><QtIcon name="shield" :size="20" /><span>危险操作只能在机器人采集终端确认，不能回邮件确认。请核对发件人、目标账号与操作内容。</span></div>
             <div v-if="store.pending.length" class="pending-list" :data-testid="T.dangerList">
               <article v-for="(p, i) in store.pending" :key="p.id" class="pending-card qt-glass" :data-testid="T.dangerRow(i)">
                 <div class="pending-top"><span class="pending-icon"><QtIcon name="shield" /></span><div class="qt-grow"><h3>{{ capabilityText(p.op) }}</h3><p>目标账号 {{ p.account_id ?? '未指定' }} · {{ p.from_addr }}</p></div><span class="ttl" :data-testid="T.dangerRowTtl(i)">剩余 {{ ttlOf(p.expires_at, p.remaining_ttl_s) }} 秒</span></div>
@@ -234,18 +362,35 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
 
 <style scoped>
 .mail-page { position: relative; }
+.mode-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; margin-bottom: 18px; padding: 18px 22px; }
+.mode-choice span { font-weight: 600; }
+.mode-choice label { display: flex; align-items: center; gap: 8px; }
+.link-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 22px; }
+.link-card { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 22px; text-align: left; }
+.link-card h2 { margin: 0; font-size: 20px; font-weight: 600; }
+.link-card > p { margin: 0; color: var(--qt-text-secondary); font-size: 13px; line-height: 1.6; }
+.link-card label { display: flex; flex-direction: column; gap: 6px; color: var(--qt-text-secondary); font-size: 12px; }
+.link-card input, .link-card select { width: 100%; padding: 8px 12px; border: 1px solid var(--qt-border); border-radius: 9px; background: white; color: var(--qt-text); }
+.link-row { display: grid; grid-template-columns: 1fr 1.4fr; gap: 12px; }
+.link-card .check { flex-direction: row; align-items: center; margin-top: 22px; }
+.link-card .check input { width: auto; }
+.link-pending { padding: 28px; margin-bottom: 18px; }
+.link-pending h2 { margin: 0 0 8px; font-size: 18px; font-weight: 500; }
+.link-pending p { margin: 0; color: var(--qt-text-secondary); }
+.is-future { background: rgba(255,255,255,.45); }
 .mail-banner { display: flex; align-items: center; gap: 12px; width: 100%; margin-bottom: 16px; padding: 16px 20px; border: 1px solid #ecddc1; border-radius: 16px; background: #fff7e8; color: #805213; text-align: left; }
 button.mail-banner { cursor: pointer; }.mail-banner span { flex: 1; }.is-warning { background: #fff1e9; color: #924b2e; }
 .mail-health { display: flex; gap: 28px; padding: 24px 28px; margin-bottom: 24px; background: radial-gradient(ellipse at 0 100%, #f4e6ff99, transparent 60%), rgba(255,255,255,.75); }
 .health-heading { display: flex; align-items: center; gap: 14px; flex: 0 0 180px; }.health-heading strong { display: block; font-size: 16px; }.health-heading span:not(.health-icon) { display: block; margin-top: 6px; font-size: 12px; color: var(--qt-text-secondary); }
 .health-icon, .empty-icon, .pending-icon { display: grid; place-items: center; color: var(--qt-primary); background: #eee3fc; border: 1px solid #fff; width: 46px; height: 46px; border-radius: 16px; flex-shrink: 0; }.route-list { display: flex; flex: 1; gap: 18px 32px; flex-wrap: wrap; }.route-status { flex: 1; min-width: 230px; }.route-status > div { display: flex; gap: 12px; align-items: center; }.route-status p { margin: 8px 0 0; color: var(--qt-text-secondary); font-size: 12px; }.route-status .protocol-note { color: #976111; }
-.mail-workspace { padding: 24px; }.mail-tabs { display: flex; gap: 6px; width: fit-content; padding: 5px; background: #f2eef6; border-radius: 28px; margin-bottom: 24px; }.mail-tabs button { display: flex; align-items: center; gap: 8px; border: 0; border-radius: 22px; background: transparent; padding: 10px 28px; color: var(--qt-text-secondary); cursor: pointer; }.mail-tabs button.active { background: var(--qt-primary); color: white; box-shadow: 0 4px 12px #7547a82b; }.tab-count { display: inline-grid; place-items: center; min-width: 22px; height: 22px; border-radius: 50%; font-size: 12px; background: #f3b849; color: #4d3516; }
+.mail-workspace { padding: 24px; }.mail-tabs { display: flex; gap: 6px; width: fit-content; padding: 5px; background: #f2eef6; border-radius: 28px; margin-bottom: 24px; }.mail-tabs button { display: flex; align-items: center; gap: 8px; border: 0; border-radius: 22px; background: transparent; padding: 10px 28px; color: var(--qt-text-secondary); cursor: pointer; }.mail-tabs button.active { background: var(--qt-primary); color: white; box-shadow: 0 4px 12px var(--qt-primary-shadow-tab); }.tab-count { display: inline-grid; place-items: center; min-width: 22px; height: 22px; border-radius: 50%; font-size: 12px; background: var(--qt-badge); color: var(--qt-badge-fg); }
 .inbox-filters { margin-bottom: 20px; }.search-field { flex: 1; min-width: 240px; }.inbox-filters :deep(.ant-select) { width: 145px; }.date-filters { display: flex; align-items: flex-end; gap: 12px; width: 100%; flex-wrap: wrap; }.date-filters label { display: flex; flex-direction: column; gap: 6px; color: var(--qt-text-secondary); font-size: 12px; }.date-filters input { padding: 8px 12px; border: 1px solid var(--qt-border); border-radius: 9px; background: white; color: var(--qt-text); }.date-filters > span { padding-bottom: 8px; }
 .table-scroll { overflow-x: auto; }.mail-table { width: 100%; border-collapse: collapse; min-width: 720px; }.mail-table thead { background: #faf9fc; color: var(--qt-text-secondary); }.mail-table th { padding: 14px 16px; font-size: 12px; font-weight: 500; text-align: left; }.mail-table td { padding: 20px 16px; border-bottom: 1px dashed #e9e4ef; vertical-align: middle; }.mail-table tbody tr:hover { background: #fdfbff; }.mail-table td:first-child { width: 37%; overflow-wrap: anywhere; }.subject-link { border: none; padding: 0; background: none; text-align: left; font-weight: 600; color: var(--qt-text); cursor: pointer; }.subject-link:hover { color: var(--qt-primary); }.row-secondary { margin-top: 6px; font-size: 12px; color: var(--qt-text-secondary); line-height: 1.6; }.time-cell { font-size: 12px; white-space: nowrap; color: var(--qt-text-secondary); }.status-chip { display: inline-block; padding: 4px 10px; border-radius: 20px; background: #f0eaf7; color: #70459a; font-size: 12px; white-space: nowrap; }.status-chip.attention { background: #fff0d6; color: #8a5a16; }.status-chip.failure { background: #fff0ee; color: #ae352d; }.reason { max-width: 340px; overflow-wrap: anywhere; }.list-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 20px; color: var(--qt-text-secondary); font-size: 12px; }.row-actions { display: flex; gap: 8px; align-items: center; }
 .outbox-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 22px; }.outbox-heading h2 { margin: 0; font-size: 18px; }.outbox-heading p { margin: 8px 0 0; color: var(--qt-text-secondary); }.outbox-heading :deep(.ant-select) { width: 160px; }
 .pending-note { display: flex; gap: 12px; align-items: center; color: #825d23; background: #fff7e8; padding: 18px 20px; border-radius: 16px; margin-bottom: 20px; }.pending-note svg { flex-shrink: 0; }.pending-list { display: grid; gap: 16px; }.pending-card { padding: 22px; background: linear-gradient(120deg, #f5effba6, #fff8e599 140%); }.pending-top { display: flex; gap: 14px; align-items: center; }.pending-top h3 { margin: 0; font-size: 17px; }.pending-top p { margin: 7px 0 0; font-size: 12px; color: var(--qt-text-secondary); overflow-wrap: anywhere; }.ttl { font-size: 12px; color: #8b6224; white-space: nowrap; }.request-summary { display: flex; gap: 18px; padding: 16px 0; margin-top: 8px; font-size: 12px; }.request-summary span { color: var(--qt-text-secondary); flex-shrink: 0; }.request-summary code { overflow-wrap: anywhere; }.pending-card footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; border-top: 1px solid #ece3f3; padding-top: 16px; }
 .mail-empty, .list-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 68px 24px; color: var(--qt-text-secondary); }.mail-empty h2, .list-empty h3 { color: var(--qt-text); margin: 20px 0 8px; font-weight: 500; }.mail-empty p, .list-empty p { margin: 0 0 24px; }.mail-empty .empty-icon { width: 72px; height: 72px; border-radius: 24px; background: linear-gradient(145deg, #e6d6f8, #fff4d5); }.list-empty svg { color: #9e82bd; }
 .detail-heading h2 { margin: 12px 0; font-size: 22px; overflow-wrap: anywhere; }.detail-heading p { color: var(--qt-text-secondary); font-size: 12px; }.detail-section { margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--qt-border); }.detail-section h3 { font-size: 14px; }.mail-body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; background: #faf8fd; padding: 20px; border-radius: 16px; }
+@media (max-width: 1100px) { .link-grid { grid-template-columns: 1fr; } .link-row { grid-template-columns: 1fr; } .link-card .check { margin-top: 0; } }
 @media (max-width: 1000px) { .mail-health { flex-direction: column; gap: 20px; }.health-heading { flex-basis: auto; } }
 @media (max-width: 640px) { .mail-workspace, .mail-health { padding: 18px; }.mail-tabs { width: 100%; }.mail-tabs button { padding: 10px 16px; flex: 1; justify-content: center; }.inbox-filters { padding: 12px; }.search-field { min-width: 100%; }.pending-top { flex-wrap: wrap; }.pending-card footer { align-items: flex-start; flex-direction: column; }.outbox-heading { align-items: flex-start; flex-direction: column; }.route-status { min-width: 100%; } }
 </style>

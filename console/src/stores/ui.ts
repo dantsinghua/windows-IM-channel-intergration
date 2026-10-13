@@ -1,6 +1,7 @@
 /** `ui` store:主题、侧栏折叠、当前专注账号、画面性能档(存 console.toml / LOCALAPPDATA) */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { brandOf, type BrandId } from '@/theme/brands'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 export type PerfProfile = 'focus30' | 'focus15' | 'thumb10'
@@ -8,6 +9,7 @@ export type PerfProfile = 'focus30' | 'focus15' | 'thumb10'
 export const useUiStore = defineStore('ui', () => {
   // v1 只交付浅色,深色留 M5(P-05)
   const theme = ref<ThemeMode>('light')
+  const brand = ref<BrandId>('ceb')
   const navCollapsed = ref(false)
   const focusedAccountId = ref<string | null>(null)
   const perfProfile = ref<PerfProfile>('focus30')
@@ -17,9 +19,12 @@ export const useUiStore = defineStore('ui', () => {
   const alertDrawerOpen = ref(false)
 
   async function loadFromConfig(): Promise<void> {
+    const stored = typeof localStorage === 'undefined' ? null : localStorage.getItem('qtrade.brand')
+    if (stored) brand.value = brandOf(stored)
     const cfg = await window.qt?.config.read()
     if (!cfg) return
     theme.value = (cfg.ui?.theme as ThemeMode) ?? 'light'
+    if (!stored) brand.value = brandOf(cfg.ui?.brand as string | undefined)
     navCollapsed.value = !!cfg.ui?.nav_collapsed
     perfProfile.value = (cfg.screen?.default_focus_profile as PerfProfile) ?? 'focus30'
     notifyEnabled.value = cfg.notify?.enabled !== false
@@ -34,6 +39,13 @@ export const useUiStore = defineStore('ui', () => {
   function applyTheme(): void {
     if (typeof document === 'undefined') return
     document.documentElement.setAttribute('data-theme', theme.value === 'dark' ? 'dark' : 'light')
+    document.documentElement.setAttribute('data-brand', brand.value)
+  }
+
+  function setBrand(next: BrandId): void {
+    brand.value = next
+    if (typeof localStorage !== 'undefined') localStorage.setItem('qtrade.brand', next)
+    applyTheme()
   }
 
   function toggleNav(): void {
@@ -42,7 +54,7 @@ export const useUiStore = defineStore('ui', () => {
   }
 
   return {
-    theme, navCollapsed, focusedAccountId, perfProfile, notifyEnabled, autoLaunch, trayOnClose, alertDrawerOpen,
-    loadFromConfig, persist, applyTheme, toggleNav,
+    theme, brand, navCollapsed, focusedAccountId, perfProfile, notifyEnabled, autoLaunch, trayOnClose, alertDrawerOpen,
+    loadFromConfig, persist, applyTheme, setBrand, toggleNav,
   }
 })

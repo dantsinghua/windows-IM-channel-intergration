@@ -4,11 +4,11 @@
 # 用法:
 #   .\New-QtSelfSignedCert.ps1 -WhatIf                         # 🔴 先干跑一遍,看它打算做什么
 #   .\New-QtSelfSignedCert.ps1 -Organization 'QTrade'          # 真生成
-#   .\New-QtSelfSignedCert.ps1 -Organization 'QTrade' -ValidYears 3 -CertDir 'C:\Users\anlin\qtrade-payload\signing'
+#   .\New-QtSelfSignedCert.ps1 -Organization 'QTrade' -ValidYears 3 -CertDir '<public-certificate-output>'
 #
 # 这个脚本会改动这台机器上的什么:
 #   1) 在 `Cert:\CurrentUser\My`(**当前用户**的个人证书存储)里多一张代码签名证书;
-#   2) 在 -CertDir(默认 C:\Users\anlin\qtrade-payload\signing\)下多一个 **公钥** .cer 文件。
+#   2) Export one public .cer to CertDir (default: the OS LocalApplicationData/QTrade/signing folder).
 #   ——— 不碰 LocalMachine 任何存储、不需要管理员、不动任何已有证书。
 #   撤销:`Remove-Item Cert:\CurrentUser\My\<指纹>`,再删掉那个 .cer。
 #
@@ -21,7 +21,7 @@ param(
     [string] $Organization = '',
     # 有效期(年),默认 3 年
     [ValidateRange(1, 30)][int] $ValidYears = 3,
-    # 公钥 .cer 的导出目录;默认产物根下的 signing\(**仓库之外**)
+    # Public .cer output directory; the default uses the current user local app-data folder.
     [string] $CertDir = ''
 )
 

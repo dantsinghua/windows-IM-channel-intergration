@@ -1,7 +1,8 @@
 """WinAgent 微信端点客户端(02 §3.6 #28~#43;Agent 是**调用方**,WinAgent 从不回调,C-03/C-25)。
 
 - 鉴权/地址/令牌/超时/版本头一律复用 ``winagent_client.WinAgentClient``(02 §2.5 调用契约),本模块只拼路径与出入参。
-- 重试(02 §2.5):**只读类 1 次重试**(status/version-match/profiles/login-status/ui-visible/read/sessions);
+- 重试(02 §2.5):**纯只读类 1 次重试**(version-match/profiles/ui-visible/read/sessions);
+  Agent 的 status/login-status 会驱动自愈/状态机，因此不做传输层自动重试。
   **写类不重试**(login/start|cancel、bind、logout、key/retry、send)——重发一次写动作可能重复发消息。
 - 执行体列为 ``user``(会话代理)的端点在**用户未登录 Windows** 时回 ``503 NOT_READY``(02 §3.6 表头),
   本模块统一抛 ``WeChatNotReady``,由适配器翻成 ``NOT_READY`` 结果码 / 账号 ``degraded``。
@@ -31,6 +32,17 @@ WECHAT_READ_TIMEOUT_S = 15.0            # svc TIMEOUT_S["wechat_read"]=10;无 ta
 
 # #33 GET /wa/v1/wechat/login/status 的相位枚举(以 05 为准,R3-3;identified 是两钥取钥流程的枢纽相位)
 PHASES = ("idle", "narrator", "qrcode", "identified", "keytry", "ready", "key_failed")
+
+
+def _not_ready_from_body(parsed: Optional[dict[str, Any]]) -> WeChatNotReady:
+    """503 里如果写明了没有微信或多开微信，保留这条原因。不要一律改写成会话代理离线。"""
+    err = (parsed or {}).get("error") if isinstance(parsed, dict) else None
+    err = err if isinstance(err, dict) else {}
+    reason = str(err.get("reason") or "")
+    message = str(err.get("message") or "")
+    if reason.startswith("wechat_"):
+        return WeChatNotReady(reason, message)
+    return WeChatNotReady("user_agent_offline", message)
 
 
 class WeChatNotReady(Exception):
@@ -67,7 +79,7 @@ class WeChatWinAgent:
         except WinAgentUnavailable as e:
             raise WeChatNotReady("winagent_unreachable", e.detail) from e
         if status == 503:
-            raise WeChatNotReady("user_agent_offline", (parsed or {}).get("error", {}).get("message", "") if parsed else "")
+            raise _not_ready_from_body(parsed)
         if status >= 400:
             raise WeChatCallFailed(status, parsed, path)
         return parsed or {}
@@ -89,7 +101,7 @@ class WeChatWinAgent:
     async def status(self) -> dict[str, Any]:
         """#28:``{enabled, wechat:{installed,version,running,logged_in,wxid,nickname,pid}, chatlog:{running,port,key_ok,dll},
         ritual_done, screen_locked, login_session?}``;模块关闭时 ``enabled:false`` 其余 null。"""
-        return await self._call("GET", "/wa/v1/wechat/status", retry=True)
+        return await self._call("GET", "/wa/v1/wechat/status", timeout_s=WECHAT_READ_TIMEOUT_S)
 
     async def version_match(self) -> dict[str, Any]:
         """#29:``{match, action, current_version, bundled_version, dll, status}``(基线 §8.6)。"""
@@ -102,7 +114,7 @@ class WeChatWinAgent:
 
     async def login_status(self) -> dict[str, Any]:
         """#33:``{phase, wxid?, account_id?, nickname?, countdown_s?, narrator:{state,remaining_s}, key:{ok,dll,error}}``。"""
-        return await self._call("GET", "/wa/v1/wechat/login/status", retry=True)
+        return await self._call("GET", "/wa/v1/wechat/login/status", timeout_s=WECHAT_READ_TIMEOUT_S)
 
     async def ui_visible(self) -> dict[str, Any]:
         """#36:``{visible, minimized, locked}`` 微信主窗口是否可自动化。"""
@@ -156,7 +168,7 @@ class WeChatWinAgent:
 
     async def login_cancel(self) -> dict[str, Any]:
         """#32:取消登录会话(扫码超时/用户放弃);**微信已登进去的不登出**(05 §2.4.2.1 失败回滚原则)。"""
-        return await self._call("POST", "/wa/v1/wechat/login/cancel", body={})
+        return await self._call("POST", "/wa/v1/wechat/login/cancel", body={}, timeout_s=WECHAT_READ_TIMEOUT_S)
 
     async def bind(self, wxid: str, account_id: str) -> dict[str, Any]:
         """#33c:把取钥读到的 ``wxid`` 绑到 Agent 已建的 ``wxNN``(05 §2.4.2.1 第 4 步);同 ``wxid`` 重绑幂等,

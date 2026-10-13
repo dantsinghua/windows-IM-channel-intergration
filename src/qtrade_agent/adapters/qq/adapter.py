@@ -97,6 +97,11 @@ class QQAdapter:
                               on_reconnect=lambda a=acct: self.backfill(a))
         self._sessions[acct.id] = QQSession(acct=acct, client=client)
         await client.start()
+        if not acct.extra.get("login_pending"):
+            try:
+                await self.backfill(acct)
+            except Exception:
+                log.exception("QQ 连接后补历史失败 account=%s", acct.id)
 
     async def stop(self, acct: Account, *, graceful: bool) -> None:
         sess = self._sessions.pop(acct.id, None)
@@ -211,7 +216,7 @@ class QQAdapter:
         event.setdefault("message_type", kind)
         event["message_id"] = message_id
         self._fill_session_fields(event, native_id, kind)
-        msg = to_message(sess.acct.id, event, self_uid=sess.acct.self_uid)
+        msg = to_message(sess.acct.id, event, self_uid=sess.acct.self_uid, self_nick=sess.acct.self_nick)
         msg.dir, msg.self, msg.state = "out", True, "DELIVERED"
         inserted, changed = self._ingest(sess, msg)
         return changed or inserted
@@ -263,7 +268,7 @@ class QQAdapter:
         if self.cfg.messages.raw_payload:
             raw_ref = json.dumps(event, ensure_ascii=False)      # 02 §2.8 raw 落盘本期未接,先原样带在行上
         try:
-            msg = to_message(sess.acct.id, event, self_uid=sess.acct.self_uid, raw_ref=raw_ref)
+            msg = to_message(sess.acct.id, event, self_uid=sess.acct.self_uid, self_nick=sess.acct.self_nick, raw_ref=raw_ref)
         except ValueError as e:
             log.warning("QQ 事件无法归一化(丢弃)account=%s: %s", sess.acct.id, e)
             return
@@ -340,8 +345,16 @@ class QQAdapter:
         if sess is None or n <= 0 or sess.acct.extra.get("login_pending"):
             return 0
         total = 0
+        targets: dict[str, tuple[str, str]] = {}
         for row in self.store.list_sessions(account_id=acct.id, limit=1000):
-            native, kind = row["native_id"], row["kind"]
+            targets[row["native_id"]] = (row["kind"], "")
+        for native, kind, name in await self._recent_targets(sess):
+            prev = targets.get(native)
+            if prev is None:
+                targets[native] = (kind, name)
+            elif name and not prev[1]:
+                targets[native] = (prev[0], name)
+        for native, (kind, name) in targets.items():
             cur = self.store.cursor_get(acct.id, f"onebot_seq:{native}")
             since = cur.value_int if cur else None
             action, params = history_action_for(native, kind, n)
@@ -361,7 +374,7 @@ class QQAdapter:
                 if since is not None and seq is not None and seq <= since:
                     continue                                    # 只补水位之后的
                 try:
-                    msg = to_message(acct.id, ev, self_uid=acct.self_uid)
+                    msg = to_message(acct.id, ev, self_uid=acct.self_uid, self_nick=acct.self_nick)
                 except ValueError as e:
                     log.warning("QQ 补历史行无法归一化(跳过)account=%s: %s", acct.id, e)
                     continue
@@ -371,5 +384,33 @@ class QQAdapter:
                     top = seq
             if top is not None and top != since:
                 self.store.cursor_set(acct.id, f"onebot_seq:{native}", top)
+            if name:
+                self.store.con.execute(
+                    "UPDATE sessions SET name=? WHERE account_id=? AND native_id=? AND (name IS NULL OR name='')",
+                    (name, acct.id, native))
         sess.backfilled += total
         return total
+
+    async def _recent_targets(self, sess: QQSession) -> list[tuple[str, str, str]]:
+        """NapCat 最近会话。本地还没有会话时，消息中心否则是空的，和企点、微信不一样。"""
+        try:
+            data = await sess.client.call_action("get_recent_contact", {"count": 100})
+        except (OneBotClosed, OneBotError):
+            return []
+        rows = data if isinstance(data, list) else []
+        found: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            uin = row.get("peerUin")
+            if uin is None:
+                continue
+            kind = "group" if str(row.get("chatType")) == "2" else "private"
+            native = f"g_{uin}" if kind == "group" else str(uin)
+            if native in seen:
+                continue
+            seen.add(native)
+            label = str(row.get("remark") or row.get("peerName") or "").strip()
+            found.append((native, kind, label))
+        return found

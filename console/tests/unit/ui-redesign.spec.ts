@@ -96,6 +96,7 @@ beforeEach(() => {
   vi.spyOn(accountsApi, 'capabilities').mockResolvedValue({ capabilities: [], matrix: {} })
   vi.spyOn(systemApi, 'health').mockResolvedValue({ ok: true } as Awaited<ReturnType<typeof systemApi.health>>)
   vi.spyOn(useAccountsStore(), 'load').mockResolvedValue()
+  vi.spyOn(useAccountsStore(), 'loadFirst').mockResolvedValue()
   for (const key of ['loadAll', 'loadPublicEndpoint', 'loadSelftest', 'loadObserved'] as const) {
     vi.spyOn(useEnvStore(), key).mockResolvedValue()
   }

@@ -9,10 +9,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import struct
 import urllib.request
 import zlib
 from typing import Any, Awaitable, Callable
+
+log = logging.getLogger("qtrade.qq.login")
 
 MAX_QR_BYTES = 1024 * 1024
 QR_REFRESH_MS = 30_000
@@ -96,7 +99,8 @@ class NapCatLoginBackend:
             raise
         except NapCatLoginError:
             raise
-        except Exception:
+        except Exception as exc:
+            log.warning("QQ 二维码读取异常 %s", type(exc).__name__)
             raise NapCatLoginError("qrcode_unavailable") from None
 
     async def _qrcode(self, row: dict[str, Any], *, refresh: bool) -> bytes:
@@ -105,7 +109,9 @@ class NapCatLoginBackend:
             raise NapCatLoginError("invalid_account")
         token = self._token_for(row)
         if not isinstance(token, str) or not token:
-            raise NapCatLoginError("webui_not_ready")
+            # NapCat 自己会把登录二维码写到 /app/napcat/cache/qrcode.png。
+            # webui.json 没有 token 时不能走 WebUI 登录，也不该让人去浏览器里填一个不存在的令牌。
+            return await self._png_from_napcat(row, refresh=False)
         auth = await self._request(16300 + seq, "auth/login", {"hash": hashlib.sha256((token + ".napcat").encode()).hexdigest()})
         token = ""
         credential = auth.get("Credential")
@@ -132,4 +138,29 @@ class NapCatLoginBackend:
             if valid_png(png) and (not refresh or png != before):
                 return png
             await asyncio.sleep(0.2)
+        raise NapCatLoginError("qrcode_not_ready")
+
+    async def _png_from_napcat(self, row: dict[str, Any], *, refresh: bool) -> bytes:
+        """没有 WebUI token 时，直接用 NapCat 自己写下的二维码，不打开管理页、不向人要令牌。"""
+        before = b""
+        latest = b""
+        if refresh:
+            try:
+                before = await self._read_png(row)
+            except Exception:
+                pass
+            if valid_png(before):
+                latest = before
+        for _ in range(15):
+            try:
+                png = await self._read_png(row)
+            except Exception:
+                png = b""
+            if valid_png(png):
+                latest = png
+                if not refresh or png != before:
+                    return png
+            await asyncio.sleep(0.2)
+        if valid_png(latest):
+            return latest
         raise NapCatLoginError("qrcode_not_ready")

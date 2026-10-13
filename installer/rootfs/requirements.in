@@ -20,3 +20,4 @@ fastapi>=0.115
 uvicorn>=0.30
 websockets>=12
 aiosqlite>=0.20
+cryptography>=50.0.2

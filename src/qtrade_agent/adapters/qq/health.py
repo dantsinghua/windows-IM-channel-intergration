@@ -101,6 +101,8 @@ class QQHealth:
     async def check(self) -> None:
         now = self._clock()
         hb_timeout_ms = self.cfg.health.napcat_heartbeat_timeout_s * 1000
+        watched_ids = {row["id"] for row in self.watched()}
+        self._resolve_unwatched(watched_ids)
         for row in self.watched():
             aid = row["id"]
             sess = self._adapter.session_of(aid)
@@ -134,6 +136,37 @@ class QQHealth:
                 await self._reconnect_grace_exceeded(aid, subject, st, disconnected_s=disconnected_s, now=now)
                 continue
             await self._judge(aid, subject, st, lost=lost, online=online, silence=silence, now=now)
+
+    def _resolve_unwatched(self, watched_ids: set[str]) -> None:
+        """停机、删除、不再期望在线的号没有心跳是正常的。告警不跟着消掉，抽屉会一直挂着。"""
+        cleared: set[str] = set()
+        for (code, subject) in list(self._alerts.active):
+            if code != H08_NAPCAT_HEARTBEAT_LOST or not str(subject).startswith("account:"):
+                continue
+            aid = str(subject).split(":", 1)[1]
+            if aid not in watched_ids:
+                self._alerts.resolve(code, subject=subject, account_id=aid)
+                cleared.add(aid)
+        if getattr(self, "_h08_swept", False):
+            return
+        self._h08_swept = True
+        latest: dict[str, str] = {}
+        try:
+            rows = self._store.list_events(event="alert")
+        except Exception:
+            rows = []
+        for row in rows:
+            payload = row.get("payload") or {}
+            if payload.get("code") != H08_NAPCAT_HEARTBEAT_LOST:
+                continue
+            subject = str(payload.get("subject") or "")
+            state = str(payload.get("state") or "")
+            if subject.startswith("account:") and state in ("firing", "resolved"):
+                latest[subject] = state
+        for subject, state in latest.items():
+            aid = subject.split(":", 1)[1]
+            if state == "firing" and aid not in watched_ids and aid not in cleared:
+                self._alerts.settle(H08_NAPCAT_HEARTBEAT_LOST, subject=subject, account_id=aid)
 
     async def _reconnect_grace_exceeded(self, account_id: str, subject: str, st: H08State, *,
                                         disconnected_s: int, now: int) -> None:

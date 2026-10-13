@@ -331,6 +331,25 @@ class WinAgentClient:
         raise WinAgentUnavailable("unreachable", repr(last))
 
     # ---- #1 ping(无鉴权,2 s)
+    async def deployment_volume_probe(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        """Windows 用户上下文只读查询；不用 WSL 的 PATH、互操作或 HKCU。"""
+        try:
+            status, body = await self.request("POST", "/wa/v1/metrics/deployment-volumes", json=query,
+                                              timeout_s=12, retry=False)
+        except WinAgentUnavailable:
+            raise ValueError("windows_volume_bridge_unavailable") from None
+        if status != 200:
+            error = body.get("error") if isinstance(body, dict) else None
+            reason = error.get("reason") if isinstance(error, dict) else None
+            allowed = {"current_distro_mapping_missing", "windows_system_root_unavailable", "windows_volume_timeout",
+                       "windows_volume_command_unavailable", "windows_volume_command_failed", "windows_volume_response_invalid",
+                       "user_agent_offline"}
+            raise ValueError(reason if isinstance(reason, str) and reason in allowed else "windows_volume_bridge_failed")
+        rows = body.get("rows") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("windows_volume_response_invalid")
+        return rows
+
     async def ping(self) -> Optional[dict[str, Any]]:
         try:
             status, body = await self.request("GET", "/wa/v1/ping", timeout_s=TIMEOUT_S["ping"], retry=True, auth=False)

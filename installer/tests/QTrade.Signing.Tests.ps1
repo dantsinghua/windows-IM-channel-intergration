@@ -595,7 +595,7 @@ Describe '🔴 build.ps1 签名顺序(内层先于外壳、签名先于 manifest
     }
 
     It '.cmd 不签(Authenticode 不支持),链首脚本仍从仓库原件复制' {
-        $script:BuildText | Should -Match 'Copy-Item -LiteralPath \(Join-Path \$EngineDir \$ChainHeadName\)'
+        $script:BuildText | Should -Match ([regex]::Escape("Copy-Item -LiteralPath `$_.FullName -Destination (Join-Path `$StageDir 'install\engine')"))
     }
 }
 

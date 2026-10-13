@@ -100,13 +100,13 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
             <tr v-for="row in m?.ours.accounts ?? []" :key="row.id"><td><button class="account-link" @click="router.push('/acct/' + row.id)">{{ accounts.byId[row.id]?.label || row.id }}<small>{{ accounts.byId[row.id] ? CHANNEL_TEXT[accounts.byId[row.id].channel] : '账号' }} · {{ row.id }}</small></button></td><td :data-testid="T.memAcct(row.id, 'current')">{{ mb(row.current_mb ?? row.rss_mb) }}</td><td :data-testid="T.cpuAcct(row.id)">{{ pct(row.cpu_pct) }}</td><td><a-button type="text" @click="router.push('/acct/' + row.id)">↗</a-button></td></tr>
             <tr v-if="!m?.ours.accounts.length"><td colspan="4"><a-empty description="暂无账号资源快照" /></td></tr>
           </tbody></table></div>
-          <div class="process-grid"><div><span>Agent</span><b :data-testid="T.memProc('agent')">{{ mb(m?.ours.procs.agent_mb) }}</b></div><div><span>WinAgent</span><b :data-testid="T.memProc('winagent')">{{ mb(m?.ours.procs.winagent_mb) }}</b></div><div><span>控制台</span><b :data-testid="T.memProc('console')">{{ mb(consoleRssMb ?? m?.ours.procs.console_mb) }}</b></div><div><span>微信 PC</span><b :data-testid="T.memWechat">{{ mb(m?.ours.wechat?.wechat_pc_mb) }}</b></div></div>
+          <div class="process-grid"><div><span>Agent</span><b :data-testid="T.memProc('agent')">{{ mb(m?.ours.procs.agent_mb) }}</b></div><div><span>WinAgent</span><b :data-testid="T.memProc('winagent')">{{ mb(m?.ours.procs.winagent_mb) }}</b></div><div><span>机器人采集终端</span><b :data-testid="T.memProc('console')">{{ mb(consoleRssMb ?? m?.ours.procs.console_mb) }}</b></div><div><span>微信 PC</span><b :data-testid="T.memWechat">{{ mb(m?.ours.wechat?.wechat_pc_mb) }}</b></div></div>
         </section>
         <section class="qt-card resource-panel" :data-testid="T.col('host')">
           <header class="section-heading"><div><div class="qt-eyebrow">SYSTEM CAPACITY</div><h2>可用资源</h2></div><span class="soft-tag" :data-testid="T.memWatermark">{{ levelText(mem?.level) }}</span></header>
           <div class="available-memory"><span>WSL 可用内存</span><strong :data-testid="T.memHost('avail')">{{ mb(m?.hardware?.mem?.avail_mb) }}</strong></div>
           <p class="qt-small qt-muted">预警 {{ mb(mem?.warn_mb) }} · 严重 {{ mb(mem?.critical_mb) }}</p>
-          <p class="capacity-note" :data-testid="T.lruNote">{{ mem?.level === 'critical' ? '当前内存紧张，请减少运行中的账号。系统已限制新增与自动恢复。' : mem?.level === 'warn' ? '可用内存接近预警线，建议关注账号占用。' : mem ? '可在账号工作台按需启停账号，管理资源占用。' : '尚未取得内存状态，等待服务返回采集结果。' }}</p>
+          <p class="capacity-note" :data-testid="T.lruNote">{{ mem?.level === 'critical' ? '当前内存紧张，请减少运行中的账号。系统已限制新增与自动恢复。' : mem?.level === 'warn' ? '可用内存接近预警线，建议关注账号占用。' : mem ? '可在机器人采集终端按需启停账号，管理资源占用。' : '尚未取得内存状态，等待服务返回采集结果。' }}</p>
           <a-button block :data-testid="T.actionOpenEnv" @click="router.push('/env')">查看系统环境 ↗</a-button>
         </section>
       </div>
@@ -139,8 +139,8 @@ onUnmounted(() => { if (tick) clearInterval(tick) })
 .resource-stat strong { font-size: 36px; line-height: 1.2; letter-spacing: -1.5px; font-weight: 600; color: var(--qt-text); }
 .resource-stat p { margin: auto 0 0; padding-top: 14px; font-size: 11px; color: var(--qt-text-secondary); }
 .usage-track { height: 5px; background: rgba(117,71,168,.08); border-radius: 6px; margin-top: 22px; overflow: hidden; }
-.usage-track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#b899d9,#7547a8); }
-.usage-track.golden > span { background: linear-gradient(90deg,#f9d88c,#f2ad38); }
+.usage-track > span { display: block; height: 100%; border-radius: inherit; background: var(--qt-usage); }
+.usage-track.golden > span { background: var(--qt-usage-accent); }
 .resource-columns { display: grid; grid-template-columns: minmax(0,1.65fr) minmax(260px,1fr); gap: 22px; margin-bottom: 22px; }
 .resource-panel { padding: 26px; min-width: 0; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }

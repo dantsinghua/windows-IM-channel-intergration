@@ -225,6 +225,32 @@ def test_stage_wx_key_dll_places_dll_where_chatlog_loads_it(tmp_path):
         stage_wx_key_dll(str(src), str(work), "wx_key9.dll")
 
 
+def test_stage_wx_key_dll_is_idempotent_and_survives_locked_target(tmp_path, monkeypatch):
+    """R6-100:取钥成功后 wx_key.dll 被注入的微信持续 load,再 stage 同一 DLL 不能去覆盖(否则 PermissionError→login/start 500)。
+    同字节 ⇒ 跳过 copy(复用被 load 的那份);不同字节被占用 ⇒ 失败，不能冒称换成新候选。"""
+    import qtrade_winagent.win.wechat as wx
+    from qtrade_winagent.win.wechat import WX_KEY_REL, stage_wx_key_dll
+    src = tmp_path / "pkg"; src.mkdir()
+    (src / "wx_key2.dll").write_bytes(b"MZ-v2")
+    (src / "wx_key1.dll").write_bytes(b"MZ-v1")
+    work = tmp_path / "work"
+    stage_wx_key_dll(str(src), str(work), "wx_key2.dll")
+    # 同一 DLL 再 stage:copyfile 绝不被调用(目标可能正被进程 load,一碰就 PermissionError)
+    calls = []
+    monkeypatch.setattr(wx.shutil, "copyfile", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("不该 copy")))
+    assert stage_wx_key_dll(str(src), str(work), "wx_key2.dll") == str(work / WX_KEY_REL)
+    assert calls == []
+    # 不同 DLL 被占用：明确失败，保留原字节供诊断，不报告替换成功。
+    monkeypatch.setattr(wx.shutil, "copyfile", lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, "in use")))
+    with pytest.raises(PermissionError):
+        stage_wx_key_dll(str(src), str(work), "wx_key1.dll")
+    assert (work / "lib" / "windows_x64" / "wx_key.dll").read_bytes() == b"MZ-v2"
+    # 目标不存在 + copyfile 失败 ⇒ 必须抛(没有可沿用的)
+    empty = tmp_path / "empty"
+    with pytest.raises(PermissionError):
+        stage_wx_key_dll(str(src), str(empty), "wx_key1.dll")
+
+
 def test_redact_keys_masks_both_keys_but_keeps_short_hex():
     """chatlog 把两把钥明文打进日志 ⇒ 落盘前必须打码;函数地址这类短串保留以便排障。"""
     from qtrade_winagent.win.wechat import redact_keys
@@ -376,11 +402,148 @@ def test_pick_readback_needs_self_after_send_and_text_match():
     assert pick_readback(img, text=None, image=True, since_s=t0 - 2)["seq"] == 11
 
 
+def test_only_weixin_process_counts_as_wechat_window():
+    """同名 Qt 窗口若不是微信进程，不能拿来发快捷键。"""
+    from qtrade_winagent.win.wechat import wechat_main_hwnds
+    rows = [
+        (7, "Qt51514QWindowIcon", "Weixin.exe"),
+        (8, "Qt51514QWindowIcon", "QTrade.exe"),
+        (9, "mmui::LoginWindow", "Weixin.exe"),
+        (10, "mmui::MainWindow", "WeChat.exe"),
+    ]
+    assert wechat_main_hwnds(rows) == [7, 10]
+
+
+def test_wechat_click_points_match_the_window_that_delivered():
+    """输入区和绿色发送按钮的相对位置，来自已经写进文件传输助手的那次窗口。"""
+    from qtrade_winagent.win.wechat import wechat_click_points
+    points = wechat_click_points(2121, 1351)
+    assert points["composer"] == (975, 1188)
+    assert points["send"] == (1336, 1276)
+    assert points["search"][1] < points["composer"][1]
+
+
+def test_foreground_claim_attaches_the_calling_thread():
+    """前台锁开着时，调用线程必须挂上当前前台线程，只互挂两个窗口线程不够。"""
+    from qtrade_winagent.win.wechat import foreground_threads_to_attach
+    assert foreground_threads_to_attach(1, 2, 3) == (2, 3)
+    assert foreground_threads_to_attach(2, 2, 3) == (3,)
+    assert foreground_threads_to_attach(3, 0, 3) == ()
+
+
+def test_not_foreground_switches_before_input_is_allowed():
+    """Cursor 在前台、桌面只有一个微信时，必须先切到这个微信。切不成功就不允许发信。"""
+    from qtrade_winagent.win.wechat import WeChatWindowError, begin_wechat_input, wechat_main_hwnds
+    rows = [
+        (3, "Chrome_WidgetWin_1", "Cursor.exe"),
+        (7, "Qt51514QWindowIcon", "Weixin.exe"),
+        (8, "Qt51514QWindowIcon", "QTrade.exe"),
+    ]
+    hwnds = wechat_main_hwnds(rows)
+    state = {"fg": 3}
+    calls = []
+
+    def claim(hwnd: int) -> bool:
+        calls.append(hwnd)
+        state["fg"] = hwnd
+        return True
+
+    assert begin_wechat_input(3, hwnds, claim, lambda: state["fg"]) == 7
+    assert calls == [7]
+
+
+def test_already_foreground_does_not_switch_again():
+    from qtrade_winagent.win.wechat import begin_wechat_input
+
+    def claim(_hwnd: int) -> bool:
+        raise AssertionError("已经是微信前台，不应再切换")
+
+    assert begin_wechat_input(7, [7], claim, lambda: 7) == 7
+
+
+def test_failed_switch_refuses_before_any_input():
+    from qtrade_winagent.win.wechat import WeChatWindowError, begin_wechat_input
+
+    def claim(_hwnd: int) -> bool:
+        return False
+
+    try:
+        begin_wechat_input(3, [7], claim, lambda: 3)
+    except WeChatWindowError as exc:
+        assert exc.reason == "wechat_not_foreground"
+    else:
+        raise AssertionError("切换失败仍允许发信")
+
+
+def test_switch_that_does_not_stick_is_refused():
+    from qtrade_winagent.win.wechat import WeChatWindowError, begin_wechat_input
+
+    def claim(_hwnd: int) -> bool:
+        return True
+
+    try:
+        begin_wechat_input(3, [7], claim, lambda: 3)
+    except WeChatWindowError as exc:
+        assert exc.reason == "wechat_not_foreground"
+    else:
+        raise AssertionError("前台仍不是微信却允许发信")
+
+
+def test_missing_or_ambiguous_window_never_switches():
+    from qtrade_winagent.win.wechat import WeChatWindowError, begin_wechat_input
+    calls = []
+
+    def claim(hwnd: int) -> bool:
+        calls.append(hwnd)
+        return True
+
+    for hwnds, reason in (([], "wechat_window_missing"), ([7, 8], "wechat_window_ambiguous")):
+        try:
+            begin_wechat_input(1, hwnds, claim, lambda: 1)
+        except WeChatWindowError as exc:
+            assert exc.reason == reason
+        else:
+            raise AssertionError(reason)
+    assert calls == []
+
+
+def test_send_switches_to_wechat_before_clicking():
+    """发信源码里，切换前台必须写在点击搜索框和发送按钮之前。"""
+    import inspect
+    from qtrade_winagent.win import wechat as winwx
+    keyboard = inspect.getsource(winwx.WinWeChat._keyboard_send_text)
+    send = inspect.getsource(winwx.WinWeChat.send)
+    assert keyboard.index("_require_foreground") < keyboard.index("_click_send_in_open_wechat")
+    assert send.index("_require_foreground") < send.index("_pyweixin_send")
+    assert send.index("_require_foreground") < send.index("_keyboard_send_text")
+    assert 'hotkey("ctrl", "f")' not in inspect.getsource(winwx._click_send_in_open_wechat)
+
+
+def test_foreground_uses_the_only_wechat_window():
+    """当前窗口不是微信时，只能把唯一的微信主窗口调到前台；已经是它就直接发快捷键。"""
+    from qtrade_winagent.win.wechat import WeChatWindowError, plan_wechat_foreground
+    assert plan_wechat_foreground(7, [7]) == ("ready", 7)
+    assert plan_wechat_foreground(3, [7]) == ("activate", 7)
+    assert plan_wechat_foreground(None, [7, 7]) == ("activate", 7)
+    try:
+        plan_wechat_foreground(1, [])
+    except WeChatWindowError as exc:
+        assert exc.reason == "wechat_window_missing"
+    else:
+        raise AssertionError("没有微信窗口却允许发信")
+    try:
+        plan_wechat_foreground(1, [7, 8])
+    except WeChatWindowError as exc:
+        assert exc.reason == "wechat_window_ambiguous"
+    else:
+        raise AssertionError("多个微信窗口却允许发信")
+
+
 def test_send_no_longer_uses_nonexistent_weixinclient():
     """回归:上游 pyweixin 没有 WeixinClient;必须走 Messages/Files,显式 close_weixin=False,且先解析显示名。"""
     import inspect
     from qtrade_winagent.win import wechat as winwx
-    src = inspect.getsource(winwx.WinWeChat.send)
+    src = inspect.getsource(winwx.WinWeChat.send) + inspect.getsource(winwx.WinWeChat._pyweixin_send)
     assert "WeixinClient" not in src.split('"""', 2)[-1]
     assert "send_messages_to_friend" in src and "send_files_to_friend" in src
     assert src.count("close_weixin=False") >= 2 and "_resolve_send_target" in src
@@ -391,7 +554,7 @@ def test_chatlog_start_passes_pid_to_avoid_interactive_picker():
     import inspect
     from qtrade_winagent.win import wechat as winwx
     src = inspect.getsource(winwx.WinWeChat.chatlog_start)
-    assert '"--pid"' in src and "login_pid()" in src
+    assert '"--pid"' in src and "login_pid()" in inspect.getsource(winwx.WinWeChat._key_target)
     assert "main_window()" in inspect.getsource(winwx.WinWeChat.login_pid)
 
 
@@ -407,15 +570,15 @@ _WX_TREE = [
 
 @pytest.mark.parametrize("window_pid", [None, 23424, 44680, 21328])
 def test_pick_wechat_root_pid_targets_login_main_process(window_pid):
-    """R6-96:托盘态(无窗口 pid)、窗口 pid 落在子进程上,都要挂到登录主进程 —— 挂子进程必「模式匹配失败,0 个结果」。"""
+    """窗口 PID 沿父链定位主进程；无窗口且多个根进程时拒绝凭内存大小猜目标。"""
     from qtrade_winagent.win.wechat import pick_wechat_root_pid
-    assert pick_wechat_root_pid(_WX_TREE, window_pid) == 23424
+    assert pick_wechat_root_pid(_WX_TREE, window_pid) == (None if window_pid is None else 23424)
 
 
 def test_pick_wechat_root_pid_edge_cases():
     from qtrade_winagent.win.wechat import pick_wechat_root_pid
     assert pick_wechat_root_pid([], None) is None                       # 微信没开
-    assert pick_wechat_root_pid([], 777) == 777                         # 枚举失败时退回窗口 pid
+    assert pick_wechat_root_pid([], 777) is None                       # 枚举失败，未能证明窗口 PID 属于微信。
     assert pick_wechat_root_pid(_WX_TREE[-1:], None) == 36000           # 只有一个进程
 
 
@@ -441,15 +604,35 @@ def test_parse_key_progress_reads_real_chatlog_markers():
     assert not noise["img_key"] and noise["error"] is None
 
 
-def test_chatlog_stop_unloads_hook_before_force_kill():
-    """R6-96 真机实锤:``taskkill /F`` 强杀正在 hook 的 chatlog 会把 inline hook 残留在微信进程里,
-    之后取钥全「模式匹配失败,0 个结果」。stop 必须先 CTRL_BREAK 优雅卸载,再兜底强杀;spawn 必须 NEW_PROCESS_GROUP。"""
-    import inspect
-    from qtrade_winagent.win import wechat as winwx
-    stop_src = inspect.getsource(winwx.WinWeChat.chatlog_stop)
-    assert "CTRL_BREAK_EVENT" in stop_src
-    assert stop_src.index("CTRL_BREAK_EVENT") < stop_src.index("force=True")   # 先优雅,后兜底强杀
-    assert "CREATE_NEW_PROCESS_GROUP" in inspect.getsource(winwx.spawn_redacted)
+async def test_chatlog_stop_unloads_hook_before_force_kill(monkeypatch):
+    """先给本对象拥有的取钥进程卸载机会；禁止按名称扫描并停止其它实例。"""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from qtrade_winagent.win import proc, wechat as winwx
+
+    calls = []
+    child = SimpleNamespace(pid=741, returncode=None)
+    async def interrupt(pid):
+        calls.append(("interrupt", pid))
+        return True
+    async def wait():
+        calls.append(("wait", child.pid))
+        if child.returncode is None:
+            raise TimeoutError
+        return child.returncode
+    def kill():
+        calls.append(("kill_handle", child.pid))
+        child.returncode = -1
+    child.wait, child.kill = wait, kill
+    find = Mock(side_effect=AssertionError("Do not enumerate chatlog by name"))
+    monkeypatch.setattr(proc, "WinProc", lambda: SimpleNamespace(find=find, interrupt=interrupt))
+    monkeypatch.setattr(winwx.os, "kill", Mock(side_effect=AssertionError("No real signals")))
+    adapter = winwx.WinWeChat()
+    adapter._chatlog_process, adapter._chatlog_pid, adapter._chatlog_created = child, 741, 100.0
+    monkeypatch.setattr(adapter, "_process_created", lambda pid: 100.0)
+    await adapter.chatlog_stop()
+    assert calls == [("interrupt", 741), ("wait", 741), ("kill_handle", 741), ("wait", 741)]
+    find.assert_not_called()
 
 
 def test_decode_line_handles_gbk_console_output():

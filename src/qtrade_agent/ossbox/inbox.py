@@ -24,6 +24,7 @@ from ..models import Message, Session
 from .bind import Dedup
 from .crypto import open_sealed, seal
 from .keys import ack_object_name, in_object_name
+from .object_io import ObjectIO
 from .schema import validate_command, validate_receipt
 
 log = logging.getLogger("qtrade.ossbox.inbox")
@@ -86,23 +87,18 @@ class XunjiaInbox:
         self.confirm_wait_s = confirm_wait_s
         self._dedup = Dedup()
         self._outcome: dict[str, dict[str, Any]] = {}
+        self._io = ObjectIO()
 
     @classmethod
-    def from_env(cls, store: Any, send: SendFn, *, clock: Callable[[], int] | None = None) -> "XunjiaInbox | None":
+    def from_env(cls, store: Any, send: SendFn, *, clock: Callable[[], int] | None = None,
+                 box: Any = None, workbench_id: str | None = None) -> "XunjiaInbox | None":
         """环境变量齐了才装配。缺任何一项就返回 None，不拉网、不打密钥。"""
-        endpoint = os.environ.get("OSS_ENDPOINT", "").strip()
-        bucket = os.environ.get("OSS_BUCKET", "").strip()
-        workbench_id = os.environ.get("OSS_WORKBENCH_ID", "").strip()
-        key_id = os.environ.get("OSS_ACCESS_KEY_ID", "").strip()
-        secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "").strip()
+        if workbench_id is None:
+            workbench_id = os.environ.get("OSS_WORKBENCH_ID", "").strip()
         seal_hex = (os.environ.get("OSS_SEAL_KEY_XUNJIA") or os.environ.get("OSSBOX_KEY_XUNJIA") or "").strip()
         missing = [
             name for name, value in (
-                ("OSS_ENDPOINT", endpoint),
-                ("OSS_BUCKET", bucket),
                 ("OSS_WORKBENCH_ID", workbench_id),
-                ("OSS_ACCESS_KEY_ID", key_id),
-                ("OSS_ACCESS_KEY_SECRET", secret),
                 ("OSS_SEAL_KEY_XUNJIA", seal_hex),
             ) if not value
         ]
@@ -119,6 +115,15 @@ class XunjiaInbox:
             return None
         from .oss_http import OssV1Box
 
+        try:
+            box = box if box is not None else OssV1Box.from_env()
+        except ValueError:
+            log.warning("询价对象存储配置无效，未装配轮询")
+            return None
+        if box is None:
+            log.warning("询价对象存储配置不完整，未装配轮询")
+            return None
+
         log.info("询价指令轮询已装配 workbench=%s", workbench_id)
         wait_raw = os.environ.get("XUNJIA_LAND_WAIT_S", "20").strip()
         try:
@@ -126,7 +131,7 @@ class XunjiaInbox:
         except ValueError:
             confirm_wait_s = 20.0
         return cls(
-            OssV1Box(endpoint=endpoint, bucket=bucket, key_id=key_id, secret=secret),
+            box,
             key,
             workbench_id,
             send,
@@ -136,8 +141,9 @@ class XunjiaInbox:
         )
 
     async def poll(self) -> None:
+        self._io.check_idle()
         prefix = f"wb/{self.workbench_id}/in/xunjia/"
-        names = [str(item) for item in self.box.list_prefix(prefix)]
+        names = [str(item) for item in await self._io.run(self.box.list_prefix, prefix)]
         held: list[str] = []
         acked: list[str] = []
         pending: list[str] = []
@@ -153,7 +159,7 @@ class XunjiaInbox:
                 log.info("跳过不补发的询价指令 cmd_id=%s object=%s", cmd_id, name)
                 continue
             ack_name = ack_object_name(self.workbench_id, cmd_id)
-            if self.box.get(ack_name) is not None:
+            if await self._io.run(self.box.get, ack_name) is not None:
                 acked.append(cmd_id)
                 continue
             pending.append(cmd_id)
@@ -170,10 +176,10 @@ class XunjiaInbox:
         log.info("询价文件未触发发送 cmd_id=%s object=%s branch=%s", cmd_id, name, branch)
 
     async def _one(self, name: str, cmd_id: str, ack_name: str) -> None:
-        raw = self.box.get(name)
+        raw = await self._io.run(self.box.get, name)
         if not raw:
             self._skip(cmd_id, name, "empty")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="指令对象为空"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="指令对象为空"))
             return
         try:
             opened = open_sealed(self.key, raw)
@@ -183,23 +189,23 @@ class XunjiaInbox:
                 "询价文件未触发发送 cmd_id=%s object=%s branch=unseal exc=%s nbytes=%s",
                 cmd_id, name, type(exc).__name__, len(raw),
             )
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="指令无法解开"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="指令无法解开"))
             return
         idem = str(command.get("idempotency_key") or "")
         if str(command.get("workbench_id") or "") != self.workbench_id:
             self._skip(cmd_id, name, "workbench")
             self._remember(idem, ok=False, code="failed", reason="工作台不一致")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="工作台不一致"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="工作台不一致"))
             return
         if command.get("op") != "send_text" or command.get("channel") != "qidian":
             self._skip(cmd_id, name, "not_qidian_text")
             self._remember(idem, ok=False, code="failed", reason="这次只发企点文本")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="这次只发企点文本"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="这次只发企点文本"))
             return
         prior = self._outcome.get(idem)
         if idem and prior is not None:
             self._skip(cmd_id, name, "replay")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=prior["ok"], code=prior["code"], reason=prior.get("reason") or ""))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=prior["ok"], code=prior["code"], reason=prior.get("reason") or ""))
             return
         session = command["session"]
         native_id = str(session["native_id"])
@@ -208,22 +214,22 @@ class XunjiaInbox:
         if account is None:
             self._skip(cmd_id, name, "no_account")
             self._remember(idem, ok=False, code="failed", reason="本机没有这个企点号")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="本机没有这个企点号"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="本机没有这个企点号"))
             return
         if account.state not in ("running", "degraded"):
             self._skip(cmd_id, name, "offline")
             self._remember(idem, ok=False, code="failed", reason="账号不在线")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="账号不在线"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="账号不在线"))
             return
         if idem and not self._dedup.seen_command(idem):
             self._skip(cmd_id, name, "dedup")
             prior = self._outcome.get(idem) or {"ok": True, "code": "delivered", "reason": ""}
-            self._put_ack(ack_name, _receipt(cmd_id, ok=prior["ok"], code=prior["code"], reason=prior.get("reason") or ""))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=prior["ok"], code=prior["code"], reason=prior.get("reason") or ""))
             return
         if idem and self._already_sent(account.id, idem):
             self._skip(cmd_id, name, "already_sent")
             self._remember(idem, ok=True, code="delivered")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=True, code="delivered"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=True, code="delivered"))
             return
         log.info(
             "询价文件触发企点发送 cmd_id=%s object=%s account=%s native_id=%s text_len=%s",
@@ -237,12 +243,12 @@ class XunjiaInbox:
                 cmd_id, name, account.id, type(exc).__name__,
             )
             self._remember(idem, ok=False, code="failed", reason="企点发送未执行")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="企点发送未执行"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="企点发送未执行"))
             return
         log.info("询价文件发送结果 cmd_id=%s object=%s sent=%s", cmd_id, name, bool(sent))
         if not sent:
             self._remember(idem, ok=False, code="failed", reason="企点发送未执行")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="企点发送未执行"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="企点发送未执行"))
             return
         try:
             self._write_out(account, command, native_id, text, cmd_id, idem)
@@ -252,7 +258,7 @@ class XunjiaInbox:
                 cmd_id, name, account.id, type(exc).__name__,
             )
             self._remember(idem, ok=False, code="failed", reason="采集库写入失败")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="采集库写入失败"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="采集库写入失败"))
             return
         if not await self._wait_landed(account, native_id, text):
             log.info(
@@ -260,23 +266,23 @@ class XunjiaInbox:
                 cmd_id, name, account.id, native_id, len(text),
             )
             self._remember(idem, ok=False, code="failed", reason="对话里还没有这条发出")
-            self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="对话里还没有这条发出"))
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="对话里还没有这条发出"))
             return
         self._remember(idem, ok=True, code="delivered")
-        self._put_ack(ack_name, _receipt(cmd_id, ok=True, code="delivered"))
+        await self._put_ack(ack_name, _receipt(cmd_id, ok=True, code="delivered"))
 
     def _remember(self, idem: str, *, ok: bool, code: str, reason: str = "") -> None:
         if not idem:
             return
         self._outcome[idem] = {"ok": ok, "code": code, "reason": reason}
 
-    def _put_ack(self, name: str, receipt: dict[str, Any]) -> None:
+    async def _put_ack(self, name: str, receipt: dict[str, Any]) -> None:
         log.info(
             "询价回执已写 object=%s cmd_id=%s ok=%s code=%s reason=%s",
             name, receipt.get("cmd_id"), receipt.get("ok"), receipt.get("code"), receipt.get("reason") or "",
         )
         try:
-            self.box.put(name, seal(self.key, _plaintext(receipt)))
+            await self._io.run(self.box.put, name, seal(self.key, _plaintext(receipt)))
         except Exception as exc:
             log.warning("询价回执写入失败 object=%s exc=%s", name, type(exc).__name__)
             raise

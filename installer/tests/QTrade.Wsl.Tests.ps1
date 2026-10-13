@@ -232,7 +232,7 @@ Describe '🔴 W4 回滚基线 = 当前文件去掉所有 kernel= 行,不是旧�
     }
 
     It '坏备份识别:备份里含 kernel= 行即视为过期(v2 脚本第 66~69 行)' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-bak-' + [Guid]::NewGuid().ToString('N') + '.bak')
+        $tmp = Join-Path $TestDrive ('qt-bak-' + [Guid]::NewGuid().ToString('N') + '.bak')
         try {
             [IO.File]::WriteAllText($tmp, "[wsl2]`r`nkernel=C:\\x`r`n")
             Test-QtWslConfigBackupPoisoned -Path $tmp | Should -BeTrue
@@ -245,7 +245,7 @@ Describe '🔴 W4 回滚基线 = 当前文件去掉所有 kernel= 行,不是旧�
 Describe '🔴 W3 .wslconfig 可解析性(写配置前三道前置校验之二)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-wc-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-wc-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
         $script:F = Join-Path $script:Tmp '.wslconfig'
     }
@@ -281,7 +281,7 @@ Describe '🔴 W3 .wslconfig 可解析性(写配置前三道前置校验之二)'
 Describe 'Write-QtUtf8NoBom —— .wslconfig 唯一允许的写法(W3)' {
 
     It '写出无 BOM、CRLF' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-w-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-w-' + [Guid]::NewGuid().ToString('N'))
         try {
             Write-QtUtf8NoBom -Path $tmp -Text "[wsl2]`nmemory=8GB" | Out-Null
             $b = [IO.File]::ReadAllBytes($tmp)
@@ -294,7 +294,7 @@ Describe 'Write-QtUtf8NoBom —— .wslconfig 唯一允许的写法(W3)' {
 Describe '备份 R1 —— 永不覆盖旧备份(§2.6.2 R1 / R6-14 后缀口径)' {
 
     It '同一时间戳再备份一次会另起文件名' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-bk-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-bk-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
             $src = Join-Path $tmp '.wslconfig'
@@ -310,7 +310,7 @@ Describe '备份 R1 —— 永不覆盖旧备份(§2.6.2 R1 / R6-14 后缀口径
     }
 
     It '源文件不存在时回空串(不抛)' {
-        Backup-QtWslConfig -Path 'Z:\no\such\.wslconfig' -BackupDir ([IO.Path]::GetTempPath()) | Should -Be ''
+        Backup-QtWslConfig -Path 'Z:\no\such\.wslconfig' -BackupDir $TestDrive | Should -Be ''
     }
 }
 

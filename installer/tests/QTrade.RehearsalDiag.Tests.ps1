@@ -16,7 +16,7 @@ Describe '预演诊断包' {
     }
 
     It 'kcheck 不在时 dmesg 文本说明发行版已注销,且不是空串' {
-        $script:Root = Join-Path ([IO.Path]::GetTempPath()) ('qt-rehearsal-diag-' + [Guid]::NewGuid().ToString('N'))
+        $script:Root = Join-Path $TestDrive ('qt-rehearsal-diag-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'install') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'logs') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'kernel') -Force | Out-Null

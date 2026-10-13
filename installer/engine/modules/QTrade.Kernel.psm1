@@ -12,6 +12,7 @@ Import-Module (Join-Path $PSScriptRoot 'QTrade.Exit.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.State.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Log.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Wsl.psm1') -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'QTrade.Preflight.psm1') -DisableNameChecking
 
 # docs/03 §7 `[wsl]` 段超时值(本册追加键;改要先改 docs/03 §7)
 $script:QtKernelTimeouts = [ordered]@{
@@ -191,11 +192,58 @@ function Remove-QtKCheck {
     #>
     [CmdletBinding()]
     param([string] $Directory, [int] $TimeoutSec = 60)
-    $r = Unregister-QtDistro -Name $script:QtKCheckDistro -TimeoutSec $TimeoutSec
-    if ($Directory -and (Test-QtPath -Path $Directory)) {
-        Remove-QtItem -Path $Directory -Recurse
-    }
-    return $r
+    $result = [pscustomobject]@{ Ok = $false; Reason = 'KCHECK_OWNERSHIP_UNKNOWN'; Records = @() }
+    try {
+        if (-not $Directory -or -not [IO.Path]::IsPathRooted($Directory)) { return $result }
+        $target = [IO.Path]::GetFullPath($Directory).TrimEnd('\', '/')
+        $root = Split-Path -Parent (Split-Path -Parent $target)
+        $paths = Get-QtPaths -Root $root
+        if ($target -ne $paths.KCheck) { return $result }
+        # Check ancestors and the exact deletion tree without traversing reparse points.
+        $current = $target
+        while ($current) {
+            if ((Test-QtPath -Path $current) -and
+                ((Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $result }
+            $current = Split-Path -Parent $current
+        }
+        $owner = Read-QtInstallState -Path $paths.StateFile
+        $sid = Get-QtCurrentUserSid
+        if ($null -eq $owner -or -not (Test-QtHasProperty $owner 'env') -or
+            -not (Test-QtHasProperty $owner.env 'install_user_sid') -or
+            $owner.env.install_user_sid -ne $sid -or
+            -not (Test-QtHasProperty $owner 'package_manifest_sha256') -or
+            -not (Test-QtPath -Path $paths.Manifest) -or
+            $owner.package_manifest_sha256 -ne (Get-QtFileHash -Path $paths.Manifest)) { return $result }
+        $pending = [Collections.Generic.Queue[string]]::new()
+        if (Test-QtPath -Path $target) { $pending.Enqueue($target) }
+        while ($pending.Count) {
+            foreach ($item in (Get-ChildItem -LiteralPath $pending.Dequeue() -Force -ErrorAction Stop)) {
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $result }
+                if ($item.PSIsContainer) { $pending.Enqueue($item.FullName) }
+            }
+        }
+        $allDistros = Get-QtRegisteredDistro
+        $registered = @($allDistros | Where-Object { $_.name -eq $script:QtKCheckDistro })
+        if ($registered.Count -gt 1) { return $result }
+        if ($registered.Count -eq 1) {
+            $base = ([string]$registered[0].base_path).TrimEnd('\')
+            if ($base.StartsWith('\\?\')) { $base = $base.Substring(4) }
+            if ($base -ne $target) { return $result }
+            $r = Unregister-QtDistro -Name $script:QtKCheckDistro -TimeoutSec $TimeoutSec
+            $result.Records = @(Get-QtProcessDiagnostic -Result $r -Stage 'kcheck_remove')
+            $result.Reason = 'KCHECK_REMOVE_FAILED'
+            if ($r.TimedOut -or $r.ExitCode -ne 0) { return $result }
+            $allDistros = Get-QtRegisteredDistro
+            if (@($allDistros | Where-Object { $_.name -eq $script:QtKCheckDistro }).Count) { return $result }
+        }
+        $result.Reason = 'KCHECK_REMOVE_FAILED'
+        if (Test-QtPath -Path $target) {
+            Remove-QtItem -Path $target -Recurse
+            if (Test-QtPath -Path $target) { return $result }
+        }
+        $result.Ok = $true; $result.Reason = ''
+    } catch { }
+    return $result
 }
 
 function Import-QtKCheck {
@@ -214,7 +262,8 @@ function Import-QtKCheck {
     )
     if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtKernelTimeouts.kcheck_import_timeout_s }
     # 残留先注销(§2.6.6 不变量②)
-    Remove-QtKCheck -Directory $Directory -TimeoutSec 60 | Out-Null
+    $cleanup = Remove-QtKCheck -Directory $Directory -TimeoutSec 60
+    if (-not $cleanup.Ok) { return $cleanup }
     New-QtDirectory -Path $Directory | Out-Null
     $r = Invoke-QtWsl -WslArgs @('--import', $script:QtKCheckDistro, $Directory, $TarPath, '--version', '2') -TimeoutSec $TimeoutSec
     if ($r.TimedOut -or $r.ExitCode -ne 0) {
@@ -386,8 +435,8 @@ function Invoke-QtKernelRollback {
     $sd = Invoke-QtWslShutdown -Confirmed $ShutdownConfirmed
     if (-not $sd.Ok) {
         # 🔴 §2.6.6 不变量②:任何路径结束时 kcheck 都被注销 —— 提前 return 也不能漏
-        Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
-        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'shutdown'; Records = @($sd.Process) }
+        $cleanup = Remove-QtKCheck -Directory $KCheckDirectory
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'shutdown'; Records = @($sd.Process); Cleanup = $cleanup }
     }
 
     # 3. kcheck uname -r 应为官方版本串
@@ -395,7 +444,10 @@ function Invoke-QtKernelRollback {
     $ok = (-not $u.TimedOut) -and ($u.ExitCode -eq 0) -and (Test-QtUnameLooksLikeVersion -Text $u.StdOut)
 
     # 4. 注销 kcheck(不论成败,§2.6.6 不变量②)
-    Remove-QtKCheck -Directory $KCheckDirectory | Out-Null
+    $cleanup = Remove-QtKCheck -Directory $KCheckDirectory
+    if (-not $cleanup.Ok) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'KERNEL_ROLLBACK_FAILED'; OfficialKernel = ''; Stage = 'cleanup'; Records = $cleanup.Records; Cleanup = $cleanup }
+    }
 
     if (-not $ok) {
         # Restoring configuration is not proof that the kernel recovery succeeded.
@@ -442,6 +494,8 @@ function Resolve-QtKernelSwitchFailure {
         $msg = ('Removed kernel= from .wslconfig, but qtrade-kcheck still failed its startup probe. ' +
             'Kernel recovery is unverified; this does not establish whether other WSL distributions can start. ' +
             'Original verification reason: {0}. Inspect the saved diagnostics before retrying.' -f $vr)
+    } elseif ($stage -eq 'cleanup') {
+        $msg = 'Kernel rollback cleanup could not complete. Check installation ownership and kcheck removal diagnostics before retrying.'
     } else {
         $msg = ('回滚失败(QTrade 内核验证原因码 {0}):请打开 %USERPROFILE%\.wslconfig 确认没有 kernel= 行,然后重启电脑' -f $vr)
     }

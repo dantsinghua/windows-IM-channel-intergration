@@ -50,6 +50,36 @@ def account_view(row: dict[str, Any], capabilities: list[str]) -> dict[str, Any]
     }
 
 
+def _raw_peer_title(title: str) -> bool:
+    """会话标题如果只是 wxid、群 id 或纯号码，不能拿来当对方昵称。"""
+    if title.endswith("@chatroom") or title.endswith("@openim") or title.startswith("wxid_"):
+        return True
+    return title.isdigit() and len(title) >= 5
+
+
+def sender_display_name(row: dict[str, Any]) -> Optional[str]:
+    """自己发出的消息用本账号昵称；私聊收到的、库里没有发送人名时用会话标题。
+
+    群消息没有发送人名时不拿群名充数。昵称未采到时用账号名称，避免显示成未知发送人。
+    """
+    stored = str(row.get("sender_name") or "").strip()
+    if stored:
+        return stored
+    is_self = bool(row.get("is_self")) or row.get("dir") == "out"
+    if is_self:
+        nick = str(row.get("account_self_nick") or "").strip()
+        if nick:
+            return nick
+        label = str(row.get("account_label") or "").strip()
+        return label or None
+    if row.get("session_kind") == "private":
+        title = str(row.get("session_name") or "").strip()
+        native = str(row.get("session_native_id") or "").strip()
+        if title and title != native and not _raw_peer_title(title):
+            return title
+    return None
+
+
 def message_view(row: dict[str, Any]) -> dict[str, Any]:
     try:
         media = json.loads(row.get("media_json") or "[]")
@@ -60,7 +90,7 @@ def message_view(row: dict[str, Any]) -> dict[str, Any]:
         "session": {"id": row["session_id"], "name": row.get("session_name"), "kind": row.get("session_kind")},
         "dir": row["dir"], "type": row["type"], "state": row["state"],
         "text": row.get("text"), "text_len": row.get("text_len"), "fingerprint": row.get("fingerprint"),
-        "media": media, "sender": {"id": row.get("sender_id"), "name": row.get("sender_name")}, "self": bool(row.get("is_self")),
+        "media": media, "sender": {"id": row.get("sender_id"), "name": sender_display_name(row)}, "self": bool(row.get("is_self")),
         "ts": _iso(row["ts_ms"]), "received_at": _iso(row["received_ms"]), "source": row["source"],
         "revoked": bool(row.get("revoked")), "raw_ref": row.get("raw_ref"),
         "confirmed_by": row.get("confirmed_by"), "trace_id": row.get("trace_id"),

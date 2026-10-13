@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 from typing import Any
 
-from . import require_windows, run_text
+from . import require_windows
 
 CRYPTPROTECT_LOCAL_MACHINE = 0x4
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
@@ -68,22 +67,37 @@ class WinCrypto:
 
     # ---------------------------------------------------------------- ACL
     def tighten_acl(self, path: str) -> None:
-        """继承关闭 + 只留 SYSTEM / Administrators 完全控制(05 §2.2.1)。用 ``icacls``,避免拖 pywin32 的 SD 组装。"""
+        """Use well-known SIDs and verify the protected DACL after writing."""
         require_windows("ACL 收紧")
-        subprocess.run(["icacls", path, "/inheritance:r"], check=True, capture_output=True)
-        subprocess.run(["icacls", path, "/grant:r", "SYSTEM:(F)", "/grant:r", "Administrators:(F)"],
-                       check=True, capture_output=True)
+        import win32security
+        sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)", win32security.SDDL_REVISION_1)
+        win32security.SetNamedSecurityInfo(
+            path, win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, sd.GetSecurityDescriptorDacl(), None)
+        if not self.acl_is_tight(path):
+            raise PermissionError("Vault ACL verification failed")
 
     def acl_is_tight(self, path: str) -> bool:
         """自检:除 SYSTEM / Administrators 外还有别的主体 ⇒ 判「已放宽」(→ ``VAULT_ENTROPY_MISSING``)。"""
         require_windows("ACL 自检")
-        out = run_text(["icacls", path], timeout=30).stdout
-        allowed = ("NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators", "SYSTEM", "Administrators")
-        for line in out.splitlines()[1:]:
-            line = line.strip()
-            if not line or line.startswith("Successfully") or ":" not in line:
-                continue
-            who = line.split(":", 1)[0].strip()
-            if who and not any(who.endswith(a) for a in allowed):
+        import win32security
+        try:
+            sd = win32security.GetNamedSecurityInfo(path, win32security.SE_FILE_OBJECT,
+                                                   win32security.DACL_SECURITY_INFORMATION)
+            control, _ = sd.GetSecurityDescriptorControl()
+            if not control & 0x1000:  # SE_DACL_PROTECTED
                 return False
-        return True
+            acl = sd.GetSecurityDescriptorDacl()
+            if acl is None or acl.GetAceCount() != 2:
+                return False
+            principals = set()
+            for index in range(acl.GetAceCount()):
+                (kind, flags), mask, sid = acl.GetAce(index)
+                if kind != 0 or flags != 0 or mask != 0x1F01FF:  # ACCESS_ALLOWED, FILE_ALL_ACCESS
+                    return False
+                principals.add(win32security.ConvertSidToStringSid(sid))
+            return principals == {"S-1-5-18", "S-1-5-32-544"}
+        except Exception:
+            return False

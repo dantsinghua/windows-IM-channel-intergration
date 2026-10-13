@@ -459,7 +459,8 @@ describe('业务线②管理线:#78 自检 202 → 轮询到终态', () => {
     for (const row of rows) expect(['ok', 'warn', 'error', 'skip']).toContain(row.level)
     for (const row of rows.filter((x) => x.level === 'skip')) {
       expect(row.message ?? '', 'skip 档说明列甩了英文枚举').not.toMatch(/SKIPPED/)
-      expect(row.message ?? '', 'skip 档要写「未探测」').toContain('未探测')
+      // The result column renders the skip status; this field explains the concrete reason.
+      expect((row.message ?? '').trim(), 'skip 档必须提供具体说明').not.toBe('')
     }
     if (d.redroid_boot_ms === null) {
       expect(rows.find((x) => x.item === 'redroid_boot')?.level, '没跑成的项不得标 ok').not.toBe('ok')

@@ -197,6 +197,8 @@ class AgentApp:
         self.reclaimer: JobsReclaimer
         self.endpoint_probe: PublicEndpointProbe
         self._started = False
+        self._winagent_alert_settled = False
+        self._dockerd_alert_settled = False
 
     # ------------------------------------------------------------------ 装配
     def open(self) -> "AgentApp":
@@ -217,7 +219,8 @@ class AgentApp:
         # (注了假 adb/假容器的开发容器与测试一律不装 —— 它们一个读 /proc、一个写 /etc,都不该在测试里碰真机)
         real_host = self._adb is None and self._containers is None
         self.deployment_disks = self._deployment_disks_arg if self._deployment_disks_arg is not None else (
-            DeploymentDiskReader(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__), self.data_dir)
+            DeploymentDiskReader(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__), self.data_dir,
+                                 windows_probe=self.winagent.deployment_volume_probe)
             if real_host else None)
         self.wsl_env_reader = self._wsl_env_reader_arg or (WslEnvReader() if real_host else None)
         # 🔴 docker_proxy 只写 drop-in、**不重启 dockerd**(sysenv.DockerProxyApplier 的 last_result.restart_required)
@@ -359,12 +362,25 @@ class AgentApp:
         self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
         self.scheduler.register("media_fetch", 5, self.media_tick)                                                             # 02 §2.8.2
         # 询价下行：环境变量不齐则 inbox 为 None，本轮空转，不连 OSS、不发企点。
-        self.xunjia_inbox = XunjiaInbox.from_env(self.store, sender, clock=self.clock)
+        from .ossbox.oss_http import OssV1Box
+        from .ossbox.settings import OssboxSettings
+        self.oss_settings = OssboxSettings(self.store, self.vault)
+        self._oss_sender = sender
+        self.oss_start_error = ""
+        try:
+            # A saved page profile is authoritative, including missing/invalid data.
+            # Its Vault access is asynchronous and happens before scheduler startup.
+            oss_box = OssV1Box.from_env() if not self.oss_settings.has_saved() else None
+        except ValueError:
+            log.warning("对象存储配置无效，询价轮询与目录发布未启用")
+            oss_box = None
+        self.xunjia_inbox = (XunjiaInbox.from_env(self.store, sender, clock=self.clock, box=oss_box)
+                             if oss_box is not None else None)
         self.scheduler.register("xunjia_inbox", POLL_INTERVAL_SEC, self.xunjia_inbox_tick, run_immediately=True)
         from .ossbox.catalog_publish import CatalogPublisher
-        self.catalog_publisher = CatalogPublisher.from_env(
-            self.store, os.path.join(self.data_dir, "catalog-publish.json"),
-        )
+        self.catalog_publisher = (CatalogPublisher.from_env(
+            self.store, os.path.join(self.data_dir, "catalog-publish.json"), box=oss_box,
+        ) if oss_box is not None else None)
         self.scheduler.register("catalog_publish", 60, self.catalog_publish_tick)
         return self
 
@@ -390,7 +406,7 @@ class AgentApp:
         if publisher is None:
             return
         try:
-            await asyncio.to_thread(publisher.publish_once)
+            await publisher.publish()
         except Exception:
             log.exception("目录分片上传失败")
 
@@ -764,7 +780,12 @@ class AgentApp:
                 self.pool.set_windows(known=False)
                 self.pressure.evaluate(None)                                   # 读不到整机内存 = unknown,不阻断
             return
-        self.alerts.resolve(H02_WINAGENT_API_DOWN, subject="host")            # ping 通即恢复(去重键翻转才发事件)
+        if not self._winagent_alert_settled:
+            # 重启会清空内存告警，但旧 firing 仍在 outbox；首次真实成功补齐恢复。
+            self.alerts.settle(H02_WINAGENT_API_DOWN, subject="host")
+            self._winagent_alert_settled = True
+        else:
+            self.alerts.resolve(H02_WINAGENT_API_DOWN, subject="host")
         h = await self.winagent.health()
         if h is None:
             self.health.set_winagent(True, version=self.winagent.last_version)
@@ -774,8 +795,9 @@ class AgentApp:
         modules = h.get("modules") or {}
         self.pool.set_windows(total_mb=host.get("total_mb"), available_mb=host.get("available_mb"),
                               wechat_enabled=(modules.get("wechat") == "enabled"), known=True)
-        if host.get("wsl_vm_mb"):
-            self.pool.set_wsl_total(int(host["wsl_vm_mb"]), source="winagent")
+        # R6-98:`host.wsl_vm_mb` 是 WinAgent.monitor 量到的 vmmem 进程 RSS(实占、随时波动),**不是** `.wslconfig memory=`;
+        # 真机曾被它把 wsl.total_mb 从 28050 写成 5691,叠加校准出的 reserved 5375 ⇒ 剩余 316,企点永远 409。
+        # wsl 池 total 由 Pool 启动时读 VM 内 MemTotal 刷新(02 §2.2.5),这里不再覆盖。
         # E-19 内存水位:整机可用内存 → warn/critical;critical 时只对显式开了 auto_stop_on_pressure 的账号按 LRU 逐停
         self.pressure.evaluate(host.get("available_mb"))
         await self.pressure.enforce()
@@ -785,7 +807,11 @@ class AgentApp:
         self.health.set_dockerd(ok)
         # 02 §3.7 登记 `H03_DOCKERD_DOWN`(crit,subject=wsl,事件族 alert);同 H02,与 `checks.H03` 同源。
         if ok:
-            self.alerts.resolve(H03_DOCKERD_DOWN, subject="wsl")
+            if not self._dockerd_alert_settled:
+                self.alerts.settle(H03_DOCKERD_DOWN, subject="wsl")
+                self._dockerd_alert_settled = True
+            else:
+                self.alerts.resolve(H03_DOCKERD_DOWN, subject="wsl")
         else:
             self.alerts.firing(H03_DOCKERD_DOWN, subject="wsl")
 
@@ -807,10 +833,41 @@ class AgentApp:
     # ------------------------------------------------------------------ 生命周期
     async def start(self, *, recover: bool = True) -> None:
         if not self._started:
+            await self._configure_saved_ossbox()
             await self.scheduler.start()
             self._started = True
             if recover:
                 asyncio.create_task(self.accounts.recover(), name="recover")
+
+    async def _configure_saved_ossbox(self) -> None:
+        from .ossbox.catalog_publish import CatalogPublisher
+        from .ossbox.settings import OssboxSettingsError
+
+        if not self.oss_settings.has_saved():
+            return
+        self.xunjia_inbox = None
+        self.catalog_publisher = None
+        try:
+            configured = await self.oss_settings.runtime()
+            if configured is None:
+                return
+            saved, box = configured
+            if box is not None:
+                inbox = XunjiaInbox.from_env(self.store, self._oss_sender, clock=self.clock,
+                    box=box, workbench_id=saved["workbench_id"])
+                # A new destination must not reuse the former destination's upload hashes.
+                state = os.path.join(self.data_dir, "catalog-publish-" + saved["revision"] + ".json")
+                publisher = CatalogPublisher.from_env(self.store, state,
+                    box=box, workbench_id=saved["workbench_id"])
+                self.xunjia_inbox, self.catalog_publisher = inbox, publisher
+            self.oss_settings.applied_revision = saved["revision"]
+            self.oss_start_error = ""
+        except OssboxSettingsError as exc:
+            self.oss_start_error = exc.reason
+            log.warning("Page OSS configuration unavailable; services disabled (%s)", exc.reason)
+        except Exception:
+            self.oss_start_error = "ossbox_configuration_unavailable"
+            log.warning("Page OSS configuration unavailable; services disabled")
 
     async def stop(self) -> None:
         """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""

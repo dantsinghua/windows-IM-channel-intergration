@@ -107,6 +107,12 @@ def parse_iss_consts(iss: str, prefix: str) -> dict[str, str]:
     return out
 
 
+def parse_iss_switches(iss: str) -> set[str]:
+    constants = {v.strip().strip("'").rstrip("=") for v in parse_iss_consts(iss, "SW_QT_").values()}
+    direct = set(re.findall(r"GetSwitch(?:Bool|Value|Int)\('(/QT_[A-Z_]+)=", iss))
+    return constants | direct
+
+
 def parse_psm1_exit_table(psm1: str) -> dict[str, int]:
     block = _slice(psm1, "$script:QtExitTable = [ordered]@{", "\n}")
     out: dict[str, int] = {}
@@ -265,14 +271,14 @@ def test_spec_switches_parsed(doc03: str) -> None:
 
 def test_iss_declares_every_spec_switch(doc03: str, iss: str) -> None:
     spec = parse_qt_switches(doc03)
-    declared = {v.strip().strip("'").rstrip("=") for v in parse_iss_consts(iss, "SW_QT_").values()}
+    declared = parse_iss_switches(iss)
     missing = sorted(spec - declared)
     assert not missing, f".iss 没有声明 docs/03 §3.4 里的开关:{missing}"
 
 
 def test_iss_switches_are_all_documented(doc03: str, iss: str) -> None:
     """反向:.iss 声明的每个开关都必须在 docs/03 的某处出现,不许自造。"""
-    declared = {v.strip().strip("'").rstrip("=") for v in parse_iss_consts(iss, "SW_QT_").values()}
+    declared = parse_iss_switches(iss)
     undocumented = sorted(s for s in declared if s not in doc03)
     assert not undocumented, f".iss 自造了规格里没有的开关:{undocumented}"
 
@@ -591,9 +597,9 @@ def test_iss_drives_every_state() -> None:
                  "ST_WINAGENT_INSTALLED", "ST_CLIENTS_CHECKED", "ST_SELFTEST_OK", "ST_DONE"):
         assert f"RunStep({step})" in iss_text, f".iss 没有调 RunStep({step})"
     assert "RunStep('KERNEL_SWITCH')" in iss_text
-    assert "RunStep('upgrade')" in iss_text
-    assert "RunStep('repair')" in iss_text
-    assert "RunStep('uninstall')" in iss_text
+    for retired in ("upgrade",):
+        assert f"RunStep('{retired}')" not in iss_text
+    assert "RunStep('clean-reinstall')" in iss_text
     assert "RunStep('diag')" in iss_text
 
 
@@ -604,21 +610,23 @@ def test_iss_has_interactive_branches() -> None:
     assert "我已知晓内核替换的影响" in iss_text
     assert "OptAcceptShutdown := True" in iss_text
     # 同名发行版冲突(§2.7.1;**不提供改名绕过**)
-    assert "WAIT_DISTRO_CONFLICT" in iss_text
-    assert "改名绕过" in iss_text
+    assert "RunStep('clean-reinstall')" in iss_text
+    assert "OptAcceptCleanReinstall := True" in iss_text
+    assert "CLEAN_REINSTALL_CONFIRM_REQUIRED" in iss_text
     # 微信重装引导(红线 8)
     assert "WeChatUserApproved := True" in iss_text
     # 升级期停账号容器也要确认(§2.13 第 1 步)
-    assert "WAIT_SHUTDOWN_CONFIRM" in iss_text
+    assert "GetSwitchBool('/QT_ACCEPT_CLEAN_REINSTALL=', False)" in iss_text
 
 
 # ── 裁决落地 ──────────────────────────────────────────────────────────────
 def test_ruling_1_sfx_disk_maps_to_26() -> None:
     """裁决①:解压前判 6 GB 认偏差;precheck 在引擎前判、解压目录空间不足映射到 26。"""
     cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
-    assert "exit /b 26" in cmd
-    assert "6442450944" in cmd, "6 GB 门槛要写成明确的字节数"
-    assert "Ruling (1)" in cmd, "偏差要在脚本里写明,而不是只在交接里"
+    assert "exit /b 41" in cmd
+    patch = _read_bytes_text(SFX_PATCH)
+    assert "kQTradeExitDiskLow = 26" in patch
+    assert "6442450944" in patch or "6 << 30" in patch or "6) << 30" in patch
     # 可执行行与 rem 行都必须纯 ASCII。SFX 在未知代码页下拉起 .cmd,
     # rem 里的非 ASCII 会在 GBK 误读时吃掉换行,注释碎片被当成命令。
     bad = [
@@ -709,8 +717,11 @@ def test_iss_rejects_arm64_via_x64os(iss: str) -> None:
 
 def test_iss_uninstallrun_has_runonceid(iss: str) -> None:
     """[UninstallRun] 不带 RunOnceId 会被 ISCC 警告;卸载引擎只该在卸载过程中跑一次。"""
-    block = _slice(iss, "[UninstallRun]", "[Code]")
-    assert "RunOnceId:" in block
+    assert "Uninstallable=no" in iss
+    assert "[UninstallRun]" not in iss
+    retired = _slice(read(RUN_STEP), "'uninstall' {", "# ──")
+    assert "UNINSTALL_DISABLED" in retired
+    assert "Write-QtStepResult -Ok $false" in retired
 
 
 def test_iss_uses_existing_inno_api(iss: str) -> None:
@@ -749,8 +760,10 @@ def test_upgrade_wires_image_load_step() -> None:
     `Get-QtUpgradePlan` 判了 `Images` 还不够,upgrade 分支必须真的去 load。"""
     rs = read(RUN_STEP)
     body = _slice(rs, "'upgrade' {", "'repair' {")
-    assert "Invoke-QtDockerLoadImages" in body, "upgrade 分支没接上镜像加载"
-    assert "$plan.Images" in body
+    assert "FULL_INSTALLER_REQUIRED" in body
+    assert "Write-QtStepResult -Ok $false" in body
+    assert "Invoke-QtDockerLoadImages" not in body
+    assert "Invoke-QtUpgrade" not in body
 
 
 def test_old_images_are_never_removed() -> None:
@@ -836,23 +849,20 @@ def test_sfx_config_uses_only_official_keys() -> None:
 
 
 def test_precheck_stages_payload_to_programdata() -> None:
-    r"""官方存根只解到 %TEMP% 且跑完即删,所以 §2.1 要的「解压到 %ProgramData%\QTrade 并留存」
-    必须由 precheck-disk.cmd 搬运完成。"""
+    """R6-102: obsolete official extraction must fail without touching live files."""
     cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
-    assert 'set "QT_DST=%ProgramData%\\QTrade"' in cmd
-    assert "robocopy" in cmd and "/MOVE" in cmd, "要能搬(同卷 move / 已存在则 robocopy /MOVE 合并)"
-    assert "last-exit-code.txt" in cmd, "存根会丢掉退出码,必须落盘供自动化读"
+    code = "\n".join(line for line in cmd.splitlines() if not line.lower().startswith("rem"))
+    assert "exit /b 41" in code
+    assert not re.search(r"(?im)^\s*(?:robocopy|move|copy|call)\b", code)
+    assert "%ProgramData%" not in code
 
 
 def test_precheck_does_not_move_its_own_directory() -> None:
-    r"""🔴 自举陷阱:脚本住在 <src>\install\engine\。
-    把 `install` MOVE 走之后,cmd.exe 就读不到脚本文件了,后面每个 CALL 都死在
-    「The system cannot find the batch label specified」—— 而且是**半搬运**状态。
-    所以 `install` 必须用**复制**,其余顶层项才 MOVE。"""
+    """The retired chain cannot launch the live engine or move its stage."""
     cmd = read(INSTALLER_ROOT / "engine" / "precheck-disk.cmd")
-    assert 'if /I not "%%~nxD"=="install"' in cmd, "install 目录必须被排除在 MOVE 之外"
-    assert re.search(r'robocopy "%QT_SRC%\\install" "%QT_DST%\\install" /E(?! /MOVE)', cmd), \
-        "install 要用 /E 复制,不能带 /MOVE"
+    code = "\n".join(line for line in cmd.splitlines() if not line.lower().startswith("rem"))
+    assert not re.search(r"(?im)^\s*(?:robocopy|move|copy|call|start)\b", code)
+    assert "qtrade-setup-engine.exe" not in code
 
 
 def test_precheck_has_no_install_target_backdoor() -> None:
@@ -957,8 +967,10 @@ def test_patch_adds_installpath_key() -> None:
     added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
     assert 'GetTextConfigValue(pairs, "InstallPath")' in added, \
         "补丁没有新增读取 InstallPath 的代码"
-    assert "QTrade_ExpandInstallPath" in added, "InstallPath 要支持 %ProgramData% 这类环境变量展开"
-    assert "ExpandEnvironmentStringsW" in added
+    assert "SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA" in added
+    assert 'wcscmp(configuredPath.Ptr(), L"%ProgramData%\\\\QTrade-Staging") != 0' in added
+    assert "CoCreateGuid(&id)" in added
+    assert "ExpandEnvironmentStringsW" not in added
 
 
 def test_patch_propagates_child_exit_code() -> None:
@@ -1124,16 +1136,12 @@ def test_restore_data_is_a_paired_arg_not_a_qt_switch(doc03: str) -> None:
 
 
 def test_r6_58_cm_selfbuilt_stub_is_primary_and_fallback_warns(doc03: str) -> None:
-    """🔴 R6-58 (cm):外壳的**正路**是自编存根;官方存根只是回退路径,
-    而且「构建脚本必须在用回退路径时显式打出这条警告,不许静默降级」。"""
-    assert "QTradeSD.sfx" in doc03, "规格已把自编存根写成正路"
+    """R6-102 rejects the obsolete official stub instead of degrading staging."""
+    assert "QTradeSD.sfx" in doc03
     b = read(INSTALLER_ROOT / "build" / "build.ps1")
-    # 缺省 -Stub auto:有自编存根就用自编的
-    assert "$Stub -eq 'auto' -and (Test-Path -LiteralPath $QtStubFile)" in b, \
-        "auto 模式没有优先选自编存根"
-    # 回退时必须打警告,且点名「退出码不可作判据」
-    assert "不透传退出码" in b and "last-exit-code.txt" in b, \
-        "走官方存根回退路径时没有显式警告 —— 规格不许静默降级"
+    assert "$Stub -eq 'official') { throw" in b
+    assert "-Candidates @($QtStubFile)" in b
+    assert b.index("$Stub -eq 'official') { throw") < b.index("-Candidates @($QtStubFile)")
 
 
 def test_r6_58_cn_sfx_extract_no_longer_maps_to_123(doc03: str) -> None:
@@ -1197,7 +1205,7 @@ def test_payload_staged_hardens_acl_before_everything_else() -> None:
     位置必须在「已完成就跳过」之前 —— 否则**续跑**那条路不会收紧;
     它幂等(先读回比对,已经对了就一个字节都不写),放在前面成本只有一次 Get-Acl。"""
     step = read(INSTALLER_ROOT / "engine" / "run-step.ps1")
-    branch = _slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest")
+    branch = _slice(step, "$aclRes = Set-QtInstallRootAcl -Path $paths.Root", "$manifest = Read-QtManifest")
     i_acl = branch.index("Set-QtInstallRootAcl")
     i_skip = branch.index("Test-QtStepComplete")
     assert i_acl < i_skip, "ACL 收紧跑到了「跳过」判断后面,续跑时就不会执行"
@@ -1219,7 +1227,8 @@ def test_acl_failure_blocks_the_install() -> None:
 
     # 安装根(PAYLOAD_STAGED)与内核文件(KERNEL_STAGED)两处都要阻断
     for marker, where in (("'PAYLOAD_STAGED' {", "安装根"), ("'KERNEL_STAGED' {", "内核文件")):
-        branch = _slice(step, marker, "Write-QtStepResult -Ok $true")
+        start = "$aclRes = Set-QtInstallRootAcl -Path $paths.Root" if marker == "'PAYLOAD_STAGED' {" else marker
+        branch = _slice(step, start, "Write-QtStepResult -Ok $true")
         assert "E_INSTALL_ACL_HARDEN_FAILED" in branch, f"{where}的 ACL 失败没有用 31 号码阻断"
         assert "ACL_HARDEN_FAILED" in branch, f"{where}缺 ACL_HARDEN_FAILED 原因码"
         assert "Write-QtLog -Level 'ERROR'" in branch, f"{where}的 ACL 失败没有 ERROR 日志"
@@ -1227,7 +1236,7 @@ def test_acl_failure_blocks_the_install() -> None:
     # 失败前必须先把结果落进 install_state —— 否则诊断包里看不到为什么装不上。
     # ⚠️ 比位置前**必须先去注释**:说明文字里也写着 E_INSTALL_ACL_HARDEN_FAILED,
     #    照原文找 index 会命中注释而不是代码。
-    payload = strip_comments(_slice(step, "'PAYLOAD_STAGED' {", "Read-QtManifest"))
+    payload = strip_comments(_slice(step, "$aclRes = Set-QtInstallRootAcl -Path $paths.Root", "$manifest = Read-QtManifest"))
     assert payload.index("Set-QtAclHardened") < payload.index("E_INSTALL_ACL_HARDEN_FAILED"), \
         "先退出再落状态,诊断包就带不走原因了"
 
@@ -1328,6 +1337,7 @@ def test_patch_embeds_explicit_manifest() -> None:
     assert files == [
         "CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp",
         "CPP/7zip/Bundles/SFXSetup/ExtractEngine.h",
+        "CPP/7zip/Bundles/SFXSetup/QTradeStage.h",
         "CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp",
         "CPP/7zip/Bundles/SFXSetup/qtrade-sfx.manifest",
         "CPP/7zip/Bundles/SFXSetup/resource.rc",

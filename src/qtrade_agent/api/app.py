@@ -16,6 +16,7 @@ import os
 import re
 import time
 from datetime import datetime
+from urllib.parse import quote
 from email.utils import formatdate
 from typing import Any, Optional
 
@@ -601,6 +602,13 @@ def create_api(agent) -> FastAPI:
         p = _principal(request, "write")
         require_account(p, account_id)
         request.state.account_id = account_id
+        backend = getattr(agent, "stream_backend", None)
+        drop = getattr(backend, "drop_account", None)
+        if drop is not None:
+            try:
+                await drop(account_id)
+            except Exception as e:
+                log.warning("重启前拆画面通道失败 account=%s: %r", account_id, e)
         res = await agent.accounts.restart(account_id, actor=p.actor)
         return JSONResponse(status_code=202, content={"ok": True, **res})
 
@@ -1661,11 +1669,22 @@ def create_api(agent) -> FastAPI:
         row = _runtime_action_guard(p, account_id, ("qq",))
         request.state.account_id = account_id
         body = await _json_or_empty(request)
-        minutes = int(body.get("minutes") or cfg.runtime.webui_temp_minutes)
-        until = agent.clock() + minutes * 60_000
+        # persist：一直开着，直到用户自己关。不写到期时间，到期任务就不会再重启容器。
+        if body.get("persist"):
+            until = None
+        else:
+            minutes = int(body.get("minutes") or cfg.runtime.webui_temp_minutes)
+            until = agent.clock() + minutes * 60_000
         res = await agent.accounts.set_webui(account_id, True, until_ms=until, actor=p.actor)
         port = row.get("webui_port") or (16300 + int(row["seq"]))
-        return {"ok": True, "url": f"http://127.0.0.1:{port}/", "until": iso8601(res["until_ms"]), **res}
+        if not await agent.runtime.wait_napcat_webui(port):
+            raise ApiError(503, "NOT_READY", "NapCat 工作台尚未开始应答，请稍后再打开", reason="napcat_webui_unavailable", retryable=True)
+        until_ms = res.get("until_ms")
+        url = f"http://127.0.0.1:{port}/"
+        token = await agent.runtime.napcat_webui_access_token(row)
+        if token:
+            url = f"http://127.0.0.1:{port}/webui?token={quote(token)}"
+        return {"ok": True, "url": url, "until": iso8601(until_ms) if until_ms else None, **res}
 
     @app.post(f"{API_PREFIX}/accounts/{{account_id}}/webui/close")
     async def webui_close(request: Request, account_id: str):
@@ -1771,8 +1790,57 @@ def create_api(agent) -> FastAPI:
         written: dict[str, int] = {}
         for name, blob in todo:
             written[name] = await _upsert_route_or_503(mail, None if name == "default" else name, None, blob)
+        if isinstance(body.get("enabled"), bool):
+            _apply_mail_enabled(bool(body["enabled"]))
         mail.reload()
         return {"ok": True, "written": written}
+
+    def _apply_mail_enabled(enabled: bool) -> None:
+        """总开关写进当前进程,并只改 agent.toml 的 ``[mail] enabled``,不重写整份配置。"""
+        cfg.mail.enabled = enabled
+        path = getattr(agent, "config_path", None)
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError as exc:
+            log.error("读取 agent.toml 失败,邮件总开关只在本次进程生效: %s", exc)
+            return
+        flag = "true" if enabled else "false"
+        out: list[str] = []
+        in_mail = False
+        wrote = False
+        seen = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if in_mail and not wrote:
+                    out.append(f"enabled = {flag}")
+                    wrote = True
+                in_mail = stripped == "[mail]"
+                seen = seen or in_mail
+            elif in_mail and not wrote and re.match(r"enabled\s*=", stripped):
+                out.append(f"enabled = {flag}")
+                wrote = True
+                continue
+            out.append(line)
+        if in_mail and not wrote:
+            out.append(f"enabled = {flag}")
+        elif not seen:
+            if out and out[-1] != "":
+                out.append("")
+            out.append("[mail]")
+            out.append(f"enabled = {flag}")
+        tmp = f"{path}.mail.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(out) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.error("写回 [mail] enabled 失败,邮件总开关只在本次进程生效: %s", exc)
 
     # ---- 02 §3.4 里此前没有执行体的那批端点(#24/#36/#51/#74/#75/#78/#80/#84/#85/#86/#87/#90~#93)。
     #      🔴 注册点**必须在 `/settings/{group}` 兜底路由之前**:`/settings/api-clients` 与 `{group}` 都是
@@ -1785,6 +1853,9 @@ def create_api(agent) -> FastAPI:
 
     # ---- #88/#89 的 `{group}` 兜底路由必须**排在全部具体 `/settings/*` 路由之后**(FastAPI 按注册顺序匹配,
     #      否则 `/settings/webhooks` 会先被 `{group}` 吃掉)
+    from ..ossbox.routes import register_ossbox_settings
+    register_ossbox_settings(app, agent=agent, prefix=API_PREFIX, principal=_principal)
+
     @app.get(f"{API_PREFIX}/settings/{{group}}")
     async def get_settings_group(request: Request, group: str):
         """#88:分组读;``api``/``mail`` 组要 A,其余 R。``*_ref`` 只回引用、密码类字段不出现。"""
@@ -2444,7 +2515,8 @@ def create_api(agent) -> FastAPI:
                 for r in rows:
                     last_seq = r["seq"]
                     frame = {"event": r["event"], "seq": r["seq"], "ts": iso8601(r["ts_ms"]), "trace_id": r["trace_id"], "account_id": r["account_id"],
-                             "channel": r["channel"], "payload": r["payload"]}       # 00 §7.5 Event:ts ISO 8601(00 §6)
+                             "channel": r["channel"], "payload": r["payload"],
+                             "replayed": r["seq"] <= subscribed_after}       # 仅 WS 传输层标记，不进入持久 payload
                     if allowed(frame):
                         frame["payload"] = agent.events.live_payload(frame, subscribed_after=subscribed_after)
                         await ws.send_json(frame)

@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 from typing import Optional
 
 from ..backends import ProcInfo
-from . import require_windows
+from . import require_windows, run_text
 
 
 class WinProc:
@@ -17,7 +18,20 @@ class WinProc:
 
     async def stop(self, pid: int, *, force: bool = False) -> None:
         args = ["taskkill", "/PID", str(pid)] + (["/F"] if force else [])
-        await asyncio.to_thread(subprocess.run, args, capture_output=True)
+        await asyncio.to_thread(run_text, args, timeout=5)
+
+    async def interrupt(self, pid: int) -> bool:
+        """在短命辅助进程里附着目标控制台,不改变常驻用户代理的控制台状态。"""
+        require_windows("CTRL_BREAK")
+        if type(pid) is not int or not 0 < pid < 0xFFFFFFFF:
+            raise ValueError("Invalid console process id")
+        args = ([sys.executable, "--console-break", str(pid)] if getattr(sys, "frozen", False)
+                else [sys.executable, "-m", "qtrade_winagent.win.console_signal", str(pid)])
+        try:
+            result = await asyncio.to_thread(run_text, args, timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        return result.returncode == 0
 
     def find(self, name: str) -> list[ProcInfo]:
         """按映像名找进程。🔴 只按 ``name`` 扫全表,``memory_info``/``create_time`` 只对命中的几条取:

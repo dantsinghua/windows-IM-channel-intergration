@@ -230,8 +230,8 @@ async def test_key_fail_degrades_and_retries_key_at_most_three_times_per_hour(ri
     row = rig.store.get_account_full("wx01")
     assert row["state"] == "degraded" and row["state_code"] == "KEY_FAIL"
     assert rig.wechat.key_retry_calls == 3
-    sev = [e["payload"]["severity"] for e in rig.events_of("alert") if e["payload"]["code"] == "ACCOUNT_OFFLINE"]
-    assert "error" in sev
+    # 05 §2.5.4:取钥耗尽不是掉线,不得发 ACCOUNT_OFFLINE(旧实现把 KEY_FAIL 耗尽记成这条,已停的 wx01 会一直挂在告警抽屉)。
+    assert [e for e in rig.events_of("alert") if e["payload"]["code"] == "ACCOUNT_OFFLINE"] == []
 
 
 async def test_key_fail_on_never_completed_first_login_is_not_auto_retried(rig):

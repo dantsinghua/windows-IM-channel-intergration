@@ -29,6 +29,41 @@ export interface Envelope<T> {
   [k: string]: unknown
 }
 
+/** STS 配置只返回凭据是否已保存，永不返回密钥或临时凭据。 */
+export interface OssboxSettingsData {
+  sts_url: string
+  allow_http: boolean
+  endpoint: string
+  bucket: string
+  workbench_id: string
+  auth_key_configured: boolean
+  sm4_key_configured: boolean
+  saved: boolean
+}
+
+export interface OssboxSettingsResponse {
+  data: OssboxSettingsData
+  restart_required: boolean
+  inquiry_configured: boolean
+  catalog_configured: boolean
+}
+
+export interface OssboxSettingsInput {
+  sts_url: string
+  allow_http: boolean
+  endpoint: string
+  bucket: string
+  workbench_id: string
+  auth_key?: string
+  sm4_key?: string
+}
+
+export interface OssboxAuthenticationResult {
+  authenticated: boolean
+  bucket: string
+  expiration: string
+}
+
 /* ── Account(00 §7.1;02「Account 序列化」R6-4) ── */
 
 export interface AccountRuntime {
@@ -707,6 +742,10 @@ export interface SelftestRun {
   run_id?: string | null
   redroid_boot_ms?: number | null
   napcat_ok?: boolean | null
+  /** 已在运行的 NapCat 容器，例如「qq92 运行中」 */
+  napcat_detail?: string | null
+  /** 日常检查看到的企点 / QQ 容器。不是安装时那只一次性容器。 */
+  account_containers?: { id: string; channel: string; running: boolean }[]
   winagent_ok?: boolean | null
   winagent_version?: string | null
   probes?: ProbeRow[]
@@ -793,6 +832,25 @@ export function probeLineZh(r: ProbeRow): string {
   return `${r.target ?? r.side ?? '?'}:${statusZh}${detailZh ? `(${detailZh})` : ''}`
 }
 
+const RUNTIME_REASON_ZH: Record<string, string> = {
+  no_executor: '没有可调用的检查程序',
+  no_qq: '没有已启用的 QQ',
+  install_only: '这是安装时才会启动的一次性容器 qtrade-selftest（端口 16099），测完即删。日常检查不启动它。',
+}
+
+function runtimeRow(item: string, label: string, value: boolean | null | undefined, reason: string | null): SelftestRow {
+  if (reason === 'install_only' || reason === 'no_qq') {
+    return { item, label, level: 'skip', message: RUNTIME_REASON_ZH[reason] }
+  }
+  return boolRow(item, label, value, reason ? (RUNTIME_REASON_ZH[reason] ?? reason) : null)
+}
+
+function installContainerRow(bootMs: number | null | undefined): SelftestRow | null {
+  // 只有安装向导真的启动过 qtrade-selftest 才有耗时。日常检查不启动它，结果里不能留「未探测」。
+  if (bootMs == null) return null
+  return { item: 'redroid_boot', label: '一次性安装容器', level: 'ok', message: `${bootMs} ms` }
+}
+
 function boolRow(item: string, label: string, v: boolean | null | undefined, skipped: string | null): SelftestRow {
   if (v === true) return { item, label, level: 'ok' }
   if (v === false) return { item, label, level: 'error', message: skipped ?? '检查未通过' }
@@ -805,18 +863,29 @@ export function selftestRows(run: SelftestRun | SelftestRow[] | null | undefined
   if (!run) return []
   if (Array.isArray(run)) return run
   const why = (step: string): string | null => run.skipped?.find((x) => x.step === step)?.reason ?? null
-  const rows: SelftestRow[] = [
-    run.redroid_boot_ms != null
-      ? { item: 'redroid_boot', label: '临时容器启动', level: 'ok', message: `${run.redroid_boot_ms} ms` }
-      : boolRow('redroid_boot', '临时容器启动', null, why('redroid_boot')),
-    boolRow('napcat', 'NapCat 可用', run.napcat_ok, why('napcat')),
+  const napcat = runtimeRow('napcat', 'NapCat 可用', run.napcat_ok, why('napcat'))
+  if (run.napcat_detail) napcat.message = run.napcat_detail
+  const containers = run.account_containers ?? []
+  const rows: SelftestRow[] = [napcat]
+  const boot = installContainerRow(run.redroid_boot_ms)
+  if (boot) rows.unshift(boot)
+  if (containers.length) {
+    const up = containers.filter((row) => row.running)
+    rows.push({
+      item: 'account_containers',
+      label: '账号容器',
+      level: up.length === containers.length ? 'ok' : up.length ? 'warn' : 'error',
+      message: containers.map((row) => `${row.id} ${row.running ? '运行中' : '未运行'}`).join('、'),
+    })
+  }
+  rows.push(
     boolRow(
       'winagent',
       `WinAgent 健康${run.winagent_version ? `(${run.winagent_version})` : ''}`,
       run.winagent_ok,
       why('winagent'),
     ),
-  ]
+  )
   const probes = run.probes ?? []
   if (probes.length) {
     /**
@@ -945,6 +1014,8 @@ export interface QtEvent<P = unknown> {
   event: EventKind
   ts: string
   seq: number
+  /** WS 订阅时的服务端 seq 分界；旧服务端可能缺失，不能据此猜测实时通知。 */
+  replayed?: boolean
   trace_id?: string
   account_id?: string
   channel?: Channel

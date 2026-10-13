@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from xml.sax.saxutils import quoteattr
 
@@ -426,6 +427,19 @@ async def test_中文换行表情占位原样经base64送达(rig):
     out = await ui.send(acct(), "10001", text)
     # 送出去的是原文(base64,不经 shell 转义);回读比对按 XML 属性规范化(换行→空格)后逐字比
     assert out.ok is True and adb.typed == [text]
+
+
+async def test_回读仍带换行但规范化后一致_点发送(rig):
+    """真机回读把换行留在 text 里。和原文规范化后一致就要点发送，不能当成没打上。"""
+    ui, adb, _ = rig
+    text = "第一行\n第二行"
+    adb.fg = CHAT_ACT
+    adb.dumps = [CHAT_TREE, CHAT_TREE, CHAT_TREE, chat_tree_with_input(text), CHAT_TREE, CHAT_TREE]
+    ui._store = _FakeStore({"10001": "张三-华泰固收"})
+    out = await ui.send(acct(), "10001", text)
+    assert out.ok is True, out
+    assert adb.typed == [text]
+    assert adb.taps[-1] == "input tap 660 1085"
 
 
 async def test_输入回读不符_不点发送(rig):

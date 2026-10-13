@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """引擎 ``qtrade-setup-engine.iss`` 的编译门 + [Code] 段保留字静态守卫。
 
 来由:验收 X5(2026-09-26)—— ``JsonStr`` 用 Pascal Script 保留字 ``Out`` 作局部变量名,
@@ -307,7 +307,7 @@ def _assert_engine_version(exe: Path, pp_text: str, version: str) -> None:
     assert prod_ver == f"{version}.0", f"VersionInfo 产品版本 {prod_ver},期望 {version}.0"
     assert re.search(rf"^AppVersion={re.escape(version)}\s*$", pp_text, re.M), "预处理后 AppVersion 不是命令行版本"
     assert re.search(rf"^VersionInfoVersion={re.escape(version)}\s*$", pp_text, re.M), "预处理后 VersionInfoVersion 不是命令行版本"
-    assert f"',\"package_version\":\"' + '{version}' + '\"'" in pp_text, "[Code] 写进 package_version 的常量不是命令行版本"
+    assert f"',\"package_version\":' + JsonQuoted('{version}')" in pp_text, "[Code] 写进 package_version 的常量不是命令行版本"
 
 
 def test_engine_version_overridable_from_command_line(tmp_path: Path) -> None:
@@ -342,3 +342,11 @@ def test_engine_version_define_guarded_by_ifndef() -> None:
                 f"第 {lineno} 行 `{s}` 不在 `#ifndef EngineVersion` 块内 —— 会盖掉 build.ps1 的 /DEngineVersion(B1)"
             )
     assert found, ".iss 里没有 `#define EngineVersion` 默认值"
+
+
+def test_version_guard_rejects_wrong_json_version_even_when_pe_version_matches(monkeypatch):
+    monkeypatch.setattr(__import__(__name__), "_pe_fixed_versions", lambda _: ("9.9.9.0", "9.9.9.0"))
+    pp = 'AppVersion=9.9.9\nVersionInfoVersion=9.9.9\n'
+    pp += "S := S + ',\"package_version\":' + JsonQuoted('8.8.8');"
+    with pytest.raises(AssertionError, match="package_version"):
+        _assert_engine_version(Path("unused-fixture.exe"), pp, "9.9.9")

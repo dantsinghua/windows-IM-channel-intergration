@@ -71,7 +71,7 @@ Describe 'B6 端到端(验证 → 回滚 → 文案),Invoke-QtWsl 打桩' {
 
     BeforeEach {
         Mock -ModuleName QTrade.Kernel Start-QtSleep { }
-        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { }
+        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
         Mock -ModuleName QTrade.Kernel Test-QtPath { $false }
         $script:Cfg = Join-Path $TestDrive 'e2e.wslconfig'
     }
@@ -168,7 +168,7 @@ Describe '预演 #16:Save-QtKCheckDmesg' {
 Describe '预演 #16:诊断包带上注销前抓的 dmesg,不再只写占位句' {
 
     It 'kcheck 已注销、日志目录有 kcheck-dmesg-*.txt → 包里有原文件,kcheck-dmesg.txt 含其内容' {
-        $root = Join-Path ([IO.Path]::GetTempPath()) ('qt-kfail-diag-' + [Guid]::NewGuid().ToString('N'))
+        $root = Join-Path $TestDrive ('qt-kfail-diag-' + [Guid]::NewGuid().ToString('N'))
         foreach ($d in @('install', 'logs', 'kernel')) { New-Item -ItemType Directory -Path (Join-Path $root $d) -Force | Out-Null }
         [IO.File]::WriteAllText((Join-Path $root 'install\install_state.json'), '{"state":"FAILED"}')
         [IO.File]::WriteAllText((Join-Path $root 'logs\kcheck-dmesg-20260926-120000.txt'), "# head`nMARK-DMESG-LINE hv_vmbus: probe failed")

@@ -523,7 +523,7 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         try:
             session = await backend.open(account_id, profile=profile)
         except Exception as e:
-            log.warning("#34 打开画面流失败 account=%s: %s", account_id, e)
+            log.warning("#34 打开画面流失败 account=%s: %r", account_id, e)
             await _ws_close(ws, WS_CLOSE_NOT_READY, f"画面流打开失败:{e}")
             return
         if is_focus:
@@ -563,6 +563,12 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
                         except Exception:
                             pass
                         return
+                # 通道结束(账号重启拆掉画面服务)时把这条空连接关掉。
+                # 页面才会重连，而不是停在硬解 0 帧的黑画布上。
+                try:
+                    await ws.close(code=1001, reason="画面通道已关闭")
+                except Exception:
+                    pass
 
             pump = asyncio.create_task(pump_frames(), name=f"stream:{account_id}:{conn_id}")
             while True:

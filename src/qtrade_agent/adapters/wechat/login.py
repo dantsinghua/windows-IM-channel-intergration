@@ -95,6 +95,8 @@ class WechatLoginFlow:
                 await self._sleep(self._status_interval_s)
                 continue
             phase = str(st.get("phase") or "idle")
+            if st.get("login_session_id") and st["login_session_id"] != ls:
+                return await self._fail_stopped(aid, ls, "微信登录会话已变化，本次尝试已结束，请重新开始")
 
             # R6-91:login/start 成功后又回 idle ⇒ 会话代理丢了这次登录会话(崩溃 / 被杀 / 升级重启;用户取消走
             # accounts.login_cancel,会先结束本任务,不会落到这里)。此前不处理,傻等 qr_max_wait_s(30 min)。

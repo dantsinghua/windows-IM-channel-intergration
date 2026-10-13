@@ -160,6 +160,11 @@ APK_SRC="$SOURCE_ROOT/third_party/apk/ADBKeyboard.apk"
 [ -r "$APK_SRC" ] || die "缺 $APK_SRC"
 cp -f "$APK_SRC" "$P/ADBKeyboard.apk"
 APK_VERSION="$(cat "$SOURCE_ROOT/third_party/apk/.version" 2>/dev/null || echo unknown)"
+QIDIAN_APK="$SOURCE_ROOT/third_party/apk/qidian.apk"
+[ -r "$QIDIAN_APK" ] || die "Missing offline Qidian APK: $QIDIAN_APK"
+cp -f "$QIDIAN_APK" "$P/qidian.apk"
+QIDIAN_VERSION="$(cat "$SOURCE_ROOT/third_party/apk/qidian.version")" || die "Missing Qidian version"
+[ -n "$QIDIAN_VERSION" ] || die "Invalid Qidian version"
 
 # 机型档案库 —— 🔴 落点 = docs/05 §7 `[device_profiles] library` 的
 # `/opt/qtrade/agent/data/device_profiles.json`(裁决 00 §15g R6-62 Ⅶ②,文档不改)。
@@ -246,6 +251,7 @@ jq -n \
     --arg scrcpy_ver "$SCRCPY_VERSION" --arg scrcpy_sha "$(sha "$P/scrcpy-server")" \
     --arg frida_name "$FRIDA_NAME" --arg frida_ver "$FRIDA_VERSION" --arg frida_sha "$(sha "$P/$FRIDA_NAME")" \
     --arg apk_ver "$APK_VERSION" --arg apk_sha "$(sha "$P/ADBKeyboard.apk")" \
+    --arg qidian_ver "$QIDIAN_VERSION" --arg qidian_sha "$(sha "$P/qidian.apk")" \
     --arg prof_ver "$PROFILES_VERSION" --arg prof_sha "$(sha "$P/device_profiles.json")" \
     --arg rootfs_ver "$ROOTFS_VERSION" --arg built "$(date -Is)" \
     '{
@@ -260,6 +266,7 @@ jq -n \
         scrcpy_server:   { path: "/opt/qtrade/scrcpy/scrcpy-server", version: $scrcpy_ver, sha256: $scrcpy_sha },
         frida_server:    { path: ("/opt/qtrade/frida/" + $frida_name), version: $frida_ver, sha256: $frida_sha },
         adbkeyboard_apk: { path: "/opt/qtrade/apk/ADBKeyboard.apk", version: $apk_ver, sha256: $apk_sha },
+        qidian_apk: { path: "/opt/qtrade/apk/qidian.apk", version: $qidian_ver, sha256: $qidian_sha },
         device_profiles: { path: "/opt/qtrade/agent/data/device_profiles.json", version: $prof_ver, sha256: $prof_sha }
      }' > "$STAGE/etc/qtrade/contents.json"
 

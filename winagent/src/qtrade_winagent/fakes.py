@@ -412,6 +412,9 @@ class FakeWsl:
             if d["name"] == distro:
                 d["running"] = False
 
+    async def close(self) -> None:
+        pass
+
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
         for d in self.distros:
@@ -430,6 +433,9 @@ class FakeWsl:
 
     async def version(self) -> str:
         return self.wsl_version
+
+    async def exec_stdin(self, distro: str, argv: list[str], data: bytes) -> tuple[int, str]:
+        return await self.exec(distro, argv)
 
     def wslconfig_path(self) -> str:
         return self.wslconfig_file

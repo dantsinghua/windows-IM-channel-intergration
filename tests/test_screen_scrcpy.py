@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shlex
 import struct
@@ -828,34 +829,63 @@ async def test_end_to_end_41_open_meta_frames_and_control_bytes():
     配置包 + 关键帧 → touch / scroll / key / text 落到控制 socket 的逐字节内容。"""
     srv = FakeScrcpyServer(width=576, height=1024)
     srv.script = [pkt(FLAG_CONFIG, SPS_PPS), pkt(FLAG_KEY | 42_000_777, b"\x00\x00\x00\x01\x65IDR")]
-    be = make_backend(srv, FakeAdbRunner())
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb)
     try:
         s = await be.open("qd01", profile="focus")
         try:
             assert srv.events == ["probe_closed", "accept_video", "accept_control", "header"]
             assert s.meta == {"codec": "h264", "width": 576, "height": 1024, "profile": "focus", "fps": 30, "seq0": 0}
             assert await next_item(s) == (42000, SPS_PPS + b"\x00\x00\x00\x01\x65IDR")
+            n_calls = len(adb.calls)
             for m in ({"type": "touch", "action": "down", "x": 0.25, "y": 0.5, "pointer": 3},
                       {"type": "touch", "action": "up", "x": 0.25, "y": 0.5, "pointer": 3},
                       {"type": "scroll", "x": 0.5, "y": 0.5, "dx": 0, "dy": -200},
                       {"type": "key", "keycode": "ENTER", "action": "down"},
-                      {"type": "text", "text": "你好"}):
+                      {"type": "text", "text": "ok"}):
                 await s.control(m)
             want = (
                 struct.pack(">BBqiiHHHII", 2, 0, 3, 144, 512, 576, 1024, 0xFFFF, 1, 1)
                 + struct.pack(">BBqiiHHHII", 2, 1, 3, 144, 512, 576, 1024, 0, 1, 0)
                 + struct.pack(">BiiHHhhI", 3, 288, 512, 576, 1024, 0, 0x1000, 0)   # 上滚 2 格:2/16*32768
                 + struct.pack(">BBIII", 0, 0, 66, 0, 0)
-                + struct.pack(">BI", 1, 6) + "你好".encode("utf-8"))
+                + struct.pack(">BI", 1, 2) + b"ok")
             await wait_for(lambda: len(srv.ctrl) >= len(want))
             assert bytes(srv.ctrl) == want
             assert srv.msgs == [2, 2, 3, 0, 1]
+            assert len(adb.calls) == n_calls                       # 纯 ASCII 文本不经任何 shell
             assert _server_scroll(0x1000) == 2.0
         finally:
             await s.close()
     finally:
         await be.aclose()
         srv.close()
+
+
+async def test_ws_text_with_non_ascii_goes_to_adbkeyboard_not_scrcpy(srv):
+    """R6-99(2026-10-11 真机):scrcpy INJECT_TEXT 只能合成 ASCII 按键,中文逐字 `Could not inject char` 丢弃——
+    安琳打「a个大师的噶」只剩「a」。含非 ASCII 的整段改走 ADBKeyboard ``ADB_INPUT_B64``,一个字节都不进控制 socket。"""
+    adb = FakeAdbRunner()
+    be = make_backend(srv, adb)
+    s = await be.open("qd01", profile="focus")
+    try:
+        n_ctrl, n_calls = len(srv.ctrl), len(adb.calls)
+        await s.control({"type": "text", "text": "a个大师的噶"})
+        serial, verb, cmd = adb.calls[-1]
+        argv = shlex.split(cmd)
+        assert (serial, verb, argv[:5]) == (SERIAL, "shell", ["am", "broadcast", "-a", "ADB_INPUT_B64", "--es"])
+        assert base64.b64decode(argv[6]).decode("utf-8") == "a个大师的噶"      # 整段一起走,顺序不乱
+        assert len(adb.calls) == n_calls + 1
+        await s.control({"type": "text", "text": "abc"})                     # 纯 ASCII 仍走 scrcpy
+        await wait_for(lambda: len(srv.ctrl) == n_ctrl + 5 + 3)
+        assert bytes(srv.ctrl[n_ctrl:]) == struct.pack(">BI", 1, 3) + b"abc"
+        assert len(adb.calls) == n_calls + 1
+        for t in ("中文", "🙂", "换\n行"):                                     # 中文 / 表情 / 换行都不进控制 socket
+            await s.control({"type": "text", "text": t})
+        await asyncio.sleep(0.05)
+        assert len(srv.ctrl) == n_ctrl + 8 and len(adb.calls) == n_calls + 4
+    finally:
+        await s.close()
 
 
 # ══════════════════════════════════════════════════ 控制 socket
@@ -1230,6 +1260,20 @@ async def test_adb_input_text_is_shell_quoted():
     serial, verb, cmd = adb.calls[-1]
     assert (serial, verb) == (SERIAL, "shell")
     assert shlex.split(cmd) == ["input", "text", nasty]           # 设备 shell 拆出来还是原样一个参数
+
+
+async def test_adb_input_text_non_ascii_goes_to_adbkeyboard():
+    """R6-99:``input text`` 对非 ASCII 直接 NPE(真机 rc=1 `Attempt to get length of null`)⇒ #35 同样分流到 ADBKeyboard。"""
+    adb = FakeAdbRunner()
+    assert await screen_adb.adb_input(adb, SERIAL, {"type": "text", "text": "ab测试cd"}) == {"ok": True, "via": "ime"}
+    serial, verb, cmd = adb.calls[-1]
+    argv = shlex.split(cmd)
+    assert (serial, verb, argv[:6]) == (SERIAL, "shell", ["am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg"])
+    assert base64.b64decode(argv[6]).decode("utf-8") == "ab测试cd"
+    assert not any("input text" in c[-1] for c in adb.calls)
+    adb.fail.add("shell")
+    with pytest.raises(RuntimeError, match="ADBKeyboard"):
+        await screen_adb.adb_input(adb, SERIAL, {"type": "text", "text": "中"})
 
 
 async def test_adb_input_tap_swipe_key():

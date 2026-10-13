@@ -181,9 +181,14 @@ async def test_distro_repair_requires_confirm_and_keeps_data(tmp_path):
     with pytest.raises(WaError) as e:
         await c.distro_repair(confirm=False, rootfs="r.tar", backup_tar="b.tar")
     assert e.value.reason == "not_confirmed"
-    out = await c.distro_repair(confirm=True, rootfs="r.tar", backup_tar="b.tar")
-    assert out["partial"] == ["terminate", "export:b.tar", "unregister", "import", "start", "restore"]
-    assert w.shutdown_calls == 0                                       # 修复发行版也不 --shutdown
+    with pytest.raises(WaError) as error:
+        await c.distro_repair(confirm=True, rootfs="r.tar", backup_tar="b.tar")
+    assert error.value.code == "NOT_READY"
+    assert error.value.reason == "repair_requires_verified_plan"
+    assert error.value.needs_human is True
+    assert w.shutdown_calls == 0
+    assert w.terminate_calls == []
+    assert w.exec_log == []
 
 
 async def test_status_reports_kernel_state(tmp_path):

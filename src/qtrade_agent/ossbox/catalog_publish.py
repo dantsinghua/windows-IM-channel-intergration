@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .envelope import pack_piece_envelope
+from .object_io import ObjectIO
 from .split import catalog_pieces
 
 _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
@@ -119,17 +120,16 @@ class CatalogPublisher:
         self.deposit_key = deposit_key
         self.xunjia_key = xunjia_key
         self.state_path = state_path
+        self._io = ObjectIO()
 
     @classmethod
-    def from_env(cls, store: Any, state_path: str) -> "CatalogPublisher | None":
-        endpoint = os.environ.get("OSS_ENDPOINT", "").strip()
-        bucket = os.environ.get("OSS_BUCKET", "").strip()
-        workbench_id = os.environ.get("OSS_WORKBENCH_ID", "").strip()
-        key_id = os.environ.get("OSS_ACCESS_KEY_ID", "").strip()
-        secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "").strip()
+    def from_env(cls, store: Any, state_path: str, *, box: Any = None,
+                 workbench_id: str | None = None) -> "CatalogPublisher | None":
+        if workbench_id is None:
+            workbench_id = os.environ.get("OSS_WORKBENCH_ID", "").strip()
         deposit_hex = (os.environ.get("OSS_SEAL_KEY_DEPOSIT") or os.environ.get("OSSBOX_KEY_DEPOSIT") or "").strip()
         xunjia_hex = (os.environ.get("OSS_SEAL_KEY_XUNJIA") or os.environ.get("OSSBOX_KEY_XUNJIA") or "").strip()
-        if not all((endpoint, bucket, workbench_id, key_id, secret, deposit_hex, xunjia_hex)):
+        if not all((workbench_id, deposit_hex, xunjia_hex)):
             log.warning("目录发布未装配，对象存储或两把封套密钥不齐")
             return None
         try:
@@ -143,8 +143,17 @@ class CatalogPublisher:
             return None
         from .oss_http import OssV1Box
 
+        try:
+            box = box if box is not None else OssV1Box.from_env()
+        except ValueError:
+            log.warning("目录对象存储配置无效，未装配发布")
+            return None
+        if box is None:
+            log.warning("目录对象存储配置不完整，未装配发布")
+            return None
+
         return cls(
-            OssV1Box(endpoint=endpoint, bucket=bucket, key_id=key_id, secret=secret),
+            box,
             store,
             workbench_id,
             deposit_key,
@@ -153,13 +162,25 @@ class CatalogPublisher:
         )
 
     def publish_once(self) -> None:
+        self._publish_pieces(self._pieces())
+
+    async def publish(self) -> None:
+        """数据库快照在所属线程取得，只有对象 IO 和缓存文件移到线程。"""
+        self._io.check_idle()
+        pieces = self._pieces()
+        if pieces:
+            await self._io.run(self._publish_pieces, pieces)
+
+    def _pieces(self) -> list[tuple[str, dict[str, Any]]]:
         accounts = self.store.list_accounts()
         sessions: list[dict[str, Any]] = []
         for account in accounts:
             if account.get("channel") != "wechat" or not account.get("self_uid"):
                 continue
             sessions.extend(self.store.list_sessions(account_id=account["id"], kind="group", limit=None))
-        pieces = pieces_for(self.workbench_id, accounts, sessions)
+        return pieces_for(self.workbench_id, accounts, sessions)
+
+    def _publish_pieces(self, pieces: list[tuple[str, dict[str, Any]]]) -> None:
         if not pieces:
             return
         prior = self._load()

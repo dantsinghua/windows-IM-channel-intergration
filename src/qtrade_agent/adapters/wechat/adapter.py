@@ -33,6 +33,14 @@ log = logging.getLogger("qtrade.adapters.wechat")
 
 KEY_FAIL_MESSAGE = "微信解密不可用,无法确认送达,已拒绝发送"      # 05 §2.4.7 逐字
 SCREEN_LOCKED_MESSAGE = "Windows 已锁屏,发送不可用"                # 05 §2.5.4 state_reason 逐字
+WECHAT_NOT_RUNNING_CODE = "WECHAT_NOT_RUNNING"
+WECHAT_AMBIGUOUS_CODE = "WECHAT_WINDOW_AMBIGUOUS"
+WECHAT_NOT_RUNNING_MESSAGE = "采集端显示该微信号在运行，但当前系统没有微信窗口，已停止"
+WECHAT_AMBIGUOUS_MESSAGE = "桌面上有多个微信窗口，无法确定发到哪一个，已停止"
+_DESKTOP_FAULTS = {
+    "wechat_window_missing": (WECHAT_NOT_RUNNING_CODE, WECHAT_NOT_RUNNING_MESSAGE),
+    "wechat_window_ambiguous": (WECHAT_AMBIGUOUS_CODE, WECHAT_AMBIGUOUS_MESSAGE),
+}
 PROBE_LOOKBACK_SEQ = 50            # confirm_probe 回看的 seq 余量(02 §2.2.3:微信查 chatlog 同分钟同文本,P-14)
 
 
@@ -49,6 +57,7 @@ class WechatAdapter:
         self._client = client
         self._store = store
         self._media_put = media_put
+        self._stop_account = None
 
     @staticmethod
     def _view(acct: Account) -> WechatAccountView:
@@ -88,6 +97,12 @@ class WechatAdapter:
             return "degraded", "WINAGENT_USER_OFFLINE", "winagent.toml [wechat] enabled=false(未启用微信模块)"
         wx = st.get("wechat") or {}
         chatlog = st.get("chatlog") or {}
+        count = wx.get("window_count")
+        # 只有明确报了 0 个窗口才是「号在跑、桌面没窗」。没报 window_count 且进程不在，仍是登出。
+        if count == 0:
+            return "stopped", WECHAT_NOT_RUNNING_CODE, WECHAT_NOT_RUNNING_MESSAGE
+        if isinstance(count, int) and count > 1:
+            return "stopped", WECHAT_AMBIGUOUS_CODE, WECHAT_AMBIGUOUS_MESSAGE
         if not wx.get("running") or not wx.get("logged_in"):
             # 主窗口消失 / Weixin.exe 退出 ⇒ login_required(LOGGED_OUT);槽位 holder 保持为它(它仍是「该在线的那个」)
             return "login_required", "LOGGED_OUT", "微信已退出登录,请点「登录」重新扫码"
@@ -108,6 +123,12 @@ class WechatAdapter:
         if acct.state == "degraded" and code == "SCREEN_LOCKED":
             return _not_ready(SCREEN_LOCKED_MESSAGE, "screen_locked")
         return None
+
+    def report_desktop_fault(self, account_id: str, code: str, reason: str) -> None:
+        """没有微信或多开微信：记错误日志，并把账号停到「已停止」。界面提示由状态事件带出。"""
+        log.error("微信账号已停止 account=%s code=%s: %s", account_id, code, reason)
+        if self._stop_account is not None:
+            self._stop_account(account_id, code, reason)
 
     def read_guard(self, acct: Account) -> Optional[CommandResult]:
         """``KEY_FAIL`` 下 chatlog 拿不到 Data Key、库读不了 ⇒ ``read_messages`` 也不可用(05 §2.4.7 读那一条);
@@ -188,7 +209,12 @@ class WechatAdapter:
                                           idempotency_key=cmd.idempotency_key or trace,
                                           confirm_timeout_ms=self._poller.cfg.bus.confirm_timeout_wechat_ms)
         except WeChatNotReady as e:
-            return _with_trace(_not_ready(f"微信发送不可用({e.reason})", e.reason), trace)
+            fault = _DESKTOP_FAULTS.get(e.reason)
+            if fault is not None:
+                code, reason = fault
+                self.report_desktop_fault(acct.id, code, e.detail or reason)
+                return _with_trace(_not_ready(e.detail or reason, e.reason), trace)
+            return _with_trace(_not_ready(e.detail or f"微信发送不可用({e.reason})", e.reason), trace)
         except WeChatCallFailed as e:
             err = (e.body.get("error") or {}) if isinstance(e.body, dict) else {}
             if e.status == 404:

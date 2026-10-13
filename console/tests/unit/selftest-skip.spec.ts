@@ -19,7 +19,10 @@ import EnvPage from '@/pages/env/EnvPage.vue'
 import { useEnvStore } from '@/stores/env'
 import type { SelftestRow } from '@/api/types'
 
-vi.mock('vue-router', () => ({ useRoute: () => ({ path: '/env', query: {} }) }))
+vi.mock('vue-router', () => ({
+  useRoute: () => ({ path: '/env', query: {} }),
+  useRouter: () => ({ push: vi.fn() }),
+}))
 
 beforeEach(() => {
   setActivePinia(createPinia())

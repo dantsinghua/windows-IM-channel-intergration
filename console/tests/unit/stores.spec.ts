@@ -102,8 +102,13 @@ describe('accounts store', () => {
     enabled: true, runtime: {}, capabilities: ['get_state'], ...over,
   })
 
+  function seed(id: string, channel: 'qidian' | 'qq' | 'wechat'): void {
+    useAccountsStore().upsert({ id, channel, state: 'created', deleted_ms: null, label: id, host: 'wsl', enabled: true, auto_recover: true, quota_mb: 0, state_code: '', state_reason: '', error_since_ms: null, runtime: {}, capabilities: [] } as never)
+  }
+
   it('account_state 事件按 account_id 归约', () => {
     const s = useAccountsStore()
+    seed('qd02', 'qidian')
     s.applyAccountState(ev('account_state', payload({ state: 'login_required', state_code: 'WAIT_SMS' }), 1, 'qd02'))
     expect(s.byId.qd02.state).toBe('login_required')
     expect(s.byId.qd02.state_code).toBe('WAIT_SMS')
@@ -111,6 +116,7 @@ describe('accounts store', () => {
 
   it('prompt 随事件进 store,离开 login_required 即清', () => {
     const s = useAccountsStore()
+    seed('qq01', 'qq')
     s.applyAccountState(ev('account_state', payload({
       state: 'login_required', state_code: 'WAIT_QRCODE',
       prompt: { kind: 'WAIT_QRCODE', text: '扫码' }, login_session_id: 'ls_1',
@@ -125,6 +131,7 @@ describe('accounts store', () => {
   it('已故障 N 分钟只认信封字段 error_since_ms(R6-4)', () => {
     const s = useAccountsStore()
     const t = 1_700_000_000_000
+    seed('wx01', 'wechat')
     s.applyAccountState(ev('account_state', payload({ state: 'error', error_since_ms: t - 360_000 }), 1, 'wx01'))
     expect(s.errorMinutes(s.byId.wx01, t)).toBe(6)
     expect(s.errorSeconds(s.byId.wx01, t)).toBe(360)
@@ -135,6 +142,7 @@ describe('accounts store', () => {
 
   it('§2.6.1 可用操作:login_required 放开注入与只读、禁 IM 写类(R-06)', () => {
     const s = useAccountsStore()
+    seed('qd02', 'qidian')
     s.applyAccountState(ev('account_state', payload({ state: 'login_required', state_code: 'WAIT_SMS' }), 1, 'qd02'))
     const ops = s.ops(s.byId.qd02)
     expect(ops.inject).toBe(true)
@@ -145,7 +153,7 @@ describe('accounts store', () => {
 
   it('软删后的停止事件不能把账号加回列表', () => {
     const s = useAccountsStore()
-    s.applyAccountState(ev('account_state', payload({ state: 'stopped' }), 1, 'wx01'))
+    s.upsert({ id: 'wx01', channel: 'wechat', state: 'stopped', deleted_ms: null } as never)
     expect(s.byId.wx01.state).toBe('stopped')
     s.forget('wx01')
     expect(s.byId.wx01).toBeUndefined()
@@ -153,6 +161,28 @@ describe('accounts store', () => {
     s.applyAccountState(ev('account_state', payload({ state: 'stopped', deleted_at: '2026-10-10T23:49:00+08:00' }), 3, 'wx02'))
     expect(s.byId.wx01).toBeUndefined()
     expect(s.byId.wx02).toBeUndefined()
+  })
+
+  it('列表里没有的账号，任何状态事件都不能造出卡片', () => {
+    const s = useAccountsStore()
+    s.applyAccountState(ev('account_state', payload({ state: 'stopped' }), 1, 'wx04'))
+    s.applyAccountState(ev('account_state', payload({ state: 'disabled' }), 2, 'qq90'))
+    s.applyAccountState(ev('account_state', payload({ state: 'login_required' }), 3, 'qd02'))
+    s.applyAccountState(ev('account_state', payload({ state: 'running' }), 4, 'qq91'))
+    expect(s.byId.wx04).toBeUndefined()
+    expect(s.byId.qq90).toBeUndefined()
+    expect(s.byId.qd02).toBeUndefined()
+    expect(s.byId.qq91).toBeUndefined()
+    expect(s.byChannel.qq).toEqual([])
+  })
+
+  it('软删账号不进入首页和账号页共用的分桶', () => {
+    const s = useAccountsStore()
+    s.upsert({ id: 'wx04', channel: 'wechat', state: 'stopped', deleted_ms: 1 } as never)
+    s.upsert({ id: 'wx07', channel: 'wechat', state: 'degraded', deleted_ms: null } as never)
+    expect(s.byChannel.wechat.map((a) => a.id)).toEqual(['wx07'])
+    expect(s.summary.wechat.total).toBe(1)
+    expect(s.summary.wechat.online).toBe(1)
   })
 
   it('微信档案 = channel=wechat 且 stopped/disabled 的行(C-01)', () => {

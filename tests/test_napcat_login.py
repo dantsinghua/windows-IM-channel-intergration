@@ -35,6 +35,18 @@ async def test_refresh_authenticates_loopback_and_returns_new_png_not_url(monkey
                      (16301, 'QQLogin/RefreshQRcode', {}, 'fake-credential')]
 
 
+async def test_missing_webui_token_reads_napcat_png_without_login(monkeypatch):
+    """没有 WebUI token 时直接读 NapCat 已写下的 PNG，不请求 /api/auth/login，也不向人要令牌。"""
+    calls = []
+    async def request(port, path, body, credential=''):
+        calls.append(path)
+        return {}
+    monkeypatch.setattr(login, 'asyncio', SimpleNamespace(wait_for=login.asyncio.wait_for, sleep=AsyncMock(), CancelledError=login.asyncio.CancelledError))
+    backend = login.NapCatLoginBackend(token_for=lambda row: '', read_png=AsyncMock(return_value=png(4)), request=request)
+    assert await backend.qrcode(ROW, refresh=True) == png(4)
+    assert calls == []
+
+
 async def test_get_qrcode_also_reads_png_and_does_not_fetch_scan_url():
     calls = []
     async def request(port, path, body, credential=''):

@@ -752,6 +752,16 @@ class ScrcpySession:
             if new in self._b.profiles and new != ch.profile:
                 await ch.restart(notify=True, profile=new, why="profile")
             return
+        if kind == "text":
+            text = msg.get("text")
+            if isinstance(text, str) and text and screen_adb.needs_ime(text):
+                # R6-99:scrcpy INJECT_TEXT 只能合成 ASCII 按键(server 对中文逐字 `Could not inject char` 丢弃),
+                # 含非 ASCII 的整段改走 ADBKeyboard 广播——与 #35 / 企点适配器发消息同一条路;整段一起走保证顺序。
+                rc, out = await screen_adb.ime_input_text(self._b.adb, ch.serial, text)
+                if rc != 0:
+                    log.warning("画面流文本经 ADBKeyboard 注入失败 account=%s rc=%d: %s",
+                                ch.account_id, rc, out.decode("utf-8", "replace")[:200])
+                return
         blobs = control_bytes(msg, ch.width, ch.height)
         if not blobs:
             # 不认识的键名 / 动作一律丢弃,不落成任何默认键
@@ -838,6 +848,13 @@ class ScrcpyBackend:
     async def inject(self, account_id: str, msg: dict[str, Any]) -> dict[str, Any]:
         serial, _port = self._target_of(account_id)
         return await screen_adb.adb_input(self.adb, serial, msg)
+
+    async def drop_account(self, account_id: str) -> None:
+        """账号重启会拆掉容器里的画面服务。先拆通道，页面收到关闭后再自己重连。"""
+        ch = self.channels.get(account_id)
+        if ch is None or ch.closed:
+            return
+        await ch.close()
 
     async def aclose(self) -> None:
         for ch in list(self.channels.values()):

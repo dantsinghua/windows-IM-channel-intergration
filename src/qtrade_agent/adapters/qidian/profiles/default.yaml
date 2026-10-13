@@ -43,8 +43,8 @@ nodes:
   card_identity:       {id: "com.tencent.qidian:id/account_uin"}                    # [推测] 名片页上的 uin/账号,发送前对象校验靠它
   card_send_msg:       {text_any: ["发消息", "发送消息"]}                          # [推测]
   chat_title:          {id: "com.tencent.qidian:id/title"}                          # [推测] 聊天页标题(= 闸门1/2 的判据)
-  chat_input:          {id: "com.tencent.qidian:id/input"}                          # [推测]
-  chat_send:           {id: "com.tencent.qidian:id/fun_btn", text_any: ["发送"]}    # [推测]
+  chat_input:          {id: "com.tencent.qidian:id/input", id_any: ["com.tencent.qidian:id/qdui_aio_inputbar_edittext"]}
+  chat_send:           {id: "com.tencent.qidian:id/fun_btn", id_any: ["com.tencent.qidian:id/qdui_aio_inputbar_send_btn"], text_any: ["发送"]}
 
 # 文本标记(在控件树的 text+content-desc 全文里找子串)
 markers:

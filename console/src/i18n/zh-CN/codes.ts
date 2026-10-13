@@ -75,7 +75,7 @@ export const RESULT_CODES: Record<ResultCode, ResultCodeMeta> = {
   },
   // 🔴 R6-58 (ca):00 §8.3 本轮补登 `CONFIRM_REQUIRED` —— 高危 op 经邮件触发后**已受理、停在待控制台确认、尚未执行**。
   //   语气用 `pending` 而不是 `fail`:它不是失败,是在等人批;文案里给出下一步该去哪儿点。
-  CONFIRM_REQUIRED: { zh: '已受理,等待在控制台确认后才会执行', tone: 'pending', action: '去邮件页待确认列表' },
+  CONFIRM_REQUIRED: { zh: '已受理,等待在机器人采集终端确认后才会执行', tone: 'pending', action: '去邮件页待确认列表' },
   CONFIRM_EXPIRED: { zh: '该确认已过期,已自动作废', tone: 'na' },
 }
 
@@ -424,7 +424,7 @@ export const MAIL_INBOX_STATUS: Record<string, string> = {
   OP_DENIED: '操作不允许',
   TARGET_NOT_FOUND: '目标不存在',
   INGEST_ERROR: '落库异常',
-  CONFIRM_REQUIRED: '待控制台确认',
+  CONFIRM_REQUIRED: '待机器人采集终端确认',
   CONFIRM_EXPIRED: '确认已过期',
   ROUTE_MISMATCH: '账号不属于本路由',
 }
@@ -432,7 +432,7 @@ export const MAIL_INBOX_STATUS: Record<string, string> = {
 /** OP_DENIED 的 reason 前缀三值(R6-29);前缀缺失/未知回落「操作不允许」 */
 export const OP_DENIED_REASONS: { prefix: string; zh: string; red: boolean }[] = [
   { prefix: 'NOT_ALLOWED:', zh: '该操作未在邮件白名单内', red: false },
-  { prefix: 'REJECTED:', zh: '已在控制台驳回', red: false },
+  { prefix: 'REJECTED:', zh: '已在机器人采集终端驳回', red: false },
   { prefix: 'ARGS_TAMPERED:', zh: ARGS_DIGEST_MISMATCH_TEXT, red: true },
 ]
 

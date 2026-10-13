@@ -10,6 +10,7 @@
  * 背压:`decodeQueueSize` 超过 `MAX_DECODE_QUEUE` 就丢非关键帧,一直丢到下一个关键帧(画面要「实时」不要「完整」)。
  * 降级三档:硬解 → 软解(强制 thumb)→ 静态预览(#33 截图轮询 + #35 REST 注入);**自动降、不自动升**。
  */
+import { agentOrigin } from '@/api/http'
 
 export type StreamProfile = 'thumb' | 'focus' | 'focus15' | 'thumb10'
 export type DecodePath = 'hardware' | 'software' | 'static'
@@ -44,8 +45,9 @@ export const MAX_DECODE_ERRORS = 3
 const PROBE_CODEC = 'avc1.42E01E'
 
 export function streamUrl(accountId: string, profile: StreamProfile): string {
+  const origin = agentOrigin()
   const base =
-    typeof location !== 'undefined' && location.protocol.startsWith('http')
+    origin ? origin.replace(/^http/, 'ws') : typeof location !== 'undefined' && location.protocol.startsWith('http')
       ? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`
       : 'ws://127.0.0.1:17600'
   return `${base}/api/v1/accounts/${accountId}/stream?profile=${profile}`
@@ -177,11 +179,23 @@ export interface StreamClosed {
   retryable: boolean
 }
 
-export function classifyClose(code: number, everOpened: boolean): StreamClosed {
+export function classifyClose(code: number, everOpened: boolean, reasonText = ''): StreamClosed {
+  // 4503 有两种：真的没装画面服务，和重启时手机还没起来。后者必须重连，不能停在黑画布上。
+  if (code === 4503 && reasonText.includes('打开失败')) {
+    return { code, reason: 'stream_open_failed', text: '企点还在起来，画面会自己接上', everOpened, retryable: true }
+  }
   const known = STREAM_CLOSE_CODES[code]
   if (known) return { code, reason: known.reason, text: known.text, everOpened, retryable: known.retryable }
   if (code === 1000 || code === 1001) return { code, reason: 'normal', text: '画面流已关闭', everOpened, retryable: true }
   return { code, reason: 'transport', text: `画面流连接中断(关闭码 ${code || '未知'})`, everOpened, retryable: true }
+}
+
+/** 视频断了之后页面怎么走。账号重启后的断线要继续重连，不能停在黑画布上。 */
+export function screenAfterClose(reason: string, retryable: boolean): 'stop' | 'retry' | 'shots' {
+  if (reason === 'forbidden_inject' || reason === 'channel_no_stream') return 'stop'
+  if (reason === 'stream_open_failed' || reason === 'transport' || reason === 'normal' || reason === 'client_too_slow' || reason === 'focus_taken') return 'retry'
+  if (!retryable) return 'shots'
+  return 'retry'
 }
 
 export interface StreamHooks {
@@ -243,6 +257,7 @@ export class ScreenStream {
   private paused = false
   /** 收到不可重试的关闭码(4401/4400/4409/4503)后置位:服务端的 `restart` 一律不再理会 */
   private fatalClosed = false
+  private startGeneration = 0
 
   path: DecodePath = 'hardware'
   /** 背压丢掉的帧数(给状态条/测试看) */
@@ -261,10 +276,13 @@ export class ScreenStream {
   }
 
   async start(): Promise<void> {
+    this.stop()
+    const generation = this.startGeneration
     this.fatalClosed = false
     this.decodeErrors = 0
     this.dropUntilKey = false
     const probed = await probeDecodePath()
+    if (generation !== this.startGeneration) return
     // 不自动升:已经降过的档不因为重新 start 就回去(升档只走 retryHardware)
     if (RANK[probed] > RANK[this.path]) this.path = probed
     if (this.path === 'software') this.profile = 'thumb'
@@ -293,7 +311,7 @@ export class ScreenStream {
     }
     ws.onclose = (ev) => {
       this.hooks.onStats({ connected: false })
-      const info = classifyClose(ev?.code ?? 0, everOpened)
+      const info = classifyClose(ev?.code ?? 0, everOpened, ev?.reason ?? '')
       this.lastClose = info
       // 🔴 4503/4409/4401/4400 重试没有意义 —— 停手,由页面显示对应提示,不无限重连
       if (!info.retryable) this.fatalClosed = true
@@ -538,6 +556,7 @@ export class ScreenStream {
   }
 
   stop(): void {
+    this.startGeneration++
     if (this.fpsTimer) clearInterval(this.fpsTimer)
     this.fpsTimer = null
     this.closeDecoder()

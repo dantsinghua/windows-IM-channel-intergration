@@ -28,7 +28,10 @@ export const useAccountsStore = defineStore('accounts', () => {
 
   const byChannel = computed(() => {
     const out: Record<Channel, Account[]> = { qidian: [], qq: [], wechat: [] }
-    for (const a of items.value) out[a.channel]?.push(a)
+    for (const a of items.value) {
+      if (a.deleted_ms != null) continue
+      out[a.channel]?.push(a)
+    }
     return out
   })
 
@@ -146,6 +149,9 @@ export const useAccountsStore = defineStore('accounts', () => {
       forget(id)
       return
     }
+    const i = items.value.findIndex((x) => x.id === id)
+    // 事件只更新名单里已有的号。旧号的回放不能再造出已软删的卡片；新号由创建接口写入名单。
+    if (i < 0) return
     const incomingSession = p.login_session_id || null
     const previousSession = loginSessions.value[id] || null
     if (incomingSession && retiredLoginSessions.get(id)?.has(incomingSession)) return
@@ -157,7 +163,6 @@ export const useAccountsStore = defineStore('accounts', () => {
       if (!loginPhase && incomingSession) retired.add(incomingSession)
       retiredLoginSessions.set(id, retired)
     }
-    const i = items.value.findIndex((x) => x.id === id)
     const patch: Partial<Account> = {
       state: p.state,
       state_code: p.state_code ?? '',
@@ -169,12 +174,15 @@ export const useAccountsStore = defineStore('accounts', () => {
       self_nick: p.self_nick,
     }
     if (p.self_uid !== undefined) patch.self_uid = p.self_uid
-    if (i >= 0) items.value[i] = { ...items.value[i], ...patch }
-    else items.value.push({ id, channel: (ev.channel ?? 'qidian') as Channel, label: id, host: 'wsl',
-      quota_mb: 0, deleted_ms: null, auto_recover: true, ...patch } as Account)
+    items.value[i] = { ...items.value[i], ...patch }
 
-    if (p.prompt) prompts.value[id] = p.prompt
-    else if (p.state !== 'login_required') delete prompts.value[id]
+    if (p.prompt) {
+      const prev = prompts.value[id]
+      const next = { ...p.prompt }
+      // 持久化事件故意去掉二维码。后来的状态帧不能把已经取到的图擦掉。
+      if (!next.qrcode_png_b64 && prev?.qrcode_png_b64 && next.kind === prev.kind) next.qrcode_png_b64 = prev.qrcode_png_b64
+      prompts.value[id] = next
+    } else if (p.state !== 'login_required') delete prompts.value[id]
     loginSessions.value[id] = loginPhase ? incomingSession ?? previousSession : null
   }
 

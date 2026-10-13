@@ -75,9 +75,7 @@ class Monitor:
         self._alerts = alerts
         self._cfg = cfg
         self._probe = probe
-        self._disks = disks or [DiskTarget("programdata", "C:\\ProgramData\\QTrade"),
-                                DiskTarget("vhdx", "C:\\Users\\vhdx"),
-                                DiskTarget("wechat_data", "D:\\", product_level=False)]
+        self._disks = list(disks) if disks is not None else []
         self._clock = clock
         self.state = MonitorState()
         self._host_cache: Optional[tuple[int, dict[str, float]]] = None      # (采样时刻 ms, host 段)

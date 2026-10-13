@@ -18,6 +18,11 @@ def is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def hidden_process_kwargs() -> dict[str, int]:
+    """后台 CLI 不创建控制台窗口;非 Windows 不传专用标志。"""
+    return {"creationflags": 0x08000000} if is_windows() else {}
+
+
 def decode_console_output(raw: bytes) -> str:
     """把 Windows 命令行工具的原始输出解成 str,**绝不抛解码异常**。
 
@@ -55,7 +60,8 @@ def run_text(args: Sequence[str], *, timeout: float, check: bool = False) -> sub
 
     返回的 ``CompletedProcess.stdout/stderr`` 恒为 ``str``(可能为空串,绝不为 ``None``)。
     """
-    p = subprocess.run(list(args), capture_output=True, timeout=timeout, check=check)
+    p = subprocess.run(list(args), capture_output=True, timeout=timeout, check=check,
+                       **hidden_process_kwargs())
     return subprocess.CompletedProcess(p.args, p.returncode,
                                        decode_console_output(p.stdout or b""), decode_console_output(p.stderr or b""))
 

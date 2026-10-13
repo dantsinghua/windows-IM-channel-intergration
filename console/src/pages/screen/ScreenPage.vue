@@ -12,7 +12,7 @@ import { useUiStore } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { accountsApi } from '@/api/client'
 import { ApiFailure } from '@/api/http'
-import { ScreenStream, type StreamClosed, type StreamProfile, type StreamStats } from '@/codec/stream'
+import { screenAfterClose, ScreenStream, type StreamClosed, type StreamProfile, type StreamStats } from '@/codec/stream'
 import StateDot from '@/components/StateDot.vue'
 import { STATE_CODES } from '@/i18n/zh-CN/codes'
 import { normInContain, PointerRelay, restGesture } from './pointer'
@@ -65,7 +65,56 @@ const PROFILE_OF: Record<string, StreamProfile> = { focus30: 'focus', focus15: '
 /** 画布指针 → #34 控制帧(首帧前不发、move ≤ 60 Hz、长按期间不发任何东西) */
 const relay = new PointerRelay((f) => { if (!readOnly.value) stream?.send(f) })
 
+let focusGen = 0
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+let retryWait = 800
+let noFrameTimer: ReturnType<typeof setTimeout> | null = null
+const SCREEN_STATES = ['running', 'degraded', 'login_required', 'starting']
+
+function clearNoFrame(): void {
+  if (noFrameTimer) { clearTimeout(noFrameTimer); noFrameTimer = null }
+}
+
+function clearRetry(): void {
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
+}
+
+/** 账号回到可看画面的状态，或视频断了，就再拉一次。间隔逐步放到 5 秒，避免打满。 */
+function scheduleLive(): void {
+  if (!active || readOnly.value) return
+  clearRetry()
+  const wait = retryWait
+  retryWait = Math.min(retryWait * 2, 5000)
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    if (active && !readOnly.value) void startFocus()
+  }, wait)
+}
+
+/** 连上以后一直没有帧，就不能停在黑画布上。 */
+function armNoFrame(): void {
+  clearNoFrame()
+  noFrameTimer = setTimeout(() => {
+    if (!active || readOnly.value || stats.value.fps > 0) return
+    degradeMsg.value = '视频流没有出帧，正在重连'
+    useStillShots(degradeMsg.value)
+    scheduleLive()
+  }, 8000)
+}
+
+function useStillShots(why: string): void {
+  clearNoFrame()
+  degradeMsg.value = why
+  stopAll()
+  stats.value = { ...stats.value, decoder: 'static', connected: false, fps: 0 }
+  startStaticPreview()
+}
+
 function draw(frame: VideoFrame): void {
+  retryWait = 800
+  clearRetry()
+  clearNoFrame()
+  degradeMsg.value = ''
   const c = canvas.value
   if (!c) { frame.close(); return }
   const ctx = c.getContext('2d')
@@ -81,6 +130,8 @@ function draw(frame: VideoFrame): void {
 }
 
 function stopAll(): void {
+  clearRetry()
+  clearNoFrame()
   relay.releaseAll()
   relay.setMedia(0, 0)
   stream?.stop()
@@ -89,15 +140,15 @@ function stopAll(): void {
   previewTimer = null
 }
 
-async function startFocus(): Promise<void> {
-  if (!active) return
+async function startFocus(manual = false): Promise<void> {
+  if (!active || (readOnly.value && !manual)) return
+  const gen = ++focusGen
   stopAll()
-  degradeMsg.value = ''
   closeIme()
   const a = focus.value
   if (!a) return
   if (a.channel === 'qq' || a.channel === 'wechat') return     // R6-94:QQ / 微信都不拉画面
-  if (!['running', 'degraded', 'login_required', 'starting'].includes(a.state)) return
+  if (!SCREEN_STATES.includes(a.state)) { scheduleLive(); return }
   streamClosed.value = null
   const s = new ScreenStream(a.id, PROFILE_OF[ui.perfProfile] ?? 'focus', {
     onHeader: (h) => relay.setMedia(h.width, h.height),
@@ -110,9 +161,12 @@ async function startFocus(): Promise<void> {
       streamClosed.value = info
       // 4403:令牌只能看。停手、不自动重连,等用户点「重新连接(只看)」
       if (info.reason === 'forbidden_inject') { enterReadOnly(); stopAll(); return }
-      if (info.reason === 'stream_backend_missing') { stopAll(); return }
-      // 4401 由 App.vue 的事件流横幅统一引导「重取令牌」;4409/4400 重试无意义,都停手。
-      if (!info.retryable) stopAll()
+      const next = screenAfterClose(info.reason, info.retryable)
+      if (next === 'stop') { stopAll(); return }
+      degradeMsg.value = info.text || '画面断开了，正在重连'
+      if (next === 'shots') { useStillShots(degradeMsg.value); return }
+      useStillShots(degradeMsg.value)
+      scheduleLive()
     },
     // 第三档:流已关,改走 #33 截图轮询,点击改走 #35 REST
     onStatic: () => {
@@ -122,12 +176,19 @@ async function startFocus(): Promise<void> {
   })
   stream = s
   if (hidden) s.pause()
+  armNoFrame()
   await s.start()
+  if (!active || gen !== focusGen) {
+    s.stop()
+    if (stream === s) stream = null
+  }
 }
 
 /** 进只读:先置位再松开指针(松开时的 up/cancel 也不许再发) */
 function enterReadOnly(): void {
   readOnly.value = true
+  clearRetry()
+  clearNoFrame()
   relay.releaseAll()
   staticDown = null
   closeIme()
@@ -247,13 +308,11 @@ function onStaticPointer(e: PointerEvent, kind: 'down' | 'move' | 'up' | 'cancel
 /** 控制键 → `key`(按下 + 抬起各一帧);静态预览走 #35 */
 function sendKey(keycode: string): void {
   if (readOnly.value) return
-  if (isStatic.value) {
-    if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'key', keycode }).catch(onRestInjectError)
-    return
-  }
-  if (!stream) return
-  stream.send({ type: 'key', keycode, action: 'down' })
-  stream.send({ type: 'key', keycode, action: 'up' })
+  const sent = !isStatic.value
+    && !!stream?.send({ type: 'key', keycode, action: 'down' })
+    && !!stream?.send({ type: 'key', keycode, action: 'up' })
+  if (sent) return
+  if (focus.value) void accountsApi.streamInput(focus.value.id, { type: 'key', keycode }).catch(onRestInjectError)
 }
 
 function sendText(text: string): void {
@@ -356,9 +415,17 @@ function startAccount(id: string): void {
   else void accountsApi.start(id)
 }
 
-watch(focusId, () => void startFocus())
+// 显式切换账号/路由允许开始观看,但不会解除令牌只读状态。
+watch(focusId, () => void startFocus(true))
 // 令牌变化(离开 ok 再回到 ok = 重新取过令牌)才解除只读;换账号不解除
 watch(() => session.authState, (v, old) => { if (v === 'ok' && old !== 'ok') readOnly.value = false })
+watch(() => focus.value?.state, (state, prev) => {
+  if (!active || !prev || !state || state === prev) return
+  if (SCREEN_STATES.includes(state) && !SCREEN_STATES.includes(prev)) {
+    retryWait = 800
+    void startFocus()
+  }
+})
 watch(() => route.params.id, (v) => { if (!props.embedded && v) focusId.value = String(v) })
 watch(() => props.accountId, (v) => { if (props.embedded && v) focusId.value = v })
 
@@ -382,6 +449,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   active = false
+  clearRetry()
   stopAll()
   visibilityOff?.()
   visibilityOff = undefined
@@ -420,7 +488,7 @@ onUnmounted(() => {
         :data-testid="T.qqHint(a.id)"
         @click="router.push(`/acct/${a.id}`)"
       >
-        {{ a.label || a.id }} · 打开 QQ 工作台
+        {{ a.label || a.id }} · 打开 QQ
       </div>
       <div
         v-for="a in wechatAccounts"
@@ -453,7 +521,7 @@ onUnmounted(() => {
           <a-button type="primary" @click="startAccount(focus.id)">{{ isWechat ? '登录此微信' : '启动' }}</a-button>
         </a-empty>
 
-        <a-empty v-else-if="focus.channel === 'qq'" description="QQ 通过 NapCat 工作台管理">
+        <a-empty v-else-if="focus.channel === 'qq'" description="QQ 通过 NapCat 管理">
           <a-button type="primary" @click="router.push(`/acct/${focus.id}`)">打开账号详情</a-button>
         </a-empty>
 
@@ -478,7 +546,7 @@ onUnmounted(() => {
               v-if="streamClosed?.reason === 'forbidden_inject'"
               size="small"
               :data-testid="T.readonlyReconnect"
-              @click="startFocus"
+              @click="startFocus(true)"
             >重新连接(只看)</a-button>
           </div>
           <div v-else-if="streamClosed && !streamClosed.retryable" class="banner crit">
@@ -493,7 +561,7 @@ onUnmounted(() => {
           </div>
           <div v-else-if="streamClosed && streamClosed.reason === 'focus_taken'" class="banner">
             {{ streamClosed.text }}
-            <a-button size="small" @click="startFocus">再试一次</a-button>
+            <a-button size="small" @click="startFocus(true)">再试一次</a-button>
           </div>
 
           <!-- 第三档:静态预览(#33 每 2 s 一帧),点击/拖动松手时经 #35 REST 注入 -->

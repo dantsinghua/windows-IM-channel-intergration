@@ -246,7 +246,7 @@ describe('4403 / 403 ⇒ 只读模式(R6-72)', () => {
   }
 
   it('收到 4403 不自动重连;画布指针/键盘/滚轮/工具条都不再发注入', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval'] })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     try {
       const w = await mountPage()
       const c = await openCanvas(w)

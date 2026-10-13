@@ -17,6 +17,8 @@ import base64
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import tempfile
 import time
@@ -26,7 +28,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from ..alerts import QIDIAN_NOT_ROOT
 from ..config import H05_BOOT_POLL_S, AgentConfig
-from .backends import AdbBackend, ContainerBackend, ContainerInfo, ContainerSpec
+from .backends import AdbBackend, ContainerBackend, ContainerInfo, ContainerSpec, FakeContainers
 from . import apk
 from .network import probe_qidian_network
 
@@ -281,32 +283,132 @@ class Runtime:
             raise ValueError("Invalid QQ account")
         return f"{self.data_dir(acct['id'])}/napcat_config/{filename}"
 
+    _WEBUI_TOKEN_RE = re.compile(r"WebUi Token:\s*([0-9a-fA-F]{8,64})")
+
+    async def napcat_webui_access_token(self, acct: AccountRow) -> str:
+        """工作台地址自己带上令牌。文件里没有时，用这次容器启动日志里的那一个，并写回去。"""
+        if isinstance(self._containers, FakeContainers):
+            return ""
+        config = await self._read_napcat_config(acct, "webui.json")
+        token = config.get("token")
+        if isinstance(token, str) and re.fullmatch(r"[0-9a-fA-F]{8,64}", token):
+            return token
+        logs = getattr(self._containers, "logs", None)
+        found = ""
+        if logs is not None:
+            raw = re.sub(r"\x1b\[[0-9;]*m", "", await logs(container_name(acct["id"])))
+            hits = self._WEBUI_TOKEN_RE.findall(raw)
+            if hits:
+                found = hits[-1]
+        if not found:
+            return ""
+        config["token"] = found
+        await self._write_napcat_config(acct, "webui.json", config)
+        return found
+
     def napcat_webui_token(self, acct: AccountRow) -> str:
-        value = self._fs.read_json(self._napcat_config_path(acct, "webui.json")).get("token")
+        try:
+            value = self._fs.read_json(self._napcat_config_path(acct, "webui.json")).get("token")
+        except OSError:
+            # 容器里的 webui.json 常是 root 所有,宿主读不到。没有 token 就改读 NapCat 自己写下的二维码。
+            return ""
         return value if isinstance(value, str) else ""
 
     def napcat_webui_enabled(self, acct: AccountRow) -> bool:
-        config = self._fs.read_json(self._napcat_config_path(acct, "webui.json"))
+        try:
+            config = self._fs.read_json(self._napcat_config_path(acct, "webui.json"))
+        except OSError:
+            return False
         return bool(config) and config.get("disableWebUI", False) is False
+
+    async def napcat_webui_is_enabled(self, acct: AccountRow) -> bool:
+        """以容器里的配置为准。宿主读不到 root:600 时不能当成已关闭，否则每次打开都会重启容器。"""
+        try:
+            config = await self._read_napcat_config(acct, "webui.json")
+        except Exception:
+            return False
+        return bool(config) and config.get("disableWebUI", False) is False
+
+    async def wait_napcat_webui(self, port: int, *, timeout_s: float = 25) -> bool:
+        """等本机工作台真正返回页面。假容器没有端口，直接视为就绪。"""
+        if isinstance(self._containers, FakeContainers):
+            return True
+        url = f"http://127.0.0.1:{int(port)}/webui"
+        deadline = time.monotonic() + timeout_s
+
+        def once() -> bool:
+            import urllib.error
+            import urllib.request
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    return resp.status < 500
+            except urllib.error.HTTPError as exc:
+                return exc.code < 500
+            except Exception:
+                return False
+
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(once):
+                return True
+            await asyncio.sleep(0.4)
+        return False
+
+    async def _read_napcat_config(self, acct: AccountRow, filename: str) -> dict[str, Any]:
+        """宿主文件被容器写成 root:600 时，改从运行中的容器里读。"""
+        path = self._napcat_config_path(acct, filename)
+        try:
+            return self._fs.read_json(path)
+        except OSError:
+            await self._relax_napcat_config(acct)
+            try:
+                return self._fs.read_json(path)
+            except OSError:
+                pass
+            raw = await self._containers.exec(container_name(acct["id"]), f"cat /app/napcat/config/{filename}")
+            if not raw.strip():
+                return {}
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("Invalid NapCat configuration")
+            return data
+
+    async def _write_napcat_config(self, acct: AccountRow, filename: str, value: dict[str, Any]) -> None:
+        path = self._napcat_config_path(acct, filename)
+        try:
+            self._fs.write_json(path, value)
+            return
+        except OSError as exc:
+            log.info("宿主写不了 NapCat 配置 %s，改在容器内写: %s", filename, type(exc).__name__)
+        import base64
+        blob = base64.b64encode(json.dumps(value, ensure_ascii=False).encode()).decode()
+        dest = f"/app/napcat/config/{filename}"
+        await self._relax_napcat_config(acct)
+        await self._containers.exec(container_name(acct["id"]), f"echo {blob} | base64 -d > {dest}")
+
+    async def _relax_napcat_config(self, acct: AccountRow) -> None:
+        """NapCat 以 root 把配置写成 600。放宽成任何人可读可写，干净机器上不用手工 chown。"""
+        await self._containers.exec(container_name(acct["id"]), "chmod -R a+rwX /app/napcat/config")
 
     async def prepare_napcat(self, acct: AccountRow) -> None:
         """启动前落实官方 4.18.28 配置；不清 QQ 数据，不覆盖其它配置键。"""
         # 官方 Docker entrypoint 在 napcat.json 不存在时复制整套模板；先保留/建立
         # 官方允许的默认配置，避免首次解压覆盖下面已写好的 OneBot/WebUI 配置。
-        core_path = self._napcat_config_path(acct, "napcat.json")
-        self._fs.write_json(core_path, self._fs.read_json(core_path))
-        webui_path = self._napcat_config_path(acct, "webui.json")
-        webui = self._fs.read_json(webui_path)
+        core = await self._read_napcat_config(acct, "napcat.json")
+        await self._write_napcat_config(acct, "napcat.json", core)
+        webui = await self._read_napcat_config(acct, "webui.json")
         webui.update({"host": "0.0.0.0", "port": 6099, "disableWebUI": False})
-        self._fs.write_json(webui_path, webui)
+        token = webui.get("token")
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-fA-F]{8,64}", token):
+            webui["token"] = secrets.token_hex(4)
+        await self._write_napcat_config(acct, "webui.json", webui)
         identity = json.loads(acct.get("identity_json") or "{}")
         uin = str(identity.get("qq_uin") or acct.get("self_uid") or "")
         if uin and (not uin.isascii() or not uin.isdigit()):
             raise ValueError("Invalid QQ identity")
         filenames = ["onebot11.json"] + ([f"onebot11_{uin}.json"] if uin else [])
         for filename in filenames:
-            path = self._napcat_config_path(acct, filename)
-            config = self._fs.read_json(path)
+            config = await self._read_napcat_config(acct, filename)
             network = config.setdefault("network", {})
             for key, port in (("websocketServers", 3001), ("httpServers", 3000)):
                 servers = network.setdefault(key, [])
@@ -317,13 +419,16 @@ class Runtime:
                 server.update({"enable": True, "host": "0.0.0.0", "messagePostFormat": "array", "debug": False})
                 if key == "websocketServers":
                     server.update({"reportSelfMessage": True, "heartInterval": 5000})
-            self._fs.write_json(path, config)
+            await self._write_napcat_config(acct, filename, config)
 
     def napcat_onebot_token(self, acct: AccountRow) -> Optional[str]:
         identity = json.loads(acct.get("identity_json") or "{}")
         uin = str(identity.get("qq_uin") or acct.get("self_uid") or "")
         filename = f"onebot11_{uin}.json" if uin and uin.isascii() and uin.isdigit() else "onebot11.json"
-        config = self._fs.read_json(self._napcat_config_path(acct, filename))
+        try:
+            config = self._fs.read_json(self._napcat_config_path(acct, filename))
+        except OSError:
+            return None
         for server in config.get("network", {}).get("websocketServers", []):
             if server.get("port") == 3001 and server.get("enable"):
                 return server.get("token") or None
@@ -344,8 +449,15 @@ class Runtime:
             raise NapCatLoginError("qrcode_file_unavailable") from None
 
     async def set_napcat_webui(self, acct: AccountRow, enable: bool) -> bool:
-        path = self._napcat_config_path(acct, "webui.json")
-        config = self._fs.read_json(path)
+        name = container_name(acct["id"])
+        observed = await self._containers.inspect(name)
+        if observed is None:
+            raise RuntimeError("napcat container missing")
+        if not observed.running:
+            if not enable:
+                return False
+            await self._containers.start(name)
+        config = await self._read_napcat_config(acct, "webui.json")
         confirmed_uid = acct.get("qq_confirmed_uid")
         if confirmed_uid is not None and (not isinstance(confirmed_uid, str) or not confirmed_uid.isascii() or not confirmed_uid.isdigit()):
             raise ValueError("Invalid confirmed QQ identity")
@@ -374,7 +486,7 @@ class Runtime:
                     and not acct.get("napcat_restart_required") and not rebuild):
                 return False
             config["disableWebUI"] = not enable
-            self._fs.write_json(path, config)
+            await self._write_napcat_config(acct, "webui.json", config)
             if observed.running:
                 await self._containers.stop(container_name(acct["id"]), timeout_s=10)
                 stopped = await self.inspect(acct, fresh=True)

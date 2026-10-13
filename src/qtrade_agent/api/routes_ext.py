@@ -280,13 +280,70 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
         return {"ok": True, **out}
 
     # ================================================================== #78 自检
+    def _summarize_runtime(observed: list[dict[str, Any]]) -> dict[str, Any]:
+        """把已经 inspect 过的 QQ / 企点容器收成自检字段。不启动、不删除容器。"""
+        if not observed:
+            return {
+                "napcat_ok": None,
+                "napcat_detail": "",
+                "account_containers": [],
+                "skipped": [
+                    {"step": "napcat", "reason": "no_executor"},
+                ],
+            }
+        containers = [
+            {"id": row["id"], "channel": row["channel"], "running": row["running"] is True}
+            for row in observed
+        ]
+        qq = [row for row in observed if row["channel"] == "qq"]
+        skipped: list[dict[str, str]] = []
+        napcat_ok: Optional[bool] = None
+        detail = ""
+        if any(row["running"] is True for row in qq):
+            napcat_ok = True
+            detail = "、".join(row["id"] for row in qq if row["running"] is True) + " 运行中"
+        elif qq and all(row["running"] is False for row in qq):
+            napcat_ok = False
+            detail = "、".join(row["id"] for row in qq) + " 未在运行"
+        elif qq:
+            skipped.append({"step": "napcat", "reason": "no_executor"})
+        else:
+            skipped.append({"step": "napcat", "reason": "no_qq"})
+        return {
+            "napcat_ok": napcat_ok,
+            "napcat_detail": detail,
+            "account_containers": containers,
+            "skipped": skipped,
+        }
+
+    async def _observe_account_containers() -> dict[str, Any]:
+        rows = agent.store.list_accounts()
+        runtime = getattr(agent, "runtime", None)
+        observed: list[dict[str, Any]] = []
+        for row in rows:
+            if row.get("channel") not in ("qq", "qidian"):
+                continue
+            if row.get("state") not in ("running", "degraded", "starting", "logging_in"):
+                continue
+            running: Optional[bool] = None
+            if runtime is not None:
+                try:
+                    info = await runtime.inspect(row)
+                    running = bool(info.running)
+                except Exception:
+                    running = None
+            observed.append({"id": row["id"], "channel": row["channel"], "running": running})
+        return _summarize_runtime(observed)
+
     @app.post(f"{P}/system/selftest")
     async def system_selftest_run(request: Request):
         """#78,级别 A → ``202 {run_id}``;结果经 #79 ``GET /system/selftest/{run_id}`` 取(02 逐字给的就是 `run_id`,
         **不是 `job_id`** —— `jobs.kind` 的 CHECK 里没有 selftest,硬塞会直接违反约束)。
 
-        ⚠️ **临时 redroid(adb 16099)那一步本期没有执行体** ⇒ ``redroid_boot_ms`` / ``napcat_ok`` 如实回 ``null``
-        并在 ``skipped`` 里写明原因,不假装启过容器(04 §2.4.5 的「不编造」同口径)。
+        一次性安装容器 ``qtrade-selftest``（adb 16099）只在安装向导里启动、测完即删。
+        日常自检不启动它，也不把它写进检查结果。已有 QQ / 企点容器时，NapCat 与账号容器按 ``inspect`` 的真实结果填写；
+        没有任何可检查的账号容器时，``napcat_ok`` 回 ``null`` 并登记跳过原因。
+        日常接口不执行临时 redroid 启动检查，始终登记 ``redroid_boot/no_executor``，不编造启动耗时。
         """
         p = principal(request, "admin")
         body = await json_or_empty(request)
@@ -306,11 +363,14 @@ def register_ext(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_em
                 probes = (await _probe_full(list(targets), trigger="install", detail="selftest"))["results"]
             except ApiError as e:
                 probes = [{"side": "windows", "status": "SKIPPED", "level_reached": "none", "detail": e.reason or "probe_failed"}]
-            data = {"run_id": run_id, "redroid_boot_ms": None, "napcat_ok": None,
+            runtime_view = await _observe_account_containers()
+            data = {"run_id": run_id, "redroid_boot_ms": None,
+                    "napcat_ok": runtime_view["napcat_ok"],
+                    "napcat_detail": runtime_view["napcat_detail"],
+                    "account_containers": runtime_view["account_containers"],
                     "winagent_ok": ping is not None, "winagent_version": (ping or {}).get("version"),
                     "probes": probes, "started_at": _iso(started), "finished_at": _iso(agent.clock()),
-                    "skipped": [{"step": "redroid_boot", "reason": "no_executor"},
-                                {"step": "napcat", "reason": "no_executor"}]}
+                    "skipped": runtime_view["skipped"] + [{"step": "redroid_boot", "reason": "no_executor"}]}
             agent.store.settings_set(f"system.selftest.{run_id}", data, actor=p.actor)
             agent.store.settings_set("system.selftest.last", run_id, actor=p.actor)
             agent.events.emit("job", payload={"job_id": run_id, "kind": "selftest", "state": "succeeded"})

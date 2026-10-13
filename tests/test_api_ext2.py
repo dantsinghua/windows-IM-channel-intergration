@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 from typing import Any, AsyncIterator, Optional
@@ -95,16 +96,20 @@ class FakeStreamSession:
         self._frames = frames
         self.controls: list[dict[str, Any]] = []
         self.closed = False
+        self._closed = asyncio.Event()
 
     async def frames(self) -> AsyncIterator[tuple[int, bytes]]:
         for f in self._frames:
             yield f
+        # Live 视频暂时没有新帧不等于 EOF，控制通道保持可用直到关闭。
+        await self._closed.wait()
 
     async def control(self, msg: dict[str, Any]) -> None:
         self.controls.append(msg)
 
     async def close(self) -> None:
         self.closed = True
+        self._closed.set()
 
 
 class FakeStreamBackend:

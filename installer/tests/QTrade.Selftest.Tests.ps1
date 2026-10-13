@@ -7,6 +7,18 @@ BeforeAll {
     }
 }
 
+Describe 'Isolated installer health and selftest fixtures' {
+
+BeforeEach {
+    Mock -ModuleName QTrade.Native Invoke-QtProcess { throw 'Real processes are forbidden in selftest fixtures.' }
+    Mock -ModuleName QTrade.Distro Invoke-QtWsl { throw 'Real WSL is forbidden in selftest fixtures.' }
+    Mock -ModuleName QTrade.WinAgent Invoke-QtWsl { throw 'Real WSL is forbidden in selftest fixtures.' }
+    Mock -ModuleName QTrade.Selftest Invoke-QtWsl { throw 'Every selftest WSL call must have an explicit fixture.' }
+    Mock -ModuleName QTrade.Selftest Get-QtBootstrapTokens {
+        [pscustomobject]@{ Ok = $true; ConsoleToken = ('A' * 64); WinAgentToken = ('B' * 64); Reason = '' }
+    }
+}
+
 Describe '§7 [probe] install_targets(基线 §8.5 十个 probe_target)' {
 
     It '十个目标' {
@@ -125,40 +137,43 @@ Describe '§2.11 第 2 项 Agent 健康(docker:ok、db:ok、winagent_reachable:t
     }
 }
 
-Describe '§2.11 第 3 项 临时 redroid(202 + 轮询)' {
-
-    BeforeEach { Mock -ModuleName QTrade.Selftest Start-QtSleep { } }
-
-    It '202 → 轮询到 ok → 通过,并带回耗时' {
-        Mock -ModuleName QTrade.Selftest Invoke-QtHttp {
-            if ($Method -eq 'POST') { return [pscustomobject]@{ Ok = $true; StatusCode = 202; Body = '{"run_id":"r1"}' } }
-            return [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"status":"ok"}' }
+Describe 'Installer redroid selftest uses only its dedicated fake WSL boundary' {
+    It 'accepts a successful script result and returns its observed elapsed time' {
+        Mock -ModuleName QTrade.Selftest Invoke-QtWsl {
+            [pscustomobject]@{ ExitCode = 0; TimedOut = $false; StdOut = '{"ok":true,"redroid_boot_ms":42000}'; StdErr = '' }
         }
-        $r = Invoke-QtSelftestRedroid
+        $r = Invoke-QtSelftestRedroid -TimeoutSec 180
         $r.Ok | Should -BeTrue
-        $r.RunId | Should -Be 'r1'
-    }
-
-    It '没回 202 → SELFTEST_REDROID_BOOT' {
-        Mock -ModuleName QTrade.Selftest Invoke-QtHttp { [pscustomobject]@{ Ok = $false; StatusCode = 500; Body = 'boom' } }
-        (Invoke-QtSelftestRedroid).Reason | Should -Be 'SELFTEST_REDROID_BOOT'
-    }
-
-    It '202 但没带 run_id → SELFTEST_REDROID_BOOT(不静默当成功)' {
-        Mock -ModuleName QTrade.Selftest Invoke-QtHttp { [pscustomobject]@{ Ok = $true; StatusCode = 202; Body = '{}' } }
-        (Invoke-QtSelftestRedroid).Reason | Should -Be 'SELFTEST_REDROID_BOOT'
-    }
-
-    It '🔴 轮询到 failed → 失败并**附 docker logs 前 40 行**(§2.11 第 3 项)' {
-        Mock -ModuleName QTrade.Selftest Invoke-QtHttp {
-            if ($Method -eq 'POST') { return [pscustomobject]@{ Ok = $true; StatusCode = 202; Body = '{"run_id":"r1"}' } }
-            return [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"status":"failed"}' }
+        $r.ElapsedSec | Should -Be 42
+        Should -Invoke -ModuleName QTrade.Selftest Invoke-QtWsl -Times 1 -Exactly -ParameterFilter {
+            $WslArgs -contains 'qtrade' -and $WslArgs -contains '/opt/qtrade/bin/qtrade-install-selftest.sh' -and
+            $WslArgs[-1] -eq '180' -and $TimeoutSec -eq 360
         }
-        Mock -ModuleName QTrade.Selftest Get-QtContainerLogsTail { 'boot loop...' }
+    }
+    It 'fails on a <Case> and preserves script diagnostics' -ForEach @(
+        @{ Case = 'nonzero exit'; Exit = 1; TimedOut = $false },
+        @{ Case = 'timeout'; Exit = 0; TimedOut = $true }
+    ) {
+        Mock -ModuleName QTrade.Selftest Invoke-QtWsl {
+            [pscustomobject]@{ ExitCode = $Exit; TimedOut = $TimedOut; StdOut = '{"ok":true,"redroid_boot_ms":42000}'; StdErr = 'fixture boot loop diagnostic' }
+        }
         $r = Invoke-QtSelftestRedroid
         $r.Ok | Should -BeFalse
-        $r.Logs | Should -Be 'boot loop...'
-        Should -Invoke -ModuleName QTrade.Selftest Get-QtContainerLogsTail -Times 1 -ParameterFilter { $Lines -eq 40 }
+        $r.Reason | Should -Be 'SELFTEST_REDROID_BOOT'
+        $r.Logs | Should -Be 'fixture boot loop diagnostic'
+    }
+    It 'rejects incomplete or failed script result <Body>' -ForEach @(
+        @{ Body = 'not JSON' }, @{ Body = '{}' }, @{ Body = '{"ok":false,"redroid_boot_ms":1}' },
+        @{ Body = '{"ok":true}' }, @{ Body = '{"ok":true,"redroid_boot_ms":-1}' }
+    ) {
+        Mock -ModuleName QTrade.Selftest Invoke-QtWsl {
+            [pscustomobject]@{ ExitCode = 0; TimedOut = $false; StdOut = $Body; StdErr = '' }
+        }
+        (Invoke-QtSelftestRedroid).Ok | Should -BeFalse
+    }
+    It 'rejects a foreign distro before any WSL call' {
+        (Invoke-QtSelftestRedroid -DistroName 'customer-distro').Ok | Should -BeFalse
+        Should -Invoke -ModuleName QTrade.Selftest Invoke-QtWsl -Times 0 -Exactly
     }
 }
 
@@ -225,4 +240,6 @@ Describe '🔴 SELFTEST_OK 幂等判据不含「临时容器还在不在」' {
         Mock -ModuleName QTrade.Selftest Invoke-QtSelftestRedroid { throw '幂等判据不该起容器' }
         Test-QtSelftestComplete -Context ([pscustomobject]@{ WinAgentBaseUrl = 'http://x'; AgentBaseUrl = 'http://y' }) | Should -BeTrue
     }
+}
+
 }

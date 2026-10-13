@@ -119,16 +119,34 @@ function Install-QtWinAgentService {
     param(
         [Parameter(Mandatory)][string] $ExePath,
         [string] $Name = 'QTradeWinAgent',
-        [string] $DisplayName = 'QTrade WinAgent'
+        [string] $DisplayName = 'QTrade WinAgent',
+        [string] $InstallUserSid = '',
+        [string] $Root = ''
     )
     $cmds = @()
-    $create = @('create', $Name, 'binPath=', ('"{0}"' -f $ExePath), 'start=', 'delayed-auto', 'obj=', 'LocalSystem',
-        'DisplayName=', $DisplayName, 'depend=', 'LxssManager')
+    if ($InstallUserSid -notmatch '\AS-1-(?:5-21|12-1)(?:-\d+){4}\z') {
+        return [pscustomobject]@{ Ok = $false; Reason = 'INSTALL_USER_SID_INVALID'; Commands = $cmds }
+    }
+    if (-not $Root) { $Root = Split-Path -Parent (Split-Path -Parent $ExePath) }
+    $binary = (@($ExePath, '--service', '--root', $Root, '--install-user-sid', $InstallUserSid) |
+        ForEach-Object { ConvertTo-QtProcessArgument -Value $_ }) -join ' '
+    # WinAgent provides diagnostics even when WSL is unavailable. Do not depend
+    # on a Windows WSL service name that differs across supported releases.
+    $create = @('create', $Name, 'binPath=', $binary, 'start=', 'delayed-auto', 'obj=', 'LocalSystem',
+        'DisplayName=', $DisplayName)
     $cmds += ($create -join ' ')
     $r = Invoke-QtSc -ScArgs $create
     if ($r.ExitCode -ne 0 -and $r.ExitCode -ne 1073) {
         # 1073 = 服务已存在,幂等重跑属正常
         return [pscustomobject]@{ Ok = $false; Reason = 'SERVICE_INSTALL_FAILED'; Commands = $cmds }
+    }
+    if ($r.ExitCode -eq 1073) {
+        $update = @('config', $Name, 'binPath=', $binary, 'start=', 'delayed-auto', 'obj=', 'LocalSystem', 'depend=', '/')
+        $cmds += ($update -join ' ')
+        $updated = Invoke-QtSc -ScArgs $update
+        if ($updated.ExitCode -ne 0) {
+            return [pscustomobject]@{ Ok = $false; Reason = 'SERVICE_INSTALL_FAILED'; Commands = $cmds }
+        }
     }
     $desc = @('description', $Name, 'QTrade WinAgent 服务:vault / monitor / netprobe / 防火墙 / installer-ops')
     $cmds += ($desc -join ' ')
@@ -168,24 +186,44 @@ function Register-QtWinAgentUserTask {
 function Get-QtWinAgentHealth {
     <#
     .SYNOPSIS
-        `GET /wa/v1/health` → {Ok, StatusCode, UserAgent, Vault, Version, Raw}
+        Authenticated health with a ready Vault; the user agent may be offline.
     #>
     [CmdletBinding()]
-    param([string] $BaseUrl = 'http://127.0.0.1:17610', [int] $TimeoutSec = 5)
-    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/health') -Method GET -TimeoutSec $TimeoutSec
+    param(
+        [string] $BaseUrl = 'http://127.0.0.1:17610',
+        [ValidateRange(1, 120)][int] $TimeoutSec = 5,
+        [AllowEmptyString()][string] $Token = ''
+    )
+    $deadline = (Get-QtNow).AddSeconds($TimeoutSec)
+    if (-not $Token) {
+        $bootstrap = Get-QtBootstrapTokens -TimeoutSec $TimeoutSec
+        if (-not $bootstrap.Ok) {
+            return [pscustomobject]@{ Ok = $false; StatusCode = 0; UserAgent = $false; Vault = ''; Version = ''; Raw = '' }
+        }
+        $Token = $bootstrap.ConsoleToken
+    }
+    $remaining = [int][Math]::Ceiling(($deadline - (Get-QtNow)).TotalSeconds)
+    if ($remaining -le 0) {
+        return [pscustomobject]@{ Ok = $false; StatusCode = 0; UserAgent = $false; Vault = ''; Version = ''; Raw = '' }
+    }
+    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/health') -Method GET -Headers @{ Authorization = ('Bearer ' + $Token) } -TimeoutSec $remaining
     $userAgent = $false
     $vault = ''
     $version = ''
-    if ($r.Ok -and $r.Body) {
+    $healthy = $false
+    if ($r.Ok -and $r.StatusCode -eq 200 -and $r.Body) {
         try {
             $j = $r.Body | ConvertFrom-Json
-            if (Test-QtHasProperty -Object $j -Name 'user_agent') { $userAgent = [bool]$j.user_agent }
-            if (Test-QtHasProperty -Object $j -Name 'vault') { $vault = [string]$j.vault }
-            if (Test-QtHasProperty -Object $j -Name 'version') { $version = [string]$j.version }
+            if ((Test-QtHasProperty -Object $j -Name 'user_agent') -and $j.user_agent -is [bool]) { $userAgent = $j.user_agent }
+            if ((Test-QtHasProperty -Object $j -Name 'modules') -and
+                (Test-QtHasProperty -Object $j.modules -Name 'vault') -and $j.modules.vault -is [string]) { $vault = $j.modules.vault }
+            if ((Test-QtHasProperty -Object $j -Name 'version') -and $j.version -is [string]) { $version = $j.version }
+            $healthy = ((Test-QtHasProperty -Object $j -Name 'ok') -and $j.ok -is [bool] -and $j.ok -and
+                (Test-QtHasProperty -Object $j -Name 'user_agent') -and $j.user_agent -is [bool] -and $vault -ceq 'ok')
         } catch { }
     }
     return [pscustomobject]@{
-        Ok         = ($r.Ok -and $r.StatusCode -eq 200)
+        Ok         = $healthy
         StatusCode = $r.StatusCode
         UserAgent  = $userAgent
         Vault      = $vault
@@ -197,24 +235,28 @@ function Get-QtWinAgentHealth {
 function Wait-QtWinAgentHealthy {
     <#
     .SYNOPSIS
-        §2.8.3 第 5 步:启动服务 → 等 `/wa/v1/health` 200(30 s)。
-        🔴 R3-16:**服务 200 即视为本步成功,不再以 `user_agent:true` 为门** —— 静默/无人值守安装下
-        用户未登录、会话代理不在属正常态;`E_INSTALL_WINAGENT_NOT_READY` 只留给「服务起不来或 30 s 内不 200」。
+        Wait for authenticated service health and Vault readiness.
+        An offline user agent remains supported for unattended installation.
     .OUTPUTS
         {Ok, UserAgent, Reason}
     #>
     [CmdletBinding()]
     param(
         [string] $BaseUrl = 'http://127.0.0.1:17610',
-        [int] $TimeoutSec = 30,
-        [int] $IntervalSec = 2
+        [ValidateRange(1, 120)][int] $TimeoutSec = 30,
+        [ValidateRange(1, 120)][int] $IntervalSec = 2,
+        [AllowEmptyString()][string] $Token = ''
     )
     $deadline = (Get-QtNow).AddSeconds($TimeoutSec)
     $last = $null
     while ((Get-QtNow) -lt $deadline) {
-        $last = Get-QtWinAgentHealth -BaseUrl $BaseUrl
+        $remaining = [int][Math]::Ceiling(($deadline - (Get-QtNow)).TotalSeconds)
+        if ($remaining -le 0) { break }
+        $last = Get-QtWinAgentHealth -BaseUrl $BaseUrl -Token $Token -TimeoutSec ([Math]::Min(5, $remaining))
         if ($last.Ok) { return [pscustomobject]@{ Ok = $true; UserAgent = $last.UserAgent; Reason = '' } }
-        Start-QtSleep -Seconds $IntervalSec
+        $remaining = [int][Math]::Floor(($deadline - (Get-QtNow)).TotalSeconds)
+        if ($remaining -le 0) { break }
+        Start-QtSleep -Seconds ([Math]::Min($IntervalSec, $remaining))
     }
     $ua = $false
     if ($null -ne $last) { $ua = $last.UserAgent }
@@ -224,14 +266,111 @@ function Wait-QtWinAgentHealthy {
 function Test-QtWinAgentInstalled {
     <#
     .SYNOPSIS
-        WINAGENT_INSTALLED 幂等判据(docs/03 §2.3):服务 `Running` 且 `/wa/v1/health` 200
-        (**不要求 `user_agent:true`**,R3-16)。
+        Require the registered service and authenticated health to be ready.
+        The user agent may be offline.
     #>
     [CmdletBinding()][OutputType([bool])]
     param([Parameter(Mandatory)] $Context)
     if ((Get-QtServiceStatus -Name $script:QtServiceName) -ne 'Running') { return $false }
     $h = Get-QtWinAgentHealth -BaseUrl $script:QtWinAgentBase
     return $h.Ok
+}
+
+function Invoke-QtBootstrapPipe {
+    [CmdletBinding()]
+    param([ValidateRange(1, 120)][int] $TimeoutSec = 30)
+    $result = [pscustomobject]@{ Ok = $false; Reason = 'BOOTSTRAP_PIPE_FAILED'; Response = $null }
+    $pipe = $null
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $servicePid = Get-QtServiceProcessId -Name $script:QtServiceName
+        if ($servicePid -le 0) { $result.Reason = 'WINAGENT_NOT_READY'; return $result }
+        if (-not ('QTrade.InstallerPipeIdentity' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace QTrade {
+    public static class InstallerPipeIdentity {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint processId);
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', 'qtrade-winagent', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous, [Security.Principal.TokenImpersonationLevel]::Identification)
+        $pipe.Connect([Math]::Max(1, $TimeoutSec * 1000 - [int]$clock.ElapsedMilliseconds))
+        [uint32]$serverPid = 0
+        if (-not [QTrade.InstallerPipeIdentity]::GetNamedPipeServerProcessId($pipe.SafePipeHandle.DangerousGetHandle(), [ref]$serverPid) -or $serverPid -ne $servicePid -or $serverPid -ne (Get-QtServiceProcessId -Name $script:QtServiceName)) {
+            $result.Reason = 'BOOTSTRAP_PIPE_UNTRUSTED'; return $result
+        }
+        $request = [Text.Encoding]::UTF8.GetBytes('{"op":"issue_bootstrap"}' + "`n")
+        $write = $pipe.WriteAsync($request, 0, $request.Length)
+        if (-not $write.Wait([Math]::Max(0, $TimeoutSec * 1000 - [int]$clock.ElapsedMilliseconds))) { $result.Reason = 'BOOTSTRAP_PIPE_TIMEOUT'; return $result }
+        $bytes = New-Object 'System.Collections.Generic.List[byte]'
+        $buffer = New-Object byte[] 1024
+        $complete = $false
+        while (-not $complete) {
+            $read = $pipe.ReadAsync($buffer, 0, $buffer.Length)
+            if (-not $read.Wait([Math]::Max(0, $TimeoutSec * 1000 - [int]$clock.ElapsedMilliseconds))) { $result.Reason = 'BOOTSTRAP_PIPE_TIMEOUT'; return $result }
+            $count = $read.Result
+            if ($count -eq 0) { return $result }
+            for ($i = 0; $i -lt $count; $i++) {
+                if ($buffer[$i] -eq 10) { $complete = $true; break }
+                $bytes.Add($buffer[$i])
+                if ($bytes.Count -gt 16384) { $result.Reason = 'BOOTSTRAP_PIPE_INVALID'; return $result }
+            }
+        }
+        $encoding = New-Object Text.UTF8Encoding($false, $true)
+        $response = $encoding.GetString($bytes.ToArray()) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $response -or $response -is [array] -or $response -isnot [pscustomobject]) { $result.Reason = 'BOOTSTRAP_PIPE_INVALID'; return $result }
+        $result.Ok = $true; $result.Reason = ''; $result.Response = $response
+        return $result
+    } catch {
+        # Never expose exception text, request bytes, or a response credential.
+        return $result
+    } finally {
+        if ($null -ne $pipe) { $pipe.Dispose() }
+        $clock.Stop()
+    }
+}
+
+function Get-QtBootstrapTokens {
+    [CmdletBinding()]
+    param([ValidateRange(1, 120)][int] $TimeoutSec = 30)
+    $result = [pscustomobject]@{ Ok = $false; Reason = 'BOOTSTRAP_TOKEN_INVALID'; ConsoleToken = ''; WinAgentToken = '' }
+    $deadline = (Get-QtNow).AddSeconds($TimeoutSec)
+    while ($true) {
+        $remaining = [int][Math]::Ceiling(($deadline - (Get-QtNow)).TotalSeconds)
+        if ($remaining -le 0) { return $result }
+        $reply = Invoke-QtBootstrapPipe -TimeoutSec ([Math]::Min(5, $remaining))
+        $retry = $false
+        if (-not $reply.Ok) {
+            $result.Reason = $reply.Reason
+            $retry = $reply.Reason -in @('WINAGENT_NOT_READY', 'BOOTSTRAP_PIPE_FAILED', 'BOOTSTRAP_PIPE_TIMEOUT')
+        } elseif (Test-QtHasProperty -Object $reply.Response -Name 'error') {
+            $result.Reason = 'BOOTSTRAP_TOKEN_INVALID'
+            if ([string]$reply.Response.error -in @('FORBIDDEN', 'NOT_READY', 'INVALID_ARGS')) { $result.Reason = [string]$reply.Response.error }
+            $retry = $result.Reason -eq 'NOT_READY'
+        } else { break }
+        if (-not $retry -or (Get-QtNow) -ge $deadline) { return $result }
+        Start-QtSleep -Seconds 1
+    }
+    $result.Reason = 'BOOTSTRAP_TOKEN_INVALID'
+    foreach ($key in @('console_token', 'winagent_token')) {
+        if (-not (Test-QtHasProperty -Object $reply.Response -Name $key) -or $reply.Response.$key -isnot [string] -or $reply.Response.$key -cnotmatch '^[A-Za-z0-9_-]{32,4096}$') { return $result }
+    }
+    $result.Ok = $true; $result.Reason = ''
+    $result.ConsoleToken = $reply.Response.console_token; $result.WinAgentToken = $reply.Response.winagent_token
+    return $result
+}
+
+function Set-QtAgentConsoleToken {
+    [CmdletBinding()][OutputType([bool])]
+    param([Parameter(Mandatory)][string] $Token, [string] $DistroName = 'qtrade', [int] $TimeoutSec = 60)
+    if ($DistroName -cne 'qtrade' -or $Token -cnotmatch '^[A-Za-z0-9_-]{32,4096}$') { return $false }
+    $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', '/opt/qtrade/agent/venv/bin/python', '-m', 'qtrade_agent.main', '--bootstrap-console-token-stdin') -StandardInput $Token -TimeoutSec $TimeoutSec
+    return (-not $r.TimedOut -and $r.ExitCode -eq 0)
 }
 
 function Write-QtWinAgentToken {
@@ -250,9 +389,10 @@ function Write-QtWinAgentToken {
         [string] $DistroName = 'qtrade',
         [int] $TimeoutSec = 60
     )
+    if ($DistroName -cne 'qtrade') { return [pscustomobject]@{ Ok = $false; Reason = 'DISTRO_NAME_INVALID' } }
     if ([string]::IsNullOrWhiteSpace($Token)) { return [pscustomobject]@{ Ok = $false; Reason = 'EMPTY_TOKEN' } }
     # Send exact UTF-8 bytes through stdin, without a shell or a plaintext temp file.
-    $script = 'umask 077 && mkdir -p /etc/qtrade && cat > /etc/qtrade/winagent.token && chmod 600 /etc/qtrade/winagent.token && chown root:root /etc/qtrade/winagent.token'
+    $script = 'set -e; umask 077; test ! -L /etc/qtrade; mkdir -p /etc/qtrade; test ! -L /etc/qtrade/winagent.token; tmp=$(mktemp /etc/qtrade/winagent.token.XXXXXX); cat > "$tmp"; chmod 600 "$tmp"; chown root:root "$tmp"; mv -f -- "$tmp" /etc/qtrade/winagent.token'
     $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'sh', '-c', $script) -StandardInput $Token -TimeoutSec $TimeoutSec
     if ($r.TimedOut -or $r.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Reason = 'TOKEN_WRITE_FAILED' } }
     return [pscustomobject]@{ Ok = $true; Reason = '' }
@@ -275,4 +415,5 @@ Register-QtStepCheck -Step 'WINAGENT_INSTALLED' -Check { param($ctx) Test-QtWinA
 
 Export-ModuleMember -Function Get-QtWinAgentNames, Install-QtVcRedist, Merge-QtWinAgentToml,
 Install-QtWinAgentService, Register-QtWinAgentUserTask, Get-QtWinAgentHealth, Wait-QtWinAgentHealthy,
-Test-QtWinAgentInstalled, Write-QtWinAgentToken, Uninstall-QtWinAgent
+Test-QtWinAgentInstalled, Write-QtWinAgentToken, Uninstall-QtWinAgent,
+Get-QtBootstrapTokens, Set-QtAgentConsoleToken

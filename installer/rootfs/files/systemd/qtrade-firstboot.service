@@ -6,6 +6,8 @@ After=docker.service
 Requires=docker.service
 After=qtrade-docker-config.service
 ConditionPathExists=!/etc/qtrade/.imported
+ConditionPathExists=/etc/qtrade/install.env
+ConditionPathExists=/etc/qtrade/winagent.token
 
 [Service]
 Type=oneshot

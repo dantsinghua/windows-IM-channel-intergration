@@ -1,0 +1,7 @@
+{
+  "ok": true,
+  "agent": true,
+  "dockerd": true,
+  "winagent": true,
+  "user_agent": false
+}

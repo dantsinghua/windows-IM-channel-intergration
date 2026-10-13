@@ -188,9 +188,10 @@ def decode(msgtype: int, msgdata: bytes) -> Decoded:
 class MessageFactory:
     """``to_message(r) -> (Message | None, unknown)``(06 §2.9.5 ④);未知 msgtype 的「见过」集合是进程内状态。"""
 
-    def __init__(self, account_id: str, self_uid: str):
+    def __init__(self, account_id: str, self_uid: str, self_nick: Optional[str] = None):
         self.account_id = account_id
         self.self_uid = self_uid
+        self.self_nick = (self_nick or "").strip() or None
         self.seen_unknown: set[int] = set()
 
     def to_message(self, r: MainDbRow, *, table: str, native_id: str, kind: str) -> tuple[Optional[Message], bool]:
@@ -222,7 +223,7 @@ class MessageFactory:
             ext_msg_id=f"qd:{r.uniseq}",
             dedup_kind="native",
             sender_id=sender or None,
-            sender_name=None,
+            sender_name=self.self_nick if is_self else None,
             self=is_self,
             state="DELIVERED",
         )

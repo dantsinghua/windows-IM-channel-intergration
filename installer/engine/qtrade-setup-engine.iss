@@ -46,8 +46,7 @@ OutputBaseFilename={#EngineExeName}
 Compression=lzma2/max
 SolidCompression=yes
 SetupLogging=yes
-Uninstallable=yes
-UninstallDisplayName=QTrade
+Uninstallable=no
 WizardStyle=modern
 ; 引擎自身不含载荷(载荷由外层 7z 归档承载,§2.1)
 DiskSpanning=no
@@ -78,12 +77,6 @@ Source: "modules\*.psm1";   DestDir: "{app}\install\engine\modules"; Flags: igno
 Source: "run-step.ps1";     Flags: dontcopy ignoreversion
 Source: "lang\*.isl";       Flags: dontcopy ignoreversion
 Source: "modules\*.psm1";   Flags: dontcopy ignoreversion
-
-[UninstallRun]
-; §2.14:卸载指向落盘引擎;`/QT_KEEP_DATA` 缺省 1(保留数据)。
-; RunOnceId 保证这条在卸载过程中**只执行一次** —— 卸载本身是可重入的(§2.14 的每步都带判据),
-; 但重复跑一遍 `--unregister`/删服务只会刷一堆「对象不存在」的噪声,没必要。
-Filename: "{app}\install\engine\{#EngineExeName}.exe"; Parameters: "/QT_MODE=uninstall"; Flags: runhidden; RunOnceId: "QTradeUninstallEngine"
 
 [Code]
 // ───────────────────────────────────────────────────────────────────────────
@@ -275,6 +268,8 @@ const
 var
   OptMode: String;
   OptAcceptShutdown: Boolean;
+  OptAcceptCleanReinstall: Boolean;
+  OptStageRoot: String;
   OptAcceptReboot: Boolean;
   OptWslMemory: String;
   OptKeepWslMemory: Boolean;
@@ -296,6 +291,7 @@ var
   PageKernelConfirm: TInputOptionWizardPage;
   PageWeChat: TInputOptionWizardPage;
   LastStepJson: String;
+  FirewallWarning: String;
   LastStepExit: Integer;
   AckKernelImpact: Boolean;
   DistroConflictChoice: String;    // '' | 'unregister' | 'cancel'
@@ -361,6 +357,10 @@ end;
 procedure ParseCommandLine();
 begin
   OptMode               := GetSwitchValue(SW_QT_MODE, 'install');
+  OptAcceptCleanReinstall := GetSwitchBool('/QT_ACCEPT_CLEAN_REINSTALL=', False);
+  OptStageRoot := ExtractFileDir(ExtractFileDir(ExtractFileDir(ExpandConstant('{srcexe}'))));
+  if CompareText(OptStageRoot, ExpandConstant('{commonappdata}\QTrade')) = 0 then
+    OptStageRoot := '';
   OptAcceptShutdown     := GetSwitchBool(SW_QT_ACCEPT_SHUTDOWN, False);
   OptAcceptReboot       := GetSwitchBool(SW_QT_ACCEPT_REBOOT, False);
   OptWslMemory          := GetSwitchValue(SW_QT_WSL_MEMORY, '');
@@ -475,32 +475,53 @@ begin
 end;
 
 // ── 调 PowerShell 派发器 ───────────────────────────────────────────────────
+function JsonQuoted(const Value: String): String;
+var
+  I, Code: Integer;
+  Hex: String;
+begin
+  Hex := '0123456789abcdef';
+  Result := '"';
+  for I := 1 to Length(Value) do begin
+    Code := Ord(Value[I]);
+    if Value[I] = '"' then Result := Result + '\"'
+    else if Value[I] = '\' then Result := Result + '\\'
+    else if (Code < 32) or (Code > 126) then
+      Result := Result + '\u' + Hex[(Code div 4096) + 1] +
+        Hex[((Code div 256) mod 16) + 1] + Hex[((Code div 16) mod 16) + 1] + Hex[(Code mod 16) + 1]
+    else Result := Result + Value[I];
+  end;
+  Result := Result + '"';
+end;
+
 function BuildOptionsJson(): String;
 var
   S: String;
 begin
   S := '{';
-  S := S + '"mode":"' + OptMode + '"';
+  S := S + '"mode":' + JsonQuoted(OptMode);
+  if OptAcceptCleanReinstall then S := S + ',"accept_clean_reinstall":true' else S := S + ',"accept_clean_reinstall":false';
   if OptAcceptShutdown then S := S + ',"accept_shutdown":true' else S := S + ',"accept_shutdown":false';
   if OptAcceptReboot then S := S + ',"accept_reboot":true' else S := S + ',"accept_reboot":false';
   if OptKeepWslMemory then S := S + ',"keep_wsl_memory":true' else S := S + ',"keep_wsl_memory":false';
   if OptReplaceOtherKernel then S := S + ',"replace_other_kernel":true' else S := S + ',"replace_other_kernel":false';
   if OptKeepData then S := S + ',"keep_data":true' else S := S + ',"keep_data":false';
   if OptWeChatHostsBlock then S := S + ',"wechat_hosts_block":true' else S := S + ',"wechat_hosts_block":false';
-  S := S + ',"wsl_memory":"' + OptWslMemory + '"';
-  S := S + ',"crash_dumps":"' + OptCrashDumps + '"';
-  S := S + ',"crash_dump_dir":"' + OptCrashDumpDir + '"';
-  S := S + ',"wechat":"' + OptWeChat + '"';
-  S := S + ',"wechat_backup_dir":"' + OptWeChatBackupDir + '"';
-  S := S + ',"wechat_backup_mode":"' + OptWeChatBackupMode + '"';
-  S := S + ',"apk_url":"' + OptApkUrl + '"';
-  S := S + ',"docker_cidr":"' + OptDockerCidr + '"';
-  S := S + ',"source_exe":"' + OptSourceExe + '"';
-  S := S + ',"package_version":"' + '{#EngineVersion}' + '"';
-  S := S + ',"restore_data":"' + OptRestoreData + '"';
-  S := S + ',"distro_conflict_choice":"' + DistroConflictChoice + '"';
-  S := S + ',"wechat_backup_mode":"' + WeChatBackupModeSel + '"';
-  S := S + ',"wechat_selected_path":"' + WeChatSelectedPath + '"';
+  S := S + ',"wsl_memory":' + JsonQuoted(OptWslMemory);
+  S := S + ',"crash_dumps":' + JsonQuoted(OptCrashDumps);
+  S := S + ',"crash_dump_dir":' + JsonQuoted(OptCrashDumpDir);
+  S := S + ',"wechat":' + JsonQuoted(OptWeChat);
+  S := S + ',"wechat_backup_dir":' + JsonQuoted(OptWeChatBackupDir);
+  if WeChatBackupModeSel <> '' then
+    S := S + ',"wechat_backup_mode":' + JsonQuoted(WeChatBackupModeSel)
+  else S := S + ',"wechat_backup_mode":' + JsonQuoted(OptWeChatBackupMode);
+  S := S + ',"apk_url":' + JsonQuoted(OptApkUrl);
+  S := S + ',"docker_cidr":' + JsonQuoted(OptDockerCidr);
+  S := S + ',"source_exe":' + JsonQuoted(OptSourceExe);
+  S := S + ',"package_version":' + JsonQuoted('{#EngineVersion}');
+  S := S + ',"restore_data":' + JsonQuoted(OptRestoreData);
+  S := S + ',"distro_conflict_choice":' + JsonQuoted(DistroConflictChoice);
+  S := S + ',"wechat_selected_path":' + JsonQuoted(WeChatSelectedPath);
   if WeChatUninstallConfirmed then S := S + ',"wechat_uninstall_confirmed":true' else S := S + ',"wechat_uninstall_confirmed":false';
   if IsSilentRun() then S := S + ',"silent":true' else S := S + ',"silent":false';
   if WeChatUserApproved then S := S + ',"wechat_user_approved":true' else S := S + ',"wechat_user_approved":false';
@@ -720,7 +741,7 @@ begin
   SaveStringsToUTF8File(OptFile, OptLines, False);
   Cmd := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
   // 🔴 ps1 一律 `-ExecutionPolicy Bypass -File` 调用(§2.2.3);同时对 ps1 做 Authenticode 签名,AllSigned 机器也能跑
-  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\qte\run-step.ps1') + '" -Step ' + StepName + ' -Root "' + ExpandConstant('{commonappdata}\QTrade') + '" -OptionsPath "' + OptFile + '" > "' + OutFile + '"';
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\qte\run-step.ps1') + '" -Step ' + StepName + ' -Root "' + ExpandConstant('{commonappdata}\QTrade') + '" -StageRoot "' + OptStageRoot + '" -OptionsPath "' + OptFile + '" > "' + OutFile + '"';
   if not WizardSilent() then
   begin
     WizardForm.StatusLabel.Caption := StepName + '，可能需要几分钟';
@@ -802,8 +823,10 @@ end;
 procedure FailWith(const Code: Integer; const Msg: String);
 var
   Answer: Integer;
-  DiagMsg: String;
+  DiagMsg, InstallLogs: String;
 begin
+  InstallLogs := ExpandConstant('{commonappdata}\QTrade\logs\');
+  if OptStageRoot <> '' then InstallLogs := OptStageRoot + '\logs\';
   if EngineScriptsBroken then
   begin
     // 脚本都没释放出来,诊断包(也是跑 run-step.ps1)无从谈起;不提供,免得递归
@@ -814,7 +837,7 @@ begin
   begin
     // §5.3:每个失败页带日志路径与【导出诊断包】。诊断包**不含** vault / 密码 / 微信数据 / 消息正文(红线 2)。
     Answer := MsgBox(Msg + #13#10#13#10 +
-      '日志:' + ExpandConstant('{commonappdata}\QTrade\logs\') + #13#10#13#10 +
+      '日志:' + InstallLogs + #13#10#13#10 +
       '要导出一份诊断包吗?它只包含安装日志、.wslconfig、WSL 状态与策略键,' +
       '不包含任何密码、凭据、微信数据或聊天内容。',
       mbCriticalError, MB_YESNO);
@@ -883,6 +906,8 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if (CurPageID = wpFinished) and (FirewallWarning <> '') then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + FirewallWarning;
   if CurPageID = PageKernelConfirm.ID then
     PageKernelConfirm.SubCaptionLabel.Caption :=
       '接下来要把 WSL 切换到 QTrade 的内核。这一步**会关闭 WSL 里正在运行的所有程序**' +
@@ -978,46 +1003,11 @@ begin
     ExitProcess(OK);
   end;
 
-  // §2.13:新版本 EXE 检测到 `install_state.state=DONE` 且 `package_version <` 自身即进 upgrade;
-  // bootstrap 已算好建议模式,这里只在用户没显式给 /QT_MODE 时采纳它。
-  if (CompareText(OptMode, 'install') = 0) then
-  begin
-    StateName := JsonStr(LastStepJson, 'recommended_mode');
-    if CompareText(StateName, 'upgrade') = 0 then OptMode := 'upgrade';
-    if CompareText(StateName, 'downgrade-refused') = 0 then
-      FailWith(E_INSTALL_DOWNGRADE_REFUSED,
-        '本机已安装的版本高于本安装包,不支持降级。请先卸载现有版本,再安装这一版。');
-  end;
-
-  if CompareText(OptMode, 'upgrade') = 0 then
-  begin
-    // schema_breaking 时向导第一页明示 + 二次确认(A-5;验收 M1-22b)
-    if not RunStep('upgrade') then
-    begin
-      if JsonStr(LastStepJson, 'reason') = 'WAIT_SCHEMA_BREAKING_CONFIRM' then
-      begin
-        if IsSilentRun() then FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-        Answer := MsgBox(JsonStr(LastStepJson, 'message') + #13#10#13#10 + '确定要继续吗?', mbConfirmation, MB_YESNO);
-        if Answer <> IDYES then ExitProcess(OK);
-        AcceptSchemaBreaking := True;
-        if MsgBox('再确认一次:本次升级会重建数据。升级前会自动做一份备份。确定继续?', mbConfirmation, MB_YESNO) <> IDYES then
-          ExitProcess(OK);
-        if not RunStep('upgrade') then FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-      end
-      else if JsonStr(LastStepJson, 'reason') = 'WAIT_SHUTDOWN_CONFIRM' then
-      begin
-        if IsSilentRun() then FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-        // 🔴 [NOSHUTDOWN] / 红线 6:停账号容器会中断账号,先明示、用户确认时机
-        if MsgBox(JsonStr(LastStepJson, 'message') + #13#10#13#10 + '现在开始升级吗?', mbConfirmation, MB_YESNO) <> IDYES then
-          ExitProcess(E_INSTALL_WAIT_USER);
-        OptAcceptShutdown := True;
-        if not RunStep('upgrade') then FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-      end
-      else
-        FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-    end;
-    ExitProcess(OK);
-  end;
+  // Every new package uses the same verified clean-install path.
+  // An installed engine can resume an interrupted install, never fabricate an upgrade.
+  if (OptStageRoot = '') and
+     ((CompareText(OptMode, 'install') = 0) or (CompareText(OptMode, 'upgrade') = 0)) then
+    FailWith(E_INSTALL_WAIT_USER, '请运行完整安装包。新版采用清空 QTrade 后重新安装，不提供原地升级。');
 
   if CompareText(OptMode, 'repair') = 0 then
   begin
@@ -1031,10 +1021,25 @@ begin
   if not RunStep(ST_PRECHECK) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
-  // 2) PAYLOAD_STAGED(§2.2.1)——外壳已解压,这里逐文件复核 sha256
-  WizardForm.StatusLabel.Caption := '正在校验安装包…';
-  if not RunStep(ST_PAYLOAD_STAGED) then
-    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  // 2) Verify the independent stage before offering any destructive action.
+  if OptStageRoot <> '' then
+  begin
+    WizardForm.StatusLabel.Caption := '正在校验独立暂存安装包…';
+    if not RunStep(ST_PAYLOAD_STAGED) then
+      FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+    if not RunStep('clean-reinstall') then
+    begin
+      if (JsonStr(LastStepJson, 'reason') <> 'CLEAN_REINSTALL_CONFIRM_REQUIRED') or IsSilentRun() then
+        FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+      Answer := MsgBox('本版会删除已确认属于 QTrade 的旧程序、账号本地配置、凭据和登录状态、采集记录及 QTrade 专用 WSL 数据，然后全新安装。' + #13#10#13#10 +
+        '不备份、不迁移。微信和 QQ 客户端自己的数据、其他 WSL 发行版与 Docker Desktop 数据不会删除。' + #13#10#13#10 +
+        '确定清空 QTrade 并重新安装吗？', mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+      if Answer <> IDYES then ExitProcess(E_INSTALL_WAIT_USER);
+      OptAcceptCleanReinstall := True;
+      if not RunStep('clean-reinstall') then
+        FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+    end;
+  end;
 
   // 3) WSL_FEATURE(§2.5.1)——需要重启则写 RunOnce 并退 3010,**不自动重启**
   WizardForm.StatusLabel.Caption := '正在启用 Windows 组件…';
@@ -1058,6 +1063,14 @@ begin
   WizardForm.StatusLabel.Caption := '正在安装 WSL 运行时…';
   if not RunStep(ST_WSL_MSI) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  if CompareText(JsonStr(LastStepJson, 'state'), ST_REBOOT_PENDING) = 0 then
+  begin
+    if OptAcceptReboot then
+      Exec(ExpandConstant('{sys}\shutdown.exe'), '/r /t 15', '', SW_HIDE, ewNoWait, LastStepExit);
+    if not IsSilentRun() then
+      MsgBox('WSL 运行时安装完成，需要重启。重启并登录安装账号后将继续，已完成的清空步骤不会重做。', mbInformation, MB_OK);
+    ExitProcess(E_INSTALL_REBOOT_REQUIRED);
+  end;
 
   // 5) KERNEL_STAGED(§2.6.1)——落盘 + ACL + 指针 + 在**官方内核上**预导入 kcheck
   WizardForm.StatusLabel.Caption := '正在准备 QTrade 内核…';
@@ -1074,23 +1087,13 @@ begin
   WizardForm.StatusLabel.Caption := '正在导入发行版(约 3–6 分钟)…';
   if not RunStep(ST_DISTRO_IMPORTED) then
   begin
-    if JsonStr(LastStepJson, 'reason') = 'WAIT_DISTRO_CONFLICT' then
-    begin
-      if IsSilentRun() then
-        FailWith(E_INSTALL_DISTRO_NAME_CONFLICT_DECLINED,
-          '发现不是本程序创建的同名发行版 qtrade;静默模式下不做处置。请先手工处理后重试。');
-      Answer := MsgBox(JsonStr(LastStepJson, 'message') + #13#10#13#10 +
-        '【是】= 先导出备份再注销它,然后重新导入(导出失败就不会注销);' + #13#10 +
-        '【否】= 取消安装。' + #13#10#13#10 +
-        '注意:不提供「改名绕过」—— 端口、路径、WinAgent 都写死 qtrade,改名等于改产品。',
-        mbConfirmation, MB_YESNO);
-      if Answer = IDYES then DistroConflictChoice := 'unregister' else DistroConflictChoice := 'cancel';
-      if not RunStep(ST_DISTRO_IMPORTED) then
-        FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
-    end
-    else
-      FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
   end;
+
+  // 9) WINAGENT_INSTALLED(§2.8.3)
+  WizardForm.StatusLabel.Caption := '正在安装 WinAgent…';
+  if not RunStep(ST_WINAGENT_INSTALLED) then
+    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
   // 8) IMAGES_LOADED(§2.7.3 末 / §2.2.1 G-10)
   WizardForm.StatusLabel.Caption := '正在加载镜像并等待 Agent 就绪…';
@@ -1107,11 +1110,6 @@ begin
     end;
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
   end;
-
-  // 9) WINAGENT_INSTALLED(§2.8.3)
-  WizardForm.StatusLabel.Caption := '正在安装 WinAgent…';
-  if not RunStep(ST_WINAGENT_INSTALLED) then
-    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
   // 10) CLIENTS_CHECKED(§2.9)——微信重装引导(红线 8:必须引导、用户确认后才动)
   WizardForm.StatusLabel.Caption := '正在检查客户端…';
@@ -1173,6 +1171,7 @@ begin
   WizardForm.StatusLabel.Caption := '正在收尾…';
   if not RunStep(ST_DONE) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  FirewallWarning := JsonStr(LastStepJson, 'firewall_message');
 
   WizardForm.StatusLabel.Caption := '安装完成';
 end;

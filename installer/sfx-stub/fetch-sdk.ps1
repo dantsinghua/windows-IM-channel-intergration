@@ -100,6 +100,11 @@ if ($SkipPatch) {
 }
 $patch = Join-Path $PSScriptRoot 'qtrade-sfx.patch'
 $changed = Invoke-QtUnifiedDiff -PatchPath $patch -Root $DestDir
+# The native build contract requires a BOM for this patched C++ source.
+# Keep resource.rc and the manifest unchanged: RC input must stay BOM-free.
+$mainCpp = Join-Path $projDir 'SfxSetup.cpp'
+$mainText = [System.IO.File]::ReadAllText($mainCpp, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($mainCpp, $mainText, (New-Object System.Text.UTF8Encoding($true)))
 Write-Host "补丁已应用($($changed.Count) 个文件):" -ForegroundColor Green
 foreach ($c in $changed) { Write-Host "  $c" }
 Write-Host ''

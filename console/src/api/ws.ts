@@ -252,8 +252,10 @@ export class EventsClient {
     // 首帧可能是重放截断告知
     if (msg.replay === 'truncated') {
       const from = Number(msg.from_seq ?? 0)
-      this.lastSeq = Number.isFinite(from) ? from : 0
-      this.hooks.onReplayTruncated(this.lastSeq)
+      if (!Number.isSafeInteger(from) || from < 1) return
+      // from_seq 是第一条可回放事件，去重水位必须留在它之前。
+      this.lastSeq = from - 1
+      this.hooks.onReplayTruncated(from)
       return
     }
     // 心跳帧:只刷新存活,不入环形缓冲

@@ -12,7 +12,8 @@ import type {
   Account, AdoptProbeResult, ApiClientRow, AuditRow, CapabilityDef, CommandOutcome,
   CommandResult, DeviceProfileTemplate, Job, MailCleanupRow, MailInboxDetail, MailInboxRow,
   MailOutboxRow, MailRouteOverride, MailTemplate, Message, MetricsSnapshot,
-  ObservedProbeRow, PendingConfirm, Prompt, ProbeRow, PublicEndpoint, ResourcePool, SampleRow,
+  ObservedProbeRow, OssboxAuthenticationResult, OssboxSettingsData, OssboxSettingsInput,
+  OssboxSettingsResponse, PendingConfirm, Prompt, ProbeRow, PublicEndpoint, ResourcePool, SampleRow,
   SelftestRow, SelftestRun, SessionRow, SystemEnv, SystemHealth, SystemVersion, WorkflowDef, WorkflowRun,
 } from './types'
 import type { Channel } from '@/i18n/zh-CN/codes'
@@ -52,7 +53,7 @@ export const accountsApi = {
 
   start: (id: string) => request<{ state: string }>(`/accounts/${id}/start`, { method: 'POST' }),
   stop: (id: string) => request<{ state: string }>(`/accounts/${id}/stop`, { method: 'POST', body: { graceful: true } }),
-  restart: (id: string) => request<{ state: string }>(`/accounts/${id}/restart`, { method: 'POST' }),
+  restart: (id: string) => request<{ state: string }>(`/accounts/${id}/restart`, { method: 'POST', signal: AbortSignal.timeout(15_000) }),
   enable: (id: string) => request<{ state: string }>(`/accounts/${id}/enable`, { method: 'POST' }),
   disable: (id: string) => request<{ state: string }>(`/accounts/${id}/disable`, { method: 'POST', body: { graceful: true } }),
 
@@ -135,9 +136,11 @@ export const accountsApi = {
   capabilities: (id: string) =>
     request<{ capabilities: string[]; matrix: Record<string, string> }>(`/accounts/${id}/capabilities`),
 
-  /** #97/#98 QQ 临时 WebUI(C-35) */
-  webuiOpen: (id: string, minutes = 10) =>
-    request<{ url: string; until: string }>(`/accounts/${id}/webui/open`, { method: 'POST', body: { minutes } }),
+  /** #97/#98 QQ WebUI。persist 表示一直开着，直到用户关闭。 */
+  webuiOpen: (id: string, options?: number | { minutes?: number; persist?: boolean }) => {
+    const body = typeof options === 'number' ? { minutes: options } : (options ?? { minutes: 10 })
+    return request<{ url: string; until: string | null }>(`/accounts/${id}/webui/open`, { method: 'POST', body })
+  },
   webuiClose: (id: string) => request<{ ok: boolean }>(`/accounts/${id}/webui/close`, { method: 'POST' }),
 
   /** #99 仅 QQ:导出 qq_data → job */
@@ -466,7 +469,7 @@ export const systemApi = {
       query: runId ? { run_id: runId } : undefined,
     }).then((env) => ({
       // #79 的 data 是**一轮的对象**(`{redroid_boot_ms, napcat_ok, winagent_ok, probes}`);
-      // 01 §4 的自检表要行 ⇒ 在 selftestRows 里派生,没跑过的项一律 warn + 原因,不假装 ok
+      // 01 §4 的自检表要行 ⇒ 在 selftestRows 里派生。没检查到的项不标成正常。
       items: selftestRows(env.data as SelftestRun | SelftestRow[] | null),
       run: (Array.isArray(env.data) ? null : (env.data as SelftestRun | null)) ?? null,
       runId: (env.run_id as string | null) ?? null,
@@ -584,6 +587,26 @@ export const mailApi = {
 }
 
 /* ───────────────── 设置 ───────────────── */
+
+async function ossboxSettingsRequest(body?: OssboxSettingsInput, signal?: AbortSignal): Promise<OssboxSettingsResponse> {
+  const env = await requestEnvelope<OssboxSettingsData>('/settings/ossbox', {
+    method: body ? 'PUT' : 'GET', body, signal,
+  })
+  if (!env.data || env.group !== 'ossbox') throw new Error('Invalid OSS settings response')
+  return {
+    data: env.data,
+    restart_required: env.restart_required === true,
+    inquiry_configured: env.inquiry_configured === true,
+    catalog_configured: env.catalog_configured === true,
+  }
+}
+
+export const ossboxApi = {
+  get: (signal?: AbortSignal) => ossboxSettingsRequest(undefined, signal),
+  put: (body: OssboxSettingsInput, signal?: AbortSignal) => ossboxSettingsRequest(body, signal),
+  test: (body: OssboxSettingsInput, signal?: AbortSignal) =>
+    request<OssboxAuthenticationResult>('/settings/ossbox/test', { method: 'POST', body, signal }),
+}
 
 export const settingsApi = {
   get: <T = Record<string, unknown>>(group: string) => request<T>(`/settings/${group}`),

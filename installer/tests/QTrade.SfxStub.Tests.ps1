@@ -91,11 +91,11 @@ Describe 'ConvertFrom-QtUnifiedDiff（解析真补丁）' {
         $script:RealPatch = [System.IO.File]::ReadAllText((Join-Path $script:StubDir 'qtrade-sfx.patch'))
         $script:Parsed = ConvertFrom-QtUnifiedDiff -PatchText $script:RealPatch
     }
-    It '正好五个文件段(三处改动:两处行为 + 一处清单)' {
-        $script:Parsed.Count | Should -Be 5
+    It 'has six patch sections including the secure staging helper' {
+        $script:Parsed.Count | Should -Be 6
     }
     It '剥掉 a/ b/ 前缀后是 SDK 内的相对路径' {
-        foreach ($f in @('SfxSetup.cpp', 'ExtractEngine.cpp', 'ExtractEngine.h', 'resource.rc', 'qtrade-sfx.manifest')) {
+        foreach ($f in @('SfxSetup.cpp', 'ExtractEngine.cpp', 'ExtractEngine.h', 'QTradeStage.h', 'resource.rc', 'qtrade-sfx.manifest')) {
             $script:Parsed.Path | Should -Contain ('CPP\7zip\Bundles\SFXSetup\' + $f)
         }
     }

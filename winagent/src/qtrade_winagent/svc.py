@@ -49,7 +49,7 @@ TIMEOUT_S = {"ping": 2.0, "health": 2.0, "time": 3.0, "vault": 3.0, "metrics": 3
              "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0,
              # 快捷键发送约数秒,再加上 10s 读回确认。15s 时消息已经发出,读回还没返回,服务就把会话代理判超时。
              "wechat_send": 45.0,
-             "wechat_login_start": 60.0}
+             "wechat_login_start": 60.0, "wechat_snapshot": 3.0}
 
 
 @dataclass
@@ -240,6 +240,20 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
             return fail(e, request)
         return {"samples": d.monitor.metrics(scope=scope, subject=subject, since=since, until=until,
                                              resolution=resolution)}
+
+    @app.post("/wa/v1/metrics/deployment-volumes")
+    async def deployment_volumes(request: Request):                            # type: ignore[no-untyped-def]
+        """R6-79: read deployment volumes through the installing user's HKCU."""
+        from .win.storage import validate_volume_request
+        try:
+            auth(request, (ROLE_AGENT,), action="metrics.deployment_volumes")
+            try:
+                query = validate_volume_request(await _json(request))
+            except ValueError as exc:
+                raise WaError(INVALID_ARGS, "Invalid deployment volume query", reason=str(exc)) from None
+            return await via_pipe("metrics.deployment-volumes", query, timeout_s=11.0, request=request)
+        except WaError as e:
+            return fail(e, request)
 
     # ================================================================== #6 alerts(A,svc)
     @app.get("/wa/v1/alerts")
@@ -577,11 +591,13 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
     @app.get("/wa/v1/wechat/status")
     async def wechat_status(request: Request):                                    # type: ignore[no-untyped-def]
         try:
-            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.status")
+            role = auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.status")
             if not d.cfg.wechat.enabled:
                 return {"enabled": False, "wechat": None, "chatlog": None, "ritual_done": None,
                         "screen_locked": None, "login_session": None, "hosts_block": d.hosts_block.state()}
-            out = await via_pipe("wechat.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+            advance = role == ROLE_AGENT
+            out = await via_pipe("wechat.status", {"advance": advance},
+                                 timeout_s=TIMEOUT_S["wechat_read" if advance else "wechat_snapshot"], request=request)
         except WaError as e:
             return fail(e, request)
         out["hosts_block"] = d.hosts_block.state()                                 # #33b:状态并入 #28
@@ -634,7 +650,9 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
                 body.get("account_id"), default=d.cfg.wechat.main_wnd_class)
             out = await via_pipe("wechat.login.start", {"account_id": body.get("account_id"),
                                                         "login_session_id": body.get("login_session_id"),
-                                                        "main_wnd_class": main_wnd_class},
+                                                        "main_wnd_class": main_wnd_class,
+                                                        "supported_versions": [row["version"] for row in d.wechat_store.matrix()
+                                                                               if row.get("status") == "verified"]},
                                  timeout_s=TIMEOUT_S["wechat_login_start"], request=request)
         except WaError as e:
             return fail(e, request)
@@ -666,8 +684,10 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
     async def wechat_login_status(request: Request):                              # type: ignore[no-untyped-def]
         try:
             # 01 §2.5 白名单③ / 05 §3.2 R6-5:登录流只读状态控制台可直调(向导刷新/步④ 讲述人状态);写动作仍只 A
-            auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.login_status")
-            out = await via_pipe("wechat.login.status", {}, timeout_s=TIMEOUT_S["wechat_read"], request=request)
+            role = auth(request, (ROLE_AGENT, ROLE_CONSOLE), action="wechat.login_status")
+            advance = role == ROLE_AGENT
+            out = await via_pipe("wechat.login.status", {"advance": advance},
+                                 timeout_s=TIMEOUT_S["wechat_read" if advance else "wechat_snapshot"], request=request)
         except WaError as e:
             return fail(e, request)
         # R6-58 (au) 跟进:05 §2.4.4 ⑤⑥ 取钥成功即算一次完整登录 ——「刚进 ready」这一次(一次性标记,
@@ -675,10 +695,10 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         # 由服务落库;会话代理不碰 DB)。两个内部字段用完即弹出,不进 #33 的公开响应形状。
         just_became_ready = out.pop("just_became_ready", False)
         wechat_version = out.pop("wechat_version", None)
-        if (out.get("narrator") or {}).get("stop_pending"):
+        if advance and (out.get("narrator") or {}).get("stop_pending"):
             if await _kill_narrator_from_service(request):
                 out["narrator"] = {**out["narrator"], "state": "stopped", "stop_pending": False}
-        if just_became_ready and out.get("wxid") and out.get("account_id"):
+        if advance and just_became_ready and out.get("wxid") and out.get("account_id"):
             d.wechat_store.record_login(wxid=out["wxid"], account_id=out["account_id"],
                                         wechat_version=wechat_version, wxkey_dll=(out.get("key") or {}).get("dll"))
         return out

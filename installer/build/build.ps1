@@ -171,33 +171,12 @@ $SevenZip = Find-QtTool -Explicit $SevenZipPath -Name '7z.exe' -Param '-SevenZip
 # 🔴 存根、配置、链首脚本这三样必须**配套**。配错的后果不是报错,是静默跑偏:
 #    官方存根遇到 InstallPath 会直接忽略它,于是载荷解到 %TEMP%、跑完即删。
 #    所以下面把三者绑成一个对象,G5 按它切换白名单。
-$QtStubFile     = Join-Path $BuildDir 'QTradeSD.sfx'
-$OfficialStubs  = @(
-    (Join-Path $BuildDir '7zSD.sfx')
-    (Join-Path $BuildDir '7zS2.sfx')
-    "$env:ProgramFiles\7-Zip\7zSD.sfx"
-    "$env:ProgramFiles\7-Zip\7z.sfx"
-)
-
-$StubKind = 'official'
-if ($SfxStubPath) {
-    # 显式指定时,按文件名判类型(QTradeSD.sfx = 自编);G5 之后还会验二进制自证
-    $StubKind = if ((Split-Path -Leaf $SfxStubPath) -ieq 'QTradeSD.sfx') { 'qtrade' } else { 'official' }
-    if ($Stub -ne 'auto') { $StubKind = $Stub }
-    $SfxStub = Find-QtTool -Explicit $SfxStubPath -Name 'QTradeSD.sfx' -Param '-SfxStubPath' `
-        -HowTo '检查 -SfxStubPath 指的路径' -Candidates @()
-}
-elseif ($Stub -eq 'qtrade' -or ($Stub -eq 'auto' -and (Test-Path -LiteralPath $QtStubFile))) {
-    $StubKind = 'qtrade'
-    $SfxStub = Find-QtTool -Explicit '' -Name 'QTradeSD.sfx' -Param '-SfxStubPath' `
-        -HowTo '自编存根:cd installer\sfx-stub; .\fetch-sdk.ps1 -Proxy <代理>; .\build.ps1(需要 MSVC C++ 工具集)' `
-        -Candidates @($QtStubFile)
-}
-else {
-    $SfxStub = Find-QtTool -Explicit '' -Name '7zSD.sfx' -Param '-SfxStubPath' `
-        -HowTo '🔴 SFX 存根**不在 7-Zip 主安装包里**:从**官方 LZMA SDK**(lzma<ver>.7z)或 7-Zip Extra 里解出 7zSD.sfx 放进 installer\build\。⚠️ 要官方件,**不要**第三方改版 7zsfxmm(理由见 build/README §8)' `
-        -Candidates $OfficialStubs
-}
+$QtStubFile = Join-Path $BuildDir 'QTradeSD.sfx'
+if ($Stub -eq 'official') { throw 'Official SFX is disabled. A verified QTrade staging stub is required.' }
+$StubKind = 'qtrade'
+$SfxStub = Find-QtTool -Explicit $SfxStubPath -Name 'QTradeSD.sfx' -Param '-SfxStubPath' `
+    -HowTo 'Build the current QTrade staging stub with installer/sfx-stub/build.ps1.' `
+    -Candidates @($QtStubFile)
 
 # 存根类型决定的那三样
 if ($StubKind -eq 'qtrade') {
@@ -350,13 +329,16 @@ if (-not (Test-Path -LiteralPath $sfxCfg)) { throw ('缺配置文件:{0}' -f $sf
 $badKeys = @()
 $seenKeys = @()
 $runProgram = ''
+$installPath = ''
 foreach ($line in [IO.File]::ReadAllLines($sfxCfg)) {
     $s = $line.Trim()
     if ($s -eq '' -or $s.StartsWith(';')) { continue }
     $m = [regex]::Match($s, '^([A-Za-z_]+)\s*=\s*"?([^"]*)"?')
     if (-not $m.Success) { continue }
     $k = $m.Groups[1].Value
+    if ($seenKeys -contains $k) { throw ('Duplicate SFX configuration key: ' + $k) }
     $seenKeys += $k
+    if ($k -eq 'InstallPath') { $installPath = $m.Groups[2].Value }
     if ($k -eq 'RunProgram') { $runProgram = $m.Groups[2].Value }
     if ($SfxAllowedKeys -notcontains $k) { $badKeys += $k }
 }
@@ -371,6 +353,10 @@ if ($seenKeys -notcontains 'RunProgram') { throw ('{0} 缺 RunProgram —— 外
 # 自编存根的价值全在 InstallPath 上,缺了它就退化成官方行为、而链首脚本又不搬运 -> 装不成
 if ($StubKind -eq 'qtrade' -and $seenKeys -notcontains 'InstallPath') {
     throw ('{0} 缺 InstallPath —— 自编存根会退化成「解到 %TEMP% 跑完即删」,而 run-engine.cmd 不做搬运' -f $SfxConfigName)
+}
+# This fixed token selects the known-folder base, never a live destination.
+if ($StubKind -eq 'qtrade' -and $installPath.Replace('\\', '\') -cne '%ProgramData%\QTrade-Staging') {
+    throw 'QTrade SFX must use the exact %ProgramData%\QTrade-Staging token.'
 }
 if ($StubKind -eq 'official' -and $seenKeys -contains 'InstallPath') {
     throw 'sfx-config.txt 里出现了 InstallPath —— 官方存根不认它,会静默忽略'
@@ -394,6 +380,13 @@ if ($runNorm -ne $expectedRun) {
             $SfxConfigName, $runProgram, $StubKind, $expectedRun)
 }
 Write-Ok ('配置键全部合法({0});链首 = {1}' -f ($seenKeys -join ', '), $ChainHeadName)
+
+# CheckOnly must prove the same native staging behavior as final assembly.
+if ($StubKind -eq 'qtrade') {
+    Import-Module (Join-Path $InstallerRoot 'sfx-stub\QTrade.SfxStub.psm1') -DisableNameChecking
+    $stageStubProof = Test-QtSfxStubBinary -Path $SfxStub
+    if (-not $stageStubProof.Ok) { throw ('Unsafe QTrade SFX stub: ' + ($stageStubProof.Problems -join '; ')) }
+}
 
 if ($CheckOnly) {
     Write-Section '仅检查模式(-CheckOnly):五道门已跑完,不出包'
@@ -526,7 +519,13 @@ $collect = & (Join-Path $BuildDir 'collect-payload.ps1') -Stage $StageDir -Sourc
 
 # 引擎与 SFX 链首脚本落进载荷(§2.1:引擎本来就在解压目录里)
 New-Item -ItemType Directory -Path (Join-Path $StageDir 'install\engine') -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $EngineDir $ChainHeadName) -Destination (Join-Path $StageDir 'install\engine') -Force
+# Copy the complete signed engine tree before calculating its manifest hashes.
+foreach ($extension in @('*.ps1', '*.cmd')) {
+    Get-ChildItem -LiteralPath $IssSourceDir -Filter $extension -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $StageDir 'install\engine') -Force
+    }
+}
+Copy-Item -LiteralPath (Join-Path $IssSourceDir 'modules') -Destination (Join-Path $StageDir 'install\engine') -Recurse -Force
 if ($engineExe) {
     Copy-Item -LiteralPath $engineExe -Destination (Join-Path $StageDir 'install\engine') -Force
     # 引擎进了 stage 才能进 manifest,故重跑一次收集(它会把引擎登记进 files[])
@@ -579,9 +578,17 @@ if ($existingPacked.Count -gt 0) {
 
 # 归档后复核:manifest 里每个非通配条目都能在归档里按**原路径**找到
 # (上面那类「绝对路径 → 落到归档根」的错位是静默的,只有这一步能把它逼出来)
-$listed = & $SevenZip 'l' '-ba' '-slt' $ArchivePath
+# The native producer and PowerShell decoder must use the same explicit charset.
+$archiveOutputEncoding = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+    $listed = & $SevenZip 'l' '-ba' '-slt' '-sccUTF-8' $ArchivePath
+    if ($LASTEXITCODE -ne 0) { throw ('Archive listing failed with exit code {0}.' -f $LASTEXITCODE) }
+} finally {
+    [Console]::OutputEncoding = $archiveOutputEncoding
+}
 $inArchive = @($listed | Where-Object { $_ -like 'Path = *' } | ForEach-Object { ($_ -replace '^Path = ', '').Trim() })
-$manifestObj = (Get-Content -LiteralPath (Join-Path $StageDir 'install\manifest.json') -Raw) | ConvertFrom-Json
+$manifestObj = (Get-Content -LiteralPath (Join-Path $StageDir 'install\manifest.json') -Raw -Encoding UTF8) | ConvertFrom-Json
 $lost = @()
 foreach ($f in $manifestObj.files) {
     $rel = ([string]$f.path) -replace '/', '\'
@@ -702,7 +709,7 @@ if ($Sign) {
     $mfPath = Join-Path $StageDir 'install\manifest.json'
     $engInStage = Join-Path $StageDir 'install\engine\qtrade-setup-engine.exe'
     if ((Test-Path -LiteralPath $mfPath) -and (Test-Path -LiteralPath $engInStage)) {
-        $mf = (Get-Content -LiteralPath $mfPath -Raw) | ConvertFrom-Json
+        $mf = (Get-Content -LiteralPath $mfPath -Raw -Encoding UTF8) | ConvertFrom-Json
         $row = @($mf.files | Where-Object { $_.path -eq 'install/engine/qtrade-setup-engine.exe' })
         if ($row.Count -gt 0) {
             $actual = (Get-FileHash -LiteralPath $engInStage -Algorithm SHA256).Hash.ToLowerInvariant()

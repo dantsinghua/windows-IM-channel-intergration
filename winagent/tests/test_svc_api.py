@@ -182,7 +182,11 @@ async def test_net_snapshot_shape(rig):
     async with client(rig) as c:
         b = (await c.get("/wa/v1/net")).json()
     assert set(b) == {"seq", "net_state", "proxy", "vpn_adapters", "wsl_subnet", "host_ip", "agent_base_url", "mtu"}
-    assert b["wsl_subnet"] == "172.23.16.0/20" and b["agent_base_url"] == "http://172.23.16.1:17600"
+    assert b["wsl_subnet"] == "172.23.16.0/20"
+    assert b["host_ip"] == "172.23.16.1"
+    # This fixture has no authenticated guest discovery provider. The Windows
+    # adapter address must not be substituted for the WSL Agent address.
+    assert b["agent_base_url"] is None
 
 
 async def test_probe_returns_202_and_probes_readback(rig):
@@ -315,10 +319,15 @@ async def test_kernel_verify_records_history(rig_with_user):
 
 
 async def test_distro_repair_requires_confirm(rig_with_user):
+    before = list(rig_with_user.wsl.exec_log)
     async with client(rig_with_user, token=CONSOLE_TOKEN) as c:
         assert (await c.post("/wa/v1/wsl/distro/repair", json={})).status_code == 400
-        assert (await c.post("/wa/v1/wsl/distro/repair", json={"confirm": True})).status_code == 202
+        denied = await c.post("/wa/v1/wsl/distro/repair", json={"confirm": True})
+        assert denied.status_code == 503
+        assert denied.json()["error"]["reason"] == "repair_requires_verified_plan"
     assert rig_with_user.wsl.shutdown_calls == 0
+    assert rig_with_user.wsl.terminate_calls == []
+    assert rig_with_user.wsl.exec_log == before
 
 
 # ---------------------------------------------------------------- power 混合端点

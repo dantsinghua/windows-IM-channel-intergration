@@ -24,7 +24,7 @@ export const API_MIN_VERSION = '1.0'
 
 /**
  * Agent 源:浏览器形态(Vite dev / 真机 Edge 预览)用同源相对路径 `/api/v1`,由 dev 代理转发;
- * Electron 形态由 preload 暴露 `qt.endpoint.agent`(来自 console.toml `[endpoint] agent`,主进程只对该源注入令牌、
+ * Electron 形态由 preload 暴露 `qt.endpoint.agent`(正式包来自认证管道,开发包可用回环配置;主进程只对该源注入令牌、
  * CSP 也只放行该源),渲染进程据此拼**绝对**地址。2026-10-10 真实链路实测:Electron 里若仍用相对路径,请求会落到
  * 页面来源(Vite 5313 或 file://),被 CSP `connect-src` 整体拒绝,桌面壳一条 API 都发不出去。
  * 17610 被主进程 webRequest 阻断(R-07/§11.19),这里永远不会拼它。
@@ -256,7 +256,7 @@ async function perform(path: string, opts: RequestOptions): Promise<Attempted> {
         needMin: API_MIN_VERSION,
         serverVersion: apiVersion,
         message: env.error?.message
-          ?? `控制台需要 API ${API_MIN_VERSION},当前 Agent ${apiVersion ?? '未知'};请用安装包整体升级。`,
+          ?? `机器人采集终端需要 API ${API_MIN_VERSION},当前 Agent ${apiVersion ?? '未知'};请用安装包整体升级。`,
       })
     }
 

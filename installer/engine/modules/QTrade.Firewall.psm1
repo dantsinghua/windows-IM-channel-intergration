@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Native.psm1') -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'QTrade.Log.psm1') -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'QTrade.WinAgent.psm1') -DisableNameChecking
 
 # docs/04 §2.6.3 的固定规则名
 $script:QtFirewallRuleNames = @('QTrade-WinAgent-17610-from-WSL', 'QTrade-Agent-17600-LAN')
@@ -23,27 +24,37 @@ function Invoke-QtFirewallEnsure {
         {Ok, Action, RuleName, Blocked, Message}
     #>
     [CmdletBinding()]
-    param([string] $BaseUrl = 'http://127.0.0.1:17610', [int] $TimeoutSec = 30)
-    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/firewall/ensure') -Method POST -Body '{}' -TimeoutSec $TimeoutSec
+    param([string] $BaseUrl = 'http://127.0.0.1:17610', [int] $TimeoutSec = 30, [string] $Token = '')
+    if (-not $Token) {
+        $bootstrap = Get-QtBootstrapTokens
+        if ($bootstrap.Ok) { $Token = $bootstrap.ConsoleToken }
+    }
+    if (-not $Token) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'BOOTSTRAP_NOT_READY'; Action = ''; RuleName = ''; Blocked = $false; Message = 'BOOTSTRAP_NOT_READY' }
+    }
+    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/firewall/ensure') -Method POST -Body '{}' -Headers @{ Authorization = ('Bearer ' + $Token) } -TimeoutSec $TimeoutSec
     if (-not $r.Ok) {
-        return [pscustomobject]@{ Ok = $false; Action = ''; RuleName = ''; Blocked = $false; Message = $r.Body }
+        return [pscustomobject]@{ Ok = $false; Reason = 'FIREWALL_REQUEST_FAILED'; Action = ''; RuleName = ''; Blocked = $false; Message = 'The authenticated firewall request failed.' }
     }
     $action = ''
     $ruleName = ''
     try {
-        $j = $r.Body | ConvertFrom-Json
-        foreach ($n in @('created', 'updated', 'unchanged', 'blocked_by_policy')) {
-            if ((Test-QtHasProperty -Object $j -Name $n) -and $j.$n) { $action = $n }
-        }
-        if (Test-QtHasProperty -Object $j -Name 'action') { $action = [string]$j.action }
-        if (Test-QtHasProperty -Object $j -Name 'rule_name') { $ruleName = [string]$j.rule_name }
-    } catch { }
+        $j = $r.Body | ConvertFrom-Json -ErrorAction Stop
+        if ($j -isnot [pscustomobject] -or -not (Test-QtHasProperty $j 'result') -or
+            $j.result -isnot [string] -or $j.result -cnotin @('created', 'updated', 'unchanged', 'blocked_by_policy') -or
+            -not (Test-QtHasProperty $j 'rule_name') -or $j.rule_name -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($j.rule_name)) { throw 'FIREWALL_RESPONSE_INVALID' }
+        $action = $j.result
+        $ruleName = $j.rule_name
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Reason = 'FIREWALL_RESPONSE_INVALID'; Action = ''; RuleName = ''; Blocked = $false; Message = 'The firewall response did not match the service contract.' }
+    }
     $blocked = ($action -eq 'blocked_by_policy')
     $msg = ''
     if ($blocked) {
-        $msg = '17610 入站规则被策略阻止,Agent 可能连不上 WinAgent,请 IT 放行'
+        $msg = 'Policy blocked inbound port 17610. The Agent may be unable to reach WinAgent. Ask IT to allow the required rule.'
     }
-    return [pscustomobject]@{ Ok = $true; Action = $action; RuleName = $ruleName; Blocked = $blocked; Message = $msg }
+    return [pscustomobject]@{ Ok = $true; Reason = ''; Action = $action; RuleName = $ruleName; Blocked = $blocked; Message = $msg }
 }
 
 function Invoke-QtFirewallDelete {
@@ -58,9 +69,15 @@ function Invoke-QtFirewallDelete {
     param(
         [string] $BaseUrl = 'http://127.0.0.1:17610',
         [string[]] $FallbackRuleNames = @(),
-        [int] $TimeoutSec = 30
+        [int] $TimeoutSec = 30,
+        [string] $Token = ''
     )
-    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/firewall') -Method DELETE -TimeoutSec $TimeoutSec
+    if (-not $Token) {
+        $bootstrap = Get-QtBootstrapTokens
+        if ($bootstrap.Ok) { $Token = $bootstrap.ConsoleToken }
+    }
+    $r = [pscustomobject]@{ Ok = $false }
+    if ($Token) { $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/firewall') -Method DELETE -Headers @{ Authorization = ('Bearer ' + $Token) } -TimeoutSec $TimeoutSec }
     if ($r.Ok) { return [pscustomobject]@{ Ok = $true; Via = 'winagent'; Removed = @() } }
 
     $names = @($FallbackRuleNames)

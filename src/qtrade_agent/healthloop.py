@@ -85,8 +85,8 @@ class HealthLoop:
         for row in self._watched():
             aid = row["id"]
             subject = f"account:{aid}"
-            if self._accounts.busy(aid):
-                continue                                             # 序列进行中(启动/停止)不判
+            if self._accounts.busy(aid) or self._accounts.qq_login_pending(aid):
+                continue                                             # 启动/停止/扫码收尾进行中不判，避免拆容器的空档被写成「容器不存在」
             info = await self._runtime.inspect(row, fresh=True)
             self.last["H04"][aid] = {"running": info.running, "checked_ms": now}
             if info.exists and info.running:
@@ -158,9 +158,10 @@ class HealthLoop:
         if ad is None:
             return
         now = self._clock()
-        for row in self._store.list_accounts(channel="wechat"):
+        self._clear_false_wechat_offline()
+        for row in self._store.list_accounts(channel="wechat", include_deleted=True):
             aid = row["id"]
-            if row["state"] not in ("running", "degraded") or self._accounts.busy(aid):
+            if row.get("deleted_ms") or row["state"] not in ("running", "degraded") or self._accounts.busy(aid):
                 continue
             acct = Account(id=aid, channel="wechat", state=row["state"], self_uid=row.get("self_uid"),
                            self_nick=row.get("self_nick"), state_code=row.get("state_code"))
@@ -176,16 +177,56 @@ class HealthLoop:
             # (取钥要人重登),反而反复拆掉用户正在做的那一轮;它们由控制台「重新取钥」重跑登录流(含回填/绑定)。
             if code == "KEY_FAIL" and row.get("self_uid"):
                 await self._wechat_key_retry(aid, now)
+            elif state == "running":
+                self._alerts.resolve(ACCOUNT_OFFLINE, subject=f"account:{aid}", account_id=aid)
+
+    def _clear_false_wechat_offline(self) -> None:
+        """``ACCOUNT_OFFLINE`` 只属于 05 §2.5.4 的掉线(``login_required`` + ``KICKED|LOGGED_OUT|TOKEN_EXPIRED|LOGIN_TIMEOUT``)。
+
+        取钥耗尽、已停止、已软删都不是掉线。旧进程把 ``KEY_FAIL`` 耗尽错记成这条告警，
+        outbox 重放后抽屉会一直挂着；每个账号只补一次 ``resolved``。
+        """
+        offline = {"KICKED", "LOGGED_OUT", "TOKEN_EXPIRED", "LOGIN_TIMEOUT"}
+        accounts = {r["id"]: r for r in self._store.list_accounts(include_deleted=True)}
+
+        def real(aid: str) -> bool:
+            row = accounts.get(aid)
+            return bool(row and not row.get("deleted_ms") and row.get("state") == "login_required"
+                        and row.get("state_code") in offline)
+
+        for (code, subject) in list(self._alerts.active):
+            if code != ACCOUNT_OFFLINE or not subject.startswith("account:"):
+                continue
+            aid = subject.split(":", 1)[1]
+            if not real(aid):
+                self._alerts.resolve(ACCOUNT_OFFLINE, subject=subject, account_id=aid)
+        if getattr(self, "_outbox_offline_swept", False):
+            return
+        self._outbox_offline_swept = True
+        latest: dict[str, str] = {}
+        try:
+            rows = self._store.list_events(event="alert")
+        except Exception:
+            rows = []
+        for row in rows:
+            payload = row.get("payload") or {}
+            if payload.get("code") != ACCOUNT_OFFLINE:
+                continue
+            subject = str(payload.get("subject") or "")
+            state = str(payload.get("state") or "")
+            if subject.startswith("account:") and state in ("firing", "resolved"):
+                latest[subject] = state
+        for subject, state in latest.items():
+            aid = subject.split(":", 1)[1]
+            if state == "firing" and not real(aid):
+                self._alerts.settle(ACCOUNT_OFFLINE, subject=subject, account_id=aid)
 
     async def _wechat_key_retry(self, account_id: str, now: int) -> None:
-        """``degraded(KEY_FAIL)`` 下自动重试取钥,每小时 ``KEY_RETRY_PER_HOUR`` 次;超限只 alert(error)不再试。"""
+        """``degraded(KEY_FAIL)`` 下自动重试取钥,每小时 ``KEY_RETRY_PER_HOUR`` 次;超限停在 ``degraded``,不再试,也**不是掉线**。"""
         hist = [t for t in self.key_retry.get(account_id, []) if now - t < 3600_000]
-        subject = f"account:{account_id}"
         if len(hist) >= self.KEY_RETRY_PER_HOUR:
             self.key_retry[account_id] = hist
-            self._alerts.firing(ACCOUNT_OFFLINE, subject=subject, severity="error", account_id=account_id,
-                                evidence={"code": "KEY_FAIL", "key_retry_1h": len(hist), "exhausted": True},
-                                hint_actions=["retry_key"])
+            log.warning("微信取钥重试已达每小时上限 account=%s retries=%s,保持 degraded(KEY_FAIL)", account_id, len(hist))
             return
         hist.append(now)
         self.key_retry[account_id] = hist

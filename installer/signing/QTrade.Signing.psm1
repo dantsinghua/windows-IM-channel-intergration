@@ -12,8 +12,8 @@
 #requires -Version 5.1
 Set-StrictMode -Version Latest
 
-# 自签名阶段的默认公钥导出目录:**产物根之下、仓库之外**(仓库里绝不出现任何密钥材料)
-$script:QtDefaultCertDir = 'C:\Users\anlin\qtrade-payload\signing'
+# Resolve the current user's data directory; never embed a build-machine path.
+$script:QtDefaultCertDir = [IO.Path]::Combine([Environment]::GetFolderPath('LocalApplicationData'), 'QTrade', 'signing')
 # 默认时间戳服务(RFC 3161);离线环境用 -NoTimestamp 显式关闭
 $script:QtDefaultTimestampUrl = 'http://timestamp.digicert.com'
 $script:QtCertSubjectCn = 'QTrade Internal Code Signing'

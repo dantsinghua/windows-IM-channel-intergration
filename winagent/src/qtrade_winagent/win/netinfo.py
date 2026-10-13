@@ -1,7 +1,7 @@
 """``WinNet`` —— 适配器 / 路由 / 代理识别(04 §2.6.1、§2.6.3、§2.6.4)。
 
-- **WSL 网卡查找规则(04 §2.6.3 逐字)**:``InterfaceDescription == "Hyper-V Virtual Ethernet Adapter"``
-  且 ``Name`` 以 ``vEthernet (WSL`` 开头;找不到则退化为「IPv4 属于 172.16.0.0/12 的 Hyper-V 虚拟网卡」。
+- **WSL 网卡查找规则**:Hyper-V 描述基名允许数字编号后缀,优先唯一的 ``vEthernet (WSL`` 名称。
+  无命名匹配时仅采用 IPv4 属于 172.16.0.0/12 的唯一 Hyper-V 网卡;歧义时不猜测。
 - **代理四来源**:WinHTTP(机器级)、WinINET(用户级,经 ``WTSQueryUserToken`` 拿活动会话 SID 读 **HKU**——
   🔴 此绕法**只用于读用户级注册表**,C-02;不用它去跑任何进程)、PAC/WPAD、策略 ``ProxySettingsPerUser``。
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from typing import Any, Optional
 
 from ..backends import Adapter, ProxyInfo
@@ -53,19 +54,21 @@ class WinNet:
         return out
 
     def wsl_adapter(self) -> Optional[Adapter]:
-        items = self.adapters()
-        for a in items:
-            if a.up and a.description == WSL_DESC and a.name.startswith(WSL_NAME_PREFIX):
-                return a
+        items = [a for a in self.adapters() if a.up and
+                 re.fullmatch(re.escape(WSL_DESC) + r"(?: #[0-9]+)?", a.description)]
+        managed = [a for a in items if a.name.startswith(WSL_NAME_PREFIX)]
+        if managed:
+            return managed[0] if len(managed) == 1 else None
         net = ipaddress.ip_network(WSL_FALLBACK_NET)
-        for a in items:                                       # 退化规则(04 §2.6.3「找不到则…」)
-            if a.up and a.is_virtual and a.ipv4:
+        fallback = []
+        for a in items:                                       # 无命名匹配时仅接受唯一候选。
+            if a.ipv4:
                 try:
                     if ipaddress.ip_address(a.ipv4) in net:
-                        return a
+                        fallback.append(a)
                 except ValueError:
                     continue
-        return None
+        return fallback[0] if len(fallback) == 1 else None
 
     def proxy(self) -> ProxyInfo:
         require_windows("代理识别")

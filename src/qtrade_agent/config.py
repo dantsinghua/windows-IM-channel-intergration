@@ -155,7 +155,7 @@ class RuntimeConfig:
     """02 §7.1 [runtime]:docker 编排参数(02 §2.2.4)。"""
     docker_socket: str = "unix:///var/run/docker.sock"
     redroid_image: str = "redroid/redroid:11.0.0-latest"
-    napcat_image: str = "mlikiowa/napcat-docker:latest"
+    napcat_image: str = "mlikiowa/napcat-docker:v4.18.28"
     qidian_mem_limit_mb: int = 3584             # A.5 建议 3.5G
     qq_mem_limit_mb: int = 1024
     qidian_resolution: str = "720x1280"

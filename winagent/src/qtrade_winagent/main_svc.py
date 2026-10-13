@@ -13,9 +13,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import ntpath
 import os
+import re
 import socket
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -23,6 +26,7 @@ from . import __version__
 from .alerts import AlertBuffer
 from .audit import Audit
 from .config import WinAgentConfig, load as load_cfg
+from .console_pipe import ConsoleTokenPipe
 from .db import Db
 from .installer_ops import InstallerOps
 from .logfmt import WaFormatter, get_logger
@@ -209,15 +213,22 @@ def contain(path: str, root: str) -> str:
 
 
 def expand(path: str, root: str) -> str:
-    """展开 ``%ProgramData%`` 一类环境变量(**生产语义**);**在非 Windows 上展不开才落到 ``--root`` 下**。
+    """Resolve shipped QTrade defaults from the real winagent install root.
 
-    Windows 上 ``%ProgramData%\\QTrade\\winagent\\vault`` 就该解析成真机那个真实目录——02 §7.2 的
-    ``[vault] dir`` 默认值指的正是它。``os.path.expandvars`` 只认当前平台的语法,Linux 上该串会原样留下,
-    于是被当成**相对当前目录**的路径创建出来(``--dev`` 冒烟时实测在仓库里拉了一坨 ``%ProgramData%\\...`` 目录),
-    故展不开(仍含 ``%``)时兜回 ``root`` 下。
-
-    🔴 **自包含不归这个函数管**:``--dev`` 的落点收口一律走 ``contain()``。
+    Explicit custom paths retain their meaning. Development writes use
+    contain() instead, so they cannot escape the supplied isolated root.
     """
+    prefix = "%programdata%/qtrade"
+    normalized = path.replace("\\", "/")
+    if normalized.lower() == prefix or normalized.lower().startswith(prefix + "/"):
+        # Root names the real winagent directory, even on a relocated install.
+        # Only rebase our shipped defaults, never arbitrary absolute settings.
+        pathmod = ntpath if ntpath.isabs(root) and "\\" in root else os.path
+        product_root = pathmod.dirname(pathmod.normpath(root))
+        relative = [part for part in normalized[len(prefix):].split("/") if part]
+        if relative and relative[0].lower() == "winagent":
+            return pathmod.join(root, *relative[1:])
+        return pathmod.join(product_root, *relative)
     p = os.path.expandvars(path)
     if "%" not in p:
         return p
@@ -271,14 +282,22 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
         hostsb = WinHosts(backup_dir=expand(cfg.wechat.hosts_backup_dir, root),
                           backup_keep=cfg.wechat.hosts_backup_keep)
     vault = Vault(db, crypto, cfg.vault, root=place(cfg.vault.dir, root), audit=audit)
-    disks = [DiskTarget("programdata", expand(r"%ProgramData%\QTrade", root)),
-             DiskTarget("vhdx", expand(r"%LOCALAPPDATA%", root)),
-             DiskTarget("wechat_data", "D:\\", product_level=False)]
+    # LocalSystem's LOCALAPPDATA and a developer's D: drive are not the
+    # installing user's WSL or WeChat volumes. Those require user-side facts.
+    disks = [DiskTarget("programdata", os.path.dirname(os.path.abspath(root)))]
     monitor = Monitor(db, sysb, alerts, cfg.monitor, probe=probeb, disks=disks)
-    svc_exe = os.path.join(root, "qtrade-winagent-svc.exe")            # R-14:防火墙规则 Program 限**服务 exe**
-    netprobe = NetProbe(db, netb, fwb, probeb, cfg.net, cfg.probe, alerts, svc_exe=svc_exe, port=cfg.api.port)
+    svc_exe = os.path.join(root, "app", "qtrade-winagent-svc.exe")
     hub = PipeHub(pipeb, cfg.ipc, pipe_name=cfg.api.pipe_user, install_user_sid=install_user_sid,
                   version=__version__, alerts=alerts, audit=audit)
+
+    async def guest_ip() -> Optional[str]:
+        if not hub.user_agent_online:
+            return None
+        result = await hub.call("wsl.network", {}, timeout_s=5)
+        return result.get("guest_ip") if isinstance(result, dict) else None
+
+    netprobe = NetProbe(db, netb, fwb, probeb, cfg.net, cfg.probe, alerts,
+                       svc_exe=svc_exe, port=cfg.api.port, guest_ip_provider=guest_ip)
     installer = InstallerOps(db, kernel_dir=place(cfg.wsl.kernel_dir, root),
                              wsl_backup_dir=place(cfg.wsl.backup_dir, root), package_version=__version__,
                              crypto=crypto, audit=audit, hub=hub)
@@ -315,6 +334,7 @@ async def periodic(d: SvcDeps, listeners: Optional[Listeners] = None) -> None:
             await asyncio.to_thread(d.monitor.sample_fast)
             await asyncio.to_thread(d.monitor.check_session_locked)
             reported = await align_listen(d, listeners, reported)       # H16 自愈:真的补绑/解绑(评审 B2)
+            await sync_host_hint(d)
             if now >= next_slow:
                 await asyncio.to_thread(d.monitor.sample_slow)
                 await asyncio.to_thread(d.monitor.check_disks)
@@ -334,20 +354,58 @@ async def periodic(d: SvcDeps, listeners: Optional[Listeners] = None) -> None:
         await asyncio.sleep(cfg.monitor.sample_interval_s)
 
 
+async def sync_host_hint(d: SvcDeps) -> None:
+    if d.hub.user_agent_online:
+        # Recompute the host-side address even when the guest changed between
+        # slow probes. User-side execution is restricted to the owned distro.
+        adapter = await asyncio.to_thread(d.netprobe._net.wsl_adapter)
+        d.netprobe.state.host_ip = adapter.ipv4 if adapter else None
+        if d.netprobe.state.host_ip:
+            await d.hub.call("wsl.host.update", d.netprobe.host_json(), timeout_s=5)
+
+
+def validate_install_sid(value: str) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(
+            r"S-1-(?:5-21|12-1)-[0-9]+-[0-9]+-[0-9]+-[0-9]+", value):
+        return False
+    if any(int(part) > 0xFFFFFFFF for part in value.split("-")[4:]):
+        return False
+    if sys.platform == "win32":
+        try:
+            import win32security
+            sid = win32security.ConvertStringSidToSid(value)
+            return win32security.ConvertSidToStringSid(sid) == value
+        except Exception:
+            return False
+    return True
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="qtrade-winagent-svc")
     ap.add_argument("--root", default=None, help="%%ProgramData%%\\QTrade\\winagent(--dev 下必填)")
     ap.add_argument("--config", default=None, help="winagent.toml 路径(默认 <root>\\winagent.toml)")
-    ap.add_argument("--install-user-sid", default=os.environ.get("QT_INSTALL_USER_SID", ""),
+    ap.add_argument("--install-user-sid", default="",
                     help="安装用户 SID(R3-12 仲裁前的安全校验基准)")
     ap.add_argument("--dev", action="store_true", help="用假后端起一份本机实例(仅开发;不碰任何真系统状态)")
+    ap.add_argument("--service", action="store_true", help="Run under Windows Service Control Manager")
     args = ap.parse_args(argv)
+    if not args.dev and not validate_install_sid(args.install_user_sid):
+        ap.error("--install-user-sid must identify the installing user")
+    if args.service and args.dev:
+        ap.error("--service cannot be combined with --dev")
     if args.dev and not args.root:
         # 不给 --root 时默认 root **就是生产目录**,--dev 的假后端会把 winagent.db/vault/内核/备份写进真机生产位置。
         # 这里选「拒绝启动」而不是「默认到临时目录」:临时目录是隐式的,假熵会悄悄堆在 %TEMP% 里且仍可能被当真;
         # 显式给 --root 零歧义、零写入,也正是 README §3 示例的写法。
         ap.error("--dev 必须显式给 --root(否则默认落进生产目录 %ProgramData%\\QTrade\\winagent);"
                  "照 README §3 的写法:--dev --root /tmp/wa-dev")
+    if args.service:
+        from .service_host import dispatch
+        return dispatch(args, run_service)
+    return run_service(args, threading.Event(), lambda: None)
+
+
+def run_service(args: Any, stop_event: threading.Event, on_ready: Callable[[], None]) -> int:
     root = args.root or DEFAULT_ROOT
     config_path = args.config or os.path.join(root, "winagent.toml")
     cfg = load_cfg(read_toml(config_path))
@@ -356,6 +414,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     d.config_path = None if args.dev else config_path                    # R6-88:#43 写回真值;--dev 不落盘
     listeners = Listeners(cfg.api.port)
     tasks: set[asyncio.Task] = set()                                   # 留住后台任务引用,防被 GC
+    console_pipe = ConsoleTokenPipe(d.hub._backend, pipe_name=cfg.api.pipe_console,
+                                    install_user_sid=args.install_user_sid, tokens=d.tokens,
+                                    endpoint_provider=d.netprobe.agent_endpoint)
 
     async def boot() -> None:
         await load_tokens(d)
@@ -364,6 +425,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             d.alerts.firing(alert["code"], subject=alert["subject"], severity=alert["severity"],
                             evidence=alert["evidence"])
         await d.hub.start()
+        await console_pipe.start()
+        if not args.dev:
+            await d.hub._backend.wait_ready(cfg.api.pipe_user)
+            await d.hub._backend.wait_ready(cfg.api.pipe_console)
         await d.netprobe.refresh()
         # 真机:d.listen = **真正绑上的**集合(vEthernet 没绑上时与期望不一致 ⇒ 周期任务报 H16 并补绑)
         d.listen = d.netprobe.desired_listen() if args.dev else listeners.actual()
@@ -383,9 +448,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     listeners.open((LOOPBACK,) if args.dev else d.netprobe.desired_listen())
     log.info("WinAgent 服务启动", extra={"op": "svc.start", "code": "OK",
                                         "kv": {"listen": ",".join(listeners.actual()), "port": cfg.api.port}})
-    server = uvicorn.Server(uvicorn.Config(app, ws="websockets", log_config=None))
+    server = uvicorn.Server(uvicorn.Config(app, ws="websockets", log_config=None,
+                                          timeout_graceful_shutdown=10))
     listeners.server = server
-    server.run(sockets=list(listeners.sockets.values()))
+    async def serve() -> None:
+        serving = asyncio.create_task(server.serve(sockets=list(listeners.sockets.values())))
+        ready = False
+        try:
+            while not serving.done():
+                if stop_event.is_set():
+                    server.should_exit = True
+                else:
+                    for task in (console_pipe._task, d.hub._accept_task):
+                        if task is not None and task.done():
+                            task.result()
+                            raise RuntimeError("WinAgent pipe listener stopped")
+                if server.started and not ready and not stop_event.is_set():
+                    ready = True
+                    on_ready()
+                await asyncio.sleep(0.05)
+            await serving
+            if not ready and not stop_event.is_set():
+                raise RuntimeError("WinAgent HTTP startup did not become ready")
+        finally:
+            server.should_exit = True
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await console_pipe.stop()
+            await d.hub.stop()
+            if not serving.done():
+                await serving
+
+    try:
+        asyncio.run(serve())
+    finally:
+        for sock in listeners.sockets.values():
+            sock.close()
+        d.db.close()
     return 0
 
 

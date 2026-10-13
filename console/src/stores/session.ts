@@ -38,16 +38,16 @@ export const useSessionStore = defineStore('session', () => {
   )
   const gateTitle = computed(() => {
     if (upgradeRequired.value) return 'API 版本不匹配,请用安装包整体升级'
-    if (authState.value === 'winagent_offline') return 'WinAgent 未运行'
-    if (authState.value === 'no_token') return '控制台令牌失效,请在 WinAgent 中重新签发'
+    if (authState.value === 'winagent_offline') return '本机服务尚未就绪'
+    if (authState.value === 'no_token') return '机器人采集终端令牌失效,请在 WinAgent 中重新签发'
     if (!agentReachable.value) return 'Agent 未运行(WSL 发行版 qtrade 可能已停止)'
     return ''
   })
   /** 门禁正文第二行:426 时写清「控制台要什么、Agent 是什么」 */
   const gateDetail = computed(() => {
     const u = upgradeRequired.value
-    if (!u) return ''
-    return `${u.message}(控制台要求 API ≥ ${u.needMin},当前 Agent ${u.serverVersion ?? '未报告版本'})`
+    if (!u) return authState.value === 'winagent_offline' ? '请检查 WinAgent 服务与受管 WSL Agent。连接就绪后会自动恢复。' : ''
+    return `${u.message}(机器人采集终端要求 API ≥ ${u.needMin},当前 Agent ${u.serverVersion ?? '未报告版本'})`
   })
 
   /** A-7:两处门禁共用的固定一句 */
@@ -100,6 +100,8 @@ export const useSessionStore = defineStore('session', () => {
   /** 让 WinAgent 拉起 Agent(§5.4;需会话代理在线,否则 503 NOT_READY) */
   async function startWsl(): Promise<void> {
     await window.qt?.wa.invoke('wsl.start', {})
+    await window.qt?.auth.refresh()
+    await refreshAuth()
     await pingAgent()
   }
 

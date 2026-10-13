@@ -684,8 +684,15 @@ class QidianUi:
         await self._input_text(acct, p, text)
         if p.verify_input:
             back = await self._read_input(acct, p)
-            if back != attr_normalize(text):
-                return SendOutcome(False, reason="input_readback_mismatch", evidence={"readback": back})
+            # 控件树把换行留在 text 里。期望值换成空格后，回读也换一次再比；两边换完仍不同才拒发。
+            if back is None or attr_normalize(back) != attr_normalize(text):
+                trace = {"back_is_none": back is None, "expect_len": len(text),
+                         "back_len": len(back) if back is not None else None}
+                log.error(
+                    "企点输入回读不符 account=%s native_id=%s back_is_none=%s expect_len=%s back_len=%s",
+                    acct.id, native_id, trace["back_is_none"], trace["expect_len"], trace["back_len"],
+                )
+                return SendOutcome(False, reason="input_readback_mismatch", evidence={"trace": trace})
         gate2 = await self._assert_session(acct, p, native_id, expect, where="before_send")
         if not gate2.ok:
             return gate2                                                           # 闸门2:打完字到点发送之间会话被切走
@@ -821,12 +828,13 @@ def find_node(nodes: list[Node], anchor: dict[str, Any]) -> Optional[Node]:
     正文 ``dialogText`` 与左键「不同意」在文档序上都排在右键「同意」之前、且都含子串「同意」,若按文档序
     混排取第一个,``agree_button`` 会命中正文或「不同意」⇒ 点不掉协议、登录界面永远准备不好(UI_UNEXPECTED)。
     """
-    rid = anchor.get("id")
+    ids = [str(anchor["id"])] if anchor.get("id") else []
+    ids += [str(x) for x in (anchor.get("id_any") or []) if x]
     texts = [str(t) for t in (anchor.get("text_any") or [])]
     descs = [str(t) for t in (anchor.get("desc_any") or [])]
-    if rid:
+    if ids:
         for n in nodes:
-            if n.rid == rid:
+            if n.rid in ids:
                 return n
     for n in nodes:
         if texts and any(t in n.text for t in texts):

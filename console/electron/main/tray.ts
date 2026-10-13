@@ -42,7 +42,7 @@ export class TrayController {
   install(): void {
     if (this.tray) return
     this.tray = new Tray(brandIcon(16))           // 此前是 nativeImage.createEmpty():托盘里一个空白方块
-    this.tray.setToolTip('QTrade 控制台')
+    this.tray.setToolTip('机器人采集终端')
     this.tray.on('click', () => this.toggleWindow())
     this.render()
   }
@@ -85,7 +85,7 @@ export class TrayController {
       .map(([ch, n]) => `${CHANNEL_LABEL[ch] ?? ch} ${n} 在线`)
       .join(' · ')
     const menu = Menu.buildFromTemplate([
-      { label: '打开控制台', click: () => this.show() },
+      { label: '打开机器人采集终端', click: () => this.show() },
       { label: lines || '暂无在线账号', enabled: false },
       { type: 'separator' },
       {
@@ -101,7 +101,7 @@ export class TrayController {
     ])
     this.tray.setContextMenu(menu)
     const badge = this.summary.unreadAlerts > 0 ? `(${this.summary.unreadAlerts}) ` : ''
-    this.tray.setToolTip(`${badge}QTrade 控制台${lines ? ` — ${lines}` : ''}`)
+    this.tray.setToolTip(`${badge}机器人采集终端${lines ? ` — ${lines}` : ''}`)
     if (process.platform === 'win32') {
       app.setBadgeCount?.(this.summary.unreadAlerts)
     }

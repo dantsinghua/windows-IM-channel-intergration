@@ -56,7 +56,7 @@ async def test_get_15_returns_new_code_and_stale_session_has_no_side_effect(firs
         assert len(r.qr.calls) == count
 
 
-@pytest.mark.parametrize('failure', ['error', 'invalid_png', 'same_png'])
+@pytest.mark.parametrize('failure', ['error', 'invalid_png'])
 async def test_refresh_failure_removes_old_code_and_exposes_retry(first_login_rig, failure, caplog):
     r = first_login_rig
     previous = await start_waiting(r)
@@ -71,20 +71,29 @@ async def test_refresh_failure_removes_old_code_and_exposes_retry(first_login_ri
     assert previous['qrcode_png_b64'] not in caplog.text
 
 
-async def test_scan_reconnects_new_onebot_identity_before_running(first_login_rig):
+async def test_unchanged_qr_is_not_reported_as_unavailable(first_login_rig):
+    r = first_login_rig
+    previous = await start_waiting(r)
+    r.qr.value = base64.b64decode(previous['qrcode_png_b64'])
+    result = await r.accounts.refresh_prompt(r.id)
+    assert result.get('qrcode_png_b64') == previous['qrcode_png_b64']
+    assert '暂不可用' not in (result.get('text') or '')
+    assert r.accounts.get(r.id)['state_reason'] == ''
+
+
+async def test_scan_confirms_on_the_live_container_without_rebuilding(first_login_rig):
     r = first_login_rig
     await start_waiting(r)
     r.first.online = True
-    r.second.nickname = 'confirmed-after-restart'
     await r.accounts.poll_qq_logins()
     row = r.accounts.get(r.id)
     assert row['state'] == 'running' and row['self_uid'] == '123456789'
-    assert row['self_nick'] == 'confirmed-after-restart'
-    assert r.first.close_calls == 1 and len(r.issued) == 2
-    assert 'get_login_info' in r.second.actions
+    assert row['self_nick'] == '假QQ'
+    assert r.first.close_calls == 0 and len(r.issued) == 1
+    assert ('stop', f'qtrade-{r.id}') not in r.containers.calls
+    assert ('remove', f'qtrade-{r.id}') not in r.containers.calls
     assert states(r)[-2:] == ['logging_in', 'running']
     assert r.accounts.prompt(r.id) == {'kind': None}
-    assert r.fs.read_json(f'{r.agent.runtime.data_dir(r.id)}/napcat_config/webui.json')['disableWebUI'] is True
 
 
 @pytest.mark.parametrize('uid', [False, True, 0, -1, '', ' 123456789', '１２３４', '1.2', None])
@@ -110,15 +119,15 @@ async def test_wrong_scan_identity_rejected_without_container_closing(first_logi
     assert ('stop', f'qtrade-{r.id}') not in r.containers.calls
 
 
-@pytest.mark.parametrize('online,uid', [(False, 123456789), (True, 999999999)])
-async def test_post_close_offline_or_wrong_identity_cannot_be_running(first_login_rig, online, uid):
+async def test_confirmed_scan_stays_running_without_a_second_handshake(first_login_rig):
     r = first_login_rig
     await start_waiting(r)
-    r.first.online, r.second.online, r.second.self_id = True, online, uid
+    r.first.online = True
+    r.second.online = False
     await r.accounts.poll_qq_logins()
     row = r.accounts.get(r.id)
-    assert row['state'] == 'error' and row['state_code'] == 'ONEBOT_UNREACHABLE'
-    assert row['self_uid'] is None
+    assert row['state'] == 'running' and row['self_uid'] == '123456789'
+    assert ('stop', f'qtrade-{r.id}') not in r.containers.calls
 
 
 async def test_quick_login_still_emits_all_states_without_qr(first_login_rig):
@@ -231,7 +240,6 @@ async def test_empty_account_rebuild_preserves_volumes_configuration_and_limits(
     r.store.con.execute('UPDATE accounts SET identity_json=? WHERE id=?', ('{}', r.id))
     await start_waiting(r)
     name = f'qtrade-{r.id}'
-    previous = r.containers.containers[name].spec
     original_remove = r.containers.remove
     removed = []
     async def remove(name, *, volumes):
@@ -241,16 +249,15 @@ async def test_empty_account_rebuild_preserves_volumes_configuration_and_limits(
     r.fs.put(f'{r.agent.runtime.data_dir(r.id)}/qq_data/fingerprint', 17)
     r.first.online = True
     await r.accounts.poll_qq_logins()
-    current = r.containers.containers[name].spec
     assert r.accounts.get(r.id)['state'] == 'running'
-    assert current.env['ACCOUNT'] == '123456789' and removed == [False]
-    assert (current.volumes, current.ports, current.image, current.mem_limit_mb) == (previous.volumes, previous.ports, previous.image, previous.mem_limit_mb)
+    assert removed == []
     assert r.fs.files[f'{r.agent.runtime.data_dir(r.id)}/qq_data/fingerprint'] == 17
+    assert ('remove', name) not in r.containers.calls
 
 
 @pytest.mark.parametrize('empty_identity', [True, False])
 @pytest.mark.parametrize('wrong_field', ['container_id', 'container_name'])
-async def test_foreign_container_ownership_denies_rebuild_and_mutation(first_login_rig, wrong_field, empty_identity):
+async def test_foreign_container_is_not_rebuilt_and_scan_still_completes(first_login_rig, wrong_field, empty_identity):
     r = first_login_rig
     if empty_identity:
         r.store.con.execute('UPDATE accounts SET identity_json=? WHERE id=?', ('{}', r.id))
@@ -260,21 +267,21 @@ async def test_foreign_container_ownership_denies_rebuild_and_mutation(first_log
     r.containers.calls.clear()
     r.first.online = True
     await r.accounts.poll_qq_logins()
-    assert r.accounts.get(r.id)['state'] == 'error'
+    assert r.accounts.get(r.id)['state'] == 'running'
     assert not any(call[0] in ('stop', 'remove', 'create', 'start') for call in r.containers.calls)
     assert json.dumps(r.fs.json_files, sort_keys=True) == before
 
 
-async def test_registered_uid_but_missing_container_account_rebuilds_before_running(first_login_rig):
+async def test_scan_does_not_rebuild_container_when_account_env_is_empty(first_login_rig):
     r = first_login_rig
     await start_waiting(r)
     name = f'qtrade-{r.id}'
     r.containers.containers[name].spec.env = {}
     r.first.online = True
     await r.accounts.poll_qq_logins()
-    assert ('remove', name) in r.containers.calls
-    assert r.containers.containers[name].spec.env.get('ACCOUNT') == '123456789'
+    assert ('remove', name) not in r.containers.calls
     assert r.accounts.get(r.id)['state'] == 'running'
+    assert r.accounts.get(r.id)['self_uid'] == '123456789'
 
 
 @pytest.mark.parametrize('ending', ['cancel', 'stop', 'timeout', 'new_session'])

@@ -89,3 +89,20 @@ def test_pool_rows_seeded_from_config_only_once(tmp_path):
     rig2 = make_rig(tmp_path, cfg=AgentConfig(pool=PoolConfig(quota_qidian_mb=3000)))
     assert rig2.store.pool_get("wsl")["quota"]["qidian"] == 2600            # 表是真值,toml 只是首次默认(C-43)
     rig2.store.close()
+
+
+def test_wsl_total_refreshed_from_meminfo_on_start_unless_manual(tmp_path):
+    """R6-98:wsl.total_mb = `.wslconfig memory=` 落地值(VM 内 MemTotal),每次启动刷新;真机曾被 WinAgent 的 vmmem 实占
+    写成 5691(配 reserved 5375 ⇒ 剩余 316,企点永远 409),重启后必须自愈;只有 `manual` 不动。"""
+    rig = make_rig(tmp_path, wsl_total_mb=28050)
+    rig.store.pool_set("wsl", total_mb=5691, reserved_mb=5375, source="winagent")
+    rig.store.close()
+    rig2 = make_rig(tmp_path, wsl_total_mb=28050)
+    w = rig2.store.pool_get("wsl")
+    assert (w["total_mb"], w["source"], w["reserved_mb"]) == (28050, "default", 5375)      # total 刷新,reserved(校准值)保留
+    assert rig2.agent.pool.can_add("qidian")[0] is True
+    rig2.store.pool_set("wsl", total_mb=16384, source="manual")
+    rig2.store.close()
+    rig3 = make_rig(tmp_path, wsl_total_mb=28050)
+    assert rig3.store.pool_get("wsl")["total_mb"] == 16384 and rig3.store.pool_get("wsl")["source"] == "manual"
+    rig3.store.close()

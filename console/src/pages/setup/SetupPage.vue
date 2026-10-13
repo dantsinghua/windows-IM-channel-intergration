@@ -30,6 +30,7 @@ const step = computed({ get: () => store.step, set: (v: number) => { store.step 
 const autoLaunch = ref(true)
 const trayOnClose = ref(true)
 const running = ref(false)
+const startingService = ref(false)
 
 const STEPS = ['连接服务', '检查环境', '添加账号', '准备完成']
 const LAST_STEP = STEPS.length - 1
@@ -60,6 +61,18 @@ const selftestVerdict = computed(() => {
 async function runSelfcheck(): Promise<void> {
   running.value = true
   try { await env.runSelftest() } finally { running.value = false }
+}
+
+async function startService(): Promise<void> {
+  if (startingService.value) return
+  startingService.value = true
+  try {
+    await session.startWsl()
+  } catch (e) {
+    message.error(`启动服务失败：${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    startingService.value = false
+  }
 }
 
 async function finish(): Promise<void> {
@@ -98,7 +111,7 @@ onMounted(async () => {
 <template>
   <div class="setup qt-page">
     <header class="qt-page-heading setup-heading">
-      <div><span class="qt-eyebrow">WELCOME TO QTRADE</span><h1>准备好你的账号工作台</h1><p>跟着这四步完成准备，随后就能集中查看和管理 IM 账号。</p></div>
+      <div><span class="qt-eyebrow">机器人采集终端</span><h1>准备好机器人采集终端</h1><p>跟着这四步完成准备，随后就能集中查看和管理 IM 账号。</p></div>
       <span class="setup-emblem"><QtIcon name="shield" :size="32" /></span>
     </header>
     <div class="step-panel qt-glass">
@@ -109,9 +122,9 @@ onMounted(async () => {
 
     <!-- 步 1 连接 -->
     <section v-if="step === 0" class="qt-surface pane">
-      <div class="pane-heading"><span class="step-label">01 / 连接服务</span><h2>确认工作台可以连接各项服务</h2><p>服务连接正常后，就可以进入环境检查。</p></div>
+      <div class="pane-heading"><span class="step-label">01 / 连接服务</span><h2>确认机器人采集终端可以连接各项服务</h2><p>服务连接正常后，就可以进入环境检查。</p></div>
       <div class="probe-row" :data-testid="T.connAgent">
-        <div class="probe-name"><span class="probe-icon"><QtIcon name="env" /></span><div><strong>账号运行服务</strong><p>Agent · {{ env.version?.agent ?? '版本暂不可用' }}</p></div></div>
+        <div class="probe-name"><span class="probe-icon"><QtIcon name="env" /></span><div><strong>账号运行服务</strong><p>Agent · {{ env.version?.agent?.version ?? '版本暂不可用' }}</p></div></div>
         <span class="connection-state" :class="session.agentReachable ? 'is-ready' : 'is-unavailable'">
           {{ session.agentReachable ? '已连接' : '未连接' }}
         </span>
@@ -127,6 +140,7 @@ onMounted(async () => {
       </div>
       <p v-if="!session.userAgentOnline" class="qt-warn">{{ session.GATE_LOGIN_HINT }}</p>
       <a-button class="retry-connection" :data-testid="T.connRetry" @click="session.retryToken()"><template #icon><QtIcon name="refresh" :size="16" /></template>重新连接</a-button>
+      <a-button v-if="!session.agentReachable && session.winagentOnline" :loading="startingService" :disabled="!session.userAgentOnline || startingService" @click="startService">启动服务</a-button>
     </section>
 
     <!-- 步 2 自检 -->
@@ -177,12 +191,12 @@ onMounted(async () => {
     <!-- 步 4 完成 -->
     <section v-else class="qt-surface pane finish-pane">
       <span class="finish-icon"><QtIcon name="check" :size="36" /></span>
-      <div class="pane-heading"><span class="step-label">04 / 准备完成</span><h2>欢迎来到你的账号工作台</h2><p>准备步骤已完成，选择适合你的使用习惯。</p></div>
+      <div class="pane-heading"><span class="step-label">04 / 准备完成</span><h2>欢迎来到机器人采集终端</h2><p>准备步骤已完成，选择适合你的使用习惯。</p></div>
       <div class="finish-options">
         <a-checkbox :data-testid="T.autolaunch" v-model:checked="autoLaunch">开机自动启动，保持在托盘中</a-checkbox>
         <a-checkbox :data-testid="T.trayOnClose" v-model:checked="trayOnClose">关闭窗口时，继续在托盘中运行</a-checkbox>
       </div>
-      <a-button type="primary" size="large" :data-testid="T.finish" @click="finish">进入账号工作台<QtIcon name="chevron" :size="16" /></a-button>
+      <a-button type="primary" size="large" :data-testid="T.finish" @click="finish">进入机器人采集终端<QtIcon name="chevron" :size="16" /></a-button>
     </section>
 
     <footer class="foot">

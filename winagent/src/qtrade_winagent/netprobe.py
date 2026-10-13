@@ -27,7 +27,7 @@ import asyncio
 import ipaddress
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from . import alerts as A
 from .alerts import AlertBuffer
@@ -63,6 +63,19 @@ SETTING_PROBE_INTERVAL = "probe.interval_s"
 HOSTS_KEY_BY_CHANNEL = {"qidian": "qidian_hosts", "qq": "qq_hosts", "wechat": "wechat_hosts"}
 
 
+def private_ipv4(value: Any) -> Optional[str]:
+    """Accept only canonical RFC1918 IPv4 discovered from the managed guest."""
+    if not isinstance(value, str):
+        return None
+    try:
+        ip = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        return None
+    if any(ip in ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+        return str(ip)
+    return None
+
+
 @dataclass
 class ProbeTargetSpec:
     target: str
@@ -89,6 +102,7 @@ class NetProbe:
     def __init__(self, db: Db, net: NetBackend, firewall: FirewallBackend, probe: ProbeBackend,
                  net_cfg: NetConfig, probe_cfg: ProbeConfig, alerts: AlertBuffer, *,
                  svc_exe: str, port: int = 17610, agent_port: int = 17600,
+                 guest_ip_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000)):
         self._db = db
         self._net = net
@@ -101,6 +115,7 @@ class NetProbe:
         self._port = port
         self._agent_port = agent_port
         self._clock = clock
+        self._guest_ip_provider = guest_ip_provider
         self.state = NetState()
 
     # ---------------------------------------------------------------- VPN / 代理 / net_state
@@ -159,6 +174,7 @@ class NetProbe:
     async def refresh(self) -> NetState:
         """重算 ``net_state`` / VPN / 子网 / MTU;有实质变化则 ``bump_seq()`` 并推 ``NET_STATE_CHANGED``。"""
         old_state, old_subnet = self.state.net_state, self.state.wsl_subnet
+        old_endpoint = self.state.agent_base_url
         ns = await self.net_state()
         wsl = await asyncio.to_thread(self._net.wsl_adapter)
         subnet = wsl_subnet_cidr(wsl) if wsl else None
@@ -168,17 +184,29 @@ class NetProbe:
         self.state.net_state, self.state.wsl_subnet = ns, subnet
         self.state.vpn_adapters, self.state.mtu = vpns, mtu
         self.state.host_ip = wsl.ipv4 if wsl else None
-        self.state.agent_base_url = f"http://{wsl.ipv4}:{self._agent_port}" if wsl and wsl.ipv4 else None
+        self.state.agent_base_url = await self.agent_endpoint()
+
         self._alerts.net_offline = (ns == "OFFLINE")
         if ns == "OFFLINE":
             self._alerts.firing(A.NET_OFFLINE, subject="host", evidence={"net_state": ns})
         else:
             self._alerts.resolve(A.NET_OFFLINE, subject="host")
-        if ns != old_state or subnet != old_subnet:
+        if ns != old_state or subnet != old_subnet or old_endpoint != self.state.agent_base_url:
             self.bump_seq()
             self._alerts.firing(A.NET_STATE_CHANGED, subject="host",
                                 evidence={"net_state": ns, "changed_from": old_state, "wsl_subnet": subnet})
         return self.state
+
+    async def agent_endpoint(self) -> Optional[str]:
+        if self._guest_ip_provider is not None:
+            try:
+                guest = private_ipv4(await self._guest_ip_provider())
+                if guest:
+                    return f"http://{guest}:{self._agent_port}"
+            except Exception:
+                # A missing user session or stopped distro is not the host IP.
+                pass
+        return None
 
     def snapshot(self) -> dict[str, Any]:
         """#13 ``GET /wa/v1/net`` 的响应体(字段名逐字照 02 §3.6)。"""
@@ -194,16 +222,21 @@ class NetProbe:
 
         WSL 未启动时 vEthernet 可能不存在或没地址 ⇒ 只绑 ``127.0.0.1``,等适配器事件。
         """
-        addrs = [self._ncfg.listen_loopback]
+        if self._ncfg.listen_loopback != "127.0.0.1":
+            raise ValueError("WinAgent requires an exact loopback listener")
+        addrs = ["127.0.0.1"]
         if self._ncfg.listen_wsl_adapter:
             a = self._net.wsl_adapter()
-            if a and a.ipv4:
+            if a and private_ipv4(a.ipv4):
                 addrs.append(a.ipv4)
         return tuple(addrs)
 
     def reconcile_listen(self, *, actual: tuple[str, ...]) -> dict[str, Any]:
         """H16:期望与实际不一致 ⇒ 告警 + 返回需要重绑的地址;子网真的变了再推 ``WSL_SUBNET_CHANGED`` + 刷防火墙。"""
         want = self.desired_listen()
+        adapter = self._net.wsl_adapter()
+        self.state.wsl_subnet = wsl_subnet_cidr(adapter) if adapter else None
+        self.state.host_ip = adapter.ipv4 if adapter else None
         changed_subnet = self.state.wsl_subnet
         ok = set(want) == set(actual)
         self._alerts_check_bind(want, actual)
@@ -235,8 +268,9 @@ class NetProbe:
 
     # ---------------------------------------------------------------- #17 / #45 防火墙(唯一拥有者)
     def _rule_spec(self, *, lan: bool = False) -> FirewallRuleSpec:
-        subnet = self.state.wsl_subnet or self._ncfg.wsl_subnet_fallback      # 取不到当前子网才退化 172.16.0.0/12
-        alias = (self._net.wsl_adapter().name if self._net.wsl_adapter() else "vEthernet (WSL)")
+        adapter = self._net.wsl_adapter()
+        subnet = self.state.wsl_subnet or self._ncfg.wsl_subnet_fallback
+        alias = adapter.name if adapter else "vEthernet (WSL)"
         return FirewallRuleSpec(name=self._ncfg.firewall_rule_winagent, program=self._svc_exe, local_port=self._port,
                                 interface_alias=alias, remote_address=subnet)
 

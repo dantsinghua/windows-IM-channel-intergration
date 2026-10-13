@@ -20,7 +20,8 @@ export class TokenHolder {
 
   constructor(pipe: PipeClient = createPipeClient(), private readonly now: () => number = Date.now,
               private readonly schedule: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
-              private readonly cancel: (t: ReturnType<typeof setTimeout>) => void = clearTimeout) {
+              private readonly cancel: (t: ReturnType<typeof setTimeout>) => void = clearTimeout,
+              private readonly options: { refreshIntervalMs?: number; onRefreshed?: () => void } = {}) {
     this.pipe = pipe
   }
 
@@ -42,16 +43,13 @@ export class TokenHolder {
   private armRenewal(): void {
     if (this.renewTimer) this.cancel(this.renewTimer)
     this.renewTimer = null
-    if (!this.bundle) return
-    const life = this.bundle.expires_at - this.now()
-    if (life <= 0) return
+    const life = this.bundle ? this.bundle.expires_at - this.now() : 0
     const lead = Math.max(RENEW_MIN_LEAD_MS, life * (1 - RENEW_AT_FRACTION))
-    const delay = Math.max(1_000, life - lead)
+    const renewDelay = life > 0 ? Math.max(1_000, life - lead) : RENEW_RETRY_MS
+    const delay = Math.min(renewDelay, this.options.refreshIntervalMs ?? renewDelay)
     this.renewTimer = this.schedule(() => {
       this.renewTimer = null
-      void this.refresh().then((ok) => {
-        if (!ok) this.renewTimer = this.schedule(() => { this.renewTimer = null; void this.refresh() }, RENEW_RETRY_MS)
-      })
+      void this.refresh()
     }, delay)
     ;(this.renewTimer as { unref?: () => void }).unref?.()
   }
@@ -62,6 +60,10 @@ export class TokenHolder {
 
   get winagentToken(): string | null {
     return this.bundle?.winagent_token ?? null
+  }
+
+  get agentBaseUrl(): string | null {
+    return this.bundle?.agent_base_url ?? null
   }
 
   describe(): string {
@@ -76,11 +78,13 @@ export class TokenHolder {
         this.bundle = await this.pipe.fetchTokens()
         this.state = 'ok'
         this.armRenewal()
+        this.options.onRefreshed?.()
         return true
       } catch {
         this.bundle = null
         // 管道连不上 = WinAgent 服务没起来(§5.3)
         this.state = 'winagent_offline'
+        this.armRenewal()
         return false
       } finally {
         this.inflight = null

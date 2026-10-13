@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """代码签名 ↔ 规格 的逐字对账。
 
 规格唯一出处 = ``docs/03-安装引导与自动化配置.md`` §2.2.3「数字签名与 SmartScreen」:
@@ -216,11 +216,15 @@ class TestPrivateKeyNeverLeaves:
         assert not bad, "仓库里出现了密钥材料:" + ", ".join(str(p) for p in bad)
 
     def test_cert_dir_is_outside_repo(self, signing_text: str) -> None:
-        """公钥 .cer 默认导到**产物根**,不在仓库里。"""
-        m = re.search(r"QtDefaultCertDir\s*=\s*'([^']+)'", signing_text)
-        assert m, "找不到默认证书目录"
-        assert "qtrade-payload" in m.group(1)
-        assert "Desktop" not in m.group(1)
+        """Default public export uses the OS local-user folder outside this checkout."""
+        m = re.search(r"QtDefaultCertDir\s*=\s*(.+)", signing_text)
+        assert m, "default certificate directory missing"
+        value = m.group(1)
+        assert "[Environment]::GetFolderPath('LocalApplicationData')" in value
+        assert "Join-Path" in value or "[IO.Path]::Combine" in value
+        assert re.search(r"'QTrade(?:\\signing'|',\s*'signing')", value)
+        assert "$PSScriptRoot" not in value and "C:\\Users" not in value
+
 
 
 class TestBuildIntegration:
@@ -268,7 +272,8 @@ class TestBuildIntegration:
 
     def test_cmd_not_signed(self, build_text: str) -> None:
         """.cmd 不支持 Authenticode,链首脚本仍从仓库原件复制。"""
-        assert "Copy-Item -LiteralPath (Join-Path $EngineDir $ChainHeadName)" in build_text
+        assert "Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $StageDir 'install\\engine')" in build_text
+        assert "'*.ps1', '*.cmd'" in build_text
         assert ".cmd 不支持 Authenticode" in build_text
 
 

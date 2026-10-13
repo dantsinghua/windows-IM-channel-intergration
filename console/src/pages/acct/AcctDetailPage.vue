@@ -47,11 +47,13 @@ const pwRemember = ref(false)
 const passwordPurpose = ref<'login' | 'credential'>('login')
 const busy = ref(false)
 const webuiUntil = ref<number | null>(null)
+const webuiHeld = ref(false)
 const now = ref(Date.now())
 const webuiLeft = computed(() => webuiUntil.value ? Math.max(0, Math.round((webuiUntil.value - now.value) / 1000)) : 0)
 let tick: ReturnType<typeof setInterval> | null = null
 
 function errorText(error: unknown): string {
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) return '请求超过 15 秒，按钮已放开'
   return error instanceof ApiFailure ? error.message + '（trace ' + error.traceShort + '）' : error instanceof Error ? error.message : String(error)
 }
 async function reload(): Promise<void> {
@@ -71,9 +73,13 @@ async function reload(): Promise<void> {
 async function act(fn: () => Promise<unknown>, okText: string): Promise<boolean> {
   if (busy.value) return false
   busy.value = true
-  try { await fn(); message.success(okText); await accounts.load(); if (!accounts.byId[id.value]) await reload(); return true }
+  try { await fn(); message.success(okText); return true }
   catch (error) { message.error(errorText(error)); return false }
-  finally { busy.value = false }
+  finally {
+    busy.value = false
+    // 名单刷新不要挡住确认框。重启的真正工作在服务端后台跑，按钮必须先松开。
+    void accounts.load().then(() => { if (!accounts.byId[id.value]) void reload() }).catch(() => undefined)
+  }
 }
 /** 名称就地编辑:点名称/编辑 icon 进入输入框,失焦(或回车)即保存并恢复展示;Esc 放弃。 */
 async function startEditLabel(): Promise<void> {
@@ -128,7 +134,7 @@ async function runStateAction(action: string): Promise<void> {
     case 'key-retry':
       // R6-91:没回填过 wxid 的号(首登没走完)要重跑登录流才能回填/绑定;跑起来过的号才单独重取钥
       if (!a.value?.self_uid && !a.value?.wxid) await act(() => accountsApi.start(id.value), '已重新发起微信登录与取钥')
-      else if (!window.qt?.wa) message.info('请在桌面控制台重新取钥')
+      else if (!window.qt?.wa) message.info('请在机器人采集终端重新取钥')
       else await act(() => window.qt!.wa.invoke('wechat.key.retry', {}), '已请求重新取钥')
       break
     case 'reinstall': void router.push({ path: '/acct/new', query: { ch: 'wechat', step: 'reinstall' } }); break
@@ -143,20 +149,26 @@ async function runStateAction(action: string): Promise<void> {
   }
 }
 async function openWebui(): Promise<void> {
-  if (!window.qt?.app.openExternal) { message.info('请在桌面控制台打开 NapCat 工作台'); return }
+  if (!window.qt?.app.openExternal) { message.info('请在机器人采集终端打开 NapCat'); return }
   if (busy.value) return
   busy.value = true
   try {
-    const result = await accountsApi.webuiOpen(id.value, 10)
-    webuiUntil.value = Date.parse(result.until)
+    const result = await accountsApi.webuiOpen(id.value, { persist: true })
     const opened = await window.qt.app.openExternal(result.url)
-    if (opened === false) message.warning('临时入口已开启，但地址不在本机安全白名单内，无法打开')
-    else message.success('已打开 NapCat 工作台，入口将在 10 分钟后关闭')
+    if (opened === false) message.error('浏览器没有打开，请再点一次')
+    else {
+      webuiHeld.value = true
+      webuiUntil.value = null
+      message.success('已打开 NapCat')
+    }
   } catch (error) { message.error(errorText(error)) }
   finally { busy.value = false }
 }
 async function closeWebui(): Promise<void> {
-  if (await act(() => accountsApi.webuiClose(id.value), '临时工作台入口已关闭')) webuiUntil.value = null
+  if (await act(() => accountsApi.webuiClose(id.value), 'NapCat 已关闭')) {
+    webuiUntil.value = null
+    webuiHeld.value = false
+  }
 }
 async function doSoftDelete(): Promise<void> {
   if (!a.value) return
@@ -172,7 +184,7 @@ function startAccount(): void {
   else void act(() => accountsApi.start(id.value), '已请求启动')
 }
 function memoryText(value?: number | null): string { return value == null ? '—' : (value / 1024).toFixed(2) + ' GB' }
-watch(id, () => { screenOpen.value = false; closePassword(); webuiUntil.value = null; void reload() })
+watch(id, () => { screenOpen.value = false; closePassword(); webuiUntil.value = null; webuiHeld.value = false; void reload() })
 onMounted(() => { void reload(); tick = setInterval(() => { now.value = Date.now() }, 1000) })
 onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
 </script>
@@ -184,7 +196,7 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
     <template v-else>
       <header class="account-heading qt-glass">
         <div class="account-avatar">{{ CHANNEL_TEXT[a.channel].slice(0, 1) }}</div>
-        <div class="account-title"><div class="qt-eyebrow">{{ CHANNEL_TEXT[a.channel] }} / 账号工作台</div>
+        <div class="account-title"><div class="qt-eyebrow">{{ CHANNEL_TEXT[a.channel] }} / 机器人采集终端</div>
           <h1 v-if="!editLabel" class="label-display" title="点击修改名称" tabindex="0" @click="startEditLabel" @keydown.enter.prevent="startEditLabel">
             <span class="label-text">{{ a.label || a.self_nick || a.id }}</span>
             <span class="label-edit-icon" role="button" aria-label="修改名称" :data-testid="T.labelEdit" @click.stop="startEditLabel">✎</span>
@@ -209,11 +221,11 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
 
       <div class="account-layout">
         <section class="qt-glass account-workspace">
-          <header class="workspace-heading"><div><div class="qt-eyebrow">{{ a.channel === 'qq' ? 'NAPCAT / ONEBOT' : a.channel === 'wechat' ? 'WECHAT / WINDOWS' : 'QIDIAN / ANDROID' }}</div><h2>{{ a.channel === 'qq' ? 'QQ 工作台' : a.channel === 'wechat' ? '微信账号' : '企点操作画面' }}</h2></div><span class="workspace-label">{{ a.channel === 'qq' ? '本机受控入口' : a.channel === 'wechat' ? '本机窗口' : '实时画面' }}</span></header>
+          <header class="workspace-heading"><div><div class="qt-eyebrow">{{ a.channel === 'qq' ? 'NAPCAT / ONEBOT' : a.channel === 'wechat' ? 'WECHAT / WINDOWS' : 'QIDIAN / ANDROID' }}</div><h2>{{ a.channel === 'qq' ? '机器人采集终端' : a.channel === 'wechat' ? '微信账号' : '企点操作画面' }}</h2></div><span class="workspace-label">{{ a.channel === 'qq' ? '本机受控入口' : a.channel === 'wechat' ? '本机窗口' : '实时画面' }}</span></header>
           <!-- R6-94(2026-10-10 安琳):微信不需要画面 —— 窗口就在本机桌面,直接在微信里操作 -->
           <div v-if="a.channel === 'wechat'" class="channel-preview"><div class="preview-orbit">微</div><h3>{{ a.self_nick || a.label }}</h3><p>微信在本机 Windows 窗口里运行,登录、取钥时按右侧提示直接在微信里操作即可;收发记录在消息中心查看。</p><a-button type="primary" @click="openMessages">查看消息</a-button></div>
           <template v-else-if="a.channel === 'qq'">
-            <div class="channel-preview"><div class="preview-orbit">QQ</div><h3>{{ a.self_nick || a.label }}</h3><p>通过 NapCat 管理当前账号，收发记录可在消息中心查询。</p><a-popconfirm title="临时开放本机 NapCat 工作台 10 分钟并在浏览器打开？" @confirm="openWebui"><a-button type="primary" :disabled="session.draining || busy" :data-testid="T.webuiOpen">打开 NapCat 工作台</a-button></a-popconfirm><div v-if="webuiLeft" class="webui-timer"><span :data-testid="T.webuiCountdown">临时入口剩余 {{ webuiLeft }} 秒</span><a-button size="small" :data-testid="T.webuiClose" @click="closeWebui">提前关闭</a-button></div></div>
+            <div class="channel-preview"><div class="preview-orbit">QQ</div><h3>{{ a.self_nick || a.label }}</h3><p>通过 NapCat 管理当前账号，收发记录可在消息中心查询。</p><a-popconfirm title="在浏览器打开本机 NapCat？打开后保持可用，需要时再关闭。" @confirm="openWebui"><a-button type="primary" :disabled="session.draining || busy" :data-testid="T.webuiOpen">打开 NapCat</a-button></a-popconfirm><div v-if="webuiHeld || webuiLeft" class="webui-timer"><span v-if="webuiLeft" :data-testid="T.webuiCountdown">临时入口剩余 {{ webuiLeft }} 秒</span><a-button size="small" :data-testid="T.webuiClose" @click="closeWebui">关闭 NapCat</a-button></div></div>
           </template>
           <AccountScreen v-else-if="screenOpen" :key="a.id" embedded :account-id="a.id" />
           <div v-else class="channel-preview"><div class="preview-orbit">企</div><h3>打开专属账号画面</h3><p>按需连接实时画面，完成登录、验证码与日常操作。</p><a-button type="primary" :data-testid="T.op('screen')" @click="screenOpen = true">连接企点画面</a-button></div>

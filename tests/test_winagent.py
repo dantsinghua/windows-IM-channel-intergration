@@ -240,7 +240,10 @@ async def test_winagent_probe_updates_health_and_windows_pool(tmp_path):
     await rig.agent.winagent_probe()
     assert health.winagent_online is True and health.winagent_version == "1.0.0" and health.user_agent_online is True
     assert pool.windows_known and pool.snapshot()["pools"]["windows"]["total_mb"] == 16384 and pool.can_add("wechat")[0] is True
-    assert rig.store.pool_get("wsl")["total_mb"] == 11264 and rig.store.pool_get("wsl")["source"] == "winagent"
+    # R6-98:host.wsl_vm_mb 是 vmmem 实占,不覆盖 wsl 池 total(仍是建池时的 MemTotal / 夹具 11264,source 不变为 winagent)
+    wa.host["wsl_vm_mb"] = 5691
+    await rig.agent.winagent_probe()
+    assert rig.store.pool_get("wsl")["total_mb"] == 11264 and rig.store.pool_get("wsl")["source"] != "winagent"
     wa.user_agent = False
     await rig.agent.winagent_probe()
     assert health.user_agent_online is False and health.winagent_online is True
@@ -316,12 +319,12 @@ async def test_winagent_probe_fires_and_resolves_h02_alert(tmp_path):
     a = alerts.active[(H02_WINAGENT_API_DOWN, "host")]
     assert a.severity == "crit" and a.count == 1                        # 连探 3 次只推一次 firing
     ev = rig.store.con.execute("SELECT payload_json FROM events_outbox WHERE event='alert'").fetchall()
-    assert len(ev) == 1 and json.loads(ev[0][0])["state"] == "firing"
+    assert [json.loads(e[0])["state"] for e in ev] == ["resolved", "firing"]  # 首次健康先校正跨重启旧告警。
     rig.winagent.offline = False
     await rig.agent.winagent_probe()
     assert not alerts.is_firing(H02_WINAGENT_API_DOWN, "host") and rig.agent.health.winagent_online is True
     ev = rig.store.con.execute("SELECT payload_json FROM events_outbox WHERE event='alert'").fetchall()
-    assert [json.loads(e[0])["state"] for e in ev] == ["firing", "resolved"]
+    assert [json.loads(e[0])["state"] for e in ev] == ["resolved", "firing", "resolved"]
     rig.store.close()
 
 
@@ -335,9 +338,9 @@ async def test_dockerd_probe_fires_and_resolves_h03_alert(tmp_path):
     await rig.agent.dockerd_probe()
     assert rig.agent.health.dockerd_ok is False
     assert rig.agent.alerts.active[(H03_DOCKERD_DOWN, "wsl")].severity == "crit"
-    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 1
+    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 2
     rig.containers.dockerd_ok = True
     await rig.agent.dockerd_probe()
     assert not rig.agent.alerts.is_firing(H03_DOCKERD_DOWN, "wsl")
-    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 2
+    assert rig.store.con.execute("SELECT COUNT(*) FROM events_outbox WHERE event='alert'").fetchone()[0] == 3
     rig.store.close()

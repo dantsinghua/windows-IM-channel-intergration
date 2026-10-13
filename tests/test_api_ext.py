@@ -254,6 +254,9 @@ def test_probe_rejects_bad_args_and_read_token(rig):
 
 # ══════════════════════════════════════════════════ #78 自检
 def test_selftest_run_writes_result_and_last(rig):
+    containers = rig.agent.runtime._containers
+    container_calls_before = list(containers.calls)
+    adb_calls_before = list(rig.agent.runtime._adb.calls)
     r = rig.client.post(f"{P}/system/selftest", headers=H())
     assert r.status_code == 202
     run_id = r.json()["run_id"]
@@ -263,10 +266,67 @@ def test_selftest_run_writes_result_and_last(rig):
         rig.client.get(f"{P}/system/version", headers=H())
     got = rig.client.get(f"{P}/system/selftest", headers=H(TOK_R)).json()
     assert got["run_id"] == run_id and got["data"]["winagent_ok"] is True
-    # 本期没有临时 redroid 执行体 ⇒ 如实 null + skipped,不假装启过容器
+    # 02 #78 / 03 R6-102：日常自检无启动执行器，必须如实报告跳过。
     assert got["data"]["redroid_boot_ms"] is None
-    assert {s["step"] for s in got["data"]["skipped"]} == {"redroid_boot", "napcat"}
+    assert sorted(got["data"]["skipped"], key=lambda row: row["step"]) == [
+        {"step": "napcat", "reason": "no_executor"},
+        {"step": "redroid_boot", "reason": "no_executor"},
+    ]
+    assert got["data"]["napcat_ok"] is None
+    assert got["data"]["account_containers"] == []
     assert rig.client.post(f"{P}/system/selftest", headers=H(TOK_W)).status_code == 403
+    assert containers.calls == container_calls_before
+    assert rig.agent.runtime._adb.calls == adb_calls_before
+    assert "qtrade-selftest" not in containers.containers
+
+
+def test_selftest_uses_running_containers_and_skips_throwaway(rig):
+    """已有 QQ / 企点容器在跑时，NapCat 按 inspect 结果填写。不启动 qtrade-selftest。"""
+    import asyncio
+
+    from qtrade_agent.runtime.backends import ContainerSpec
+
+    qq = rig.store.create_account(channel="qq", label="qq", login_mode="qrcode", quota_mb=2048)
+    qd = rig.store.create_account(channel="qidian", label="qd", login_mode="qrcode", quota_mb=2048)
+    rig.store.transition(qq["id"], "running")
+    rig.store.transition(qd["id"], "running")
+    containers = rig.agent.runtime._containers
+
+    async def boot() -> None:
+        for account_id, image in ((qq["id"], "napcat"), (qd["id"], "redroid")):
+            name = f"qtrade-{account_id}"
+            await containers.create(ContainerSpec(
+                name=name, image=image, ports={}, volumes={}, mem_limit_mb=512, privileged=False,
+            ))
+            await containers.start(name)
+
+    asyncio.run(boot())
+    container_calls_before = len(containers.calls)
+    adb_calls_before = list(rig.agent.runtime._adb.calls)
+    response = rig.client.post(f"{P}/system/selftest", headers=H())
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    for _ in range(50):
+        if rig.store.settings_get("system.selftest.last") == run_id:
+            break
+        rig.client.get(f"{P}/system/version", headers=H())
+    data = rig.client.get(f"{P}/system/selftest", headers=H(TOK_R)).json()["data"]
+    assert data["napcat_ok"] is True
+    assert qq["id"] in data["napcat_detail"]
+    assert data["redroid_boot_ms"] is None
+    reasons = {row["step"]: row["reason"] for row in data["skipped"]}
+    assert reasons["redroid_boot"] == "no_executor"
+    assert data["skipped"] == [{"step": "redroid_boot", "reason": "no_executor"}]
+    assert "napcat" not in reasons
+    running = {row["id"]: row["running"] for row in data["account_containers"]}
+    assert running[qq["id"]] is True
+    assert running[qd["id"]] is True
+    assert "qtrade-selftest" not in containers.containers
+    observed_calls = containers.calls[container_calls_before:]
+    assert {name for _, name in observed_calls} == {f"qtrade-{qq['id']}", f"qtrade-{qd['id']}"}
+    # 检查调用而非只查最终容器表，才能拦住“创建后又删除”的隐性操作。
+    assert all(action == "inspect" for action, _ in observed_calls)
+    assert rig.agent.runtime._adb.calls == adb_calls_before
 
 
 # ══════════════════════════════════════════════════ #80 诊断包

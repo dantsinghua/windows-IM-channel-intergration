@@ -135,12 +135,14 @@ def _windows_disks(paths: dict[str, str], rows: list[dict]) -> list[dict]:
 
 class DeploymentDiskReader:
     def __init__(self, app_dir: str, data_dir: str, *, runner=None, platform: str | None = None,
-                 distro_name: str | None = None, clock=time.monotonic, cache_s: float = 30):
+                 distro_name: str | None = None, clock=time.monotonic, cache_s: float = 30,
+                 windows_probe=None):
         self.paths = {"app": app_dir, "data": data_dir}
         self.platform = platform or ("win32" if sys.platform == "win32" else
                                      "wsl" if os.environ.get("WSL_DISTRO_NAME") or "microsoft" in platform_module.release().lower() else "linux")
         self.distro_name = os.environ.get("WSL_DISTRO_NAME", "") if distro_name is None else distro_name
         self._runner = runner or run_probe
+        self._windows_probe = windows_probe
         self._clock, self._cache_s = clock, cache_s
         self._cache = None
         self._expires = 0.0
@@ -162,6 +164,11 @@ class DeploymentDiskReader:
             return copy.deepcopy(result)
 
     async def _powershell(self, request: dict) -> list[dict]:
+        if self._windows_probe is not None:
+            rows = await self._windows_probe(request)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("windows_volume_response_invalid")
+            return rows
         encoded = base64.b64encode(WINDOWS_PROBE_SCRIPT.encode("utf-16-le")).decode("ascii")
         argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
         rc, out, _ = await self._runner(argv, input=json.dumps(request, ensure_ascii=True).encode("ascii"), timeout_s=15)
@@ -180,8 +187,16 @@ class DeploymentDiskReader:
                 if rc or not out.strip():
                     raise ValueError("windows_path_conversion_failed")
                 paths[role] = out.decode("utf-8").strip()
-        registrations = await self._powershell({"operation": "registry"}) if any(_WSL_UNC.match(p) for p in paths.values()) else []
-        backing = resolve_windows_paths(paths, self.distro_name, registrations)
+        # systemd services do not inherit WSL_DISTRO_NAME. wslpath supplies the
+        # actual current distribution; the Windows bridge also pins its own
+        # installing user's configured distribution when reading HKCU.
+        names = {match.group(1).casefold(): match.group(1)
+                 for p in paths.values() if (match := _WSL_UNC.match(p))}
+        if len(names) > 1 or (self.distro_name and names and self.distro_name.casefold() not in names):
+            raise ValueError("current_distro_path_mismatch")
+        distro_name = self.distro_name or next(iter(names.values()), "")
+        registrations = await self._powershell({"operation": "registry"}) if names else []
+        backing = resolve_windows_paths(paths, distro_name, registrations)
         rows = await self._powershell({"operation": "volumes", "paths": list(dict.fromkeys(backing.values()))})
         return _windows_disks(backing, rows)
 

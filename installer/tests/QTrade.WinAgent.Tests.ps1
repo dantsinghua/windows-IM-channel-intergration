@@ -8,6 +8,14 @@ BeforeAll {
     }
 }
 
+Describe 'Isolated WinAgent module fixtures' {
+    BeforeEach {
+        Mock -ModuleName QTrade.Native Invoke-QtProcess { throw 'Real process forbidden in WinAgent module fixtures.' }
+        Mock -ModuleName QTrade.WinAgent Invoke-QtBootstrapPipe {
+            [pscustomobject]@{ Ok = $true; Reason = ''; Response = [pscustomobject]@{ console_token = ('A' * 64); winagent_token = ('B' * 64) } }
+        }
+    }
+
 Describe 'R-14 实名(§2.8.1:会话代理不开任何入站口)' {
 
     It '两个可执行体名字' {
@@ -41,24 +49,41 @@ Describe '服务注册用 sc.exe(§2.15:New-Service 不设恢复策略)' {
 
     It '四条命令:create / description / failure / failureflag,且 start= delayed-auto' {
         Mock -ModuleName QTrade.WinAgent Invoke-QtSc { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
-        $r = Install-QtWinAgentService -ExePath 'C:\ProgramData\QTrade\winagent\app\qtrade-winagent-svc.exe'
+        $r = Install-QtWinAgentService -ExePath 'C:\ProgramData\QTrade\winagent\app\qtrade-winagent-svc.exe' -InstallUserSid 'S-1-5-21-1111-2222-3333-1001'
         $r.Ok | Should -BeTrue
         $r.Commands.Count | Should -Be 4
         $r.Commands[0] | Should -Match 'start= delayed-auto'
         $r.Commands[0] | Should -Match 'obj= LocalSystem'
-        $r.Commands[0] | Should -Match 'depend= LxssManager'
+        $r.Commands[0] | Should -Not -Match 'depend=|LxssManager|WslService'
         $r.Commands[2] | Should -Match 'actions= restart/5000/restart/30000/restart/60000'
         $r.Commands[3] | Should -Match 'failureflag QTradeWinAgent 1'
     }
 
     It '服务已存在(1073)视为幂等成功' {
-        Mock -ModuleName QTrade.WinAgent Invoke-QtSc { [pscustomobject]@{ ExitCode = 1073; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
-        (Install-QtWinAgentService -ExePath 'X:\svc.exe').Ok | Should -BeTrue
+        Mock -ModuleName QTrade.WinAgent Invoke-QtSc { [pscustomobject]@{ ExitCode = $(if ($ScArgs[0] -eq 'create') { 1073 } else { 0 }); StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
+        (Install-QtWinAgentService -ExePath 'X:\svc.exe' -Root 'X:\fixture' -InstallUserSid 'S-1-5-21-1111-2222-3333-1001').Ok | Should -BeTrue
+        Should -Invoke -ModuleName QTrade.WinAgent Invoke-QtSc -Times 1 -Exactly -ParameterFilter {
+            $ScArgs[0] -eq 'config' -and $ScArgs -contains 'depend=' -and
+            $ScArgs[([Array]::IndexOf($ScArgs, 'depend=') + 1)] -ceq '/'
+        }
+    }
+
+    It 'fails when updating an existing service configuration is rejected' {
+        Mock -ModuleName QTrade.WinAgent Invoke-QtSc {
+            [pscustomobject]@{ ExitCode = $(if ($ScArgs[0] -eq 'create') { 1073 } else { 5 });
+                StdOut = ''; StdErr = 'denied'; TimedOut = $false; DurationMs = 1 }
+        }
+        $r = Install-QtWinAgentService -ExePath 'X:\svc.exe' -Root 'X:\fixture' -InstallUserSid 'S-1-5-21-1111-2222-3333-1001'
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'SERVICE_INSTALL_FAILED'
+        Should -Invoke -ModuleName QTrade.WinAgent Invoke-QtSc -Times 0 -Exactly -ParameterFilter {
+            $ScArgs[0] -in @('description', 'failure', 'failureflag')
+        }
     }
 
     It '真失败 → SERVICE_INSTALL_FAILED' {
         Mock -ModuleName QTrade.WinAgent Invoke-QtSc { [pscustomobject]@{ ExitCode = 5; StdOut = ''; StdErr = 'denied'; TimedOut = $false; DurationMs = 1 } }
-        (Install-QtWinAgentService -ExePath 'X:\svc.exe').Reason | Should -Be 'SERVICE_INSTALL_FAILED'
+        (Install-QtWinAgentService -ExePath 'X:\svc.exe' -Root 'X:\fixture' -InstallUserSid 'S-1-5-21-1111-2222-3333-1001').Reason | Should -Be 'SERVICE_INSTALL_FAILED'
     }
 }
 
@@ -66,7 +91,7 @@ Describe '🔴 R3-16 / R4-10:健康门不以 user_agent:true 为条件' {
 
     It 'health 200 且 user_agent=false → 仍算就绪(静默/无人值守安装属正常态)' {
         Mock -ModuleName QTrade.WinAgent Invoke-QtHttp {
-            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"user_agent":false,"vault":"ok","version":"1.0.0"}' }
+            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"ok":true,"user_agent":false,"modules":{"vault":"ok"},"version":"1.0.0"}' }
         }
         Mock -ModuleName QTrade.WinAgent Start-QtSleep { }
         $r = Wait-QtWinAgentHealthy -TimeoutSec 5
@@ -76,7 +101,7 @@ Describe '🔴 R3-16 / R4-10:健康门不以 user_agent:true 为条件' {
 
     It 'health 200 且 user_agent=true → 就绪' {
         Mock -ModuleName QTrade.WinAgent Invoke-QtHttp {
-            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"user_agent":true,"vault":"ok"}' }
+            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"ok":true,"user_agent":true,"modules":{"vault":"ok"}}' }
         }
         Mock -ModuleName QTrade.WinAgent Start-QtSleep { }
         (Wait-QtWinAgentHealthy -TimeoutSec 5).UserAgent | Should -BeTrue
@@ -96,7 +121,7 @@ Describe '🔴 R3-16 / R4-10:健康门不以 user_agent:true 为条件' {
 
     It '幂等判据:Running + health 200 → true(不看 user_agent)' {
         Mock -ModuleName QTrade.WinAgent Get-QtServiceStatus { 'Running' }
-        Mock -ModuleName QTrade.WinAgent Invoke-QtHttp { [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"user_agent":false}' } }
+        Mock -ModuleName QTrade.WinAgent Invoke-QtHttp { [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"ok":true,"user_agent":false,"modules":{"vault":"ok"}}' } }
         Test-QtWinAgentInstalled -Context ([pscustomobject]@{}) | Should -BeTrue
     }
 }
@@ -150,7 +175,7 @@ Describe '🔴 防火墙:引擎只调 WinAgent,自己不建规则(§6 / 验收 M
 
     It 'ensure 返回 created/updated/unchanged' {
         Mock -ModuleName QTrade.Firewall Invoke-QtHttp {
-            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"action":"created","rule_name":"QTrade-WinAgent-17610-from-WSL"}' }
+            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"result":"created","rule_name":"QTrade-WinAgent-17610-from-WSL"}' }
         }
         $r = Invoke-QtFirewallEnsure
         $r.Action | Should -Be 'created'
@@ -159,12 +184,12 @@ Describe '🔴 防火墙:引擎只调 WinAgent,自己不建规则(§6 / 验收 M
 
     It '🔴 blocked_by_policy 只记警告不失败(验收 M1-15:仍 DONE 退出码 0)' {
         Mock -ModuleName QTrade.Firewall Invoke-QtHttp {
-            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"action":"blocked_by_policy"}' }
+            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"result":"blocked_by_policy","rule_name":"QTrade-WinAgent-17610-from-WSL"}' }
         }
         $r = Invoke-QtFirewallEnsure
         $r.Ok | Should -BeTrue
         $r.Blocked | Should -BeTrue
-        $r.Message | Should -Match '请 IT 放行'
+        $r.Message | Should -Match 'IT'
     }
 
     It '卸载先走端点;端点不可用才按固定名兜底删' {
@@ -203,7 +228,7 @@ Describe '日志(§3.1:每行 `时间 级别 步名 消息`;不记密码/令牌)
     }
 
     It '子日志与主日志同目录同前缀(§3.1)' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-log-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-log-' + [Guid]::NewGuid().ToString('N'))
         try {
             Initialize-QtLog -Directory $tmp -Prefix 'install' -Stamp '20260920-181500' | Out-Null
             (Split-Path -Leaf (Get-QtLogPath)) | Should -Be 'install-20260920-181500.log'
@@ -279,7 +304,7 @@ Describe '卸载:.wslconfig 恢复(§2.14 第 3 步;验收 M1-28)' {
 Describe '🔴 rename 备份残留 —— 卸载只列出、不代删(§2.14 第 6 步末)' {
 
     It '列出 *.qtbak-«ts» 目录' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-ob-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-ob-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $tmp 'xwechat_files.qtbak-20260920-181500') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $tmp 'normal') -Force | Out-Null
         try {
@@ -295,7 +320,7 @@ Describe '🔴 rename 备份残留 —— 卸载只列出、不代删(§2.14 第
 Describe '安装摘要(§2.11 第 5 项;验收 M1-19「除时间戳外逐行相同」)' {
 
     It '字段顺序固定、不含随机量' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-sum-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-sum-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
             $p = Join-Path $tmp 'install-summary.txt'
@@ -316,7 +341,7 @@ Describe '安装摘要(§2.11 第 5 项;验收 M1-19「除时间戳外逐行相�
 Describe 'DONE 步:删暂存 rootfs.tar(A-6,不询问)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-done-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-done-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
     }
     AfterEach { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
@@ -372,4 +397,6 @@ Describe '🔴 完成页探测两列并列:SKIPPED 标「未探测」而不是�
     It '两列都空 → 空表,不抛' {
         (Format-QtProbeSummary).Count | Should -Be 0
     }
+}
+
 }

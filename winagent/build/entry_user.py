@@ -13,6 +13,7 @@ SELFCHECK_MODULES = (
     "qtrade_winagent.main_user", "qtrade_winagent.user", "qtrade_winagent.fakes",
     "qtrade_winagent.win.pipes", "qtrade_winagent.win.power", "qtrade_winagent.win.proc",
     "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat", "qtrade_winagent.win.sysinfo",
+    "qtrade_winagent.win.console_signal",
     "pywinauto", "PIL.ImageGrab",
     "win32api", "win32security", "win32ts", "pywintypes", "psutil",
 )
@@ -35,5 +36,8 @@ def selfcheck() -> int:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selfcheck"]:
         sys.exit(selfcheck())
+    if sys.argv[1:2] == ["--console-break"]:
+        from qtrade_winagent.win.console_signal import main as console_break
+        sys.exit(console_break(sys.argv[2:]))
     from qtrade_winagent.main_user import main
     sys.exit(main())

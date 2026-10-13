@@ -13,8 +13,8 @@ import { collectErrors, installQtStub } from './helpers.mjs'
 const ROUTES = [
   ['/dash', '所有账号，一处掌握'],
   ['/res', '看清资源，安心运行'],
-  ['/acct', '每个账号，都有自己的工作台'],
-  ['/acct/new', '把新的账号，带入工作台'],
+  ['/acct', '每个账号，都在机器人采集终端里'],
+  ['/acct/new', '把新的账号，带入机器人采集终端'],
   ['/acct/qd01', '账号信息'],
   ['/screen/qd01', '账号画面'],
   ['/msg', '历史消息'],

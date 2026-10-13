@@ -80,7 +80,7 @@ Describe '🔴 §2.7.1 FOREIGN:先导出再注销,导出失败就不注销(验�
 Describe '§2.7.3 install.env —— 选段结果传进发行版(R5-9:必须在首起 dockerd 之前)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-env-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-env-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
     }
     AfterEach { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
@@ -186,28 +186,28 @@ Describe 'G-10 rootfs_contents 复核(§2.2.1)' {
 
 Describe 'Agent 健康(§2.11 第 2 项的事实来源)' {
 
-    It '解析 docker/db/winagent_reachable' {
+    It 'parses authenticated dockerd, database counts and winagent.online' {
         Mock -ModuleName QTrade.Distro Invoke-QtHttp {
-            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '{"docker":"ok","db":"ok","winagent_reachable":true,"version":"1.0.0"}' }
+            [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'fixtures\health-agent-authenticated.json'))) }
         }
-        $h = Get-QtAgentHealth
+        $h = Get-QtAgentHealth -Token ('A' * 64)
         $h.Ok | Should -BeTrue
         $h.Docker | Should -Be 'ok'
         $h.Db | Should -Be 'ok'
         $h.WinAgentReachable | Should -BeTrue
-        $h.Version | Should -Be '1.0.0'
+        $h.Version | Should -Be '0.1.0'
     }
 
     It '不可达 → Ok=false,字段回缺省而不是抛' {
         Mock -ModuleName QTrade.Distro Invoke-QtHttp { [pscustomobject]@{ Ok = $false; StatusCode = 0; Body = 'refused' } }
-        $h = Get-QtAgentHealth
+        $h = Get-QtAgentHealth -Token ('A' * 64)
         $h.Ok | Should -BeFalse
         $h.WinAgentReachable | Should -BeFalse
     }
 
     It '回的不是 JSON 也不抛' {
         Mock -ModuleName QTrade.Distro Invoke-QtHttp { [pscustomobject]@{ Ok = $true; StatusCode = 200; Body = '<html>' } }
-        (Get-QtAgentHealth).Ok | Should -BeTrue
+        (Get-QtAgentHealth -Token ('A' * 64)).Ok | Should -BeFalse
     }
 }
 
@@ -291,7 +291,7 @@ Describe '§2.13 第 6 步:新镜像 tar 变了 → docker load' {
     }
 
     It '载荷侧带了同名 tar 时优先用它(TarOverrideDir)' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-img-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-img-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
             [IO.File]::WriteAllText((Join-Path $tmp 'redroid-11.tar'), 'x')

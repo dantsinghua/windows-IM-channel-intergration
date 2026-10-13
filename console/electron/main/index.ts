@@ -13,15 +13,19 @@ import { openLogsDir, pickFile, saveAs } from './files'
 import { loadWindowState, recordCrash, saveWindowState, clearCrashes } from './window-state'
 import { resolvePath, WA_WHITELIST } from './wa-whitelist'
 import { createLocalMetricsReader } from './local-metrics'
+import { createPipeClient } from './winagent-pipe'
 
-const DEV_URL = process.env.VITE_DEV_SERVER_URL
-const tokens = new TokenHolder()
+const DEV_URL = app.isPackaged ? undefined : process.env.VITE_DEV_SERVER_URL
+const tokens = new TokenHolder(createPipeClient({ isPackaged: app.isPackaged }), Date.now, setTimeout, clearTimeout, {
+  refreshIntervalMs: 30_000,
+  onRefreshed: syncAgentOrigin,
+})
 let mainWindow: BrowserWindow | null = null
 let tray: TrayController | null = null
 let quitting = false
 let notifyPaused = false
 let pendingRoute: string | null = null
-/** Agent / WinAgent 源:启动时从 console.toml `[endpoint]` 读一次(只认本机回环),netguard、preload、wa.invoke 共用同一份 */
+/** 正式 Agent 源只由认证管道发现;开发形态可配置回环地址。所有网络入口共用当前源。 */
 let agentOrigin = DEFAULT_AGENT_ORIGIN
 let winagentOrigin = DEFAULT_WINAGENT_ORIGIN
 
@@ -43,12 +47,24 @@ function parseRoute(argv: string[]): string | null {
   return hit ? hit.slice('--route='.length) : null
 }
 
+function syncAgentOrigin(): void {
+  if (!app.isPackaged || !tokens.agentBaseUrl || tokens.agentBaseUrl === agentOrigin) return
+  agentOrigin = tokens.agentBaseUrl
+  if (mainWindow) {
+    installNetGuard(tokens, undefined, { agentOrigin, winagentOrigin })
+    // 同次重载更新 preload、HTTP、事件与画面;旧页面不会携新令牌继续连旧地址。
+    mainWindow.webContents.reload()
+  }
+}
+
 async function bootstrap(): Promise<void> {
   await app.whenReady()
 
   const cfg = readConfig()
-  agentOrigin = normalizeLocalOrigin(cfg.endpoint?.agent, DEFAULT_AGENT_ORIGIN)
-  winagentOrigin = normalizeLocalOrigin(cfg.endpoint?.winagent, DEFAULT_WINAGENT_ORIGIN)
+  if (!app.isPackaged) {
+    agentOrigin = normalizeLocalOrigin(cfg.endpoint?.agent, DEFAULT_AGENT_ORIGIN)
+    winagentOrigin = normalizeLocalOrigin(cfg.endpoint?.winagent, DEFAULT_WINAGENT_ORIGIN)
+  }
 
   await tokens.refresh()
   installNetGuard(tokens, undefined, { agentOrigin, winagentOrigin, devUrl: DEV_URL })
@@ -94,13 +110,12 @@ function createWindow(show: boolean): void {
     minWidth: 1100,
     minHeight: 720,
     show,
-    title: 'QTrade 控制台',
+    title: '机器人采集终端',
     icon: brandIcon(),                             // 任务栏 / 窗口左上角与托盘同一枚南银标
     autoHideMenuBar: true,
     backgroundColor: '#F5F6F8',
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.cjs'),
-      additionalArguments: [`--qt-agent-origin=${agentOrigin}`],   // preload 据此暴露 qt.endpoint.agent
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -150,7 +165,7 @@ function createWindow(show: boolean): void {
     const { safeMode, route } = recordCrash(pendingRoute ?? '/dash', threshold)
     pendingRoute = route
     if (safeMode) {
-      dialog.showErrorBox('控制台已多次崩溃', '已停在环境页(画面流关闭),建议在环境页导出诊断包。')
+      dialog.showErrorBox('机器人采集终端已多次崩溃', '已停在环境页(画面流关闭),建议在环境页导出诊断包。')
     }
     createWindow(true)
     if (!win.isDestroyed()) win.destroy()          // 渲染进程已没了的旧壳不留着
@@ -172,6 +187,8 @@ function loadRenderer(win: BrowserWindow): void {
 }
 
 function registerIpc(): void {
+  // 固定只读 IPC:不接受来源或令牌参数,同步返回同份已验证源供每次 preload 加载。
+  ipcMain.on('qt:endpoint.agent', (event) => { event.returnValue = agentOrigin })
   // Fixed local scope: packaged executable folder, or the development application folder.
   const readLocalMetrics = createLocalMetricsReader(app.isPackaged ? dirname(process.execPath) : app.getAppPath())
   ipcMain.handle('qt:app.localMetrics', () => readLocalMetrics())

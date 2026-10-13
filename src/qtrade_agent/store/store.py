@@ -1047,7 +1047,12 @@ class Store:
                        sender: Optional[str] = None, q: Optional[str] = None, limit: int = 100,
                        before: Optional[tuple[int, str]] = None) -> tuple[list[dict[str, Any]], bool]:
         """#48:``q`` ≥ 3 字走 FTS trigram(多词 AND),否则 LIKE(``slow_match=True``);按 ts_ms DESC, id DESC;``before`` = 上一页末行 (ts_ms, id)。"""
-        sql = "SELECT m.*, s.name AS session_name, s.kind AS session_kind FROM messages m JOIN sessions s ON s.id = m.session_id"
+        sql = (
+            "SELECT m.*, s.name AS session_name, s.kind AS session_kind, s.native_id AS session_native_id, "
+            "a.self_nick AS account_self_nick, a.label AS account_label "
+            "FROM messages m JOIN sessions s ON s.id = m.session_id "
+            "LEFT JOIN accounts a ON a.id = m.account_id"
+        )
         params: list[Any] = []
         where: list[str] = []
         words = [w for w in (q or "").split() if w]
@@ -1085,7 +1090,13 @@ class Store:
         return [dict(r) for r in self.con.execute(sql, params).fetchall()], slow
 
     def get_message_full(self, id: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT m.*, s.name AS session_name, s.kind AS session_kind FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.id=?", (id,)).fetchone()
+        r = self.con.execute(
+            "SELECT m.*, s.name AS session_name, s.kind AS session_kind, s.native_id AS session_native_id, "
+            "a.self_nick AS account_self_nick, a.label AS account_label "
+            "FROM messages m JOIN sessions s ON s.id = m.session_id "
+            "LEFT JOIN accounts a ON a.id = m.account_id WHERE m.id=?",
+            (id,),
+        ).fetchone()
         return dict(r) if r else None
 
     def get_command(self, trace_id: str) -> Optional[dict[str, Any]]:

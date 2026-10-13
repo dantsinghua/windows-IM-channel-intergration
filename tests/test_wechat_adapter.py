@@ -25,6 +25,10 @@ async def test_probe_state_logged_out_when_window_gone(tmp_path):
     state, code, _ = await rig.adapter.probe_state(rig.account())
     assert (state, code) == ("login_required", "LOGGED_OUT")
     rig.fake.wechat["running"] = True
+    rig.fake.wechat["window_count"] = 0
+    assert (await rig.adapter.probe_state(rig.account()))[:2] == ("stopped", "WECHAT_NOT_RUNNING")
+    rig.fake.wechat.pop("window_count", None)
+    rig.fake.wechat["running"] = True
     rig.fake.wechat["logged_in"] = False
     assert (await rig.adapter.probe_state(rig.account()))[:2] == ("login_required", "LOGGED_OUT")
     rig.store.close()

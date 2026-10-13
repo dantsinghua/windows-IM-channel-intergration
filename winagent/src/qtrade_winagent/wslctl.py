@@ -19,6 +19,7 @@ LocalSystem 在 Session 0 解析到的是 ``systemprofile\\.wslconfig``,**不是
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -27,7 +28,7 @@ from typing import Any, Callable, Optional
 
 from .backends import WslBackend
 from .config import WslConfig
-from .errors import INVALID_ARGS, INTERNAL, WaError
+from .errors import INVALID_ARGS, INTERNAL, NOT_READY, WaError
 from .logfmt import get_logger
 
 log = get_logger("wslctl")
@@ -153,6 +154,8 @@ class WslCtl:
         self._backup_dir = backup_dir or cfg.backup_dir
         self._clock = clock
         self.pending_restart = False                 # #25 返回 {pending_restart:true} 并推 WSLCONFIG_PENDING_RESTART
+        self.desired_running = cfg.autostart
+        self._lifecycle_lock = asyncio.Lock()
 
     # ---------------------------------------------------------------- #20 status
     async def status(self) -> dict[str, Any]:
@@ -171,12 +174,37 @@ class WslCtl:
 
     # ---------------------------------------------------------------- #21/#22/#23
     async def start(self) -> dict[str, Any]:
-        await self._wsl.start(self._cfg.distro)
+        self.desired_running = True
+        async with self._lifecycle_lock:
+            if not await self._start_if_desired():
+                raise WaError(NOT_READY, "WSL start superseded by stop", reason="wsl_start_cancelled")
         return {"started": self._cfg.distro}
+
+    async def _start_if_desired(self) -> bool:
+        if not self.desired_running:
+            return False
+        await self._wsl.start(self._cfg.distro)
+        if not self.desired_running:
+            # stop 可能已因上游 deadline 取消;也不能留下刚就绪的持有进程。
+            await self._wsl.close()
+            return False
+        return True
+
+    async def ensure_running(self) -> None:
+        """只恢复已有运行意图;显式 stop 后不因定时器或管道重连重新拉起。"""
+        async with self._lifecycle_lock:
+            await self._start_if_desired()
+
+    async def close(self) -> None:
+        self.desired_running = False
+        async with self._lifecycle_lock:
+            await self._wsl.close()
 
     async def stop(self) -> dict[str, Any]:
         """#22:``wsl --terminate qtrade`` —— **只终止我们的发行版,永不 ``--shutdown``**。"""
-        await self._wsl.terminate(self._cfg.distro)
+        self.desired_running = False
+        async with self._lifecycle_lock:
+            await self._wsl.terminate(self._cfg.distro)
         return {"terminated": self._cfg.distro}
 
     async def restart(self, *, mode: str = "terminate", confirm: bool = False) -> dict[str, Any]:
@@ -186,11 +214,16 @@ class WslCtl:
         if mode == "shutdown" and not confirm:
             raise WaError(INVALID_ARGS, "wsl --shutdown 会中断用户全部发行版,必须由用户确认时机(confirm=true)",
                           reason="shutdown_not_confirmed", needs_human=True)
-        if mode == "shutdown":
-            await self._wsl.shutdown()
-        else:
-            await self._wsl.terminate(self._cfg.distro)
-        await self._wsl.start(self._cfg.distro)
+        self.desired_running = True
+        async with self._lifecycle_lock:
+            if not self.desired_running:
+                raise WaError(NOT_READY, "WSL restart superseded by stop", reason="wsl_start_cancelled")
+            if mode == "shutdown":
+                await self._wsl.shutdown()
+            else:
+                await self._wsl.terminate(self._cfg.distro)
+            if not await self._start_if_desired():
+                raise WaError(NOT_READY, "WSL restart superseded by stop", reason="wsl_start_cancelled")
         self.pending_restart = False
         return {"mode": mode, "restarted": self._cfg.distro}
 
@@ -312,9 +345,8 @@ class WslCtl:
             done.append("wslconfig.kernel.written")
             if out["changed"]:
                 done.append(f"backup:{out['backup']}")
-        await self._wsl.shutdown()
+        await self.restart(mode="shutdown", confirm=True)
         done.append("wsl.shutdown")
-        await self._wsl.start(self._cfg.distro)
         done.append("wsl.start")
         verdict = await self.kernel_verify()
         self.pending_restart = False
@@ -322,24 +354,9 @@ class WslCtl:
 
     # ---------------------------------------------------------------- #47 distro repair
     async def distro_repair(self, *, confirm: bool, rootfs: str, backup_tar: str) -> dict[str, Any]:
-        """03 §2.7 重导入:``--terminate`` → 导出 ``/var/lib/qtrade`` → ``--unregister`` → ``--import`` 随包 rootfs → 还原 → 拉起。
-
-        账号卷、``agent.db``、``winagent.token`` 全保留;``confirm=true`` 必带。**不做 ``--shutdown``**。
-        """
+        """Refuse reimport until a separately verified restore plan exists."""
         if not confirm:
             raise WaError(INVALID_ARGS, "重导入发行版会先注销 qtrade,必须 confirm=true", reason="not_confirmed",
                           needs_human=True, stage="user")
-        steps: list[str] = []
-        await self._wsl.terminate(self._cfg.distro)
-        steps.append("terminate")
-        rc, _ = await self._wsl.exec(self._cfg.distro, ["sh", "-c", f"tar -cf {backup_tar} /var/lib/qtrade"])
-        steps.append(f"export:{backup_tar}")
-        await self._wsl.exec(self._cfg.distro, ["--unregister"])
-        steps.append("unregister")
-        await self._wsl.exec(self._cfg.distro, ["--import", self._cfg.distro, rootfs])
-        steps.append("import")
-        await self._wsl.start(self._cfg.distro)
-        steps.append("start")
-        await self._wsl.exec(self._cfg.distro, ["sh", "-c", f"tar -xf {backup_tar} -C /"])
-        steps.append("restore")
-        return {"accepted": True, "partial": steps}
+        raise WaError(NOT_READY, "Distro repair requires a verified backup and restore plan",
+                      reason="repair_requires_verified_plan", needs_human=True, stage="user")

@@ -236,7 +236,9 @@ class AccountService:
         wechat_relogin = (row["channel"] == "wechat" and row["state"] == "degraded"
                           and (row.get("state_code") or "") in ("KEY_FAIL", "WAIT_UI_TREE", "WINAGENT_OFFLINE", "WINAGENT_USER_OFFLINE"))
         # 微信已开着、登录会话却丢了(会话代理重启 / 停在讲述人):允许重跑取钥,不要求先停号
-        wechat_resume = row["channel"] == "wechat" and row["state"] in ("login_required", "logging_in", "degraded")
+        # 锁屏不是丢登录态，解锁自己回 running，start 保持 already。
+        wechat_resume = (row["channel"] == "wechat" and row["state"] in ("login_required", "logging_in", "degraded")
+                         and (row.get("state_code") or "") != "SCREEN_LOCKED")
         if row["state"] not in STARTABLE and not wechat_relogin and not wechat_resume:
             if row["state"] in ("login_required", "logging_in", "running", "degraded", "starting", "provisioning"):
                 return {"state": row["state"], "already": True}
@@ -354,10 +356,16 @@ class AccountService:
                 encoded = base64.b64encode(png).decode("ascii")
                 previous = (self._prompts.get(id) or {}).get("prompt", {}).get("qrcode_png_b64")
                 if refresh and encoded == previous:
-                    raise ValueError("stale_qrcode")
-                prompt.update(qrcode_png_b64=encoded, expires_at=iso8601(self._clock() + QR_LIFETIME_MS))
-            except Exception:
-                # 上游错误正文可能含二维码/凭据，只向人显示固定可重试说明。
+                    # 三十秒一刷新时，NapCat 常常还没换图。当前这张仍可扫，不能写成「获取失败」。
+                    attempt["refresh_due"] = self._clock() + QR_REFRESH_MS
+                    if not (self.get(id).get("state_reason") or ""):
+                        return
+                    prompt.update(qrcode_png_b64=encoded, expires_at=iso8601(self._clock() + QR_LIFETIME_MS))
+                else:
+                    prompt.update(qrcode_png_b64=encoded, expires_at=iso8601(self._clock() + QR_LIFETIME_MS))
+            except Exception as exc:
+                # 上游错误正文可能含二维码，日志只留异常类型。失败不沿用上一张图，界面改成可重试。
+                log.info("QQ 二维码未更新 account=%s: %s", id, type(exc).__name__)
                 reason = "二维码获取暂不可用，请重试；若持续失败请检查 NapCat 登录初始化"
                 prompt["text"] = reason
             if not self._qq_attempt_current(id, attempt) or self.get(id)["state"] != "login_required":
@@ -403,28 +411,8 @@ class AccountService:
         self._prompts.pop(id, None)
         self.transition(id, "logging_in", login_session_id=ls)
         try:
-            restarted = await self._runtime.set_napcat_webui(
-                row | {"qq_confirmed_uid": uid, "qq_login_current": lambda: self._qq_attempt_current(id, attempt)}, False)
-            if not self._qq_attempt_current(id, attempt):
-                return
-            if restarted:
-                ad = self._adapters["qq"]
-                acct = Account(id=id, channel="qq", state="logging_in", self_uid=uid, extra={"login_pending": True})
-                await ad.stop(acct, graceful=True)
-                await ad.start(acct)
-                deadline = time.monotonic() + self.cfg.accounts.qq_quick_login_wait_s
-                while True:
-                    verified = await self._qq_login_info(ad, id)
-                    if not self._qq_attempt_current(id, attempt):
-                        return
-                    if verified and str(verified["user_id"]) == uid:
-                        info = verified
-                        break
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("onebot_unavailable")
-                    await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
-            if not self._qq_attempt_current(id, attempt):
-                return
+            # 扫码已经在当前容器里完成。拆掉重建会让健康检查看到空档并报「容器不存在」，
+            # 登录态也来不及落盘。这次直接进入 running，不碰容器。
             self._store.con.execute("UPDATE accounts SET self_nick=?, updated_ms=? WHERE id=?",
                                     (str(info.get("nickname") or ""), self._clock(), id))
             self.transition(id, "running", state_code=None, login_session_id=ls, self_uid=uid)
@@ -436,10 +424,23 @@ class AccountService:
                 session.acct.extra.pop("login_pending", None)
             self._store.upsert_runtime(id, kind="napcat", webui_published_until_ms=None, now_ms=self._clock())
             self._qq_attempts.pop(id, None)
+            if session is not None:
+                try:
+                    await self._adapters["qq"].backfill(session.acct)
+                except Exception:
+                    log.exception("QQ 上线后补历史失败 account=%s", id)
         except Exception:
+            log.exception("QQ 扫码已确认，收尾失败 account=%s", id)
             if self._qq_attempt_current(id, attempt):
-                self._qq_attempts.pop(id, None)
-                self.transition(id, "error", state_code="ONEBOT_UNREACHABLE", state_reason="QQ 登录后关闭管理界面或连接验证失败，请重试启动")
+                await self._qq_back_to_qr(id, attempt, row)
+
+    async def _qq_back_to_qr(self, id: str, attempt: dict[str, Any], row: dict[str, Any]) -> None:
+        """容器重启后若 NapCat 回到扫码，就交出新二维码，不要停在故障。"""
+        self.transition(id, "login_required", state_code="WAIT_QRCODE", login_session_id=attempt["session"],
+                        state_reason="", prompt={"kind": "WAIT_QRCODE", "text": "请用手机 QQ 扫码并确认登录"})
+        attempt["deadline"] = self._clock() + self.cfg.accounts.qr_max_wait_s * 1000
+        attempt["refresh_due"] = self._clock()
+        await self._qq_refresh(id, attempt, refresh=True)
 
     @staticmethod
     async def _qq_login_info(ad: Any, account_id: str) -> Optional[dict[str, Any]]:
@@ -485,16 +486,31 @@ class AccountService:
         now = self._clock()
         registered_until = rt.get("webui_published_until_ms")
         try:
-            currently_on = self._runtime.napcat_webui_enabled(row)
+            currently_on = await self._runtime.napcat_webui_is_enabled(row)
             target_until = until_ms if enable else None
-            if ((enable and currently_on and registered_until is not None and registered_until > now)
-                    or (not enable and not currently_on and registered_until is None)):
+            # 已经在听的工作台只改到期登记，不重启。重启会把刚登上的 QQ 打回二维码。
+            if enable and currently_on:
+                if until_ms is None:
+                    if registered_until is None:
+                        return {"changed": False, "restart": False, "until_ms": None}
+                    target_until = None
+                elif registered_until is not None and registered_until > now:
+                    return {"changed": False, "restart": False, "until_ms": registered_until}
+                else:
+                    target_until = until_ms
+                self._store.upsert_runtime(id, kind=self._store.RUNTIME_KIND[row["channel"]],
+                                           webui_published_until_ms=target_until, now_ms=now)
+                self._store.insert_audit(kind="system", transport="system", actor=actor, action="settings.update", account_id=id,
+                                         result_code="OK", detail={"webui": True, "until_ms": target_until, "restart": False}, now_ms=now)
+                return {"changed": True, "restart": False, "until_ms": target_until}
+            if not enable and not currently_on and registered_until is None:
                 return {"changed": False, "restart": False, "until_ms": registered_until}
             # 失败重试时配置可能已写成关闭，但上一进程尚未退出；登记保留即仍要核实重启。
             force_restart = not enable and registered_until is not None
             restarted = await self._runtime.set_napcat_webui(row | {"napcat_restart_required": force_restart}, enable)
-        except Exception:
-            raise ApiError(503, "NOT_READY", "NapCat 管理界面配置或重启失败，请重试", reason="napcat_webui_unavailable", retryable=True) from None
+        except Exception as exc:
+            log.exception("NapCat 管理界面开关失败 account=%s", id)
+            raise ApiError(503, "NOT_READY", "NapCat 管理界面配置或重启失败，请重试", reason="napcat_webui_unavailable", retryable=True) from exc
         self._store.upsert_runtime(id, kind=self._store.RUNTIME_KIND[row["channel"]],
                                    webui_published_until_ms=target_until, now_ms=now)
         self._store.insert_audit(kind="system", transport="system", actor=actor, action="settings.update", account_id=id,
@@ -855,6 +871,13 @@ class AccountService:
         if row["channel"] != "qq":
             return self.prompt(id, login_session_id)
         attempt = self._qq_attempts.get(id)
+        if attempt is None and row["state"] == "login_required" and (row.get("state_code") or "") == "WAIT_QRCODE":
+            # 进程重启后内存里的扫码尝试没了,但人还停在扫码页。沿用调用方带来的会话号,直接读 NapCat 已写下的二维码。
+            ls = login_session_id or self._current_ls.get(id) or new_login_session_id()
+            attempt = {"session": ls, "deadline": self._clock() + self.cfg.accounts.qr_max_wait_s * 1000,
+                       "refresh_due": self._clock(), "lock": asyncio.Lock()}
+            self._qq_attempts[id] = attempt
+            self._current_ls[id] = ls
         if (attempt is None or (login_session_id and login_session_id != attempt["session"])
                 or not self._qq_attempt_current(id, attempt) or row["state"] != "login_required"):
             return {"kind": None}
@@ -1242,15 +1265,32 @@ class AccountService:
                     results.append({"id": id, "ok": False, "reason": "mem_pressure"})
                     continue
                 if r["channel"] == "wechat":
-                    win = self._store.pool_get("windows")
-                    if win and win["slot_holder"] and win["slot_holder"] != id:
-                        self.transition(id, "stopped", state_reason=f"微信槽位被 {win['slot_holder']} 占用")
+                    win = self._store.pool_get("windows") or {}
+                    holder = win.get("slot_holder") or ""
+                    if holder and holder != id:
+                        self.transition(id, "stopped", state_reason=f"微信槽位被 {holder} 占用", desired_state="stopped")
                         results.append({"id": id, "ok": False, "reason": "slot_held"})
                         continue
-                if r["state"] in ("running", "degraded", "login_required", "logging_in"):
+                    # 微信没有容器。槽位已经是自己时，桌面客户端还在，不能按「容器没了」打成 stopped 再 start
+                    # （start 会因槽位被自己占用而 409，账号就停在 stopped）。
+                    if holder == id:
+                        if r["state"] != "running":
+                            self.transition(id, "running", state_reason="")
+                        results.append({"id": id, "ok": True, "reason": "wechat_attached"})
+                        continue
+                if r["channel"] != "wechat" and r["state"] in ("running", "degraded", "login_required", "logging_in"):
                     info = await self._runtime.inspect(r, fresh=True)
-                    if info.running:
+                    if info.running and not (r["channel"] == "qq" and r["state"] in ("login_required", "logging_in")):
+                        if r["channel"] == "qq" and r["state"] == "running":
+                            ad = self._adapters.get("qq")
+                            if ad is not None and ad.session_of(id) is None:
+                                await ad.start(Account(id=id, channel="qq", state="running",
+                                                       self_uid=r.get("self_uid"), self_nick=r.get("self_nick")))
                         results.append({"id": id, "ok": True, "reason": "already_running"})
+                        continue
+                    if info.running and r["channel"] == "qq" and r["state"] in ("login_required", "logging_in"):
+                        self._spawn(id, self._qq_start(id, self.get(id)))
+                        results.append({"id": id, "ok": True, "reason": "qq_login_resume"})
                         continue
                     self.transition(id, "stopped")           # 容器不在跑:按 stopped 重走 start
                 elif r["state"] not in STARTABLE:

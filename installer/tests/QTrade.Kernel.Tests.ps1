@@ -81,7 +81,7 @@ Describe '🔴 K4:uname -r 与 manifest version **逐字**相等(不再只判「
 Describe '写配置前三道前置校验(§2.6.8 第 9 条:任一不过就不写、不 shutdown)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-k-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-k-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
         $script:Bz = Join-Path $script:Tmp 'bzImage-6.6'
         [IO.File]::WriteAllText($script:Bz, 'kernel-bytes')
@@ -227,12 +227,12 @@ Describe '验证段 Invoke-QtKernelVerify(§2.6.4 第 2/4/5 步定成败)' {
 Describe '回滚段 Invoke-QtKernelRollback(§2.6.5)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-rb-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-rb-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
         $script:Wc = Join-Path $script:Tmp '.wslconfig'
         [IO.File]::WriteAllText($script:Wc, "[wsl2]`r`nkernel=C:\\ProgramData\\QTrade\\kernel\\bzImage-6.6`r`nmemory=11GB`r`nswap=2GB`r`n", (New-Object Text.UTF8Encoding($false)))
         Mock -ModuleName QTrade.Kernel Start-QtSleep { }
-        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { }
+        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
     }
     AfterEach { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
@@ -276,7 +276,7 @@ Describe '回滚段 Invoke-QtKernelRollback(§2.6.5)' {
 Describe 'kcheck 预导入(§2.6.1 / §2.6.8 第 5 条,W14)' {
 
     It '导入前先注销残留(§2.6.6 不变量②)' {
-        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { }
+        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
         Mock -ModuleName QTrade.Kernel New-QtDirectory { $Path }
         Mock -ModuleName QTrade.Kernel Invoke-QtWsl { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false; DurationMs = 1 } }
         (Import-QtKCheck -Directory 'X:\kcheck' -TarPath 'X:\kcheck.tar').Ok | Should -BeTrue
@@ -284,7 +284,7 @@ Describe 'kcheck 预导入(§2.6.1 / §2.6.8 第 5 条,W14)' {
     }
 
     It '导入失败 → KCHECK_IMPORT_FAILED(退出码 67;此时还没写配置、没 shutdown)' {
-        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { }
+        Mock -ModuleName QTrade.Kernel Remove-QtKCheck { [pscustomobject]@{ Ok = $true; Reason = ''; Records = @() } }
         Mock -ModuleName QTrade.Kernel New-QtDirectory { $Path }
         Mock -ModuleName QTrade.Kernel Invoke-QtWsl { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'nope'; TimedOut = $false; DurationMs = 1 } }
         (Import-QtKCheck -Directory 'X:\kcheck' -TarPath 'X:\kcheck.tar').Reason | Should -Be 'KCHECK_IMPORT_FAILED'
@@ -311,7 +311,7 @@ Describe '🔴 W13:dmesg 噪声不参与成败判定' {
 Describe '内核指针 current.json(§2.6.1:后续所有地方只认这个指针)' {
 
     It '写出 line/path/sha256/version,验证后补 verified_at' {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-cp-' + [Guid]::NewGuid().ToString('N'))
+        $tmp = Join-Path $TestDrive ('qt-cp-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         try {
             $p = Join-Path $tmp 'current.json'
@@ -330,7 +330,7 @@ Describe '内核指针 current.json(§2.6.1:后续所有地方只认这个指针
 Describe 'WSLCONFIG_WRITTEN 幂等判据(§2.3:文件含我们的 kernel= 行、值与 kernel_line_written 一致)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-wcw-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-wcw-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
         $script:Wc = Join-Path $script:Tmp '.wslconfig'
     }

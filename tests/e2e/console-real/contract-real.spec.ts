@@ -617,19 +617,20 @@ describe('E-03/E-04 #28 CommandResult:业务结果 ≠ 传输错误(02 #28 R6-52
        00 §7.3 CommandResult 的键:`{ok, code, data, cost_ms, trace_id, source, state_before, state_after, error}`。
        第一轮:客户端 `if (!res.ok || env.ok === false) throw` 把业务码当传输失败抛掉(E-03),
        且 `request()` 的「有 data 就返回 data」把 CommandResult 拆成它的 data(E-04)。 */
-    /* 造一个**业务**失败:把账号停掉再发。假 RPA 对任何 native_id 都会发成功,
-       所以只能从账号态入手(→ LOGIN_REQUIRED / NOT_APPLICABLE / SEND_FAILED,哪个码都行,形状要求一样)。 */
-    await accountsApi.disable(ACC)
+    // A running account and the documented session allowlist produce an
+    // accepted GATE_BLOCKED business result without triggering a send.
+    await ensureAccountRunning(ACC)
+    await accountsApi.patchSettings(ACC, { sessions: { allowlist: [] } })
     let out: Record<string, any>
     try {
       out = await commandsApi.run(ACC, {
-        op: 'send_text',
-        args: { session: '415011447', text: 'E-03 复测' },
+        op: 'send_text', args: { session: '415011447', text: 'E-03 blocked fixture' },
         idempotency_key: `e2e-e03-${Date.now()}`,
       }) as unknown as Record<string, any>
     } finally {
-      await accountsApi.enable(ACC)
+      await accountsApi.patchSettings(ACC, { sessions: { allowlist: ['*'] } })
     }
+    expect(out.code).toBe('GATE_BLOCKED')
     expect(out!, '业务失败不该抛异常').toBeTruthy()
     expect(out.ok).toBe(false)
     expect(typeof out.code).toBe('string')

@@ -1,100 +1,69 @@
 --- a/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
 +++ b/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
-@@ -116,6 +116,54 @@
+@@ -29,6 +29,8 @@
+ using namespace NWindows;
+ using namespace NFile;
+ using namespace NDir;
++
++#include "QTradeStage.h"
+ 
+ extern
+ HINSTANCE g_hInstance;
+@@ -116,6 +118,11 @@
  #define NT_CHECK_FAIL_ACTION ShowErrorMessage(L"Unsupported Windows version"); return 1;
  #endif
  
-+/* ========================= [QTrade 补丁 a-1 / b] =========================
-+   两处改动,见 installer/sfx-stub/README.md:
-+     (a) 新增配置键 InstallPath —— 解压到指定目录并**留存**(不建临时目录、
-+         自然也不存在「跑完即删」);无此键时行为与官方存根逐字一致。
-+         另加解压前的空间判据(实现在 ExtractEngine.cpp)。
-+     (b) 透传子进程退出码。
-+   ======================================================================= */
-+
-+// docs/03 §3.4:26 = E_INSTALL_DISK_LOW
++// QTrade preserves the child exit code and checks space before extraction.
 +static const int kQTradeExitDiskLow = 26;
-+
-+/* 「QTrade:目标磁盘可用空间不足,安装未开始。请清理磁盘后重新运行安装程序。」
-+   用通用字符名(\uXXXX)而不是直接写中文字面量:这份源码会在未知的编译器
-+   代码页下被 cl.exe 读取,直接写中文一旦 /source-charset 不匹配就是乱码,
-+   而 \uXXXX 在任何代码页下都编译成同一串 UTF-16。*/
 +static const wchar_t * const kQTradeDiskLowMessage =
-+    L"QTrade\uFF1A\u76EE\u6807\u78C1\u76D8\u53EF\u7528\u7A7A\u95F4\u4E0D\u8DB3\uFF0C"
-+    L"\u5B89\u88C5\u672A\u5F00\u59CB\u3002\u8BF7\u6E05\u7406\u78C1\u76D8\u540E"
-+    L"\u91CD\u65B0\u8FD0\u884C\u5B89\u88C5\u7A0B\u5E8F\u3002";
-+
-+/* 展开 InstallPath 里的环境变量(%ProgramData% 等),并要求展开结果是
-+   `<盘符>:\...` 形式的绝对路径。相对路径会落在 SFX 进程的当前目录里 ——
-+   那个位置由谁双击、从哪个壳启动决定,不可预期,直接判配置错。*/
-+static bool QTrade_ExpandInstallPath(const UString &src, UString &dest)
-+{
-+  dest.Empty();
-+  if (src.IsEmpty())
-+    return true;
-+  WCHAR buf[MAX_PATH * 2];
-+  // 长度只写一处:两处各写一遍 MAX_PATH*2,改一处忘另一处就是栈溢出
-+  const DWORD kBufChars = (DWORD)Z7_ARRAY_SIZE(buf);
-+  const DWORD len = ExpandEnvironmentStringsW(src.Ptr(), buf, kBufChars);
-+  if (len == 0 || len > kBufChars)
-+    return false;
-+  dest = buf;
-+  // 去掉多余的结尾分隔符,但保留 "C:\" 这种盘根形式里的那一个
-+  while (dest.Len() > 3 && (dest.Back() == L'\\' || dest.Back() == L'/'))
-+    dest.DeleteBack();
-+  /* 🔴 UString **没有 operator[]**,不能写 dest[1];用 SDK 自带的判据。
-+     IsDrivePath 的语义正是「前三个字符形如 a:\」。*/
-+  if (!NName::IsDrivePath(dest.Ptr()))
-+  {
-+    dest.Empty();
-+    return false;
-+  }
-+  return true;
-+}
++    L"QTrade: Not enough free disk space. Installation has not started.";
 +
  static void ShowErrorMessageSpec(const UString &name)
  {
    UString message = NError::MyFormatMessage(::GetLastError());
-@@ -174,6 +222,7 @@
+@@ -174,6 +181,7 @@
  
    UString dirPrefix ("." STRING_PATH_SEPARATOR);
    UString appLaunched;
-+  UString installPath;   // [QTrade] 空 = 保持官方行为(临时目录 + 跑完即删)
++  UString installPath;
    bool showProgress = true;
    if (!config.IsEmpty())
    {
-@@ -199,6 +248,14 @@
+@@ -199,6 +207,8 @@
          return 0;
      }
      appLaunched = GetTextConfigValue(pairs, "RunProgram");
 +
-+    // [QTrade] 新增键
-+    if (!QTrade_ExpandInstallPath(GetTextConfigValue(pairs, "InstallPath"), installPath))
-+    {
-+      if (!assumeYes)
-+        ShowErrorMessage(L"Config failed: InstallPath");
-+      return 1;
-+    }
++    installPath = GetTextConfigValue(pairs, "InstallPath");
      
      #ifdef MY_SHELL_EXECUTE
      executeFile = GetTextConfigValue(pairs, "ExecuteFile");
-@@ -206,12 +263,22 @@
+@@ -206,12 +216,30 @@
      #endif
    }
  
-+  /* [QTrade] 有 InstallPath 就直接解压到该目录并留存:不创建临时目录,
-+     CTempDir 保持未 Create 的状态,它的析构 Remove() 便无事可做。
-+     没有 InstallPath 时,下面这段与官方存根逐字相同。*/
++  // Keep the exact stage and its protected ancestor handles alive until exit.
++  CQTradeStage stage;
    CTempDir tempDir;
 -  if (!tempDir.Create(kTempDirPrefix))
-+  FString destPath;
-+  if (!installPath.IsEmpty())
-+    destPath = us2fs(installPath);
-+  else
-   {
+-  {
 -    if (!assumeYes)
 -      ShowErrorMessage(L"Cannot create temp folder archive");
 -    return 1;
++  FString destPath;
++  if (!installPath.IsEmpty())
++  {
++    UString uniqueStage;
++    if (!stage.Create(installPath, uniqueStage))
++    {
++      if (!assumeYes)
++        ShowErrorMessage(L"QTRADE_UNIQUE_STAGE_V1: unsafe or unavailable staging directory");
++      return 1;
++    }
++    destPath = us2fs(uniqueStage);
++  }
++  else
++  {
 +    if (!tempDir.Create(kTempDirPrefix))
 +    {
 +      if (!assumeYes)
@@ -105,7 +74,7 @@
    }
  
    CCodecs *codecs = new CCodecs;
-@@ -225,14 +292,22 @@
+@@ -225,14 +253,21 @@
      }
    }
  
@@ -121,8 +90,7 @@
 +    HRESULT result = ExtractArchive(codecs, fullPath, destPath, showProgress,
 +      !installPath.IsEmpty(), isCorrupt, noSpace, errorMessage);
 +
-+    /* [QTrade] 空间不足:归档打开了,但一个字节都没解压、目标目录也没建。
-+       这是唯一一条「解压前就退出」的路径,退出码固定 26(docs/03 §3.4)。*/
++    // Low space leaves an empty private stage, never a partially written live root.
 +    if (noSpace)
 +    {
 +      if (!assumeYes)
@@ -133,7 +101,7 @@
      if (result != S_OK)
      {
        if (!assumeYes)
-@@ -255,7 +330,7 @@
+@@ -255,7 +290,7 @@
  
    #ifndef UNDER_CE
    CCurrentDirRestorer currentDirRestorer;
@@ -142,7 +110,7 @@
      return 1;
    #endif
    
-@@ -315,14 +390,14 @@
+@@ -315,14 +350,14 @@
      }
      
      {
@@ -159,17 +127,11 @@
  
      if (!switches.IsEmpty())
      {
-@@ -359,10 +434,33 @@
+@@ -359,10 +394,22 @@
      ::CloseHandle(processInformation.hThread);
      hProcess = processInformation.hProcess;
    }
-+  /* [QTrade] 子进程已经起来了,把 SFX **自己**的当前目录挪出安装根。
-+     进程的当前目录会钉住该目录(目录句柄不含 DELETE 共享权限),
-+     引擎若要给安装根改名、或在回滚时删掉它,会拿到 ERROR_SHARING_VIOLATION。
-+     原版的当前目录是 %TEMP%\7zS<随机>,跑完即删,从来不会碰上这件事。
-+     子进程继承到的当前目录不动 —— 引擎本来就该知道自己在哪。
-+     (DLL 搜索序列里也有当前目录这一环:安装根是可预测且 Users 可写的路径,
-+      这一条只能由引擎去收紧安装根 ACL,存根这层管不了,已提交裁决。)*/
++  // The child inherits stage cwd; the waiting stub releases its cwd lock.
 +  if (!installPath.IsEmpty())
 +  {
 +    FString sysDir;
@@ -177,12 +139,7 @@
 +      SetCurrentDir(sysDir);
 +  }
 +
-+  /* [QTrade 补丁 b] 原版在这里无条件 `return 0` —— 子进程退 26,EXE 照样退 0。
-+     docs/03 §8b 的验收判据几乎全是退出码,那等于「全 0 = 全都看起来成功」,
-+     整套 M0/M1 验收都会失真。改为透传子进程退出码。
-+     取不到退出码、或压根没拿到进程句柄(ShellExecuteEx 在某些 verb 下即使成功
-+     也可能不回句柄)都按失败处理给 1 —— 补丁 (b) 的全部意义就是消灭「假 0」,
-+     不能自己在这里留一条。上面几条启动失败路径原本就 return 1,保持不动。*/
++  // Missing child exit status is failure, never a synthetic success.
 +  DWORD exitCode = 1;
    if (hProcess)
    {
@@ -283,17 +240,17 @@
  struct CThreadExtracting
  {
    CCodecs *Codecs;
-@@ -34,6 +107,10 @@
+@@ -33,6 +106,10 @@
+   CArchiveLink ArchiveLink;
    HRESULT Result;
    UString ErrorMessage;
- 
++
 +  // [QTrade] 空间判据:入参 CheckSpace,出参 NoSpace
 +  bool CheckSpace;
 +  bool NoSpace;
-+
+ 
    void Process2()
    {
-     NFind::CFileInfo fi;
 @@ -59,6 +136,27 @@
        return;
      }
@@ -367,18 +324,18 @@
  #endif
 --- a/CPP/7zip/Bundles/SFXSetup/resource.rc
 +++ b/CPP/7zip/Bundles/SFXSetup/resource.rc
-@@ -5,6 +5,11 @@
+@@ -4,6 +4,11 @@
+ MY_VERSION_INFO_APP("7z Setup SFX", "7zS.sfx")
  
  IDI_ICON  ICON "setup.ico"
- 
++
 +/* [QTrade] CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24).
 +   Declares requireAdministrator explicitly instead of relying on the
 +   Windows Installer Detection heuristic.  See installer/sfx-stub/README.md. */
 +1 24 "qtrade-sfx.manifest"
-+
+ 
  STRINGTABLE
  BEGIN
-   IDS_EXTRACTION_ERROR_TITLE  "Extraction Failed"
 --- /dev/null
 +++ b/CPP/7zip/Bundles/SFXSetup/qtrade-sfx.manifest
 @@ -0,0 +1,39 @@
@@ -421,3 +378,198 @@
 +    </windowsSettings>
 +  </application>
 +</assembly>
+--- /dev/null
++++ b/CPP/7zip/Bundles/SFXSetup/QTradeStage.h
+@@ -0,0 +1,192 @@
++// QTrade secure staging v2. No payload is extracted into the live install root.
++#ifndef QTRADE_STAGE_H
++#define QTRADE_STAGE_H
++
++#include <aclapi.h>
++#include <sddl.h>
++#include <shlobj.h>
++
++class CQTradeStage
++{
++  HANDLE _locks[MAX_PATH];
++  unsigned _numLocks;
++  PSECURITY_DESCRIPTOR _security;
++  PSID _system;
++  PSID _admins;
++  PSID _trustedInstaller;
++
++  bool IsTrusted(PSID sid, bool stage) const
++  {
++    return sid && (EqualSid(sid, _system) || EqualSid(sid, _admins)
++        || (!stage && EqualSid(sid, _trustedInstaller)));
++  }
++
++  bool IsSafeAcl(HANDLE handle, bool stage) const
++  {
++    PSECURITY_DESCRIPTOR descriptor = NULL;
++    PSID owner = NULL;
++    PACL acl = NULL;
++    if (GetSecurityInfo(handle, SE_FILE_OBJECT,
++        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
++        &owner, NULL, &acl, NULL, &descriptor) != ERROR_SUCCESS)
++      return false;
++    bool safe = IsTrusted(owner, stage) && acl && IsValidAcl(acl);
++    SECURITY_DESCRIPTOR_CONTROL control = 0;
++    DWORD revision = 0;
++    if (stage && (!GetSecurityDescriptorControl(descriptor, &control, &revision)
++        || !(control & SE_DACL_PROTECTED)))
++      safe = false;
++    for (DWORD index = 0; safe && index < acl->AceCount; index++)
++    {
++      void *rawAce = NULL;
++      if (!GetAce(acl, index, &rawAce))
++      {
++        safe = false;
++        break;
++      }
++      const ACE_HEADER *header = (const ACE_HEADER *)rawAce;
++      // An ancestor's inherit-only ACE does not grant rights to that ancestor.
++      // A stage's inherit-only ACE can weaken extracted child files: inspect it.
++      if (!stage && (header->AceFlags & INHERIT_ONLY_ACE))
++        continue;
++      if (header->AceType == ACCESS_DENIED_ACE_TYPE)
++        continue;
++      if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
++      {
++        safe = false;
++        break;
++      }
++      const ACCESS_ALLOWED_ACE *ace = (const ACCESS_ALLOWED_ACE *)rawAce;
++      const PSID sid = (PSID)&ace->SidStart;
++      DWORD unsafeMask = WRITE_DAC | WRITE_OWNER | DELETE | FILE_DELETE_CHILD
++          | GENERIC_ALL;
++      if (stage)
++        unsafeMask |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA
++            | FILE_WRITE_ATTRIBUTES | GENERIC_WRITE;
++      if (!IsValidSid(sid) || (!IsTrusted(sid, stage) && (ace->Mask & unsafeMask)))
++        safe = false;
++    }
++    LocalFree(descriptor);
++    return safe;
++  }
++
++  bool LockDirectory(const UString &path, bool stage)
++  {
++    if (_numLocks == Z7_ARRAY_SIZE(_locks))
++      return false;
++    // Never follow a reparse point. Keep every ancestor pinned through launch.
++    // Do not share write/delete: an attacker cannot replace or reparse it later.
++    HANDLE handle = CreateFileW(path.Ptr(), READ_CONTROL | FILE_READ_ATTRIBUTES,
++        FILE_SHARE_READ, NULL, OPEN_EXISTING,
++        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
++    if (handle == INVALID_HANDLE_VALUE)
++      return false;
++    BY_HANDLE_FILE_INFORMATION info;
++    const bool safe = GetFileInformationByHandle(handle, &info)
++        && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++        && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
++        && IsSafeAcl(handle, stage);
++    if (!safe)
++    {
++      CloseHandle(handle);
++      return false;
++    }
++    _locks[_numLocks++] = handle;
++    return true;
++  }
++
++public:
++  CQTradeStage(): _numLocks(0), _security(NULL), _system(NULL),
++      _admins(NULL), _trustedInstaller(NULL) {}
++
++  ~CQTradeStage()
++  {
++    while (_numLocks != 0)
++      CloseHandle(_locks[--_numLocks]);
++    LocalFree(_security);
++    LocalFree(_system);
++    LocalFree(_admins);
++    LocalFree(_trustedInstaller);
++    // Keep only this run's stage for diagnostics. Never recursively delete here.
++  }
++
++  bool Create(const UString &configuredPath, UString &dest)
++  {
++    dest.Empty();
++    // This token describes a known-folder base, not a caller-controlled path.
++    if (wcscmp(configuredPath.Ptr(), L"%ProgramData%\\QTrade-Staging") != 0)
++      return false;
++    WCHAR programData[MAX_PATH];
++    if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL,
++        SHGFP_TYPE_CURRENT, programData) != S_OK)
++      return false;
++    UString parent(programData);
++    while (parent.Len() > 3 && parent.Back() == L'\\')
++      parent.DeleteBack();
++    // No UNC/device/relative paths, dot components, alternate streams or overflow.
++    if (!NName::IsDrivePath(parent.Ptr()) || parent.Len() <= 3
++        || parent.Len() + 1 + 14 + 1 + 36 >= MAX_PATH)
++      return false;
++    if (!ConvertStringSidToSidW(L"S-1-5-18", &_system)
++        || !ConvertStringSidToSidW(L"S-1-5-32-544", &_admins)
++        || !ConvertStringSidToSidW(
++            L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
++            &_trustedInstaller)
++        || !ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
++            SDDL_REVISION_1, &_security, NULL))
++      return false;
++    UString current(parent.Left(3));
++    if (!LockDirectory(current, false))
++      return false;
++    unsigned start = 3;
++    for (unsigned i = 3; i <= parent.Len(); i++)
++    {
++      const wchar_t ch = parent.Ptr()[i];
++      if (ch == L'/' || ch == L':')
++        return false;
++      if (ch != L'\\' && ch != 0)
++        continue;
++      const UString component(parent.Mid(start, i - start));
++      if (component.IsEmpty() || component.Back() == L'.' || component.Back() == L' ')
++        return false;
++      current = parent.Left(i);
++      if (!LockDirectory(current, false))
++        return false;
++      start = i + 1;
++    }
++    UString base(parent);
++    base += L"\\QTrade-Staging";
++    SECURITY_ATTRIBUTES attributes;
++    attributes.nLength = sizeof(attributes);
++    attributes.lpSecurityDescriptor = _security;
++    attributes.bInheritHandle = FALSE;
++    if (!CreateDirectoryW(base.Ptr(), &attributes) && GetLastError() != ERROR_ALREADY_EXISTS)
++      return false;
++    if (!LockDirectory(base, true))
++      return false;
++    for (unsigned attempt = 0; attempt != 8; attempt++)
++    {
++      GUID id;
++      WCHAR text[40];
++      if (CoCreateGuid(&id) != S_OK || StringFromGUID2(id, text, Z7_ARRAY_SIZE(text)) == 0)
++        return false;
++      UString candidate(base);
++      candidate += L'\\';
++      candidate += UString(text + 1).Left(36);
++      if (!CreateDirectoryW(candidate.Ptr(), &attributes))
++      {
++        if (GetLastError() == ERROR_ALREADY_EXISTS)
++          continue;
++        return false;
++      }
++      if (!LockDirectory(candidate, true))
++        return false;
++      dest = candidate;
++      return true;
++    }
++    return false;
++  }
++};
++
++#endif

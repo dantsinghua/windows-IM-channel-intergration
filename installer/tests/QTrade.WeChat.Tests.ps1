@@ -163,7 +163,7 @@ Describe 'robocopy 备份 —— 退出码 < 8 算成功(退出码是位标志,�
 Describe 'rename 备份 —— 🔴 中途失败先改回,.qtbak-* 不许残留(§2.9.3 第 3 步)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-wx-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-wx-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp 'xwechat_files') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp 'xwechat') -Force | Out-Null
     }
@@ -241,7 +241,7 @@ Describe '微信数据根 ini 前缀展开(§2.9.1;🔴 不读 FileSavePath、�
 Describe '三来源版本(§2.9.1;🔴 不用卸载键 DisplayVersion)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-wv-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-wv-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp '4.1.12.26') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp 'data\xwechat_files\all_users') -Force | Out-Null
     }

@@ -45,6 +45,20 @@ async def test_no_reentry_skips_and_counts():
     await s.stop()
 
 
+async def test_round_timeout_releases_the_slot():
+    async def stuck():
+        await asyncio.sleep(10)
+
+    s = Scheduler()
+    s.register("stuck", 0.05, stuck, timeout_s=0.05, run_immediately=True)
+    await s.start()
+    await asyncio.sleep(0.2)
+    job = s.jobs["stuck"]
+    assert job.errors >= 1 and job.last_error == "timeout"
+    assert job._running is False
+    await s.stop()
+
+
 async def test_exception_does_not_kill_task():
     n = {"i": 0}
 

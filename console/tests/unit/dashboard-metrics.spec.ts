@@ -113,6 +113,7 @@ beforeEach(() => {
   vi.spyOn(resourcesApi, 'metrics').mockResolvedValue(metrics())
   vi.spyOn(messagesApi, 'list').mockResolvedValue({ items: [], nextCursor: null })
   vi.spyOn(useAccountsStore(), 'load').mockResolvedValue()
+  vi.spyOn(useAccountsStore(), 'loadFirst').mockResolvedValue()
   vi.spyOn(useMailStore(), 'reloadAll').mockResolvedValue()
   vi.spyOn(useMailStore(), 'stopPolling').mockImplementation(() => undefined)
   vi.spyOn(useCommandsStore(), 'loadCatalog').mockResolvedValue()

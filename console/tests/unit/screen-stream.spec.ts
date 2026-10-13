@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildAvcC, classifyClose, lengthPrefixed, MAX_DECODE_QUEUE, ScreenStream, splitAnnexB, STREAM_CLOSE_CODES,
+  buildAvcC, classifyClose, lengthPrefixed, MAX_DECODE_QUEUE, screenAfterClose, ScreenStream, splitAnnexB, STREAM_CLOSE_CODES,
   type StreamHooks,
 } from '@/codec/stream'
 
@@ -180,7 +180,22 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
+})
+
+describe('异步开流的生命周期', () => {
+  it('解码探测期间停止，探测稍后完成也不能创建旧连接', async () => {
+    let finish!: (value: { supported: boolean }) => void
+    vi.spyOn(FakeVD, 'isConfigSupported').mockImplementationOnce(() =>
+      new Promise(resolve => { finish = resolve }))
+    const s = new ScreenStream('qd01', 'focus', hooks())
+    const starting = s.start()
+    s.stop()
+    finish({ supported: true })
+    await starting
+    expect(FakeWS.instances).toHaveLength(0)
+  })
 })
 
 /* ────────── ② 降档链 ────────── */
@@ -406,6 +421,18 @@ describe('关闭码 4408 = 客户端接收超时(R6-74)', () => {
     expect(c.retryable).toBe(true)
     expect(c.everOpened).toBe(true)
     expect(classifyClose(1011, true).reason, '1011 已不再是发帧超时的码,只按通用断线处理').toBe('transport')
+  })
+
+  it('重启时拉不起画面要重连；真没装画面服务才改截图', () => {
+    const booting = classifyClose(4503, false, '画面流打开失败:')
+    expect(booting.reason).toBe('stream_open_failed')
+    expect(booting.retryable).toBe(true)
+    expect(classifyClose(4503, false, 'stream_backend_missing:画面流执行体本期未装配').retryable).toBe(false)
+    expect(screenAfterClose('transport', true)).toBe('retry')
+    expect(screenAfterClose('stream_open_failed', true)).toBe('retry')
+    expect(screenAfterClose('focus_taken', true)).toBe('retry')
+    expect(screenAfterClose('stream_backend_missing', false)).toBe('shots')
+    expect(screenAfterClose('forbidden_inject', false)).toBe('stop')
   })
 })
 

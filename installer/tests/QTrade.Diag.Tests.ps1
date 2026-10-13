@@ -61,7 +61,7 @@ Describe '🔴 §5.3「不含」+ §6 + 红线 2:排除清单' {
 Describe 'Copy-QtDiagFile —— 命中排除清单就**拒绝拷贝**' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-diag-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-diag-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp 'src\winagent\vault') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Tmp 'stage') -Force | Out-Null
         [IO.File]::WriteAllText((Join-Path $script:Tmp 'src\ok.json'), '{}')
@@ -89,7 +89,7 @@ Describe 'Copy-QtDiagFile —— 命中排除清单就**拒绝拷贝**' {
 Describe '🔴 Add-QtDiagText 先抹令牌再落盘(§3.1 / §6:日志不含密码、令牌)' {
 
     BeforeEach {
-        $script:Tmp = Join-Path ([IO.Path]::GetTempPath()) ('qt-dg-' + [Guid]::NewGuid().ToString('N'))
+        $script:Tmp = Join-Path $TestDrive ('qt-dg-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
     }
     AfterEach { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
@@ -110,7 +110,7 @@ Describe '🔴 Add-QtDiagText 先抹令牌再落盘(§3.1 / §6:日志不含密�
 Describe '诊断包端到端(不碰 WSL:-SkipWslCommands)' {
 
     BeforeEach {
-        $script:Root = Join-Path ([IO.Path]::GetTempPath()) ('qt-diagroot-' + [Guid]::NewGuid().ToString('N'))
+        $script:Root = Join-Path $TestDrive ('qt-diagroot-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'install') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'logs') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:Root 'kernel') -Force | Out-Null

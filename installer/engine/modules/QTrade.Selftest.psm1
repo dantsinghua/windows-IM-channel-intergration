@@ -64,12 +64,19 @@ function Invoke-QtProbe {
         [string] $Detail = 'selftest',
         [string] $AgentBaseUrl = 'http://127.0.0.1:17600',
         [string] $WinAgentBaseUrl = 'http://127.0.0.1:17610',
-        [int] $TimeoutSec = 120
+        [int] $TimeoutSec = 120,
+        [string] $ConsoleToken = ''
     )
-    $health = Get-QtAgentHealth -BaseUrl $AgentBaseUrl
+    if (-not $ConsoleToken) {
+        $bootstrap = Get-QtBootstrapTokens
+        if ($bootstrap.Ok) { $ConsoleToken = $bootstrap.ConsoleToken }
+    }
+    if (-not $ConsoleToken) { return [pscustomobject]@{ Via = 'none'; Results = @(); Reason = 'BOOTSTRAP_NOT_READY' } }
+    $headers = @{ Authorization = ('Bearer ' + $ConsoleToken) }
+    $health = Get-QtAgentHealth -BaseUrl $AgentBaseUrl -Token $ConsoleToken
     if ($health.Ok) {
         $body = (@{ targets = $Targets; trigger = $Trigger } | ConvertTo-Json -Depth 4 -Compress)
-        $r = Invoke-QtHttp -Uri ($AgentBaseUrl + '/api/v1/system/probe') -Method POST -Body $body -TimeoutSec $TimeoutSec
+        $r = Invoke-QtHttp -Uri ($AgentBaseUrl + '/api/v1/system/probe') -Method POST -Body $body -Headers $headers -TimeoutSec $TimeoutSec
         if ($r.Ok) {
             return [pscustomobject]@{ Via = 'agent'; Results = (ConvertFrom-QtProbeBody -Body $r.Body -Via 'agent' -Detail $Detail) }
         }
@@ -80,7 +87,7 @@ function Invoke-QtProbe {
     $results = @()
     if ($split.Windows.Count -gt 0) {
         $body = (@{ targets = $split.Windows } | ConvertTo-Json -Depth 4 -Compress)
-        $r = Invoke-QtHttp -Uri ($WinAgentBaseUrl + '/wa/v1/probe') -Method POST -Body $body -TimeoutSec $TimeoutSec
+        $r = Invoke-QtHttp -Uri ($WinAgentBaseUrl + '/wa/v1/probe') -Method POST -Body $body -Headers $headers -TimeoutSec $TimeoutSec
         if ($r.Ok) { $results += (ConvertFrom-QtProbeBody -Body $r.Body -Via 'winagent' -Detail $Detail) }
     }
     foreach ($t in $split.Wsl) {
@@ -126,8 +133,8 @@ function Test-QtSelftestWinAgent {
         {Ok, Reason, UserAgent, Vault}
     #>
     [CmdletBinding()]
-    param([string] $BaseUrl = 'http://127.0.0.1:17610')
-    $h = Get-QtWinAgentHealth -BaseUrl $BaseUrl
+    param([string] $BaseUrl = 'http://127.0.0.1:17610', [string] $Token = '')
+    $h = Get-QtWinAgentHealth -BaseUrl $BaseUrl -Token $Token
     if (-not $h.Ok) { return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_WINAGENT'; UserAgent = $h.UserAgent; Vault = $h.Vault } }
     if ($h.Vault -ne 'ok') { return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_WINAGENT'; UserAgent = $h.UserAgent; Vault = $h.Vault } }
     return [pscustomobject]@{ Ok = $true; Reason = ''; UserAgent = $h.UserAgent; Vault = $h.Vault }
@@ -142,64 +149,33 @@ function Test-QtSelftestAgent {
         {Ok, Reason, Health}
     #>
     [CmdletBinding()]
-    param([string] $BaseUrl = 'http://127.0.0.1:17600')
-    $h = Get-QtAgentHealth -BaseUrl $BaseUrl
+    param([string] $BaseUrl = 'http://127.0.0.1:17600', [string] $Token = '')
+    $h = Get-QtAgentHealth -BaseUrl $BaseUrl -Token $Token
     $ok = ($h.Ok -and $h.Docker -eq 'ok' -and $h.Db -eq 'ok' -and $h.WinAgentReachable)
     return [pscustomobject]@{ Ok = $ok; Reason = $(if ($ok) { '' } else { 'SELFTEST_AGENT' }); Health = $h }
 }
 
 function Invoke-QtSelftestRedroid {
-    <#
-    .SYNOPSIS
-        §2.11 第 3 项:`POST /api/v1/system/selftest` → `202 {run_id}`,再轮询 `GET …/selftest/{run_id}`。
-        容器 `qtrade-selftest` 绑 `127.0.0.1:16099`,轮询 `getprop sys.boot_completed`=1,
-        超时取 02 `[runtime] boot_timeout_s` = **180 s**(C-43,本册不另设键);完了 `docker rm -f`。
-        失败 → `SELFTEST_REDROID_BOOT`,附 `docker logs` 前 40 行。
-    .OUTPUTS
-        {Ok, Reason, RunId, ElapsedSec, Logs}
-    #>
+    # This installer-only script creates and removes its own temporary container.
     [CmdletBinding()]
     param(
-        [string] $BaseUrl = 'http://127.0.0.1:17600',
+        [string] $BaseUrl = '',
         [int] $TimeoutSec = 0,
         [int] $PollSec = 5,
-        [string] $DistroName = 'qtrade'
+        [string] $DistroName = 'qtrade',
+        [string] $Token = ''
     )
     if ($TimeoutSec -le 0) { $TimeoutSec = $script:QtRedroidBootTimeoutSec }
-    $start = Get-QtNow
-    $r = Invoke-QtHttp -Uri ($BaseUrl + '/api/v1/system/selftest') -Method POST -Body '{}' -TimeoutSec 30
-    if (-not $r.Ok -or $r.StatusCode -ne 202) {
-        return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_REDROID_BOOT'; RunId = ''; ElapsedSec = 0; Logs = $r.Body }
-    }
-    $runId = ''
+    $failure = [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_REDROID_BOOT'; RunId = ''; ElapsedSec = 0; Logs = '' }
+    if ($DistroName -ne 'qtrade') { return $failure }
+    $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec',
+        '/opt/qtrade/bin/qtrade-install-selftest.sh', [string]$TimeoutSec) -TimeoutSec ($TimeoutSec + 180)
+    if ($r.TimedOut -or $r.ExitCode -ne 0) { $failure.Logs = [string]$r.StdErr; return $failure }
     try {
-        $j = $r.Body | ConvertFrom-Json
-        if (Test-QtHasProperty -Object $j -Name 'run_id') { $runId = [string]$j.run_id }
-    } catch { }
-    if (-not $runId) {
-        return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_REDROID_BOOT'; RunId = ''; ElapsedSec = 0; Logs = '202 未带 run_id' }
-    }
-
-    $deadline = $start.AddSeconds($TimeoutSec)
-    while ((Get-QtNow) -lt $deadline) {
-        $q = Invoke-QtHttp -Uri ($BaseUrl + '/api/v1/system/selftest/' + $runId) -Method GET -TimeoutSec 30
-        $status = ''
-        if ($q.Ok -and $q.Body) {
-            try {
-                $j = $q.Body | ConvertFrom-Json
-                if (Test-QtHasProperty -Object $j -Name 'status') { $status = [string]$j.status }
-            } catch { }
-        }
-        if ($status -in @('ok', 'passed', 'succeeded')) {
-            $elapsed = [int]((Get-QtNow) - $start).TotalSeconds
-            return [pscustomobject]@{ Ok = $true; Reason = ''; RunId = $runId; ElapsedSec = $elapsed; Logs = '' }
-        }
-        if ($status -in @('failed', 'error')) { break }
-        Start-QtSleep -Seconds $PollSec
-    }
-    $logs = Get-QtContainerLogsTail -Container $script:QtSelftestContainer -Lines 40 -DistroName $DistroName
-    $elapsed = [int]((Get-QtNow) - $start).TotalSeconds
-    return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_REDROID_BOOT'; RunId = $runId; ElapsedSec = $elapsed; Logs = $logs }
+        $result = $r.StdOut | ConvertFrom-Json
+        if ($result.ok -ne $true -or $result.redroid_boot_ms -isnot [ValueType] -or $result.redroid_boot_ms -lt 0) { return $failure }
+        return [pscustomobject]@{ Ok = $true; Reason = ''; RunId = ''; ElapsedSec = ([double]$result.redroid_boot_ms / 1000); Logs = '' }
+    } catch { return $failure }
 }
 
 function Invoke-QtSelftestNapcat {
@@ -233,10 +209,18 @@ function Invoke-QtSelftest {
         [string] $DistroName = 'qtrade',
         [string] $NapcatImageRef = '',
         [switch] $SkipNapcat,
-        [string[]] $ProbeTargets = @()
+        [string[]] $ProbeTargets = @(),
+        [string] $ConsoleToken = ''
     )
     $warnings = @()
-    $wa = Test-QtSelftestWinAgent -BaseUrl $WinAgentBaseUrl
+    if (-not $ConsoleToken) {
+        $bootstrap = Get-QtBootstrapTokens
+        if (-not $bootstrap.Ok -or -not $bootstrap.ConsoleToken) {
+            return [pscustomobject]@{ Ok = $false; Reason = 'SELFTEST_WINAGENT'; WinAgent = $null; Agent = $null; Redroid = $null; Napcat = $null; Probes = $null; Warnings = $warnings }
+        }
+        $ConsoleToken = $bootstrap.ConsoleToken
+    }
+    $wa = Test-QtSelftestWinAgent -BaseUrl $WinAgentBaseUrl -Token $ConsoleToken
     if (-not $wa.Ok) {
         return [pscustomobject]@{ Ok = $false; Reason = $wa.Reason; WinAgent = $wa; Agent = $null; Redroid = $null; Napcat = $null; Probes = $null; Warnings = $warnings }
     }
@@ -245,11 +229,11 @@ function Invoke-QtSelftest {
         $warnings += '会话代理未上线:首次使用需登录 Windows 桌面(可锁屏,不要注销),账号才会运行'
     }
 
-    $ag = Test-QtSelftestAgent -BaseUrl $AgentBaseUrl
+    $ag = Test-QtSelftestAgent -BaseUrl $AgentBaseUrl -Token $ConsoleToken
     if (-not $ag.Ok) {
         # Agent 不可达时仍给一份网络汇总(§2.10 第 3 行);WSL 侧记 SKIPPED
         $probes = Invoke-QtProbe -Targets $(if ($ProbeTargets.Count -gt 0) { $ProbeTargets } else { $script:QtInstallTargets }) `
-            -AgentBaseUrl $AgentBaseUrl -WinAgentBaseUrl $WinAgentBaseUrl
+            -AgentBaseUrl $AgentBaseUrl -WinAgentBaseUrl $WinAgentBaseUrl -ConsoleToken $ConsoleToken
         return [pscustomobject]@{ Ok = $false; Reason = $ag.Reason; WinAgent = $wa; Agent = $ag; Redroid = $null; Napcat = $null; Probes = $probes; Warnings = $warnings }
     }
 
@@ -265,7 +249,7 @@ function Invoke-QtSelftest {
     }
 
     $probes = Invoke-QtProbe -Targets $(if ($ProbeTargets.Count -gt 0) { $ProbeTargets } else { $script:QtInstallTargets }) `
-        -AgentBaseUrl $AgentBaseUrl -WinAgentBaseUrl $WinAgentBaseUrl
+        -AgentBaseUrl $AgentBaseUrl -WinAgentBaseUrl $WinAgentBaseUrl -ConsoleToken $ConsoleToken
     return [pscustomobject]@{ Ok = $true; Reason = ''; WinAgent = $wa; Agent = $ag; Redroid = $rd; Napcat = $np; Probes = $probes; Warnings = $warnings }
 }
 
@@ -278,9 +262,11 @@ function Test-QtSelftestComplete {
     #>
     [CmdletBinding()][OutputType([bool])]
     param([Parameter(Mandatory)] $Context)
-    $wa = Test-QtSelftestWinAgent -BaseUrl ([string]$Context.WinAgentBaseUrl)
+    $bootstrap = Get-QtBootstrapTokens
+    if (-not $bootstrap.Ok -or -not $bootstrap.ConsoleToken) { return $false }
+    $wa = Test-QtSelftestWinAgent -BaseUrl ([string]$Context.WinAgentBaseUrl) -Token $bootstrap.ConsoleToken
     if (-not $wa.Ok) { return $false }
-    return (Test-QtSelftestAgent -BaseUrl ([string]$Context.AgentBaseUrl)).Ok
+    return (Test-QtSelftestAgent -BaseUrl ([string]$Context.AgentBaseUrl) -Token $bootstrap.ConsoleToken).Ok
 }
 
 Register-QtStepCheck -Step 'SELFTEST_OK' -Check { param($ctx) Test-QtSelftestComplete -Context $ctx }

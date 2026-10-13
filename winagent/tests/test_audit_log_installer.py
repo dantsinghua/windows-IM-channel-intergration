@@ -225,40 +225,24 @@ def test_installer_token_can_be_revoked():
     assert t.role_of("i") is None                                         # 03:安装完即吊销
 
 
-def test_expand_falls_back_under_root_when_env_var_unexpandable(tmp_path):
-    """``expand()`` 单函数的落点契约 —— **本用例按平台分叉是正当的**(2026-09-21 真机实测后分叉)。
+def test_shipped_vault_path_follows_explicit_install_root_on_every_platform(tmp_path):
+    """Packaged defaults belong to the selected WinAgent root, including relocated installs.
 
-    ``expand`` 是**生产**路径解析工具:02 §7.2 的 ``[vault] dir`` 默认值就写作
-    ``%ProgramData%\\QTrade\\winagent\\vault``,指的正是真机上那个真实目录。所以两边结论本就不同:
-
-    * **Windows**:``%ProgramData%`` 展得开 ⇒ 返回 ``C:\\ProgramData\\QTrade\\winagent\\vault``。
-      这是**期望**的生产语义,**不该**被塞进 ``--root``。
-    * **非 Windows**:变量根本不存在,``expandvars`` 原样返回带 ``%`` 的串;若直接拿去用会被当成
-      **相对路径**在 cwd 里造出名字带 ``%`` 的目录(``--dev`` 冒烟时实测在仓库里拉了一坨),
-      故兜到 ``--root`` 下。
-
-    🔴 **这个分叉不可外推**:它只说明 ``expand`` 这一个函数两平台结论不同,**不**等于
-    「``--dev`` 自包含」也能按平台分叉 —— 自包含是另一条契约,见下一个用例(那条**不分叉**)。
+    Custom absolute settings retain their meaning. Fake development isolation is
+    separately guarded by contain() and is not weakened by this change.
     """
-    import os as _os
     from qtrade_winagent.main_svc import expand
-    root = str(tmp_path)
+    root = str(tmp_path / "custom-service-root")
     out = expand(r"%ProgramData%\QTrade\winagent\vault", root)
-
-    # 两个平台共同的不变量
-    assert "%" not in out                                                 # 不许留未展开的变量
-    assert _os.path.isabs(out)                                            # 不许是相对路径
-    assert out.endswith(_os.path.join("winagent", "vault"))
-    assert expand("/var/lib/qtrade", root) == "/var/lib/qtrade"           # 已是绝对路径就别动
-
-    if _os.name == "nt":
-        assert out == _os.path.join(_os.environ["ProgramData"], "QTrade", "winagent", "vault")
-        assert expand(r"%LOCALAPPDATA%", root) == _os.environ["LOCALAPPDATA"]
+    assert out == str(tmp_path / "custom-service-root/vault")
+    assert "%" not in out
+    assert os.path.isabs(out)
+    assert expand("/var/lib/qtrade", root) == "/var/lib/qtrade"
+    if os.name == "nt":
+        assert expand(r"%LOCALAPPDATA%", root) == os.environ["LOCALAPPDATA"]
     else:
-        assert out.startswith(root)
         assert expand(r"%LOCALAPPDATA%", root).startswith(root)
-
-    assert not _os.path.exists("%ProgramData%")                           # cwd 里不许留垃圾
+    assert not os.path.exists("%ProgramData%")
 
 
 def test_dev_assembly_keeps_everything_under_root(tmp_path):

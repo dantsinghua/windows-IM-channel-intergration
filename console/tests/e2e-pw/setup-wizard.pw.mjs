@@ -125,6 +125,8 @@ test('D-B:重跑向导时离开到 P-ACCT-NEW 再返回,仍回到首登那一步
 })
 
 test('D-D:首启态(向导未完成)下首登「现在添加」能进 P-ACCT-NEW(01:353)', async ({ page }) => {
+  const errors = collectErrors(page)
+  page.on('pageerror', error => { console.error(`D-D pageerror: ${error.message}`) })
   // 不装 qt 桩 = 浏览器形态 `setup.done` 恒 false = 真正的首启态,正是守卫最严的那一路。
   await page.goto('/')
   for (let i = 0; i < 2; i++) await page.getByTestId('qt-setup-next').click()
@@ -138,6 +140,7 @@ test('D-D:首启态(向导未完成)下首登「现在添加」能进 P-ACCT-NEW
   await expect(page.getByTestId('qt-acct-new-steps'), '不能只是改了地址栏而没真渲染建号页').toBeVisible()
   await expect(page.getByTestId('qt-acct-new-res-card')).toBeVisible()
   await expect(page.getByText('资源预检').first()).toBeVisible()
+  expect(errors.filtered()).toEqual([])
 })
 
 /**

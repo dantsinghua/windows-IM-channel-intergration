@@ -47,11 +47,12 @@ class AccountPollState:
 
 @dataclass
 class QidianAccountView:
-    """poll 只需要的账号字段:``id``/``state``/``self_uid``/``app_version``,由适配器从 store 取后传入。"""
+    """poll 只需要的账号字段,由适配器从 store 取后传入。``self_nick`` 缺省空,旧的四元组构造仍可用。"""
     id: str
     state: str
     self_uid: Optional[str]
     app_version: Optional[str] = None
+    self_nick: Optional[str] = None
 
 
 def md5_upper(s: str) -> str:
@@ -110,8 +111,9 @@ class QidianPoller:
             self.alerts.resolve(QIDIAN_DB_UNAVAILABLE, subject=subject, account_id=acct.id)
             self.alerts.resolve(QIDIAN_TABLE_DECODE_STUCK, subject=subject, account_id=acct.id)
             return
-        if st.factory is None or st.factory.self_uid != acct.self_uid:
-            st.factory = MessageFactory(acct.id, acct.self_uid)
+        nick = (acct.self_nick or "").strip() or None
+        if st.factory is None or st.factory.self_uid != acct.self_uid or st.factory.self_nick != nick:
+            st.factory = MessageFactory(acct.id, acct.self_uid, nick)
 
         db = self.maindb_factory(acct.self_uid)
         try:
@@ -223,6 +225,11 @@ class QidianPoller:
                 results = self.store.ingest_batch(
                     msgs, CursorUpdate(acct.id, "qidian_rowid:" + nid, rows[-1].id, json.dumps({"last_uniseq": rows[-1].uniseq})), now_ms=now_ms)
                 for inserted, changed, msg in results:
+                    if (inserted or changed) and msg.dir == "in":
+                        log.info(
+                            "企点入站未调用Dify account=%s native_id=%s text_len=%s reason=采集端没有Dify",
+                            acct.id, nid, len(msg.text or ""),
+                        )
                     if inserted or changed:         # 三通道统一的发出条件;重扫撞键、内容无变化的已存在行不发
                         origin = None
                         if msg.dir == "out":

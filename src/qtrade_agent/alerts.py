@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from .events import iso8601
@@ -127,26 +127,37 @@ class Alerts:
         key = (code, subject)
         a = self.active.get(key)
         if a is not None:
-            a.count += 1
-            a.last_seen_ms = now
-            a.evidence = evidence or a.evidence
+            updated = replace(a, count=a.count + 1, last_seen_ms=now,
+                              evidence=evidence or a.evidence, severity=sev)
             if a.severity != sev:                       # 级别翻转(如 H06 三振 warn→crit、MEM_PRESSURE warn→crit)= 状态变化,再发一次 firing
-                a.severity = sev
-                self._events.emit(ev, payload=self._payload(a, "firing"), account_id=account_id, now_ms=now)
+                self._events.emit(ev, payload=self._payload(updated, "firing"), account_id=account_id, now_ms=now)
+                self.active[key] = updated
                 return True
+            self.active[key] = updated
             return False
         a = ActiveAlert(code, subject, sev, now, now, 1, dict(evidence or {}), list(hint_actions or []))
-        self.active[key] = a
         self._events.emit(ev, payload=self._payload(a, "firing"), account_id=account_id, now_ms=now)
+        self.active[key] = a
         return True
 
     def resolve(self, code: str, *, subject: str, account_id: Optional[str] = None, event: Optional[str] = None) -> bool:
         key = (code, subject)
-        a = self.active.pop(key, None)
+        a = self.active.get(key)
         if a is None:
             return False
-        a.last_seen_ms = self._clock()
-        self._events.emit(self.event_of(code, event), payload=self._payload(a, "resolved"), account_id=account_id, now_ms=a.last_seen_ms)
+        resolved = replace(a, last_seen_ms=self._clock())
+        self._events.emit(self.event_of(code, event), payload=self._payload(resolved, "resolved"), account_id=account_id, now_ms=resolved.last_seen_ms)
+        # 恢复事件落库后才清内存；写入失败时保留 firing，供下次真实健康探测重试。
+        del self.active[key]
+        return True
+
+    def settle(self, code: str, *, subject: str, account_id: Optional[str] = None, event: Optional[str] = None) -> bool:
+        """结束一条告警。进程内还挂着就走 ``resolve``；只在 outbox 里重放过、本进程没有内存态时，补发一条 ``resolved``，让控制台清掉。"""
+        if self.resolve(code, subject=subject, account_id=account_id, event=event):
+            return True
+        now = self._clock()
+        ghost = ActiveAlert(code, subject, REGISTERED.get(code, "warn"), now, now)
+        self._events.emit(self.event_of(code, event), payload=self._payload(ghost, "resolved"), account_id=account_id, now_ms=now)
         return True
 
     def is_firing(self, code: str, subject: str) -> bool:
