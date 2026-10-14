@@ -74,10 +74,12 @@ class WaTime:
 
 def read_token(path: str) -> Optional[str]:
     try:
-        with open(path, encoding="utf-8") as f:
-            t = f.read().strip()
-        return t or None
-    except OSError:
+        with open(path, encoding="utf-8-sig") as f:
+            raw = f.read(4097)
+        if len(raw) > 4096:
+            return None
+        return raw.strip() or None
+    except (OSError, UnicodeError):
         return None
 
 
@@ -231,6 +233,9 @@ class WinAgentClient:
         self.base_url_source: Optional[str] = "explicit" if base_url is not None else None
         self.last_version: Optional[str] = None
         self.last_error: Optional[str] = None
+        # Health diagnostics are independent of concurrent ping/time requests.
+        self.last_health_error: Optional[str] = None
+        self.last_health_status: Optional[int] = None
 
     @property
     def base_url(self) -> Optional[str]:
@@ -281,9 +286,9 @@ class WinAgentClient:
             self.base_url_source = None
 
     def token(self) -> Optional[str]:
-        if self._token is None:
-            self._token = read_token(self.cfg.token_file)
-        return self._token
+        # An explicitly injected credential is immutable. File credentials are
+        # bounded reads so atomic rebinding is observed without a process restart.
+        return self._token if self._token is not None else read_token(self.cfg.token_file)
 
     async def request(self, method: str, path: str, *, json: Optional[dict[str, Any]] = None, timeout_s: Optional[float] = None,
                       retry: bool = False, auth: bool = True, headers: Optional[dict[str, str]] = None,
@@ -359,11 +364,21 @@ class WinAgentClient:
 
     # ---- #2 health(A 令牌,2 s)
     async def health(self) -> Optional[dict[str, Any]]:
+        self.last_health_error = None
+        self.last_health_status = None
         try:
             status, body = await self.request("GET", "/wa/v1/health", timeout_s=TIMEOUT_S["health"], retry=True)
-        except WinAgentUnavailable:
+        except WinAgentUnavailable as exc:
+            self.last_health_error = exc.reason if exc.reason in {"no_token", "no_address"} else "unreachable"
             return None
-        return body if status == 200 else None
+        self.last_health_status = status
+        if status != 200:
+            self.last_health_error = {401: "unauthorized", 403: "forbidden"}.get(status, "http_error")
+            return None
+        if not isinstance(body, dict) or not isinstance(body.get("user_agent"), bool):
+            self.last_health_error = "invalid_response"
+            return None
+        return body
 
     # ---- #4 time(A 令牌,3 s):{now_ms, tz_offset_min, last_resume_ms, w32time}
     async def time(self) -> WaTime:

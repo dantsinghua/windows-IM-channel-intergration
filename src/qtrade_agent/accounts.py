@@ -1295,6 +1295,10 @@ class AccountService:
                     self.transition(id, "stopped")           # 容器不在跑:按 stopped 重走 start
                 elif r["state"] not in STARTABLE:
                     self.transition(id, "stopped")
+                current = self._store.get_account_full(id)
+                if not current or current.get("deleted_ms") or not current.get("enabled") or current.get("desired_state") != "running":
+                    results.append({"id": id, "ok": False, "reason": "recovery_cancelled"})
+                    continue
                 res = await self.start(id, actor="system:recover")
                 await self.wait_idle(id)
                 results.append({"id": id, "ok": True, "reason": res.get("state")})

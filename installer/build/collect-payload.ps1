@@ -252,12 +252,12 @@ foreach ($c in $copied) {
                 sha256 = Get-QtSha256 -Path $leaf.FullName
                 size = [long]$leaf.Length
             }
-            if ($item.Critical) { $child['critical'] = $true }
+            $child['critical'] = [bool]$item.Critical
             $files += $child
         }
         continue
     }
-    if ($item.Critical) { $entry['critical'] = $true }
+    $entry['critical'] = [bool]$item.Critical
     if ($item.Dest -eq 'kernel/bzImage-6.6') {
         $ver = Get-QtKernelVersionString -Path $c.Dest
         # K4:版本串必须以 -binder 结尾且不含 `+`(源码目录无 git tag 时 setlocalversion 会追加 `+`)

@@ -30,7 +30,6 @@ def native_rig(tmp_path, monkeypatch):
     work = tmp_path / "用户 空间"
     work.mkdir()
     wx = native.WinWeChat(chatlog_dir=str(assets), chatlog_work_dir=str(work))
-    monkeypatch.setattr(wx, "_port_in_use", lambda: False)
     monkeypatch.setattr(native, "require_windows", lambda _: None)
     monkeypatch.setattr(wx, "locate", lambda: {"installed": True, "version": "4.1.12.26", "path": "D:\\Apps\\Weixin.exe"})
     monkeypatch.setattr(wx, "login_pid", lambda: 4401)
@@ -42,6 +41,21 @@ def native_rig(tmp_path, monkeypatch):
     monkeypatch.setattr(native, "spawn_redacted", spawn)
     monkeypatch.setattr(native.os, "kill", lambda *a: pytest.fail("No real signal is allowed"))
     return wx, assets, work, spawn
+
+
+async def test_key_start_does_not_query_the_read_service_port(native_rig):
+    wx, _assets, _work, spawn = native_rig
+    calls = []
+
+    def net_connections(kind="tcp"):
+        calls.append(kind)
+        raise AssertionError("取钥动作查询了读取服务端口")
+
+    sys.modules["psutil"].net_connections = net_connections
+    sys.modules["psutil"].CONN_LISTEN = "LISTEN"
+    assert await wx.chatlog_start("wx_key2.dll") == 5501
+    assert calls == []
+    spawn.assert_awaited()
 
 
 async def test_nondefault_unicode_paths_use_explicit_target_and_do_not_require_ffmpeg(native_rig):

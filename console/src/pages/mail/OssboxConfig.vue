@@ -32,6 +32,17 @@ function errorText(error: unknown, operation: string): string {
   // 不显示服务端原始报错或请求内容，防止上游错误响应意外带回口令。
   if (error instanceof ApiFailure && error.status === 403) return '仅管理员可以配置和测试 STS 认证。'
   if (error instanceof ApiFailure && error.status === 401) return '管理会话已失效，请恢复连接后重试。'
+  // Only display reviewed backend reason codes, never the upstream response or secret text.
+  if (error instanceof ApiFailure && error.reason === 'sts_bucket_mismatch')
+    return 'STS 已返回临时凭据，但签发桶名与页面的预期桶名不一致。请填写 STS 实际授权的桶名；仅验证认证时可暂时留空。不自动切换桶。'
+  if (error instanceof ApiFailure && error.reason === 'sts_http_401')
+    return 'STS 返回 401：请核对业务口令、SM4 密钥、客户端时间及目标 STS 环境。'
+  if (error instanceof ApiFailure && error.reason === 'sts_unavailable')
+    return 'Agent 无法连接 STS 服务。请检查 WSL/VPN 网络、DNS 和 STS 地址。'
+  if (error instanceof ApiFailure && error.reason === 'sts_test_timeout')
+    return 'STS 认证请求超时，请检查服务连通性和响应时间。'
+  if (error instanceof ApiFailure && error.reason === 'sts_response_invalid')
+    return 'STS 响应中的临时凭据字段不符合协议合同，需检查 STS 服务版本。'
   if (error instanceof ApiFailure && error.status === 400) return '配置格式不正确，请检查地址、业务口令与 SM4 密钥。'
   return `${operation}失败，请检查配置或服务连接后重试。`
 }
@@ -208,13 +219,13 @@ onUnmounted(() => {
         <label>STS 接口地址<input v-model="form.sts_url" data-testid="ossbox-sts-url" type="url" autocomplete="off" placeholder="部署方提供的完整 STS 接口地址" /></label>
         <label class="check"><input v-model="form.allow_http" data-testid="ossbox-allow-http" type="checkbox" />允许 HTTP（仅测试环境，认证请求不加密传输）</label>
         <label>业务口令（auth.key）<input v-model="form.auth_key" data-testid="ossbox-auth-key" type="password" autocomplete="new-password" :placeholder="saved?.data.auth_key_configured ? '已配置；留空保留，输入新值替换' : '填写部署方提供的业务口令'" /></label>
-        <span class="secret-state" data-testid="ossbox-auth-status">{{ saved?.data.auth_key_configured ? '业务口令已配置' : '业务口令未配置' }}</span>
+        <span class="secret-state" data-testid="ossbox-auth-status">{{ saved?.data.auth_key_configured ? (form.auth_key ? '已有保存口令；本次输入尚未保存' : '业务口令已配置') : (form.auth_key ? '本次已输入，尚未保存' : '业务口令未配置') }}</span>
         <label>SM4 密钥（auth.sm4_key）<input v-model="form.sm4_key" data-testid="ossbox-sm4-key" type="password" autocomplete="new-password" :placeholder="saved?.data.sm4_key_configured ? '已配置；留空保留，输入新值替换' : 'UTF-8 编码后必须为 16 字节'" /></label>
-        <span class="secret-state" data-testid="ossbox-sm4-status">{{ saved?.data.sm4_key_configured ? 'SM4 密钥已配置' : 'SM4 密钥未配置' }}</span>
+        <span class="secret-state" data-testid="ossbox-sm4-status">{{ saved?.data.sm4_key_configured ? (form.sm4_key ? '已有保存密钥；本次输入尚未保存' : 'SM4 密钥已配置') : (form.sm4_key ? '本次已输入，尚未保存' : 'SM4 密钥未配置') }}</span>
         <p class="optional-hint">以下业务配置可稍后填写；认证通过不代表业务已启用。</p>
         <label>终端编号（可选）<input v-model="form.workbench_id" data-testid="ossbox-workbench" autocomplete="off" placeholder="部署方分配的终端编号" /></label>
         <label>OSS 上报地址（可选）<input v-model="form.endpoint" data-testid="ossbox-endpoint" autocomplete="off" placeholder="部署方提供的 OSS 域名或 HTTPS 地址" /></label>
-        <label>桶名（可选）<input v-model="form.bucket" data-testid="ossbox-bucket" autocomplete="off" placeholder="部署方提供的私有桶名" /></label>
+        <label>预期桶名（可选，需与 STS 签发桶一致）<input v-model="form.bucket" data-testid="ossbox-bucket" autocomplete="off" placeholder="部署方提供的私有桶名" /></label>
       </fieldset>
       <div class="qt-row wrap">
         <a-button type="primary" html-type="submit" data-testid="ossbox-save" :disabled="locked || !!busy" :loading="busy === 'save'">保存公网上报</a-button>

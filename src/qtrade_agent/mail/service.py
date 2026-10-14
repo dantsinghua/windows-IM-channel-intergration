@@ -36,6 +36,7 @@ class MailService:
         self.store = store
         self.cfg = cfg
         self.ms = MailStore(store)
+        self.ms.recover_interrupted_sends()
         self.clock = clock or self.ms._now
         self.alerts = alerts
         self.catalog = catalog or Catalog.load()

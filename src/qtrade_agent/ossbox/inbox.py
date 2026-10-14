@@ -20,7 +20,8 @@ import time
 from typing import Any, Awaitable, Callable
 
 from ..adapters.base import Account
-from ..models import Message, Session
+from ..models import Command, CommandOrigin, Message, Session
+from collections import OrderedDict
 from .bind import Dedup
 from .crypto import open_sealed, seal
 from .keys import ack_object_name, in_object_name
@@ -77,21 +78,23 @@ class XunjiaInbox:
         *,
         clock: Callable[[], int] | None = None,
         confirm_wait_s: float = 0.0,
+        bus: Any = None,
     ) -> None:
         self.box = box
         self.key = bytes(key)
         self.workbench_id = workbench_id
         self.send = send
+        self.bus = bus
         self.store = store
         self.clock = clock or (lambda: 0)
         self.confirm_wait_s = confirm_wait_s
         self._dedup = Dedup()
-        self._outcome: dict[str, dict[str, Any]] = {}
+        self._outcome: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._io = ObjectIO()
 
     @classmethod
     def from_env(cls, store: Any, send: SendFn, *, clock: Callable[[], int] | None = None,
-                 box: Any = None, workbench_id: str | None = None) -> "XunjiaInbox | None":
+                 box: Any = None, workbench_id: str | None = None, bus: Any = None) -> "XunjiaInbox | None":
         """环境变量齐了才装配。缺任何一项就返回 None，不拉网、不打密钥。"""
         if workbench_id is None:
             workbench_id = os.environ.get("OSS_WORKBENCH_ID", "").strip()
@@ -138,6 +141,7 @@ class XunjiaInbox:
             store,
             clock=clock,
             confirm_wait_s=confirm_wait_s,
+            bus=bus,
         )
 
     async def poll(self) -> None:
@@ -201,6 +205,9 @@ class XunjiaInbox:
             self._skip(cmd_id, name, "not_qidian_text")
             self._remember(idem, ok=False, code="failed", reason="这次只发企点文本")
             await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="这次只发企点文本"))
+            return
+        if self.bus is not None:
+            await self._submit_via_bus(command, cmd_id, ack_name)
             return
         prior = self._outcome.get(idem)
         if idem and prior is not None:
@@ -271,18 +278,34 @@ class XunjiaInbox:
         self._remember(idem, ok=True, code="delivered")
         await self._put_ack(ack_name, _receipt(cmd_id, ok=True, code="delivered"))
 
+    async def _submit_via_bus(self, command, cmd_id, ack_name):
+        account = self._account(str(command["account_uid"]))
+        key = command.get("idempotency_key")
+        if account is None:
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="Account not available"))
+            return
+        if not isinstance(key, str) or not key or len(key) > 128:
+            await self._put_ack(ack_name, _receipt(cmd_id, ok=False, code="failed", reason="Invalid idempotency key"))
+            return
+        # The shared bus owns durable intent, account serialization, Gate and confirmation.
+        cmd = Command(account.id, "send_text", {"session": command["session"]["native_id"], "text": command["text"]},
+                      idempotency_key=key, origin=CommandOrigin(transport="http", actor="oss:" + self.workbench_id))
+        result = await self.bus.submit(cmd)
+        ok = bool(result.ok and result.code in ("DELIVERED", "IDEMPOTENT_REPLAY"))
+        await self._put_ack(ack_name, _receipt(cmd_id, ok=ok, code="delivered" if ok else "failed", reason=result.code if not ok else ""))
+
     def _remember(self, idem: str, *, ok: bool, code: str, reason: str = "") -> None:
         if not idem:
             return
         self._outcome[idem] = {"ok": ok, "code": code, "reason": reason}
+        self._outcome.move_to_end(idem)
+        if len(self._outcome) > 4096:
+            self._outcome.popitem(last=False)
 
     async def _put_ack(self, name: str, receipt: dict[str, Any]) -> None:
-        log.info(
-            "询价回执已写 object=%s cmd_id=%s ok=%s code=%s reason=%s",
-            name, receipt.get("cmd_id"), receipt.get("ok"), receipt.get("code"), receipt.get("reason") or "",
-        )
         try:
             await self._io.run(self.box.put, name, seal(self.key, _plaintext(receipt)))
+            log.info("询价回执已写 object=%s cmd_id=%s ok=%s code=%s", name, receipt.get("cmd_id"), receipt.get("ok"), receipt.get("code"))
         except Exception as exc:
             log.warning("询价回执写入失败 object=%s exc=%s", name, type(exc).__name__)
             raise

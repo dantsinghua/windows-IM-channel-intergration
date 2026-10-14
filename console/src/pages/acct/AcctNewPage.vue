@@ -94,6 +94,9 @@ const stateCode = computed(() => account.value?.state_code ?? '')
 const wxFailed = computed(() => channel.value === 'wechat' && (
   ['stopped', 'error', 'disabled'].includes(account.value?.state ?? '') || stateCode.value === 'KEY_FAIL'
 ))
+const wxReadUnavailable = computed(() => wxFailed.value && stateCode.value === 'KEY_FAIL'
+  && wxStatus.value?.chatlog?.key_ok === true
+  && (!account.value?.self_uid || wxStatus.value?.wechat?.wxid === account.value.self_uid))
 const wxFailureReason = computed(() => account.value?.state_reason
   || STATE_CODES[stateCode.value]?.zh || '本次微信登录已结束，尚未完成取钥。请检查环境后重试。')
 const loginSessionId = computed(() => (createdId.value ? accounts.loginSessions[createdId.value] ?? null : null))
@@ -115,6 +118,9 @@ const nextDisabled = computed(() => busy.value
  * 此前照 01 旧文读 `module_enabled/user_agent/match`,WinAgent 从不返回这些键 ⇒ 真机上永远「未启用 / 不在线」。
  */
 const wxModuleEnabled = computed(() => wxStatus.value?.enabled === true)
+const wxStatusError = ref('')
+const wxModuleState = computed(() => wxStatus.value?.enabled === true ? 'enabled' : wxStatus.value?.enabled === false ? 'disabled' : 'unknown')
+const wxModuleLabel = computed(() => ({ enabled: '已启用', disabled: '未启用', unknown: '无法确认' })[wxModuleState.value])
 const wxDetected = computed(() => (wxStatus.value?.wechat as { installed?: boolean; version?: string | null } | null) ?? null)
 const wxMatch = computed(() => (wxVersionMatch.value?.match as string) ?? '')
 const wxAction = computed(() => (wxVersionMatch.value?.action as string) ?? '')
@@ -271,10 +277,15 @@ async function preload(): Promise<void> {
 }
 
 async function loadWxStatus(): Promise<void> {
+  wxStatusError.value = ''
   try {
-    wxStatus.value = (await window.qt?.wa.invoke('wechat.status', {})) as Record<string, unknown>
-  } catch {
+    if (!window.qt?.wa) throw new Error('WinAgent 连接不可用，无法确认微信模块状态')
+    const status = await window.qt.wa.invoke('wechat.status', {}) as Record<string, unknown>
+    if (typeof status?.enabled !== 'boolean') throw new Error('WinAgent 未返回有效的微信模块状态')
+    wxStatus.value = status
+  } catch (e) {
     wxStatus.value = null
+    wxStatusError.value = e instanceof Error ? e.message : '无法确认微信模块状态，请重新检查服务连接'
   }
   // #29 只在模块已启用时才有意义(关着时 WinAgent 没有可比对的安装信息);失败不挡步①
   if (wxStatus.value?.enabled === true) {
@@ -289,7 +300,7 @@ async function loadWxStatus(): Promise<void> {
 }
 
 async function enableWechatModule(): Promise<void> {
-  if (busy.value || wxModuleEnabled.value) return
+  if (busy.value || wxModuleState.value !== 'disabled') return
   if (!window.qt?.wa || !session.winagentOnline) {
     toastError('请在已连接 WinAgent 的机器人采集终端启用微信模块。')
     return
@@ -457,6 +468,7 @@ watch(() => [account.value?.state, stateCode.value] as const, ([s, c]) => {
   }
   if (channel.value === 'wechat' && s !== 'running') {
     syncWechatStep()
+    if (wxFailed.value) void loadWxStatus()
     if (wxFailed.value && stallTimer) {
       clearTimeout(stallTimer)
       stallTimer = null
@@ -812,15 +824,18 @@ onUnmounted(() => {
       <section v-if="channel === 'wechat' && step === 0" class="qt-card box">
         <div class="qt-section-title">检查模块与槽位</div>
         <div :data-testid="T.wxModuleStatus" class="qt-col">
-          <div>微信模块:{{ wxModuleEnabled ? '已启用' : '未启用' }}</div>
-          <div>用户会话代理:{{ session.userAgentOnline ? '在线' : '不在线' }}</div>
+          <div>微信模块:{{ wxModuleLabel }}</div>
+          <div>用户会话代理:{{ session.userAgentOnline == null ? '无法确认' : session.userAgentOnline ? '在线' : '不在线' }}</div>
           <div>槽位:holder {{ resources.slots?.holder || '—' }} · pending {{ resources.slots?.pending || '—' }}</div>
         </div>
-        <a-popconfirm v-if="!wxModuleEnabled" title="启用本机微信模块，以便继续添加微信账号？" @confirm="enableWechatModule">
+        <a-popconfirm v-if="wxModuleState === 'disabled'" title="启用本机微信模块，以便继续添加微信账号？" @confirm="enableWechatModule">
           <a-button :data-testid="T.wxEnableModule" :loading="busy" :disabled="busy || !session.winagentOnline">启用微信模块</a-button>
         </a-popconfirm>
         <p v-if="!session.winagentOnline" class="qt-warn" :data-testid="T.wxUserAgentHint">WinAgent 服务未运行:微信由 Windows 侧 WinAgent 承载,需先安装并启动 WinAgent 服务与会话代理,才能启用微信模块。</p>
-        <p v-else-if="!session.userAgentOnline" class="qt-warn" :data-testid="T.wxUserAgentHint">请先登录 Windows 桌面</p>
+        <p v-else-if="session.userAgentOnline == null" class="qt-warn" :data-testid="T.wxUserAgentHint">无法确认会话代理状态，请检查 WinAgent 认证和健康接口。</p>
+        <p v-else-if="session.userAgentOnline === false" class="qt-warn" :data-testid="T.wxUserAgentHint">请先登录 Windows 桌面，并确认用户会话代理已启动。</p>
+        <p v-if="wxStatusError" role="status" class="qt-warn">{{ wxStatusError }}</p>
+        <a-button v-if="wxModuleState === 'unknown'" aria-label="重新检查微信模块" :disabled="busy" @click="loadWxStatus">重新检查模块状态</a-button>
         <p v-if="resources.hasPending" class="qt-danger">另一次切换正在进行,不能继续。</p>
         <p v-else-if="holderBusy" class="qt-warn" :data-testid="T.wxHolderHint">
           当前 {{ resources.slots?.holder }} 在线,新增会先登出它;历史档案保留。
@@ -911,7 +926,7 @@ onUnmounted(() => {
 
       <!-- 微信 ⑥ 取钥三段 -->
       <section v-if="channel === 'wechat' && step === 5" class="qt-card box">
-        <div class="qt-section-title">{{ wxFailed ? '微信登录未完成' : '取钥(三段固定顺序)' }}</div>
+        <div class="qt-section-title">{{ wxReadUnavailable ? '微信已取钥，消息读取未就绪' : wxFailed ? '微信登录未完成' : '取钥(三段固定顺序)' }}</div>
         <ol v-if="!wxFailed" class="keysteps" :data-testid="T.wxKeyProgress">
           <li>
             ⑥a 起 hook —— 已进入取钥流程
@@ -945,8 +960,9 @@ onUnmounted(() => {
             消息读取与发送尚未就绪。请先处理上述原因，再对当前账号重试；无需重复创建账号。
           </p>
           <div class="qt-row">
-            <a-button v-if="account?.state !== 'disabled'" type="primary" :loading="busy" :data-testid="T.wxKeyRetry" @click="keyRetry">重新取钥</a-button>
-            <a-button v-if="stateCode === 'KEY_FAIL'" :data-testid="T.wxKeyReinstall" @click="step = 1.5">用随包版本重装</a-button>
+            <a-button v-if="!wxReadUnavailable && account?.state !== 'disabled'" type="primary" :loading="busy" :data-testid="T.wxKeyRetry" @click="keyRetry">重新取钥</a-button>
+            <a-button v-if="!wxReadUnavailable && stateCode === 'KEY_FAIL'" :data-testid="T.wxKeyReinstall" @click="step = 1.5">用随包版本重装</a-button>
+            <a-button v-if="wxReadUnavailable" data-testid="qt-wechat-read-recheck" @click="loadWxStatus">重新检查读取服务</a-button>
             <a-button @click="go('/env')">去环境页导日志</a-button>
           </div>
         </div>

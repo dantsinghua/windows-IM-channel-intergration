@@ -1,5 +1,23 @@
 # 交接入口 / HANDOFF(2026-10-08)
 
+> **2026-10-14 最新：真实微信启动暴露新增端口守卫回归，按安琳要求仅诊断/方案、待确认，暂停后续产品修改、部署及总装。**同版源码全量与当时源码终审通过记录保留；新版已在 QTrade-E2E 部署，90 秒真实只读联动证明 H02/H03 恢复、磁盘容量正常且无新增可见黑框。但 5030 无监听时短探针返回 10035，被误报“占用”，key 又错误继承 server 的 HTTP 端口检查；wx03 已 stopped、未起 hook。1.0.3 组件及 3356 份载荷已准备，**总安装 EXE 尚未生成/未交付**。先读 [最新交接](docs/handoffs/2026-10-13-health-wechat-fix.md)及[待确认方案](docs/reviews/2026-10-14-wechat-port-guard-remediation-plan.md)；旧 1.0.2 交付历史保留，MQ skipped，不自动重登微信。
+
+> **2026-10-13 最新：健康告警、微信取钥与磁盘监控修复已获批准，实施/独立验收进行中，尚未重交包。**现场 H02/H03 为重启后历史 firing 未结束；本地 chatlog 资产漏部署且向导漏处理失败终态；磁盘采集在 systemd 下依赖 Windows 交互环境而失败。已登记 R6-105～107，Windows 原生卷探针已取到真实容量，运行接口和新版桌面仍待更新验收。先读 [本轮修复交接](docs/handoffs/2026-10-13-health-wechat-fix.md)，保留下方 r2 已交付历史；MQ skipped，不宣称本轮全绿或零回归。
+
+> **2026-10-13 最终：r2 独立包验有限范围 PASS，可交付受控安装验收的内部测试包。**桌面交付目录 `C:\Users\anlin\Desktop\QTrade-1.0.2-20261013`；EXE 2,598,056,832字节，SHA256 `98ec27e99065dcecaf732b68f4e4778cda23193d6d6fca0e8cb54df5a7e26d68`。ARTIFACT-01 CLOSED，无包级阻断；同包SFX欢迎/取消53.30s通过，SCM不变、正式Root不存在。完整真装/真实账号/MQ未验，MQ skipped；内部自签根未信任，H03/recover仍open。安装共享WSL内核切换可能中断其他WSL/Docker Desktop并要求重启，不宣称任意机器或全域0回归。见 [最终交接](docs/handoffs/2026-10-13-portable-installer.md)。
+
+> **2026-10-13 当前：r2 全流程总装成功，独立验货/SFX冒烟进行中，尚未交付。**包2,598,056,832字节，SHA256 `98ec27e99065dcecaf732b68f4e4778cda23193d6d6fca0e8cb54df5a7e26d68`；公开交付README已准备但保留待验状态。旧ed6e5e包继续REJECT，计划桌面交付目录须等全部验收通过再移动。详见 [安装交接](docs/handoffs/2026-10-13-portable-installer.md)。MQ skipped、自签信任边界、H03/recover待办及完整真装/真实账号未验保持。
+
+> **2026-10-13 最新：首候选因构建来源元数据 REJECT，r8 修复通过，新包 out-r2 重签压缩中。**旧 `ed6e5e…` 虽完成73.31s SFX启动/取消仍不得交付；两spec过滤后组件ACCEPT/终审APPROVE，双平台各874。r8本地412文件更新、90.03s无新增可见黑框、12次健康全true跨probe6→7；WS在关闭告警遮罩后人工重连稳定10s，初次失败留档。新包仍待验货，MQ skipped、自签根未获本机信任，真装/真实账号和H03/recover差异仍未闭环。见 [最新安装交接](docs/handoffs/2026-10-13-portable-installer.md)与 [运行交接](docs/handoffs/2026-10-13-local-runtime-e2e.md)。
+
+> **2026-10-13 当前：Docker 排序根因已修，r4 rootfs 验收通过，最终包 7z 压缩中。**仅改单 unit 消除隐式 basic/socket 环；r4 SHA `05620504…99890de1`，独立排序 10 项及冷归档/关联 57 项通过、终审 APPROVE。WA 停启本轮 qtrade 后 12 次健康均 dockerd=true，WS 手动重连稳定恢复。H03 自动重启及初启账号 recover 重试仍列开放；MQ skipped，最终签名包尚未生成。见 [最新运行交接](docs/handoffs/2026-10-13-local-runtime-e2e.md)与 [安装交接](docs/handoffs/2026-10-13-portable-installer.md)。下方 r7 首轮 false 为修复前历史。
+
+> **2026-10-13 r7 最新检查点：安装器终审 APPROVE、COM 可移植性 ACCEPT；真实 Docker 健康仍待修复。**r7 已部署 413 文件，90.08s 持续运行/无新增可见黑框；但后续 12 次 health 均 dockerd=false（HTTP 200、WA 在线），不能沿用下方 r5 绿灯。COM 双平台各 852 项，载荷 ADB 三件套统一 37.0.1；见 [运行交接](docs/handoffs/2026-10-13-local-runtime-e2e.md)及 [安装交接](docs/handoffs/2026-10-13-portable-installer.md)。MQ skipped 不等于通过，最终签名包尚未总装。
+
+> **2026-10-13 最新状态：本地桌面/服务联动已在限定范围通过，继续安装器整改与打包。**r5 连续 180.09s 在线且未采样到新增可见黑框，显式停止 WSL 后 131.16s 未复活，8 页稳定复验无页面错误；rootfs r3 冷归档 39 项通过。安琳已明确“跳过 MQ 认证测试”，真实 MQ 不再作为本轮打包前置，既有失败不改成通过。最新总安装包尚未生成，真实账号与完整 SFX 安装未覆盖；先读 [本地运行 E2E 交接](docs/handoffs/2026-10-13-local-runtime-e2e.md)及 §3k。
+
+> **2026-10-13 早期发布快照（MQ 前置已由上方新决定取消）：**安琳采用“核归属后清空重装”，撤回复杂保留升级；R6-101～104 的其余合同保持。STS 地址与两钥由管理员页面填写并保存 Vault，包不带现场认证值。下方早期 401 与暂停记录仅保留历史；当前继续剩余安装器整改、总装与独立验收，不能把跳过测试写成已认证或包已交付。
+
 > **2026-10-08 最终整合当前入口：**安琳已确认前端全部重改完成，原等待 UI 状态解除。已找回 HyperV-Exchange 安装报告并按当前源码修复，正式口径合入 R6-80/81/82/83；统一目录迁移、最终全量回归与独立验收仍在进行。先读 [本轮阶段交接](docs/handoffs/2026-10-08-final-integration.md)及下方 §3h。旧“嵌套 WSL 完全不能启动”仅为历史判断，已被 10 月 8 日完整 WSL 启动成功证据替代；真实 kcheck/切内核/真装仍未验证。
 
 > **2026-10-08 21:01 UI 最新补充：**本 UI 工作流已完成首页细化并更新同一私有 Sites 预览，见 §3g。保留下方关机交接的真实账号、联调和目录迁移开放项；UI 源码与示例预览更新不等于这些事项已完成，不自动重载服务或启动真实账号。
@@ -189,6 +207,24 @@ HEAD `5e15b6f`（10-09 以原目录布局提交了 10-08 的集成修改）。10
 - **安琳当日 UI 指令（均已落源码并过单测/文档门）**：16:34 账号详情页重排（操作入头部、状态卡入右栏、名称 hover 原位改名）；17:10 **删除首次设置向导「阅读须知」步 → 裁决 R6-84**（向导四步、守卫只看 `done`、`qt-setup-notice-*` 退役、告知仅偏好页只读查看），控制台单测 423、Playwright 44、typecheck/lint 0 errors。另 Electron 壳 CSP/`connect-src` 写死 17600 导致真实链路全部 API 被拒已修（`electron/main/origins.ts` + preload `qt.endpoint.agent`）。17:40 再修三处：托盘对已销毁窗口崩溃（`closed` 置空 + 托盘重建窗口）；**R6-85** Agent 加 `[api] console_origins` CORS 放行（默认只 `null`，回环源可配，预检不进审计），否则桌面壳跨源直连 Agent 一条都发不出去；**R6-86** 微信向导步①② 以 02 #28/#29 为准（01 旧字段 `module_enabled/user_agent/match` WinAgent 从不返回），白名单③补 `wechat.version-match`。
 - 细节与命令见 [本轮可携带交接](docs/handoffs/2026-10-10-final-regression.md)，本机证据在 `.codex/final-regression-20261010/`。
 
+## 3j. 2026-10-13 可移植安装与清空重装（早期冻结；最新见 §3k）
+
+HEAD `6c5b941482d4f711a4481d18b771f9b48e16d917`，共享 dirty 主树，未提交/推送；原目录布局。安琳最后选择清空已证 QTrade 所有权资源后 fresh install；同包未完成允许续跑，DONE 重跑重新确认；不备份迁移、不动其他 WSL/Docker/微信与 QQ 客户端数据。旧 upgrade/repair/uninstall 明确停用。
+
+R6-101～103 已承接独立随机 stage、完整每文件 manifest、现场网络 env 先于 Docker、空 machine-id、离线 APK/镜像、SCM/安装 SID/可信 bootstrap、console hash 绑定与正式控制台地址发现。各组件阶段测试不能合并当最终 0 回归；本版没有整包交付或真实安装绿灯。
+
+**R6-104 当前认证入口**：P-MAIL「公网上报」由管理员填写地址、业务口令与 SM4 密钥；初始全空，两钥只存 Vault、不回显、不写入安装包。保存待下次 Agent 启动生效，测试只取 STS；旧环境路径仅在无页面 profile 时兼容，URL 必须显式提供。用户提供的合成值实测仍为 401 `invalid_ciphertext`，不是实际认证通过；页面新批已通过后端相关 173、前端全量 513/typecheck 0/lint 0 error（37 条既有 warning）、独立验收 75 和 Chromium + 真 HTTP API + 假 Vault/回环 STS 的浏览器 7/7。保存未知结果锁定后 GET 核实、JSON null 行禁止环境回退均已回归；这些与旧 161 项协议证据分开，见 [STS 交接](docs/handoffs/2026-10-13-sts-integration.md)。最终同源全 Agent **3116 passed / 0 failed、6 条 warning、308.59 秒**（含上述 75 项）；566 个输入主树/快照核对无漂移，前端 build exit 0，见 [最终报告](.codex/sts-settings-20261013/final-verification.json)。本处为早期测试后的纯文档记录；当时真实 MQ 401、打包暂停，后续安琳跳过认证前置见 §3k。
+
+**当前发布流程**：安琳后续取消本轮 MQ 认证前置，继续安装器剩余 R3～R6 整改、最终冻结/构建/签名和独立真装；认证失败保留但不再据此停工。不要依据历史“STS 尚未部署”“保留升级”或旧认证暂停条件继续。精确本轮材料在 `.codex/package-20261013/`，可携带结论和边界均在交接。
+
+## 3k. 2026-10-13 本地桌面/服务联动完成；继续整改出包
+
+安琳授权最新 Windows 打包 Electron 与真实本地服务及本次 gsudo/UAC。隔离根为 `C:\ProgramData\QTrade-E2E`，正式 QTrade 根保持不存在。最新 r5 的 SCM/用户代理/专用 qtrade 连续 180.09s、12 个状态样本全在线，100ms 窗口采样无新增可见黑框；显停 qtrade 后 131.16s 用户代理存活且不复活；正常 SCM stop/restart 与重连有分阶段实证。8 页面稳定复验 pageerrors/network 为空、health 200；早期瞬时 fetch 失败保留。
+
+实际 STS 页面可将合成参数保存进真实 Vault、清空秘密输入，刷新不泄漏；下一次 Agent 启动后 `restart_required=false`，业务配置未齐仍未启用。认证测试失败保留。**安琳最新决定“跳过 MQ 认证测试”：取消本轮打包前置，不代表认证通过。**继续安装器 R3～R6 整改、总装/签名/独立验收，尚未生成最终包。
+
+本轮独立结果：Agent 新跑 3116、WinAgent 同冻结 Linux/Windows 各 829、前端 541；rootfs r3 同归档 39 项通过（r2 权限 RED 留档）；原三项运行时问题复审 APPROVE，r5 helper 对合成 child 真验 ACCEPT。这些结果各有范围，不累计，不证明真实账号/微信 DLL 卸载或完整 SFX 安装。测试仍保留 `reachability_probe=[]` 和 guest 去除 `CAP_SYS_TIME`；正式 ProgramData 偏好 ACL 亦未覆盖。完整路径、摘要、冻结与限制见 [可携带交接](docs/handoffs/2026-10-13-local-runtime-e2e.md)。
+
 ## 4. 现在卡在哪(2026-09-21 深夜)
 
 安琳要的终点 = **一个能装、装完各功能能用的单 EXE 安装包,且须经端到端验证**。
@@ -220,7 +256,7 @@ HEAD `5e15b6f`（10-09 以原目录布局提交了 10-08 的集成修改）。10
 
 ## 7. 三条硬规矩(展开见 `CLAUDE.md` 与 SKILL §4/§5b)
 
-1. **禁区**:绝不自行 `wsl --shutdown` / 重启 WSL 或容器;企点/微信是**真实工作账号**(会离开本机的动作要先复述等确认,读消息一律走旁路读库、不 attach);
+1. **禁区**:绝不自行 `wsl --shutdown` / 重启 WSL 或容器;询价回复由 Dify 经公网信箱发出,不再逐条等确认;读消息一律走旁路读库、不 attach;成交词仍由红线闸拦截。
    真机 `C:\ProgramData\QTrade` 在非真装期间**必须不存在**;**未经安琳同意不运行**产出的安装 EXE / WinAgent exe;docker 只 `build/create/export/save/pull` 且用 `qtrade-build/` 前缀。
 2. **多 agent 编排纪律**:角色独立(**被某道质量门挡住的人不修那道门**,验收用例只由独立验收方改);agent 关了就新起对口的;一个 agent 只给一批活;重活不用 sonnet;重要产出落 `.omc/handoffs/` 且边做边写盘。
 3. **改文档的固定流程**:改 `docs/` → `cd docs && python3 check-truth-tables.py`(exit 0)→ 仓库根 `pytest -q`(代码↔文档对账在里面)→ `git commit` → `git push`。

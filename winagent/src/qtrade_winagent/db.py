@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from .sqlite_locking import LockedConnection
 import threading
 import time
 from contextlib import contextmanager
@@ -51,7 +52,8 @@ class Db:
     def open(self) -> "Db":
         if self.path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
-        con = sqlite3.connect(self.path, check_same_thread=False)
+        con = sqlite3.connect(self.path, check_same_thread=False, factory=LockedConnection)
+        con.guard = self._tx_lock
         con.row_factory = sqlite3.Row
         for p in PRAGMAS:
             con.execute(p)

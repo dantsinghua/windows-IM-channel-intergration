@@ -175,7 +175,8 @@ class HealthLoop:
                 self._accounts.transition(aid, state, state_code=code, state_reason=reason)
             # R6-91:只对「曾经取钥成功、跑起来过」的号自动试钥(self_uid 已回填)。首登没走完的号自动 key/retry 毫无意义
             # (取钥要人重登),反而反复拆掉用户正在做的那一轮;它们由控制台「重新取钥」重跑登录流(含回填/绑定)。
-            if code == "KEY_FAIL" and row.get("self_uid"):
+            if (code == "KEY_FAIL" and row.get("self_uid")
+                    and getattr(ad, "key_retry_required", lambda _aid: False)(aid)):
                 await self._wechat_key_retry(aid, now)
             elif state == "running":
                 self._alerts.resolve(ACCOUNT_OFFLINE, subject=f"account:{aid}", account_id=aid)

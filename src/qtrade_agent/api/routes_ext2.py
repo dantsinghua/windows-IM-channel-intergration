@@ -468,6 +468,11 @@ def register_ext2(app: FastAPI, *, agent, cfg, prefix: str, principal, json_or_e
         row = agent.store.api_client_by_token(token) if token else None
         if row is None:
             return None
+        from .auth import require_client_ip
+        try:
+            require_client_ip(row, ws.client.host if ws.client else None)
+        except ApiError:
+            return None
         return principal_from_row(row, transport=transport)
 
     async def _ws_close(ws: WebSocket, code: int, reason: str, *, accepted: bool = False) -> None:

@@ -58,6 +58,7 @@ class WechatAdapter:
         self._store = store
         self._media_put = media_put
         self._stop_account = None
+        self._key_retry_needed: dict[str, bool] = {}
 
     @staticmethod
     def _view(acct: Account) -> WechatAccountView:
@@ -84,6 +85,9 @@ class WechatAdapter:
         self.last_state_code = code
         return state
 
+    def key_retry_required(self, account_id: str) -> bool:
+        return self._key_retry_needed.get(account_id, False)
+
     async def probe_state(self, acct: Account) -> tuple[str, Optional[str], str]:
         """返回 ``(state, state_code, state_reason)``。判定顺序(实现口径,已登记 handoff「建议裁决」):
         会话代理/模块不可用 → 微信未登录 → **取钥失败优先于锁屏**(前者读写都拒、比后者严格)→ 锁屏 → running。"""
@@ -97,6 +101,7 @@ class WechatAdapter:
             return "degraded", "WINAGENT_USER_OFFLINE", "winagent.toml [wechat] enabled=false(未启用微信模块)"
         wx = st.get("wechat") or {}
         chatlog = st.get("chatlog") or {}
+        self._key_retry_needed[acct.id] = chatlog.get("key_ok") is False
         count = wx.get("window_count")
         # 只有明确报了 0 个窗口才是「号在跑、桌面没窗」。没报 window_count 且进程不在，仍是登出。
         if count == 0:
@@ -106,8 +111,10 @@ class WechatAdapter:
         if not wx.get("running") or not wx.get("logged_in"):
             # 主窗口消失 / Weixin.exe 退出 ⇒ login_required(LOGGED_OUT);槽位 holder 保持为它(它仍是「该在线的那个」)
             return "login_required", "LOGGED_OUT", "微信已退出登录,请点「登录」重新扫码"
-        if not chatlog.get("running") or not chatlog.get("key_ok") or self._poller.degraded_key_fail(acct.id):
+        if not chatlog.get("key_ok"):
             return "degraded", "KEY_FAIL", KEY_FAIL_MESSAGE
+        if not chatlog.get("running") or self._poller.degraded_key_fail(acct.id):
+            return "degraded", "KEY_FAIL", "密钥已就绪，但微信消息读取异常，无法确认送达，暂停发送；无需重新取钥或重装微信"
         if st.get("screen_locked"):
             return "degraded", "SCREEN_LOCKED", SCREEN_LOCKED_MESSAGE
         return "running", None, ""

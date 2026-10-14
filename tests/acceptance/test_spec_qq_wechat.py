@@ -2133,13 +2133,15 @@ async def test_wx_发送前先落SENDING行且source是chatlog(tmp_path):
 
 
 async def test_wx_十秒未读回判FAILED(tmp_path):
-    """06 §2.12 微信行(C.4.2 微信口径):10 s 内没读到 → `state=FAILED`;00 §8.3:`SEND_FAILED` = 「微信 10s 未读回」,`retryable=是`。"""
+    """06 §2.12 微信行(C.4.2 微信口径):10 s 内没读到 → `state=FAILED`;00 §8.3:`SEND_FAILED` = 「微信 10s 未读回」,R6-108:发送动作已调用而确认超时，保留兼容码但禁止自动重试，必须人工核对。"""
     async with wx_rig(tmp_path, clock=Clock(auto_step_ms=4000)) as r:
         make_wx(r, state="running", self_uid=WXID)
         r.wa.send_result = {"ok": True, "code": "SENT", "ext_msg_id": None, "confirm_ms": None}   # WinAgent 只回「点完了」
         res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
         assert res.code == "SEND_FAILED", res
-        assert res.error.retryable is True
+        assert res.error.retryable is False
+        assert res.error.needs_human is True
+        assert res.error.reason == "send_outcome_unknown"
         row = [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]
         assert row["state"] == "FAILED"
 

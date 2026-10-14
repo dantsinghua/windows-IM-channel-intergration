@@ -40,7 +40,7 @@ from ..settings_secrets import VAULT_SCOPE as SETTINGS_VAULT_SCOPE, seal as seal
 from ..store import SeqExhausted
 from ..vault_client import VaultUnavailable
 from ..workflow import WorkflowParseError
-from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level
+from .auth import ApiError, Principal, is_unauth_health_source, principal_from_row, require_account, require_level, require_client_ip, require_operation
 from .routes_ext import register_ext
 from .routes_ext2 import job_is_irreversible, register_ext2
 from .serialize import (account_view, command_view, decode_cursor, encode_cursor,
@@ -353,7 +353,7 @@ def create_api(agent) -> FastAPI:
             if int(blob.get("until_ms") or 0) <= now:
                 return None
             row = agent.store.api_client_get(app_id)
-            if row and row.get("enabled") and not row.get("revoked_ms"):
+            if row and row.get("auth_kind") == "bearer" and row.get("enabled") and not row.get("revoked_ms"):
                 return row
         return None
 
@@ -363,6 +363,7 @@ def create_api(agent) -> FastAPI:
         row = agent.store.api_client_by_token(token) or _grace_client(token)
         if row is None:
             raise ApiError(401, "UNAUTHORIZED", "令牌无效或已过期", reason="bad_token")
+        require_client_ip(row, request.client.host if request.client else None)
         p = principal_from_row(row, transport="local" if (request.client and request.client.host in ("127.0.0.1", "::1")) else "http")
         require_level(p, required)
         agent.store.api_client_touch(p.app_id, agent.clock())
@@ -719,6 +720,7 @@ def create_api(agent) -> FastAPI:
         if not isinstance(op, str) or op not in caps_by_op:
             raise ApiError(400, "INVALID_ARGS", f"未知能力 op={op!r}", reason="unknown_op", extra={"details": [{"pointer": "/op"}]})
         cap = caps_by_op[op]
+        require_operation(p, op, danger=bool(cap.get("danger")))
         key = body.get("idempotency_key")
         if cap["kind"] != "read" and not key:
             raise ApiError(400, "INVALID_ARGS", "写类指令必带 idempotency_key", reason="idempotency_key_required", extra={"details": [{"pointer": "/idempotency_key"}]})
@@ -743,7 +745,28 @@ def create_api(agent) -> FastAPI:
         if want_async is None and getattr(request.state, "hmac", None) is not None:
             want_async = True
         if want_async:
-            asyncio.create_task(agent.bus.submit(cmd), name=f"api-async:{cmd.trace_id}")
+            from ..bus.validate import validate_args
+            invalid = validate_args(op, args)
+            if invalid is not None:
+                raise ApiError(400, "INVALID_ARGS", invalid.message, reason=invalid.reason)
+            task = asyncio.create_task(agent.bus.submit(cmd), name=f"api-async:{cmd.trace_id}")
+            async def wait_for_acceptance():
+                while agent.store.get_command(cmd.trace_id) is None and not task.done():
+                    await asyncio.sleep(0.001)
+            try:
+                await asyncio.wait_for(wait_for_acceptance(), timeout=cfg.api.http_sync_max_wait_ms / 1000)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise ApiError(503, "NOT_READY", "Command admission did not complete", reason="admission_timeout")
+            if agent.store.get_command(cmd.trace_id) is None:
+                res = await task
+                return JSONResponse(status_code=HTTP_BY_CODE.get(res.code, 200), content=result_view(res))
+            # Bus owns admitted jobs; consume unexpected task errors without losing the durable trace.
+            def consume_error(t):
+                if not t.cancelled():
+                    t.exception()
+            task.add_done_callback(consume_error)
             return JSONResponse(status_code=202, content={"ok": True, "trace_id": cmd.trace_id, "accepted": True})
         task = asyncio.ensure_future(agent.bus.submit(cmd))
         try:
@@ -794,7 +817,8 @@ def create_api(agent) -> FastAPI:
         p = _principal(request, "read")
         before, since_ms, until_ms = _page_window(cursor, since, until)
         rows = agent.store.list_sessions_page(account_id=account_id, keyword=keyword, kind=kind,
-                                              since_ms=since_ms, until_ms=until_ms, limit=limit, before=before)
+                                              since_ms=since_ms, until_ms=until_ms, limit=limit, before=before,
+                                              allowed_accounts=None if "*" in p.allow_accounts else p.allow_accounts)
         nxt = _next_cursor(rows, limit, ts_key="last_msg_ms")
         return {"ok": True, "data": [session_view(r) for r in rows if p.allows_account(r["account_id"])], "next_cursor": nxt}
 
@@ -816,7 +840,8 @@ def create_api(agent) -> FastAPI:
         except ValueError:
             raise ApiError(400, "INVALID_ARGS", "since/until 须为 ISO 8601 或毫秒", reason="bad_time", extra={"details": [{"pointer": "/since"}]})
         rows, slow = agent.store.query_messages(account_id=account_id, session_id=session_id, dir=dir, type=type, state=state, since_ms=since_ms,
-                                                until_ms=until_ms, sender=sender, q=q, limit=limit, before=before)
+                                                until_ms=until_ms, sender=sender, q=q, limit=limit, before=before,
+                                                allowed_accounts=None if "*" in p.allow_accounts else p.allow_accounts)
         rows = [r for r in rows if p.allows_account(r["account_id"])]
         out: dict[str, Any] = {"ok": True, "data": [message_view(r) for r in rows],          # §3.4 通用 C-42:{ok, data, next_cursor}(R6-53)
                                "next_cursor": encode_cursor(rows[-1]["ts_ms"], rows[-1]["id"]) if len(rows) == limit else None}
@@ -2466,6 +2491,11 @@ def create_api(agent) -> FastAPI:
             if row is None:
                 await _ws_reject(ws, 4401, "缺少或无效的令牌")
                 return
+            try:
+                require_client_ip(row, ws.client.host if ws.client else None)
+            except ApiError:
+                await _ws_reject(ws, 4401, "Source IP is not permitted")
+                return
             p = principal_from_row(row, transport=transport)
         await ws.accept()
         try:
@@ -2543,6 +2573,8 @@ def create_api(agent) -> FastAPI:
     # 2026-10-10 真实链路实测:渲染进程按 `qt.endpoint.agent` 绝对地址直连 Agent,页面来源是 Vite 回环源或 `file://`(Origin: null),
     # 带 `X-Trace-Id`/`X-QT-Api-Min` 自定义头 ⇒ 浏览器先发 OPTIONS 预检,此前 Agent 回 405,桌面壳一条 API 都发不出去。
     # 🔴 放行表 = `[api] console_origins`,只收 `null` 与回环 http(s) 源;它只决定「浏览器要不要把响应交给页面」,不是鉴权。
+    from .body_limit import RequestBodyLimitMiddleware
+    app.add_middleware(RequestBodyLimitMiddleware)
     from starlette.middleware.cors import CORSMiddleware
     app.add_middleware(
         CORSMiddleware,

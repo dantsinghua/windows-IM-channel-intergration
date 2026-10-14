@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterator, Optional
 from ..ids import message_id, ulid
 from ..models import Message
 from ..text import norm
+from .locking import LockedConnection
 
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_agent.sql")
 
@@ -154,7 +155,8 @@ class Store:
         # 新建库(文件不存在或零字节)与 :memory: 跳过:没有内容可校验。
         preexisting = self.path != ":memory:" and os.path.exists(self.path) and os.path.getsize(self.path) > 0
         probed = preexisting and self._probe_readonly()
-        con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        con = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, factory=LockedConnection)
+        con.guard = self._tx_lock
         con.row_factory = sqlite3.Row
         if preexisting and not probed:      # 只读探测开不了(极少:目录不可写等)⇒ 退回原读写连接上判
             self._quick_check(con)
@@ -251,6 +253,11 @@ class Store:
         if cur > code_v:
             con.close()
             raise self._too_new(cur, code_v)
+        if cur == code_v == BASELINE_VERSION:
+            for table, columns in {"mail_inbox": {"effective_protocol", "idempotency_key"}, "mail_outbox": {"render_notes"}}.items():
+                found = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+                if found and not columns.issubset(found):
+                    raise StoreCorrupt(f"Database version matches but {table} lacks required columns; use its matching software or an explicitly reviewed migration")
 
     def _apply_script(self, version: int, name: str, sql: str) -> None:
         """一个脚本 = 一个事务 + 一行 ``schema_version``(02 §3.3;含脚本 sha256)。"""
@@ -1045,7 +1052,7 @@ class Store:
     def query_messages(self, *, account_id: Optional[str] = None, session_id: Optional[str] = None, dir: Optional[str] = None,
                        type: Optional[str] = None, state: Optional[str] = None, since_ms: Optional[int] = None, until_ms: Optional[int] = None,
                        sender: Optional[str] = None, q: Optional[str] = None, limit: int = 100,
-                       before: Optional[tuple[int, str]] = None) -> tuple[list[dict[str, Any]], bool]:
+                       before: Optional[tuple[int, str]] = None, allowed_accounts: Optional[list[str]] = None) -> tuple[list[dict[str, Any]], bool]:
         """#48:``q`` ≥ 3 字走 FTS trigram(多词 AND),否则 LIKE(``slow_match=True``);按 ts_ms DESC, id DESC;``before`` = 上一页末行 (ts_ms, id)。"""
         sql = (
             "SELECT m.*, s.name AS session_name, s.kind AS session_kind, s.native_id AS session_native_id, "
@@ -1055,6 +1062,11 @@ class Store:
         )
         params: list[Any] = []
         where: list[str] = []
+        if allowed_accounts is not None:
+            if not allowed_accounts:
+                return [], False
+            where.append("m.account_id IN (" + ",".join("?" for _ in allowed_accounts) + ")")
+            params.extend(allowed_accounts)
         words = [w for w in (q or "").split() if w]
         fts_words = [w for w in words if len(w) >= 3]          # trigram:≥3 字符子串才能命中
         like_words = [w for w in words if len(w) < 3]          # 2 字回退 LIKE(02 §2.8.6);多词一律 AND
@@ -1227,9 +1239,14 @@ class Store:
 
     def list_sessions_page(self, *, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
                            since_ms: Optional[int] = None, until_ms: Optional[int] = None,
-                           limit: int = 100, before: Optional[tuple[int, str]] = None) -> list[dict[str, Any]]:
+                           limit: int = 100, before: Optional[tuple[int, str]] = None, allowed_accounts: Optional[list[str]] = None) -> list[dict[str, Any]]:
         """#26 的分页视图:按 ``(COALESCE(last_msg_ms,0), id)`` 降序(与 ``ix_sessions_account_last`` 同向),``before`` = 上一页末行。"""
         sql, params = "SELECT * FROM sessions WHERE 1=1", []
+        if allowed_accounts is not None:
+            if not allowed_accounts:
+                return []
+            sql += " AND account_id IN (" + ",".join("?" for _ in allowed_accounts) + ")"
+            params.extend(allowed_accounts)
         if account_id:
             sql += " AND account_id=?"; params.append(account_id)
         if kind:

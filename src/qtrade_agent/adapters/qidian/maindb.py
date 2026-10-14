@@ -104,7 +104,7 @@ class LocalSqliteMainDb:
     def rows_after(self, table: str, last: int) -> list[MainDbRow]:
         rows = self._run(
             f"SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData) FROM {_q(table)} "
-            f"WHERE _id > ? ORDER BY _id", (last,))
+            f"WHERE _id > ? ORDER BY _id LIMIT 500", (last,))
         return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5] or "", r[6] or "") for r in rows]
 
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]:
@@ -173,7 +173,7 @@ class AdbMainDb:
 
     def rows_after(self, table: str, last: int) -> list[MainDbRow]:
         rows = self._sql(f"SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData) FROM {_q(table)} "
-                         f"WHERE _id > {int(last)} ORDER BY _id")
+                         f"WHERE _id > {int(last)} ORDER BY _id LIMIT 500")
         return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5], r[6]) for r in rows if len(r) == 7]
 
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]:

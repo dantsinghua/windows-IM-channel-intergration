@@ -924,8 +924,10 @@ class WeChatSession:
                    limit: Optional[int] = None) -> dict[str, Any]:
         """#39:取窗 ``cursor − lookback_overlap_s`` + ``normalize`` → 增量 ``Message[]``(``ext_msg_id="{talker}:{seq}"``)。"""
         self._require_key()
-        rows = await self._wx.read_messages(talker=talker, since_seq=since_seq, limit=limit or self._cfg.page_limit)
-        msgs = [{**r, "ext_msg_id": f"{r.get('talker')}:{r.get('seq')}"} for r in rows]
+        from .wechat_read_page import checked_limit, message_page
+        page_limit = checked_limit(self._cfg.page_limit if limit is None else limit)
+        rows = await self._wx.read_messages(talker=talker, since_seq=since_seq, limit=page_limit)
+        msgs = message_page(rows, page_limit)
         return {"messages": msgs, "next_seq": msgs[-1]["seq"] if msgs else since_seq,
                 "lookback_overlap_s": self._cfg.lookback_overlap_s}
 

@@ -824,17 +824,22 @@ class QidianUi:
 def find_node(nodes: list[Node], anchor: dict[str, Any]) -> Optional[Node]:
     """锚点命中:``id`` 全等 或 ``text_any`` 子串命中 或 ``desc_any`` 子串命中(取或)。
 
-    **``id`` 全等优先于文本子串**,两类里各按文档序取第一个。2026-10-10 真机(企点 6.9.7)核对:协议弹窗的
+    **主 ``id`` 优先于 ``id_any``，两者都优先于文本子串**。同一级里按文档序取第一个。
+    2026-10-10 真机(企点 6.9.7)核对:协议弹窗的
     正文 ``dialogText`` 与左键「不同意」在文档序上都排在右键「同意」之前、且都含子串「同意」,若按文档序
     混排取第一个,``agree_button`` 会命中正文或「不同意」⇒ 点不掉协议、登录界面永远准备不好(UI_UNEXPECTED)。
     """
-    ids = [str(anchor["id"])] if anchor.get("id") else []
-    ids += [str(x) for x in (anchor.get("id_any") or []) if x]
+    primary = str(anchor["id"]) if anchor.get("id") else ""
+    alternates = [str(x) for x in (anchor.get("id_any") or []) if x and str(x) != primary]
     texts = [str(t) for t in (anchor.get("text_any") or [])]
     descs = [str(t) for t in (anchor.get("desc_any") or [])]
-    if ids:
+    if primary:
         for n in nodes:
-            if n.rid in ids:
+            if n.rid == primary:
+                return n
+    if alternates:
+        for n in nodes:
+            if n.rid in alternates:
                 return n
     for n in nodes:
         if texts and any(t in n.text for t in texts):

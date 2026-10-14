@@ -101,9 +101,22 @@ class MockPipeClient implements PipeClient {
   }
 }
 
-export function createPipeClient({ isPackaged = true }: { isPackaged?: boolean } = {}): PipeClient {
+/** Windows development separates the Agent credential from the real local
+ * WinAgent credential. Neither credential is disclosed to the renderer. */
+class DevelopmentWindowsPipeClient implements PipeClient {
+  constructor(private readonly agentToken: string, private readonly local: PipeClient) {}
+  describe(): string { return `dev-agent + ${this.local.describe()}` }
+  async fetchTokens(): Promise<TokenBundle> {
+    const local = await this.local.fetchTokens()
+    return { agent_token: this.agentToken, winagent_token: local.winagent_token, expires_at: local.expires_at }
+  }
+}
+
+export function createPipeClient({ isPackaged = true, platform = process.platform }:
+  { isPackaged?: boolean; platform?: NodeJS.Platform } = {}): PipeClient {
   const devToken = process.env.QT_DEV_TOKEN
   if (!isPackaged && devToken?.trim()) {
+    if (platform === "win32") return new DevelopmentWindowsPipeClient(devToken, new NamedPipeClient())
     return new MockPipeClient(devToken)
   }
   return new NamedPipeClient()

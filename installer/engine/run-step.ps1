@@ -925,7 +925,7 @@ try {
             $summary = [pscustomobject]@{
                 package_version = [string]$state.package_version
                 kernel_version  = ''
-                wsl_version     = [string]$state.env.wsl_version
+                wsl_version     = $(if ($state.env.PSObject.Properties['wsl_version']) { [string]$state.env.wsl_version } else { '' })
                 distro          = [string]$state.distro.name
                 images          = ''
                 winagent        = [string]$state.firewall_rules

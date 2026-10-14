@@ -13,9 +13,9 @@ from xml.sax.saxutils import quoteattr
 import pytest
 
 from qtrade_agent.adapters.base import Account
-from qtrade_agent.adapters.qidian.ui import (Profile, ProfileError, QidianUi, attr_normalize, find_node, load_profiles,
-                                             parse_profile, parse_ui_xml, pick_profile, profiles_root, search_key,
-                                             serial_of)
+from qtrade_agent.adapters.qidian.ui import (Node, Profile, ProfileError, QidianUi, attr_normalize, find_node,
+                                             load_profiles, parse_profile, parse_ui_xml, pick_profile, profiles_root,
+                                             search_key, serial_of)
 
 #: 缺省 profile 的正文 —— 按**包内资源**取(不拼源码树路径),与 ui.load_profiles 同一条定位路径。
 DEFAULT_YAML_TEXT = profiles_root().joinpath("default.yaml").read_text(encoding="utf-8")
@@ -194,6 +194,26 @@ async def test_没有任何profile时_登录与发送都回可读原因(rig):
 
 
 # ---------------------------------------------------------------------------- 工具函数
+def _node(rid: str, order: int) -> Node:
+    return Node(rid, "", "", "", (0, 0, 10, 10), True, order)
+
+
+def test_主id优先于文档序更靠前的备用id():
+    primary = f"{PKG}:id/input"
+    alternate = f"{PKG}:id/qdui_aio_inputbar_edittext"
+    nodes = [_node(alternate, 0), _node(primary, 1)]
+    hit = find_node(nodes, {"id": primary, "id_any": [alternate], "text_any": ["发送"]})
+    assert hit is not None and hit.rid == primary and hit.order == 1
+
+
+def test_主id不在时才命中备用id():
+    primary = f"{PKG}:id/fun_btn"
+    alternate = f"{PKG}:id/qdui_aio_inputbar_send_btn"
+    nodes = [_node(alternate, 0), _node("其他", 1)]
+    hit = find_node(nodes, {"id": primary, "id_any": [alternate]})
+    assert hit is not None and hit.rid == alternate
+
+
 def test_控件树解析_容忍设备的尾巴文本():
     nodes = parse_ui_xml(CHAT_TREE)
     assert len(nodes) == 3

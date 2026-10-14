@@ -434,6 +434,11 @@ class MailStore:
         r = self.con.execute("SELECT * FROM mail_outbox WHERE id=?", (outbox_id,)).fetchone()
         return dict(r) if r else None
 
+    def recover_interrupted_sends(self) -> int:
+        with self._store._tx() as c:
+            result = c.execute("UPDATE mail_outbox SET status='DEAD', last_error='smtp_outcome_unknown: interrupted send requires operator review' WHERE status='SENDING'")
+            return result.rowcount
+
     def outbox_due(self, *, now_ms: int, limit: int = 50) -> list[dict[str, Any]]:
         """§2.1:队列消费单线程、按 ``next_attempt_ms`` 排序;一封失败不阻塞后面。"""
         return _rows(self.con.execute(

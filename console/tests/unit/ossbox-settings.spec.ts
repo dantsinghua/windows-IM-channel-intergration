@@ -166,6 +166,55 @@ describe('公网上报 STS 配置表单', () => {
     expect(find(page, 'note').text()).toContain('失败')
   })
 
+  it('口令已输入但尚未保存时明确标示草稿状态', async () => {
+    const page = await mount()
+    await fill(page)
+    expect(find(page, 'auth-status').text()).toContain('已输入')
+    expect(find(page, 'auth-status').text()).toContain('尚未保存')
+    expect(find(page, 'sm4-status').text()).toContain('已输入')
+    expect(find(page, 'sm4-status').text()).toContain('尚未保存')
+    expect(find(page, 'save-status').text()).toContain('尚未保存配置')
+  })
+
+  it('STS 桶名不匹配时显示诊断建议，不回显服务端敏感信息', async () => {
+    vi.mocked(ossboxApi.test).mockRejectedValue(new ApiFailure('NOT_READY', 503, 'fake-trace', {
+      message: 'sensitive ' + AUTH + SM4, reason: 'sts_bucket_mismatch',
+      retryable: true, needs_human: false,
+    }))
+    const page = await mount()
+    await fill(page)
+    await find(page, 'bucket').setValue('synthetic-wrong-bucket')
+    await find(page, 'test').trigger('click')
+    await flushPromises()
+    expect(ossboxApi.test).toHaveBeenCalledWith(
+      expect.objectContaining({ bucket: 'synthetic-wrong-bucket' }), expect.any(AbortSignal))
+    expect(find(page, 'note').text()).toContain('签发桶名')
+    expect(find(page, 'note').text()).toContain('不一致')
+    expect(find(page, 'note').text()).toContain('留空')
+    expect(page.text()).not.toContain(AUTH)
+    expect(page.text()).not.toContain(SM4)
+    expect(page.find('[data-testid="ossbox-auth-result"]').exists()).toBe(false)
+    expect(ossboxApi.put).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['sts_http_401', 'STS 返回 401'],
+    ['sts_unavailable', '无法连接 STS'],
+    ['sts_test_timeout', '请求超时'],
+    ['sts_response_invalid', '凭据字段'],
+  ])('STS 错误原因 %s 对应精确提示', async (reason, expected) => {
+    vi.mocked(ossboxApi.test).mockRejectedValue(new ApiFailure('NOT_READY', 503, 'fake-trace', {
+      message: 'sensitive ' + AUTH, reason, retryable: true, needs_human: false,
+    }))
+    const page = await mount()
+    await fill(page)
+    await find(page, 'test').trigger('click')
+    await flushPromises()
+    expect(find(page, 'note').text()).toContain(expected)
+    expect(page.text()).not.toContain(AUTH)
+    expect(page.find('[data-testid="ossbox-auth-result"]').exists()).toBe(false)
+  })
+
   it('失去管理员读取权限时锁定写入与测试', async () => {
     vi.mocked(ossboxApi.get).mockRejectedValue(new ApiFailure('FORBIDDEN', 403, 'fake-trace', {
       message: 'forbidden', retryable: false, needs_human: false,
@@ -240,7 +289,7 @@ describe('公网上报 STS 配置表单', () => {
     await flushPromises()
     expect(value(page, 'auth-key')).toBe(AUTH)
     expect(value(page, 'sm4-key')).toBe(SM4)
-    expect(find(page, 'auth-status').text()).toContain('未配置')
+    expect(find(page, 'auth-status').text()).toContain('尚未保存')
     expect(find(page, 'note').text()).toMatch(/格式|检查/)
     expect((find(page, 'save').element as HTMLButtonElement).disabled).toBe(false)
     expect(page.emitted('saved')).toBeUndefined()

@@ -33,6 +33,7 @@ Describe 'Exhausted network candidates preserve their public exit code' {
         }
         Mock -ModuleName QTrade.Distro Get-QtOccupiedNetworkPrefixes { [pscustomobject]@{ Ok=$true; Prefixes=@('10.0.0.0/8') } }
         Mock -ModuleName QTrade.Distro Invoke-QtWsl {
+            param($WslArgs, $StandardInput)
             if ($StandardInput) { throw 'Exhausted CIDR must not write the guest environment.' }
             if (($WslArgs -join ' ') -match 'cat /etc/qtrade/install.env') { return [pscustomobject]@{ ExitCode=44; TimedOut=$false; StdOut=''; StdErr='' } }
             [pscustomobject]@{ ExitCode=0; TimedOut=$false; StdOut=''; StdErr='' }

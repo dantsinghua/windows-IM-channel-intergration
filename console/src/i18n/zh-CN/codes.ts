@@ -343,7 +343,9 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   EVENTLOOP_BLOCKED: { severity: 'warn', event: 'alert' },
   WA_VERSION_MISMATCH: { severity: 'warn', event: 'alert' },
   WA_USER_VERSION_MISMATCH: { severity: 'warn', event: 'alert' },
-  WINAGENT_USER_OFFLINE: { severity: 'info', event: 'alert' },
+  WINAGENT_USER_OFFLINE: { severity: 'info', event: 'alert', zh: '用户会话代理未运行，请登录 Windows 桌面并启动会话代理' },
+  WINAGENT_AUTH_FAILED: { severity: 'warn', event: 'alert', zh: 'WinAgent 服务可达，但健康接口认证失败；请核对凭据来源和角色，不要关闭鉴权' },
+  WINAGENT_HEALTH_UNAVAILABLE: { severity: 'warn', event: 'alert', zh: 'WinAgent 服务可达，但健康详情不可读；会话代理状态未知，请检查服务日志' },
   VAULT_ENTROPY_MISSING: { severity: 'crit', event: 'alert' },
   DB_INTEGRITY: { severity: 'crit', event: 'alert' },
   QIDIAN_NOT_ROOT: {

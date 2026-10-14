@@ -16,7 +16,7 @@ export const useSessionStore = defineStore('session', () => {
   const agentDownReason = ref<string | null>(null)
   /** WinAgent 服务 / 用户会话代理(§5.3) */
   const winagentOnline = ref(true)
-  const userAgentOnline = ref(true)
+  const userAgentOnline = ref<boolean | null>(true)
   const apiVersion = ref('')
   const appVersion = ref<{ console: string; electron: string } | null>(null)
   /**
@@ -81,7 +81,7 @@ export const useSessionStore = defineStore('session', () => {
       agentReachable.value = true
       agentDownReason.value = null
       winagentOnline.value = typeof h.winagent === 'object' ? h.winagent.online : !!h.winagent
-      userAgentOnline.value = typeof h.winagent === 'object' ? h.winagent.user_agent : false
+      userAgentOnline.value = typeof h.winagent === 'object' ? h.winagent.user_agent : h.user_agent ?? null
     } catch {
       agentReachable.value = false
       // §5.4 / C-32 白名单⑥:只有 Agent 不可达时才直读 WinAgent 的一句话状态

@@ -28,6 +28,7 @@ from .audit import Audit
 from .config import WinAgentConfig, load as load_cfg
 from .console_pipe import ConsoleTokenPipe
 from .db import Db
+from .errors import WaError
 from .installer_ops import InstallerOps
 from .logfmt import WaFormatter, get_logger
 from .monitor import DiskTarget, Monitor
@@ -361,7 +362,12 @@ async def sync_host_hint(d: SvcDeps) -> None:
         adapter = await asyncio.to_thread(d.netprobe._net.wsl_adapter)
         d.netprobe.state.host_ip = adapter.ipv4 if adapter else None
         if d.netprobe.state.host_ip:
-            await d.hub.call("wsl.host.update", d.netprobe.host_json(), timeout_s=5)
+            try:
+                await d.hub.call("wsl.host.update", d.netprobe.host_json(), timeout_s=5)
+            except WaError as exc:
+                if exc.code != "NOT_READY":
+                    raise
+                log.info("User agent disconnected before host-hint update; retry next round", extra={"op": "wsl.host.update", "code": "NOT_READY"})
 
 
 def validate_install_sid(value: str) -> bool:

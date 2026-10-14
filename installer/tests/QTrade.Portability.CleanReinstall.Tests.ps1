@@ -95,6 +95,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
             [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; TimedOut = $false }
         }
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -eq $script:ArpKey) { $script:Effects.Add('remove-owned-arp'); $script:ArpPresent = $false; return }
             if ($Path -ne $script:LiveRoot -and (Split-Path -Parent $Path) -ne $script:LiveRoot) { throw 'Removal escaped the verified fixture live root.' }
             if ($Path -eq $script:LiveRoot) {
@@ -246,6 +247,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
 
     It 'resumes approved cleaning after the install state was removed first' {
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -ne $script:LiveRoot -and (Split-Path -Parent $Path) -ne $script:LiveRoot) { throw 'Unexpected removal.' }
             Move-Item -LiteralPath (Join-Path $script:LiveRoot 'install\install_state.json') -Destination (Join-Path $script:StageRoot 'removed-state.fixture')
             throw 'Fixture sharing violation after state deletion.'
@@ -254,6 +256,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
         $first.Ok | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:LiveRoot 'install\install_state.json') | Should -BeFalse
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -ne $script:LiveRoot -and (Split-Path -Parent $Path) -ne $script:LiveRoot) { throw 'Unexpected removal.' }
             if ($Path -eq $script:LiveRoot) { $Recurse | Should -BeFalse; @(Get-ChildItem -LiteralPath $Path -Force).Count | Should -Be 0 }
             Move-Item -LiteralPath $Path -Destination (Join-Path $script:StageRoot ('removed-' + [guid]::NewGuid().ToString('N')))
@@ -269,6 +272,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
         @{ Boundary = 'kcheck' }, @{ Boundary = 'sid' }
     ) {
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -ne $script:LiveRoot -and (Split-Path -Parent $Path) -ne $script:LiveRoot) { throw 'Unexpected removal.' }
             Move-Item -LiteralPath (Join-Path $script:LiveRoot 'install\install_state.json') -Destination (Join-Path $script:StageRoot 'removed-state.fixture')
             throw 'Fixture interrupted deletion.'
@@ -291,6 +295,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
 
     It 'resumes after final empty-root removal failed without requiring the deleted marker' {
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -eq $script:LiveRoot) {
                 $Recurse | Should -BeFalse
                 @(Get-ChildItem -LiteralPath $Path -Force).Count | Should -Be 0
@@ -304,6 +309,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
         $first.Reason | Should -Be 'Fixture empty-root sharing violation.'
         @(Get-ChildItem -LiteralPath $script:LiveRoot -Force).Count | Should -Be 0
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             $Path | Should -Be $script:LiveRoot
             $Recurse | Should -BeFalse
             @(Get-ChildItem -LiteralPath $Path -Force).Count | Should -Be 0
@@ -316,6 +322,7 @@ Describe 'Clean reinstall validates payload, consent and precise ownership befor
 
     It 'refuses a new object after committing the empty-root boundary' {
         Mock -ModuleName QTrade.Stage Remove-QtItem {
+            param($Path, [switch]$Recurse)
             if ($Path -eq $script:LiveRoot) { throw 'Fixture final boundary.' }
             if ((Split-Path -Parent $Path) -ne $script:LiveRoot) { throw 'Unexpected target.' }
             Move-Item -LiteralPath $Path -Destination (Join-Path $script:StageRoot ('removed-' + [guid]::NewGuid().ToString('N')))

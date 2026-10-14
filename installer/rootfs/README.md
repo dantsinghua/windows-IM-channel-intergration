@@ -1,5 +1,19 @@
 # `installer/rootfs/` —— 两个 WSL 发行版的构建工程
 
+
+## 2026-10-13 当前合同(R6-102/103)
+
+本轮目标 `rootfs-1.0.2`，组件仍为候选；新 MQ STS 认证前总装暂停，最终归档/真装结论见 [可移植安装交接](../../docs/handoffs/2026-10-13-portable-installer.md)。下方 9 月构建记录只作历史，不复用当时机器路径、代理地址、包数或测试数证明新版通过。
+
+- kcheck 根不预置 `/init` 文件或链接，由 WSL 注入；保留固定 BusyBox SHA、禁 systemd/interop/automount。旧 `/init -> /bin/busybox` 已撤销。新归档检查通过不等于 Hyper-V 已启动。
+- 正式 rootfs 的 `/etc/machine-id` 为空，DBus machine-id 链接到它；目标机首次 OS 启动生成身份。不装入构建机 install.env、token、agent.db、账号数据或现役 Docker 配置。
+- Docker service/socket 等待现场 `/etc/qtrade/install.env`；config oneshot 先写 daemon.json。文件由安装器 stdin 原子注入，键为 `QTRADE_PACKAGE_VERSION/QTRADE_DOCKER_POOL_BASE/QTRADE_DOCKER_BIP`；缺失、重复、非法或与既有 daemon 配置冲突就停止，不 source/eval、不回落默认网段。续跑复用已验证段。
+- WinAgent bootstrap 在 Agent 启动前完成：WA token 只落 guest root 0600 文件，console token 只散列写 Agent DB；firstboot 与 Agent 均受此门控。
+- 首启校验 contents 的两镜像 tar 与企点 6.9.7 APK SHA，原子写 runtime 四个受管键，保留其他配置；APK 为随包 file URI。NapCat 默认 v4.18.28，实际镜像引用以 contents 为准，`docker run --pull=never`。
+- 保留 `--init-db` 自身幂等和“建库后启 Agent”顺序；配置、载荷、token 或版本失败不写 `.imported`。完成 firstboot 后重入由安装器只读判定，不能为测试反复初始化正在运行的 Agent。
+- `qtrade-install-selftest.sh` 仅供安装器：新临时容器无账号挂载、无 ADB/登录；随机 owner label 加真实容器 ID 限定清理，清理成功才报告通过。普通 API 无执行器仍明确 skipped。
+- 离线资产和 Python 依赖须按 lock/精确 wheel 清单与内容 hash 验证；重建只能使用独占源副本，开发者网络仅用于构建取料，不能写进运行载荷。
+
 规格:`docs/03` §2.6.1(kcheck)、§2.7(发行版 qtrade)、§2.2.1(manifest / `rootfs_contents` / G-10 / G-11);
 `docs/02` §2.1(Agent 进程部署);`docs/05` §2.5.1 + §7(设备身份档案库与其落盘路径);
 裁决:`docs/00` §15g **R6-60 (a)(b)**、**R6-61/W4**、**R6-62 Ⅰ(i) / Ⅶ②**。
@@ -31,13 +45,7 @@ busybox 的 sha256 钉死在脚本里(`BUSYBOX_SHA256`),换版本时连那一行
 
 ## 2. 发行版 qtrade
 
-```bash
-export https_proxy=http://172.19.176.1:7890 http_proxy=http://172.19.176.1:7890
-./build-rootfs.sh \
-    --source-root /mnt/c/Users/anlin/qtrade-payload \
-    --images-dir  ~/work/qtrade-payload-build/images \
-    --out         /mnt/c/Users/anlin/qtrade-payload/rootfs/out/rootfs.tar
-```
+构建通过 `build-rootfs.sh` 的 source-root、images-dir、out 等参数传入本次独占路径。构建环境需要代理时使用该次已核验的环境设置，不复制历史主机 IP；本段不提供未经本轮执行的命令样例。
 
 ### 输入(`--source-root` 下)
 
@@ -256,10 +264,9 @@ testclient 三处弃用信号),追溯不到。本轮把运行期依赖**锁死**
 | `runtime-constraints.txt` | 版本事实来源 = 开发机 `~/.venvs/qtrade`(全量测试全绿)的 `uv pip freeze`;作 `uv pip compile --constraint`,把闭包版本钉到这套已验证的版本 |
 | `requirements.lock` | `uv pip compile` 生成的**带 sha256 hash** 全集(15 个运行期包);Dockerfile 用 `--require-hashes` 安装 |
 
-### 重新生成锁(需出网走代理)
+### 历史锁生成命令（2026-09-21；本轮未执行本段，不直接照抄刷新锁）
 
 ```bash
-export https_proxy=http://172.19.176.1:7890 http_proxy=http://172.19.176.1:7890 no_proxy=localhost,127.0.0.1
 # 事实来源:先在开发机 venv 上刷新 runtime-constraints.txt(可选)
 uv pip freeze --python ~/.venvs/qtrade/bin/python > installer/rootfs/runtime-constraints.txt   # 顶部注释需保留/补回
 # 生成 lock
@@ -311,10 +318,9 @@ wheel,被选中那个的 hash 对不上时 pip 把它静默滤掉、改装另一
 | `verify-wheels.py` | `check`:Dockerfile 装完依赖紧接着跑,断言 ①清单包集合 = 锁包集合、每行版本 = 锁、sha256 ∈ 锁;②`pip install --report` 里实装包集合 = 清单、下载文件名与 sha256 = 清单;③site-packages 里 dist-info 集合 = 清单 ∪ {pip}、每包 `WHEEL` 的 Tag 集合 = 清单文件名展开的 tag、版本 = 清单、RECORD 在;④ pip 版本 = `pip-bootstrap.lock`。任一不符 `exit 1` ⇒ 构建失败。`emit`:再生成用 |
 | `gen-wheel-manifest.sh` | 再生成清单:在构建镜像(jammy + python3.12)里按 Dockerfile 同样的 pip 版本与开关对锁跑 `pip install --dry-run --report`,交给 `verify-wheels.py emit`。只 `docker build --output type=local`,不产生镜像 / 容器 |
 
-再生成(需出网走代理;基础镜像默认 `qtrade-build/rootfs:rootfs-1.0.0`,本机没有就先跑一次 build-rootfs.sh,或 `--base` 指定任一 jammy + deadsnakes python3.12 的镜像):
+历史再生成示例（本轮未执行该示例；基础镜像默认 `qtrade-build/rootfs:rootfs-1.0.0`,本机没有就先跑一次 build-rootfs.sh,或 `--base` 指定任一 jammy + deadsnakes python3.12 的镜像):
 
 ```bash
-export https_proxy=http://172.19.176.1:7890 http_proxy=http://172.19.176.1:7890 no_proxy=localhost,127.0.0.1
 bash installer/rootfs/gen-wheel-manifest.sh > installer/rootfs/wheels.expected
 git diff installer/rootfs/wheels.expected   # 人眼看文件名变化(尤其平台 wheel ↔ py3-none-any)再提交
 ```
@@ -339,3 +345,11 @@ Dockerfile 在同一 RUN 末尾删掉,不进 rootfs。升级 pip:改 `pip-bootst
 `docker/requests/urllib3/charset-normalizer` 四包(锁解析确认它们非运行期传递依赖,故不进锁),
 供应链面收窄。产物 sha256 与八项自检(尤其 ⑧ `pip freeze` 与锁逐行一致)登记在产物根 `SOURCES.md` §13,
 交接见 `.omc/handoffs/rootfs-rebuild-2.md`。
+
+## 9. STS 依赖增量（2026-10-13）
+
+按安琳提供的 `STS接口调用说明.html`，本批新增直接运行依赖 `cryptography`，仅实现 STS 鉴权的 SM4-CBC；既有 AES-GCM 消息封套保持不变。当前锁定 `cryptography==50.0.2`、`cffi==2.1.1`、`pycparser==3.11`，运行期闭包由上节历史的 15 包增为 **18 包**。`requirements.in` 与 `pyproject.toml` 保持一致，`requirements.lock` 由约束文件生成；新增三包的验证来源为本批隔离环境，不应套用上节旧开发 venv 的全绿结论。
+
+本次变更仍须通过原 `--require-hashes`、`--only-binary=:all:`、`wheels.expected` 精确文件清单、`verify-wheels.py check` 和 `pip check`；不因新增密码库放宽校验。wheel 清单需在目标 Ubuntu 22.04 / glibc 2.35 / CPython 3.12 x86_64 环境生成，不能直接拿较新 glibc 开发机的选择结果代替。
+
+可携带配置与联调边界见 [STS 交接](../../docs/handoffs/2026-10-13-sts-integration.md)。本机依赖构建及最终验收证据在 `.codex/sts-integration-20261013/`；依赖闭包验证不代表完整 rootfs 重建、安装包重签、Windows 真装或真实 STS 已通过。

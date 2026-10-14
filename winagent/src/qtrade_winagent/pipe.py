@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -30,7 +31,7 @@ from .alerts import AlertBuffer
 from .audit import ACTOR_SVC_TO_USER, Audit
 from .backends import PipeBackend, PipeConn, PipeFrame
 from .config import IpcConfig
-from .errors import FORBIDDEN, INTERNAL, TIMEOUT, VERSION_MISMATCH, WaError, user_agent_offline
+from .errors import FORBIDDEN, INTERNAL, RESOURCE_EXHAUSTED, TIMEOUT, VERSION_MISMATCH, WaError, user_agent_offline
 from .logfmt import get_logger
 
 log = get_logger("pipe")
@@ -372,7 +373,7 @@ class UserAgentLink:
                 if frame.id != HEARTBEAT_ID:                      # 服务对心跳的回应忽略
                     t = asyncio.create_task(self._dispatch(conn, frame), name=f"ua-dispatch-{frame.id}")
                     self._tasks.add(t)
-                    t.add_done_callback(self._tasks.discard)
+                    t.add_done_callback(self._dispatch_done)
                 continue
             now = self._clock()
             if now >= next_hb:
@@ -393,6 +394,12 @@ class UserAgentLink:
         finally:
             if conn is not None:
                 await conn.close()
+
+    def _dispatch_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("IPC response delivery failed", extra={"op":"pipe.response", "code":"RESPONSE_FAILED",
+                                                           "error_type":type(task.exception()).__name__})
 
     async def _dispatch(self, conn: PipeConn, frame: PipeFrame) -> None:
         h = self.handlers.get(frame.method or "")
@@ -418,4 +425,15 @@ class UserAgentLink:
                                                                 "method": frame.method})
             await conn.send(PipeFrame(id=frame.id, ok=False, error={"code": INTERNAL, "message": repr(e)}))
             return
-        await conn.send(PipeFrame(id=frame.id, ok=True, result=result))
+        reply = PipeFrame(id=frame.id, ok=True, result=result)
+        try:
+            size = len(json.dumps(reply.to_wire(), ensure_ascii=False).encode("utf-8")) + 1
+        except (ValueError, TypeError):
+            reply = PipeFrame(id=frame.id, ok=False, error={"code":INTERNAL, "message":"Invalid IPC response",
+                                                          "reason":"ipc_response_invalid"})
+        else:
+            if size > self._cfg.max_frame_kb * 1024:
+                reply = PipeFrame(id=frame.id, ok=False, error={"code":RESOURCE_EXHAUSTED,
+                    "message":"Response exceeds IPC frame budget; operation must not be automatically repeated",
+                    "reason":"ipc_response_too_large", "retryable":False})
+        await conn.send(reply)

@@ -649,7 +649,7 @@ export interface SystemHealth {
   /** 免鉴权来源只回布尔级摘要(C-33);带令牌回全量对象 */
   agent: { version: string; api_version: string; uptime_s: number; db_mb: number; wal_mb: number } | boolean
   dockerd: boolean | null
-  winagent: { online: boolean; version: string | null; user_agent: boolean } | boolean
+  winagent: { online: boolean; version: string | null; user_agent: boolean | null } | boolean
   user_agent?: boolean
   accounts?: Record<string, number>
   disk_free_mb?: number | null

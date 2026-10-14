@@ -15,6 +15,7 @@ Describe 'Guest network plan is injected as data before product startup' {
         $script:EnvPath = Join-Path $TestDrive ([guid]::NewGuid().ToString('N') + '.env')
         Mock -ModuleName QTrade.Distro Get-QtOccupiedNetworkPrefixes { [pscustomobject]@{ Ok = $true; Prefixes = @('10.213.0.0/16') } }
         Mock -ModuleName QTrade.Distro Invoke-QtWsl {
+            param($WslArgs, $StandardInput)
             if ($null -ne $StandardInput -and $StandardInput -ne '') {
                 $script:Events.Add('stdin-env')
                 $StandardInput | Should -Match 'QTRADE_PACKAGE_VERSION=1.0.2'
@@ -129,6 +130,7 @@ Describe 'Firstboot starts only after configuration and credentials exist' {
         $script:Ready = $true; $script:Started = $false; $script:Complete = $false
         Mock -ModuleName QTrade.Distro Read-QtImportedMarker { $null }
         Mock -ModuleName QTrade.Distro Invoke-QtWsl {
+            param($WslArgs, $StandardInput)
             if ($WslArgs -contains 'show') {
                 $out = if ($script:Complete -or $script:Started) { "ActiveState=active`nSubState=exited`nResult=success" } else { "ActiveState=inactive`nSubState=dead`nResult=success" }
                 return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; StdOut = $out }

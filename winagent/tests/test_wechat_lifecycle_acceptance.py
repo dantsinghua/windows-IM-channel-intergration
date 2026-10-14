@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import sys
 import threading
@@ -153,13 +152,30 @@ def isolated_server(monkeypatch, tmp_path):
 
     process = OldProcess()
     psutil = SimpleNamespace(Error=ProcessError, NoSuchProcess=MissingProcess,
-                             AccessDenied=AccessDenied, Process=lambda pid: process)
+                             AccessDenied=AccessDenied, Process=lambda pid: process,
+                             CONN_LISTEN="LISTEN")
     monkeypatch.setitem(sys.modules, "psutil", psutil)
     monkeypatch.setattr(native, "require_windows", lambda *_: None)
-    monkeypatch.setattr(backend, "_port_in_use", lambda: False, raising=False)
     monkeypatch.setattr(backend, "_prepare_server", lambda: str(exe))
-    spawn = AsyncMock(return_value=SimpleNamespace(pid=5404))
+
+    async def spawn_owned(_args, _log_path):
+        proc = SimpleNamespace(pid=5404, returncode=None)
+        backend._chatlog_process = proc
+        backend._chatlog_mode = "server"
+        backend._chatlog_created = 123.0
+        return proc
+
+    spawn = AsyncMock(side_effect=spawn_owned)
     monkeypatch.setattr(backend, "_spawn_owned", spawn)
+
+    def listener_state():
+        proc = backend._chatlog_process
+        if proc is not None and proc.returncode is None:
+            return "occupied", proc.pid
+        return "free", None
+
+    monkeypatch.setattr(backend, "_server_listener_state", listener_state)
+    monkeypatch.setattr(backend, "_chatlog_server_healthy", lambda _timeout: True)
     row = {"state": "active", "operation_id": "previous-operation", "pid": 5403,
            "created": 123.0, "exe": str(exe), "mode": "server", "work_dir": str(work)}
     return SimpleNamespace(backend=backend, psutil=psutil, process=process, calls=calls,
@@ -191,9 +207,9 @@ async def test_recreated_backend_refuses_an_unresolved_previous_helper(isolated_
 
 
 @pytest.mark.asyncio
-async def test_unknown_port_owner_is_not_terminated_or_replaced(isolated_server, monkeypatch):
+async def test_occupied_read_port_blocks_server_start(isolated_server, monkeypatch):
     f = isolated_server
-    monkeypatch.setattr(f.backend, "_port_in_use", lambda: True, raising=False)
+    monkeypatch.setattr(f.backend, "_server_listener_state", lambda: ("occupied", 9999))
     with pytest.raises(WaError) as caught:
         await f.backend.chatlog_serve()
     assert caught.value.reason == "wechat_chatlog_port_in_use"
@@ -202,73 +218,180 @@ async def test_unknown_port_owner_is_not_terminated_or_replaced(isolated_server,
     assert not f.record.exists()
 
 
+def test_status_read_survives_a_still_running_previous_helper(isolated_server, monkeypatch):
+    f = isolated_server
+    f.record.write_text(json.dumps(f.row))
+    monkeypatch.setattr(f.backend, "locate", lambda: {"installed": True, "version": "4.1.12.26"})
+    monkeypatch.setattr(f.backend, "main_window", lambda: {"exists": False})
+    monkeypatch.setattr(f.backend, "key_state", lambda: {"ok": False})
+    monkeypatch.setattr(f.backend, "current_wxid", lambda: None)
+    monkeypatch.setattr(f.backend, "narrator_running", lambda: False)
+    monkeypatch.setattr(f.backend, "ui_tree_visible", lambda: False)
+    status = WeChatSession(f.backend, WechatConfig(enabled=True)).status()
+    assert status["chatlog"]["running"] is False
+    assert status["chatlog"]["port"] == 5030
+    assert f.calls == []
+
+
+def test_key_reservation_does_not_query_listeners(isolated_server):
+    f = isolated_server
+    queried = []
+    f.psutil.net_connections = lambda kind="tcp": queried.append(kind) or []
+    f.backend._reserve_start("key")
+    assert queried == []
+    assert f.record.is_file()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("previous", ["exited", "pid_reused"])
 async def test_proven_stale_record_allows_start_without_touching_reused_pid(isolated_server, previous):
     f = isolated_server
     f.record.write_text(json.dumps(f.row))
-    if previous == "exited":
-        def gone(_pid):
+
+    def process_for(pid):
+        if pid != f.row["pid"]:
+            return f.process
+        if previous == "exited":
             raise f.psutil.NoSuchProcess("synthetic exited process")
-        f.psutil.Process = gone
-    else:
-        f.process.create_time = lambda: 999.0
+
+        class Reused:
+            def create_time(self):
+                return 999.0
+
+            def exe(self):
+                return f.process.exe()
+
+            def cmdline(self):
+                return f.process.cmdline()
+
+        return Reused()
+
+    f.psutil.Process = process_for
     assert await f.backend.chatlog_serve() == 5404
     f.spawn.assert_awaited_once()
     assert f.calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("connect_result", [13, 101, 10060, OSError("synthetic access error"), TimeoutError("synthetic timeout")])
-async def test_uncertain_port_probe_never_claims_the_port_is_free(isolated_server, monkeypatch, connect_result):
-    import qtrade_winagent.win.wechat as native
-    import socket
-
-    class Probe:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def settimeout(self, _seconds):
-            pass
-
-        def connect_ex(self, target):
-            assert target == ("127.0.0.1", 5030)
-            if isinstance(connect_result, BaseException):
-                raise connect_result
-            return connect_result
-
+async def test_failed_listener_query_never_claims_the_port_is_free(isolated_server, monkeypatch):
     f = isolated_server
-    monkeypatch.setattr(native, "socket", SimpleNamespace(socket=lambda *_: Probe(),
-                                                        AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM))
-    monkeypatch.setattr(f.backend, "_port_in_use", WinWeChat._port_in_use.__get__(f.backend))
-    with pytest.raises(WaError):
+    monkeypatch.setattr(f.backend, "_server_listener_state",
+                        WinWeChat._server_listener_state.__get__(f.backend))
+
+    def net_connections(_kind):
+        raise OSError("synthetic listener query failure")
+
+    f.psutil.net_connections = net_connections
+    with pytest.raises(WaError) as caught:
         await f.backend.chatlog_serve()
+    assert caught.value.reason == "wechat_chatlog_port_unverified"
     f.spawn.assert_not_awaited()
     assert not f.record.exists()
 
 
-@pytest.mark.parametrize("connect_result", [errno.ECONNREFUSED, 10061])
-def test_definite_connection_refusal_means_the_port_is_available(monkeypatch, connect_result):
+@pytest.mark.asyncio
+async def test_unknown_listener_state_blocks_server_start(isolated_server, monkeypatch):
+    f = isolated_server
+    monkeypatch.setattr(f.backend, "_server_listener_state", lambda: ("unknown", None))
+    with pytest.raises(WaError) as caught:
+        await f.backend.chatlog_serve()
+    assert caught.value.reason == "wechat_chatlog_port_unverified"
+    f.spawn.assert_not_awaited()
+    assert not f.record.exists()
+
+
+@pytest.mark.asyncio
+async def test_transient_unknown_during_readiness_retries_until_our_listener_is_healthy(isolated_server, monkeypatch):
+    f = isolated_server
+    answers = [("free", None), ("unknown", None), ("unknown", None)]
+
+    def listener():
+        if answers:
+            return answers.pop(0)
+        proc = f.backend._chatlog_process
+        return "occupied", proc.pid
+
+    monkeypatch.setattr(f.backend, "_server_listener_state", listener)
+    assert await f.backend.chatlog_serve() == 5404
+    f.spawn.assert_awaited_once()
+    assert answers == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_unknown_after_launch_uses_the_remaining_budget(isolated_server, monkeypatch):
     import qtrade_winagent.win.wechat as native
-    import socket
 
-    class Probe:
-        def __enter__(self):
-            return self
+    f = isolated_server
+    monkeypatch.setattr(native, "CHATLOG_SERVER_START_TIMEOUT_S", 0.8)
+    monkeypatch.setattr(f.backend, "_server_listener_state", lambda: ("unknown", None)
+                        if f.backend._chatlog_process is not None else ("free", None))
+    with pytest.raises(WaError) as caught:
+        await f.backend.chatlog_serve()
+    assert caught.value.reason == "wechat_server_owner_unverified"
+    f.spawn.assert_awaited_once()
 
-        def __exit__(self, *_):
-            return False
 
-        def settimeout(self, _seconds):
-            pass
+@pytest.mark.asyncio
+async def test_listener_stolen_after_launch_is_not_our_ready_server(isolated_server, monkeypatch):
+    f = isolated_server
+    monkeypatch.setattr(f.backend, "_server_listener_state", lambda: ("occupied", 7777)
+                        if f.backend._chatlog_process is not None else ("free", None))
+    with pytest.raises(WaError) as caught:
+        await f.backend.chatlog_serve()
+    assert caught.value.reason == "wechat_server_owner_unverified"
+    f.spawn.assert_awaited_once()
+    assert f.calls == []
 
-        def connect_ex(self, target):
-            assert target == ("127.0.0.1", 5030)
-            return connect_result
 
-    monkeypatch.setattr(native, "socket", SimpleNamespace(socket=lambda *_: Probe(),
-                                                        AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM))
-    assert WinWeChat()._port_in_use() is False
+class _Addr:
+    def __init__(self, ip, port):
+        self.ip = ip
+        self.port = port
+
+
+class _Row:
+    def __init__(self, ip, port, pid, status="LISTEN"):
+        self.laddr = _Addr(ip, port)
+        self.port = port
+        self.pid = pid
+        self.status = status
+
+
+def test_listener_table_covers_ipv4_conflict_and_ipv6_wildcard(monkeypatch):
+    import qtrade_winagent.win.wechat as native
+
+    tables = {"tcp": [], "tcp6": []}
+
+    def net_connections(kind):
+        if kind not in tables:
+            raise AssertionError(kind)
+        return list(tables[kind])
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
+        net_connections=net_connections, CONN_LISTEN="LISTEN"))
+    backend = WinWeChat()
+
+    tables["tcp"] = [_Row("192.168.1.8", 5030, 11)]
+    assert backend._server_listener_state() == ("free", None)
+
+    tables["tcp"] = [_Row("127.0.0.1", 5030, 22), _Row("10.0.0.8", 1, 22)]
+    assert backend._server_listener_state() == ("occupied", 22)
+
+    tables["tcp"] = [_Row("0.0.0.0", 5030, 33)]
+    assert backend._server_listener_state() == ("occupied", 33)
+
+    tables["tcp"] = []
+    tables["tcp6"] = [_Row("::", 5030, 44)]
+    assert backend._server_listener_state() == ("unknown", None)
+
+    tables["tcp6"] = [_Row("::ffff:127.0.0.1", 5030, 55)]
+    assert backend._server_listener_state() == ("occupied", 55)
+
+    def broken(kind):
+        if kind == "tcp6":
+            raise OSError("synthetic ipv6 table failure")
+        return []
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
+        net_connections=broken, CONN_LISTEN="LISTEN"))
+    assert backend._server_listener_state() == ("unknown", None)

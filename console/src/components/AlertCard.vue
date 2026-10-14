@@ -13,6 +13,14 @@ const actions = computed(() => (props.alert.hint_actions ?? []).filter((a) => a 
 const unknownActions = computed(() => (props.alert.hint_actions ?? []).filter((a) => !(a in HINT_ACTIONS)))
 /** 常驻码有自己的固定文案(N-25);其余由 Agent 的 title/message 承担 */
 const fallbackZh = computed(() => ALERT_CODES[props.alert.code]?.zh ?? '')
+const driftEvidence = computed(() => {
+  if (props.alert.code !== 'POOL_CALIBRATION_DRIFT') return []
+  const labels: Record<string, string> = { budget_mb: '预算 MB', actual_mb: '实占 P95 MB', drift_pct: '偏差 %', threshold_pct: '阈值 %' }
+  return Object.entries(labels).flatMap(([key, label]) => {
+    const value = props.alert.evidence?.[key]
+    return typeof value === 'number' && Number.isFinite(value) ? [`${label}: ${value}`] : []
+  })
+})
 </script>
 
 <template>
@@ -25,6 +33,11 @@ const fallbackZh = computed(() => ALERT_CODES[props.alert.code]?.zh ?? '')
     </div>
     <div class="qt-small qt-muted">{{ alert.message || fallbackZh }}</div>
     <div class="qt-small qt-muted qt-mono">{{ alert.code }} · {{ alert.subject }}</div>
+    <div v-if="alert.first_seen_at || alert.last_seen_at" class="qt-small qt-muted">
+      <span v-if="alert.first_seen_at">首次发生: <time :datetime="alert.first_seen_at">{{ alert.first_seen_at }}</time></span>
+      <span v-if="alert.last_seen_at"> · {{ alert.state === 'resolved' ? '恢复时间' : '最近观测' }}: <time :datetime="alert.last_seen_at">{{ alert.last_seen_at }}</time></span>
+    </div>
+    <div v-if="driftEvidence.length" class="qt-small qt-muted">校准依据: {{ driftEvidence.join(' · ') }}</div>
     <div v-if="actions.length" class="qt-row">
       <a-button
         v-for="act in actions"

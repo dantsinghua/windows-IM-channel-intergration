@@ -4,7 +4,7 @@
 - 端点级别 R/W/A:``level`` read < write < admin;不够 → ``403 FORBIDDEN``;无/错令牌 → ``401 UNAUTHORIZED``。
 - ``allow_accounts_json`` 收窄账号访问(``["*"]`` = 不限)。
 - ``/system/health`` 对 ``unauth_health_sources``(loopback / WSL 网关)免鉴权、只回布尔摘要(C-33)。
-- HMAC(公网入站,02 §3.5)本期未接。
+- HMAC 由 API 中间件验签，具体操作在命令入口授权；两条路径均检查来源限制。
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ class Principal:
     level: str
     allow_accounts: list[str]
     transport: str = "http"
+    allow_ops: Optional[list[str]] = None
 
     @property
     def actor(self) -> str:
@@ -54,7 +55,8 @@ def principal_from_row(row: dict[str, Any], *, transport: str) -> Principal:
         allow = json.loads(row.get("allow_accounts_json") or '["*"]')
     except ValueError:
         allow = ["*"]
-    return Principal(app_id=row["app_id"], level=row["level"], allow_accounts=list(allow), transport=transport)
+    ops = json.loads(row.get("allow_ops_json") or '["*"]')
+    return Principal(app_id=row["app_id"], level=row["level"], allow_accounts=list(allow), transport=transport, allow_ops=list(ops))
 
 
 def is_unauth_health_source(host: Optional[str], sources: tuple[str, ...], wsl_gateway: Optional[str] = None) -> bool:
@@ -85,3 +87,19 @@ def require_level(p: Principal, required: str) -> None:
 def require_account(p: Principal, account_id: str) -> None:
     if not p.allows_account(account_id):
         raise ApiError(403, "FORBIDDEN", f"当前令牌无权访问账号 {account_id}", reason="account_not_allowed")
+
+
+def require_client_ip(row, host):
+    from ..hmac_inbound import HmacVerifier
+    try:
+        cidrs = json.loads(row.get("ip_allow_json") or "[]")
+    except (TypeError, ValueError):
+        raise ApiError(403, "FORBIDDEN", "Invalid source policy", reason="ip_not_allowed")
+    if not isinstance(cidrs, list) or not HmacVerifier._ip_allowed(host, cidrs):
+        raise ApiError(403, "FORBIDDEN", "Source IP is not permitted", reason="ip_not_allowed")
+
+def require_operation(p, op, *, danger=False):
+    if p.app_id == "console" or p.allow_ops is None:
+        return
+    if op not in p.allow_ops and not ("*" in p.allow_ops and not danger):
+        raise ApiError(403, "FORBIDDEN", "Operation is not permitted", reason="op_not_allowed")

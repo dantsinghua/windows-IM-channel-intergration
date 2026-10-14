@@ -175,7 +175,7 @@ class MailSender:
                 continue
             try:
                 with open(path, "rb") as f:
-                    data = f.read()
+                    data = f.read(int(self.cfg.outbound.max_attachment_mb * 1024 * 1024) + 1)
             except OSError:
                 continue                                                # 附件取不到不阻塞正文(§2.4.1「仍超或非图片 → 不附」同理)
             if len(data) > self.cfg.outbound.max_attachment_mb * 1024 * 1024:

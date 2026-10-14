@@ -621,9 +621,12 @@ class WinWeChat:
         import psutil
 
         try:
-            rows = psutil.net_connections(kind="tcp")
-            if not isinstance(rows, list):
-                return "unknown", None
+            rows: list[Any] = []
+            for kind in ("tcp", "tcp6"):
+                part = psutil.net_connections(kind=kind)
+                if not isinstance(part, list):
+                    return "unknown", None
+                rows.extend(part)
             listeners: set[Optional[int]] = set()
             for row in rows:
                 if row.status != psutil.CONN_LISTEN or not row.laddr or row.laddr.port != self._port:
@@ -883,6 +886,7 @@ class WinWeChat:
         require_windows("chatlog server")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CHATLOG_SERVER_START_TIMEOUT_S
+        last_state = "free"
         try:
             async with asyncio.timeout(CHATLOG_SERVER_START_TIMEOUT_S):
                 await _blocking(self._reserve_start, "server")
@@ -894,9 +898,7 @@ class WinWeChat:
                         raise WaError(NOT_READY, "微信读取服务启动后退出，请查看 chatlog-server.log",
                                       reason="wechat_server_process_exited")
                     state, listener_pid = await _blocking(self._server_listener_state)
-                    if state == "unknown":
-                        raise WaError(BUSY, "无法核实本次微信读取服务的监听状态",
-                                      reason="wechat_server_owner_unverified")
+                    last_state = state
                     if state == "occupied":
                         if listener_pid != p.pid or not self._server_process_matches(listener_pid):
                             raise WaError(BUSY, "端口监听者与本次微信读取服务进程不一致",
@@ -910,9 +912,15 @@ class WinWeChat:
                     if remaining <= 0:
                         break
                     await asyncio.sleep(min(0.1, remaining))
+                if last_state == "unknown":
+                    raise WaError(BUSY, "无法核实本次微信读取服务的监听状态",
+                                  reason="wechat_server_owner_unverified")
                 raise WaError(TIMEOUT, "微信读取服务未能在 5 秒内确认属于本次进程并就绪",
                               reason="wechat_server_start_timeout")
         except TimeoutError as exc:
+            if last_state == "unknown":
+                raise WaError(BUSY, "无法核实本次微信读取服务的监听状态",
+                              reason="wechat_server_owner_unverified") from exc
             raise WaError(TIMEOUT, "微信读取服务启动与健康确认超过 5 秒",
                           reason="wechat_server_start_timeout") from exc
 
@@ -940,8 +948,7 @@ class WinWeChat:
         return os.path.join(self._chatlog_dir, "chatlog.exe")
 
     def chatlog_status(self) -> dict[str, Any]:
-        if self._chatlog_process is None and self._chatlog_record_id is None:
-            self._previous_process()
+        """只报告本实例持有的进程。遗留记录留给下一次启动去拒绝，状态查询本身不因此失败。"""
         running = self._chatlog_process is not None and self._chatlog_process.returncode is None
         http_ok = False
         if running and self._chatlog_mode == "server":
@@ -982,40 +989,34 @@ class WinWeChat:
         return dirs[0] if dirs else None
 
     # ---------------------------------------------------------------- 读写
-    def _get_items(self, path: str, query: dict[str, Any]) -> list[dict[str, Any]]:
-        """chatlog HTTP 取 ``items``。R6-91(2026-10-10 实测):① 不带 ``format=json`` 回的是 **CSV**(json.loads 必崩);
-        ② **查无 = 404**(不是故障,当空);其它非 200 照常抛,交上层计 H09 / KEY_FAIL。"""
+    def _get_items(self, path: str, query: dict[str, Any], *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
         import urllib.error
         import urllib.parse
         import urllib.request
+        from ..errors import RESOURCE_EXHAUSTED
         url = f"http://127.0.0.1:{self._port}{path}?" + urllib.parse.urlencode({**query, "format": "json"})
         try:
-            with urllib.request.urlopen(url, timeout=10) as r:
-                body = json.loads(r.read().decode("utf-8") or "{}")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return []
-            raise
-        if isinstance(body, list):
-            return body
-        return (body or {}).get("items") or []
+            with urllib.request.urlopen(url, timeout=timeout_s) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise WaError(RESOURCE_EXHAUSTED, "Chatlog HTTP page too large", reason="wechat_read_response_too_large")
+                body = json.loads(raw.decode("utf-8") or "{}")
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+            if status == 404: return []
+            raise WaError(NOT_READY, f"Chatlog read returned HTTP {status}; stored keys unchanged",
+                          reason="wechat_read_unavailable", retryable=True) from None
+        except (OSError, ValueError):
+            raise WaError(NOT_READY, "Chatlog read is unavailable or invalid; stored keys unchanged",
+                          reason="wechat_read_unavailable", retryable=True) from None
+        return body if isinstance(body, list) else (body or {}).get("items") or []
 
     async def read_messages(self, *, talker: Optional[str], since_seq: Optional[int], limit: int) -> list[dict[str, Any]]:
-        """R6-91:``/api/v1/chatlog`` **必须同时带 ``time`` 与 ``talker``**(实测缺任一 400)。不给 talker(全量轮)
-        ⇒ 先列会话,逐会话取;``time`` 取近 ``CHATLOG_READ_DAYS`` 天的日期区间,再按 ``seq`` 过滤增量。"""
-        rng = chatlog_time_range()
-        talkers = [talker] if talker else [s.get("userName") or s.get("talker") or s.get("UserName")
-                                           for s in await self.list_sessions(keyword=None, limit=limit)]
-
-        def go() -> list[dict[str, Any]]:
-            out: list[dict[str, Any]] = []
-            for t in talkers:
-                if not t:
-                    continue
-                out.extend(self._get_items("/api/v1/chatlog", {"time": rng, "talker": t, "limit": limit}))
-            return out
-        rows = await asyncio.to_thread(go)
-        return [r for r in rows if since_seq is None or int(r.get("seq", 0) or 0) > since_seq]
+        # Both "time" and "talker" are mandatory in each backend query.
+        from ..wechat_read_page import collect_messages
+        return await _blocking(lambda: collect_messages(self._get_items, time_range=chatlog_time_range(),
+                                                       talker=talker, since_seq=since_seq, limit=limit))
 
     def _resolve_send_target(self, talker: str) -> str:
         """talker(wxid / ``xxx@chatroom``)→ pyweixin 搜索用的显示名;找不到或**重名**一律抛 ``WaError``,不发。"""

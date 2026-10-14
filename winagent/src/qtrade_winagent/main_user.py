@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import ntpath
 import os
+import re
 import sys
 from typing import Optional
 
@@ -126,11 +127,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("--dev 必须显式给 --root(否则默认落进生产目录 %ProgramData%\\QTrade\\winagent);"
                  "照 README §3 的写法:--dev --root /tmp/wa-dev")
     root = args.root or DEFAULT_ROOT
-    cfg = load_cfg(read_toml(args.config or os.path.join(root, "winagent.toml")))
     try:
         log_dir = None if args.dev else user_log_dir()
     except ValueError as e:
         ap.error(str(e))
+    config_path = args.config or os.path.join(root, "winagent.toml")
+    try:
+        if args.config and not os.path.isfile(config_path):
+            raise FileNotFoundError(config_path)
+        cfg = load_cfg(read_toml(config_path))
+    except (OSError, ValueError) as exc:
+        # Exception text may contain configuration values. Log type/location only.
+        setup_logging("ERROR", log_dir)
+        location = re.search(r"at line (\d+), column (\d+)", str(exc))
+        log.error("Invalid WinAgent configuration; startup cancelled",
+                  extra={"op": "config.load", "code": "CONFIG_INVALID",
+                         "kv": {"path": config_path, "error_type": type(exc).__name__,
+                                "location": location.group(0) if location else "unknown"}})
+        return 2
     setup_logging(cfg.log.level, log_dir)
     ua = build_user_agent(cfg, session_id=args.session_id, user_sid=user_sid, root=root,
                           fake=args.dev)

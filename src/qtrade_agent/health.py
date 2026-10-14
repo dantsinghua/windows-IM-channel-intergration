@@ -61,6 +61,10 @@ class Health:
                 self.winagent_online = False
                 self.user_agent_online = False
 
+    def invalidate_winagent_details(self) -> None:
+        # A reachable ping cannot establish authenticated session health.
+        self.user_agent_online = None
+
     def set_dockerd(self, ok: bool) -> None:
         self.dockerd_ok = ok
 

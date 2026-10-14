@@ -75,7 +75,15 @@ function Invoke-QtProcess {
         $si.RedirectStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
         if ($WorkingDirectory) { $si.WorkingDirectory = $WorkingDirectory }
         foreach ($key in $Environment.Keys) { $si.EnvironmentVariables[$key] = [string]$Environment[$key] }
-        $started = $p.Start()
+        # .NET Framework derives the stdin writer encoding from Console.InputEncoding.
+        # UTF8Encoding(true) emits a preamble even when bytes are written via BaseStream.
+        $originalInputEncoding = [Console]::InputEncoding
+        try {
+            if ($si.RedirectStandardInput) { [Console]::InputEncoding = New-Object Text.UTF8Encoding($false) }
+            $started = $p.Start()
+        } finally {
+            if ($si.RedirectStandardInput) { [Console]::InputEncoding = $originalInputEncoding }
+        }
         if (-not $started) { throw 'Process did not start.' }
         $outTask = $p.StandardOutput.BaseStream.CopyToAsync($so)
         $errTask = $p.StandardError.BaseStream.CopyToAsync($se)

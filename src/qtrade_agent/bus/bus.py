@@ -75,6 +75,8 @@ class Bus:
         self._consumers: dict[str, asyncio.Task] = {}
         self._inflight: dict[tuple[str, str], asyncio.Future] = {}
         self._last_send_ms: dict[str, int] = {}
+        self._confirm_tasks: set[asyncio.Task] = set()
+        self._jobs: dict[str, _Job] = {}
         self.random = random.Random()
 
     # ------------------------------------------------------------------ 队列
@@ -86,14 +88,27 @@ class Bus:
         return q
 
     async def close(self) -> None:
-        for t in self._consumers.values():
+        tasks = [*self._consumers.values(), *self._confirm_tasks]
+        for t in tasks:
             t.cancel()
-        for t in self._consumers.values():
+        for t in tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
         self._consumers.clear()
+        self._confirm_tasks.clear()
+        for q in self._queues.values():
+            while not q.empty():
+                item = q.get_nowait()
+                if isinstance(item, _Job) and not item.done.done():
+                    self._finalize(item, _err_result("INTERNAL", item.cmd.trace_id or "", CommandError("Agent stopped before completion", needs_human=True)))
+                q.task_done()
+        self._queues.clear()
+        for job in list(self._jobs.values()):
+            if not job.done.done():
+                self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Agent stopped; execution outcome requires review", reason="shutdown_outcome_unknown", needs_human=True)))
+        self._jobs.clear()
 
     async def _consume(self, account_id: str, q: asyncio.Queue) -> None:
         while True:
@@ -117,7 +132,7 @@ class Bus:
             except Exception as e:                      # 单条指令的异常不杀消费者
                 log.exception("bus consumer error account=%s: %s", account_id, e)
                 if isinstance(item, _Job) and not item.done.done():
-                    item.done.set_result(_err_result("INTERNAL", item.cmd.trace_id or "", CommandError(str(e))))
+                    self._finalize(item, _err_result("INTERNAL", item.cmd.trace_id or "", CommandError("Command execution failed; consult its trace", needs_human=bool(item.msg_id))))
             finally:
                 q.task_done()
 
@@ -170,12 +185,13 @@ class Bus:
             args_hash = canonical_args_hash(cmd.args)
             row = self.store.idem_get(acct.id, key)
             if row is not None:
-                if row["args_hash"] != args_hash:
+                if row["op"] != cmd.op or row["args_hash"] != args_hash:
                     return _err_result("INVALID_ARGS", tid, CommandError("幂等键已被使用且参数不同", reason="idempotency_args_mismatch"))
                 if row["status"] == "DONE":
                     prev = self.store.get_command_result(row["trace_id"]) or {}
-                    return CommandResult(ok=True, code="IDEMPOTENT_REPLAY", trace_id=row["trace_id"], data=prev.get("data", {}),
-                                         cost_ms=0, source=prev.get("source"))
+                    error = None if prev.get("ok") else CommandError(prev.get("error_message") or "Previous execution failed", retryable=bool(prev.get("error_retryable")), needs_human=bool(prev.get("error_needs_human")))
+                    return CommandResult(ok=bool(prev.get("ok")), code="IDEMPOTENT_REPLAY", trace_id=row["trace_id"], data=prev.get("data", {}),
+                                         cost_ms=0, source=prev.get("source"), error=error)
                 if row["status"] == "SENDING":
                     fut = self._inflight.get((acct.id, key))
                     if fut is not None:
@@ -183,7 +199,7 @@ class Bus:
                             res = await asyncio.wait_for(asyncio.shield(fut), timeout=cmd.timeout_ms / 1000)
                         except asyncio.TimeoutError:
                             return _err_result("TIMEOUT", tid, CommandError("同键指令仍在执行", reason="inflight"))
-                        return CommandResult(ok=res.ok, code="IDEMPOTENT_REPLAY", trace_id=res.trace_id, data=res.data, source=res.source)
+                        return CommandResult(ok=res.ok, code="IDEMPOTENT_REPLAY", trace_id=res.trace_id, data=res.data, source=res.source, error=res.error)
                     row = dict(row, status="ABANDONED")
                 if row["status"] == "ABANDONED":
                     if await adapter.confirm_probe(acct, cmd):        # 上次其实已发(只查本库:出向行是否已被 ingest 合并成 DELIVERED)
@@ -220,6 +236,8 @@ class Bus:
                                   transport=cmd.origin.transport, actor=cmd.origin.actor, ip=cmd.origin.ip, now_ms=now)
         loop = asyncio.get_running_loop()
         job = _Job(cmd=cmd, acct=acct, done=loop.create_future())
+        self._jobs[tid] = job
+        job.done.add_done_callback(lambda _: self._jobs.pop(tid, None))
         if key:
             self._inflight[(acct.id, key)] = job.done
         q = self._queue(acct.id)
@@ -236,7 +254,20 @@ class Bus:
 
     # ------------------------------------------------------------------ 执行(在账号队列里)
     async def _execute(self, job: _Job) -> None:
+        if job.done.done():
+            return
+        current = self._load_account(job.cmd.account_id)
+        if current is None:
+            self._finalize(job, _err_result("TARGET_NOT_FOUND", job.cmd.trace_id or "", CommandError("Account no longer exists")))
+            return
+        job.acct = current
         cmd, acct, adapter = job.cmd, job.acct, self.adapters[job.acct.channel]
+        if self.gate is not None and cmd.op.startswith("send_"):
+            row = self.store.get_account(acct.id)
+            blocked = self.gate.check(row, cmd.op, cmd.args) if row else CommandError("Account unavailable")
+            if blocked is not None:
+                self._finalize(job, _err_result("GATE_BLOCKED", cmd.trace_id or "", blocked))
+                return
         started = self.clock()
         self.store.command_started(cmd.trace_id, started)
         if cmd.op.startswith("send_"):
@@ -251,6 +282,8 @@ class Bus:
                     self._finalize(job, blocked)
                     return
             await self._rate_limit(acct.id)
+            if job.done.done():
+                return
             session = cmd.args["session"]
             native = session.split(":", 1)[1] if session.startswith(acct.id + ":") else session
             kind = "group" if native.startswith("g_") or native.endswith("@chatroom") else "private"
@@ -274,7 +307,9 @@ class Bus:
                 return
             self._last_send_ms[acct.id] = self.clock()
             # 队列外等确认:不 await,让消费者立刻取下一条
-            asyncio.create_task(self._confirm(job, native, started, res.source or "qidian_db"), name=f"confirm:{cmd.trace_id}")
+            task = asyncio.create_task(self._confirm(job, native, started, res.source or "qidian_db"), name=f"confirm:{cmd.trace_id}")
+            self._confirm_tasks.add(task)
+            task.add_done_callback(self._confirm_tasks.discard)
             return
         res = await adapter.execute(acct, cmd)
         res.cost_ms = self.clock() - started
@@ -299,6 +334,11 @@ class Bus:
             log.error("bus 确认窗磁盘满 account=%s: %s", job.acct.id, e.message)
             self._finalize(job, _err_result("DISK_FULL", job.cmd.trace_id or "",
                                             CommandError(e.message, reason="disk_full", retryable=False, needs_human=True)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Confirmation task failed trace=%s", job.cmd.trace_id)
+            self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Send outcome is unknown; manual review required", reason="confirmation_error", needs_human=True)))
 
     async def _confirm_loop(self, job: _Job, native_id: str, started: int, source: str) -> None:
         cmd, acct = job.cmd, job.acct
@@ -307,6 +347,8 @@ class Bus:
                     "wechat": self.cfg.wechat_adapter.confirm_poll_interval_ms}.get(acct.channel, 1000) / 1000
         deadline = started + timeout
         while True:
+            if job.done.done():
+                return
             st = self.store.message_state(job.msg_id) if job.msg_id else None
             if st and st["state"] == "DELIVERED":
                 self._finalize(job, CommandResult(ok=True, code="DELIVERED", trace_id=cmd.trace_id, source=source,
@@ -318,13 +360,16 @@ class Bus:
             if acct.channel in ("qidian", "wechat"):
                 # 窗内每 confirm_poll_interval_ms 投一轮「只查目标会话」的加速 poll
                 # (企点 06 §2.9.5;微信 05 §2.4.4 ⑦「发送确认期把 5 s 加密到 1 s」)
-                self._queue(acct.id).put_nowait((acct, [native_id]))
+                try:
+                    self._queue(acct.id).put_nowait((acct, [native_id]))
+                except asyncio.QueueFull:
+                    pass  # Normal backpressure: the regular poller still supplies readback.
             await asyncio.sleep(interval)
         if acct.channel == "wechat":
             if job.msg_id:
                 self.store.mark_out_state(job.msg_id, "FAILED")
             self._finalize(job, CommandResult(ok=False, code="SEND_FAILED", trace_id=cmd.trace_id, source=source,
-                                              error=CommandError("10 秒内未在聊天记录读到", retryable=True), cost_ms=self.clock() - started))
+                                              error=CommandError("发送动作已调用，但未在确认窗口读回；请核对会话，禁止自动补发", reason="send_outcome_unknown", retryable=False, needs_human=True), cost_ms=self.clock() - started))
         else:
             if job.msg_id:
                 self.store.mark_out_state(job.msg_id, "UNCONFIRMED")
@@ -344,7 +389,9 @@ class Bus:
                                   needs_human=err.needs_human if err else None, confirmed_by=confirmed_by, confirm_ms=confirm_ms, now_ms=now)
         if cmd.idempotency_key:
             self._inflight.pop((acct.id, cmd.idempotency_key), None)
-            if err is not None and err.needs_human:
+            if err is not None and err.reason == "send_outcome_unknown":
+                self.store.idem_finish(account_id=acct.id, key=cmd.idempotency_key, status="DONE", result_code=res.code, now_ms=now)
+            elif err is not None and err.needs_human:
                 self.store.idem_delete(acct.id, cmd.idempotency_key)   # needs_human 不落 DONE(06 §9)
             elif res.code == "SEND_CALLED_BUT_UNCONFIRMED":
                 pass                                                    # B-08:留 SENDING,下次同 key 先 confirm_probe

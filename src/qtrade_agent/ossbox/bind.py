@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from typing import Any
+from collections import OrderedDict
 
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:
@@ -46,21 +47,26 @@ class Dedup:
     """``ext_msg_id`` 与 ``idempotency_key`` 分属两个集合，互不影响。"""
 
     def __init__(self) -> None:
-        self._events: set[Any] = set()
-        self._commands: set[Any] = set()
+        self._events: OrderedDict[Any, None] = OrderedDict()
+        self._commands: OrderedDict[Any, None] = OrderedDict()
+        self.max_entries = 4096
 
     def seen_event(self, ext_msg_id: str) -> bool:
         """第一次见到该扩展消息号返回 True，之后返回 False。"""
         if ext_msg_id in self._events:
             return False
-        self._events.add(ext_msg_id)
+        self._events[ext_msg_id] = None
+        if len(self._events) > self.max_entries:
+            self._events.popitem(last=False)
         return True
 
     def seen_command(self, idempotency_key: str) -> bool:
         """第一次见到该幂等键返回 True，之后返回 False。"""
         if idempotency_key in self._commands:
             return False
-        self._commands.add(idempotency_key)
+        self._commands[idempotency_key] = None
+        if len(self._commands) > self.max_entries:
+            self._commands.popitem(last=False)
         return True
 
 

@@ -27,7 +27,8 @@ from .adapters.qidian.ui import QidianUi
 from .adapters.qq import H08_INTERVAL_S, OneBotTransport, QQAdapter, QQHealth
 from .adapters.qq.login import NapCatLoginBackend
 from .adapters.wechat import WeChatWinAgent, WechatAdapter, WechatLoginFlow, WechatPoller
-from .alerts import H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, Alerts
+from .alerts import (H02_WINAGENT_API_DOWN, H03_DOCKERD_DOWN, Alerts,
+                     WINAGENT_AUTH_FAILED, WINAGENT_HEALTH_UNAVAILABLE, WINAGENT_USER_OFFLINE)
 from .bus.bus import Bus
 from . import device_profiles as device_profiles_mod
 from .config import H13_INTERVAL_S, AgentConfig
@@ -198,7 +199,11 @@ class AgentApp:
         self.endpoint_probe: PublicEndpointProbe
         self._started = False
         self._winagent_alert_settled = False
+        self._winagent_detail_settled: set[str] = set()
         self._dockerd_alert_settled = False
+        self._recovery_enabled = False
+        self._recovery_waiting = False
+        self._recovery_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------ 装配
     def open(self) -> "AgentApp":
@@ -374,7 +379,7 @@ class AgentApp:
         except ValueError:
             log.warning("对象存储配置无效，询价轮询与目录发布未启用")
             oss_box = None
-        self.xunjia_inbox = (XunjiaInbox.from_env(self.store, sender, clock=self.clock, box=oss_box)
+        self.xunjia_inbox = (XunjiaInbox.from_env(self.store, sender, clock=self.clock, box=oss_box, bus=self.bus)
                              if oss_box is not None else None)
         self.scheduler.register("xunjia_inbox", POLL_INTERVAL_SEC, self.xunjia_inbox_tick, run_immediately=True)
         from .ossbox.catalog_publish import CatalogPublisher
@@ -763,6 +768,23 @@ class AgentApp:
         if n:
             log.info("events_outbox ws 行保留期清理 %d 行", n)
 
+    def _settle_winagent_detail(self, code: str) -> None:
+        if code not in self._winagent_detail_settled:
+            # Reconcile a real persisted firing, not a fabricated recovery.
+            row = self.store.con.execute(
+                "SELECT json_extract(payload_json, ?) FROM events_outbox "
+                "WHERE target=? AND event=? AND json_extract(payload_json, ?)=? "
+                "AND json_extract(payload_json, ?)=? ORDER BY seq DESC LIMIT 1",
+                ("$.state", "ws", "alert", "$.code", code, "$.subject", "host"),
+            ).fetchone()
+            if row and row[0] == "firing":
+                self.alerts.settle(code, subject="host")
+            else:
+                self.alerts.resolve(code, subject="host")
+            self._winagent_detail_settled.add(code)
+        else:
+            self.alerts.resolve(code, subject="host")
+
     async def winagent_probe(self) -> None:
         """H02:``GET /wa/v1/ping``(无鉴权 2 s)→ 在线再 ``GET /wa/v1/health`` 取 user_agent / host 快照 → pool 的 windows 池输入(02 §2.5 降级 ①)。"""
         pong = await self.winagent.ping()
@@ -789,8 +811,23 @@ class AgentApp:
         h = await self.winagent.health()
         if h is None:
             self.health.set_winagent(True, version=self.winagent.last_version)
+            self.health.invalidate_winagent_details()
+            self.pool.set_windows(known=False)
+            self.pressure.evaluate(None)
+            reason = self.winagent.last_health_error or "unavailable"
+            code = WINAGENT_AUTH_FAILED if reason in {"no_token", "unauthorized", "forbidden"} else WINAGENT_HEALTH_UNAVAILABLE
+            self.alerts.firing(code, subject="host", hint_actions=["open_env"],
+                               evidence={"reason": reason, "http_status": self.winagent.last_health_status,
+                                         "endpoint": "/wa/v1/health"})
             return
-        self.health.set_winagent(True, version=h.get("version") or self.winagent.last_version, user_agent=bool(h.get("user_agent")))
+        for code in (WINAGENT_AUTH_FAILED, WINAGENT_HEALTH_UNAVAILABLE):
+            self._settle_winagent_detail(code)
+        self.health.set_winagent(True, version=h.get("version") or self.winagent.last_version, user_agent=h["user_agent"])
+        if h["user_agent"]:
+            self._settle_winagent_detail(WINAGENT_USER_OFFLINE)
+        else:
+            self.alerts.firing(WINAGENT_USER_OFFLINE, subject="host", hint_actions=["open_env"],
+                               evidence={"reason": "user_agent_offline"})
         host = h.get("host") or {}
         modules = h.get("modules") or {}
         self.pool.set_windows(total_mb=host.get("total_mb"), available_mb=host.get("available_mb"),
@@ -812,6 +849,7 @@ class AgentApp:
                 self._dockerd_alert_settled = True
             else:
                 self.alerts.resolve(H03_DOCKERD_DOWN, subject="wsl")
+            self._schedule_recovery()
         else:
             self.alerts.firing(H03_DOCKERD_DOWN, subject="wsl")
 
@@ -836,8 +874,29 @@ class AgentApp:
             await self._configure_saved_ossbox()
             await self.scheduler.start()
             self._started = True
+            self._recovery_enabled = recover
+            self._recovery_waiting = recover
             if recover:
-                asyncio.create_task(self.accounts.recover(), name="recover")
+                self._schedule_recovery()
+
+    def _schedule_recovery(self) -> None:
+        if not (self._started and self._recovery_enabled and self._recovery_waiting):
+            return
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return
+        async def run():
+            try:
+                if not await self.runtime.dockerd_ok():
+                    return
+                if not (self._started and self._recovery_enabled):
+                    return
+                await self.accounts.recover()
+                self._recovery_waiting = False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Dependency-ready account recovery failed; retry after readiness probe")
+        self._recovery_task = asyncio.create_task(run(), name="recover")
 
     async def _configure_saved_ossbox(self) -> None:
         from .ossbox.catalog_publish import CatalogPublisher
@@ -854,7 +913,7 @@ class AgentApp:
             saved, box = configured
             if box is not None:
                 inbox = XunjiaInbox.from_env(self.store, self._oss_sender, clock=self.clock,
-                    box=box, workbench_id=saved["workbench_id"])
+                    box=box, workbench_id=saved["workbench_id"], bus=self.bus)
                 # A new destination must not reuse the former destination's upload hashes.
                 state = os.path.join(self.data_dir, "catalog-publish-" + saved["revision"] + ".json")
                 publisher = CatalogPublisher.from_env(self.store, state,
@@ -871,6 +930,12 @@ class AgentApp:
 
     async def stop(self) -> None:
         """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""
+        self._recovery_enabled = False
+        self._recovery_waiting = False
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            await asyncio.gather(self._recovery_task, return_exceptions=True)
+            self._recovery_task = None
         if self._started:
             await self.scheduler.stop()
             self._started = False
