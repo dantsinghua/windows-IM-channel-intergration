@@ -1,7 +1,8 @@
 """容器 / adb 执行后端 —— 协议 + 真实 CLI 实现 + 可编程假实现。
 
 真实后端只包 ``docker`` / ``adb`` 命令行(无 SDK 依赖);容器里跑测试一律注入假后端,**绝不在开发容器里碰真 docker / adb**。
-adb 协议**故意没有** ``kill_server``:06 §2.9.5 / 04 §2.7.4 第 3 条 —— 单账号问题一律不 ``kill-server``,本模块从接口上就做不到。
+adb 协议新增 ``kill_server`` / ``reconnect_all``(R6-111 自愈):仅在 H06 streak≥3 的自愈路径调用,
+受 ``auto_recover`` 与每小时上限约束;普通单账号问题仍只 disconnect+connect,不 kill-server。
 """
 from __future__ import annotations
 
@@ -78,6 +79,8 @@ class AdbBackend(Protocol):
     async def forward_remove(self, serial: str, local: str) -> None: ...
     async def package_installed(self, serial: str, package: str) -> bool: ...
     async def install(self, serial: str, apk_path: str, *, expected_package: str) -> None: ...
+    async def kill_server(self) -> None: ...                      # R6-111 自愈:H06 streak≥3 路径专用
+    async def reconnect_all(self, serials: list[str]) -> None: ...  # kill_server 后重连全部企点 serial
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,13 @@ class DockerCliBackend:
         return rc == 0
 
 
+class AdbRecoveryError(RuntimeError):
+    def __init__(self, reason: str, returncode: int | None = None):
+        self.reason = reason
+        self.returncode = returncode
+        super().__init__(reason)
+
+
 class AdbCliBackend:
     """宿主 adb server 固定 127.0.0.1:16000(04 §2.7.4);每条命令都 ``-s <serial>``,只动本账号那一条连接。"""
 
@@ -227,6 +237,33 @@ class AdbCliBackend:
             raise RuntimeError(f"Android 包安装失败 rc={rc}")
         if not await self.package_installed(serial, expected_package):
             raise RuntimeError("Android 包安装后仍不存在")
+
+    async def kill_server(self) -> None:
+        """Only the managed 16000 daemon may be reset; failures remain failures."""
+        if self._base[-2:] != ["-P", "16000"]:
+            raise AdbRecoveryError("adb_recovery_port_invalid")
+        try:
+            rc, _ = await _run_cancellable(self._base + ["kill-server"], timeout_s=10)
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+            raise AdbRecoveryError("adb_kill_timeout") from None
+        if rc != 0:
+            raise AdbRecoveryError("adb_kill_failed", rc)
+
+    async def reconnect_all(self, serials: list[str]) -> None:
+        """Continue reconnecting other owned serials, but never report partial success as OK."""
+        allowed = {"127.0.0.1:" + str(p) for p in range(16001, 16099)}
+        if self._base[-2:] != ["-P", "16000"] or any(s not in allowed for s in serials):
+            raise AdbRecoveryError("adb_recovery_serial_invalid")
+        failed = False
+        for serial in dict.fromkeys(serials):
+            try:
+                rc, out = await _run_cancellable(self._base + ["connect", serial], timeout_s=10)
+                if rc != 0 or not any(line.strip() in ("connected to " + serial, "already connected to " + serial) for line in out.splitlines()):
+                    failed = True
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired, OSError):
+                failed = True
+        if failed:
+            raise AdbRecoveryError("adb_reconnect_failed")
 
 
 # ---------------------------------------------------------------------- 假实现(开发容器 / 验收用)
@@ -363,6 +400,19 @@ class FakeAdb:
         self.connected.add(serial)
         self.state[serial] = "device"
         return True
+
+    async def kill_server(self) -> None:
+        """R6-111 自愈:清空所有连接与状态(模拟 server 重启)。"""
+        self.calls.append(("kill_server", ""))
+        self.connected.clear()
+        self.state.clear()
+
+    async def reconnect_all(self, serials: list[str]) -> None:
+        """kill_server 后依次重连全部 serial(模拟 server 重启后恢复)。"""
+        self.calls.append(("reconnect_all", ",".join(serials)))
+        for s in serials:
+            self.connected.add(s)
+            self.state[s] = "device"
 
     async def disconnect(self, serial: str) -> None:
         self.calls.append(("disconnect", serial))

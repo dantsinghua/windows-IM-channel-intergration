@@ -12,7 +12,7 @@ const AUTH = 'ui-test-business-secret'
 const SM4 = 'fEdCbA9876543210'
 const STS_URL = 'https://sts.example.invalid/v1/api/sts'
 const PUBLIC = { sts_url: STS_URL, allow_http: false, endpoint: '', bucket: '', workbench_id: '' }
-const GOOD: OssboxAuthenticationResult = { authenticated: true, bucket: 'ui-test-bucket', expiration: '2030-01-01T00:00:00Z' }
+const GOOD: OssboxAuthenticationResult = { authenticated: true, expiration: '2030-01-01T00:00:00Z' }
 const wrappers: VueWrapper[] = []
 
 function settings(configured = false): OssboxSettingsResponse {
@@ -178,7 +178,7 @@ describe('公网上报 STS 配置表单', () => {
 
   it('STS 桶名不匹配时显示诊断建议，不回显服务端敏感信息', async () => {
     vi.mocked(ossboxApi.test).mockRejectedValue(new ApiFailure('NOT_READY', 503, 'fake-trace', {
-      message: 'sensitive ' + AUTH + SM4, reason: 'sts_bucket_mismatch',
+      message: 'sensitive ' + AUTH + SM4, reason: 'sts_http_401',
       retryable: true, needs_human: false,
     }))
     const page = await mount()
@@ -188,9 +188,9 @@ describe('公网上报 STS 配置表单', () => {
     await flushPromises()
     expect(ossboxApi.test).toHaveBeenCalledWith(
       expect.objectContaining({ bucket: 'synthetic-wrong-bucket' }), expect.any(AbortSignal))
-    expect(find(page, 'note').text()).toContain('签发桶名')
-    expect(find(page, 'note').text()).toContain('不一致')
-    expect(find(page, 'note').text()).toContain('留空')
+    expect(find(page, 'note').text()).toContain('STS 返回 401')
+    expect(find(page, 'note').text()).toContain('业务口令')
+    expect(find(page, 'note').text()).toContain('SM4')
     expect(page.text()).not.toContain(AUTH)
     expect(page.text()).not.toContain(SM4)
     expect(page.find('[data-testid="ossbox-auth-result"]').exists()).toBe(false)

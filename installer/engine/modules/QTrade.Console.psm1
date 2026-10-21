@@ -53,16 +53,23 @@ function Install-QtConsoleShortcuts {
         [Parameter(Mandatory)][string] $ConsoleDir,
         [string] $StartMenuRoot,
         [string] $DesktopDir,
-        [switch] $NoDesktop
+        [switch] $NoDesktop,
+        [string] $LauncherPath = ''
     )
     if (-not $StartMenuRoot) { $StartMenuRoot = Join-Path (Get-QtEnvironmentPath -Name 'ProgramData') 'Microsoft\Windows\Start Menu\Programs' }
     if (-not $DesktopDir) { $DesktopDir = [Environment]::GetFolderPath('CommonDesktopDirectory') }
     $target = Join-Path $ConsoleDir $script:QtConsoleExeName
+    $launchArgs = ''
+    if ($LauncherPath) {
+        if (-not (Test-Path -LiteralPath $LauncherPath -PathType Leaf)) { throw 'INSTALLED_LAUNCHER_MISSING' }
+        $target = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
+        $launchArgs = (@('-NoProfile','-ExecutionPolicy','Bypass','-File',$LauncherPath) | ForEach-Object {ConvertTo-QtProcessArgument -Value $_}) -join ' '
+    }
     $created = @()
     $menuDir = Join-Path $StartMenuRoot $script:QtStartMenuFolder
-    $created += (New-QtShortcut -LinkPath (Join-Path $menuDir 'QTrade 控制台.lnk') -TargetPath $target -Description 'QTrade 多实例 IM 控制台')
+    $created += (New-QtShortcut -LinkPath (Join-Path $menuDir 'QTrade 控制台.lnk') -TargetPath $target -Arguments $launchArgs -Description 'QTrade 多实例 IM 控制台')
     if (-not $NoDesktop) {
-        $created += (New-QtShortcut -LinkPath (Join-Path $DesktopDir 'QTrade 控制台.lnk') -TargetPath $target -Description 'QTrade 多实例 IM 控制台')
+        $created += (New-QtShortcut -LinkPath (Join-Path $DesktopDir 'QTrade 控制台.lnk') -TargetPath $target -Arguments $launchArgs -Description 'QTrade 多实例 IM 控制台')
     }
     return [pscustomobject]@{ Created = $created }
 }

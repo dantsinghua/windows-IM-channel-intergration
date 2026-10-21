@@ -92,9 +92,9 @@ const account = computed<Account | null>(() => (createdId.value ? accounts.byId[
 const prompt = computed(() => (createdId.value ? accounts.prompts[createdId.value] ?? null : null))
 const stateCode = computed(() => account.value?.state_code ?? '')
 const wxFailed = computed(() => channel.value === 'wechat' && (
-  ['stopped', 'error', 'disabled'].includes(account.value?.state ?? '') || stateCode.value === 'KEY_FAIL'
+  ['stopped', 'error', 'disabled'].includes(account.value?.state ?? '') || ['KEY_FAIL', 'WECHAT_READ_FAILED'].includes(stateCode.value)
 ))
-const wxReadUnavailable = computed(() => wxFailed.value && stateCode.value === 'KEY_FAIL'
+const wxReadUnavailable = computed(() => stateCode.value === 'WECHAT_READ_FAILED' || wxFailed.value && stateCode.value === 'KEY_FAIL'
   && wxStatus.value?.chatlog?.key_ok === true
   && (!account.value?.self_uid || wxStatus.value?.wechat?.wxid === account.value.self_uid))
 const wxFailureReason = computed(() => account.value?.state_reason
@@ -600,6 +600,7 @@ async function startWechatFlow(): Promise<void> {
  */
 async function keyRetry(): Promise<void> {
   if (!flowActive || !createdId.value || busy.value) return
+  const readRetry = stateCode.value === 'WECHAT_READ_FAILED'
   busy.value = true
   try {
     await accountsApi.start(createdId.value)
@@ -608,12 +609,17 @@ async function keyRetry(): Promise<void> {
     if (!flowActive) return
     syncWechatStep()
     if (!wxFailed.value) armStallTimer()
-    message.info('已受理重试，正在检查取钥环境。请等待当前步骤提示。', TOAST_S)
+    message.info(readRetry ? '已受理消息读取重试，不会重新取钥。请等待读取状态更新。' : '已受理重试，正在检查取钥环境。请等待当前步骤提示。', TOAST_S)
   } catch (e) {
     toastError(e)
   } finally {
     busy.value = false
   }
+}
+
+async function recheckRead(): Promise<void> {
+  if (stateCode.value === 'WECHAT_READ_FAILED') await keyRetry()
+  else await loadWxStatus()
 }
 
 /** 向导内「取消」也走 Agent 级取消(R4-4),不打 WinAgent 17610 */
@@ -926,7 +932,7 @@ onUnmounted(() => {
 
       <!-- 微信 ⑥ 取钥三段 -->
       <section v-if="channel === 'wechat' && step === 5" class="qt-card box">
-        <div class="qt-section-title">{{ wxReadUnavailable ? '微信已取钥，消息读取未就绪' : wxFailed ? '微信登录未完成' : '取钥(三段固定顺序)' }}</div>
+        <div class="qt-section-title">{{ wxReadUnavailable ? '微信消息读取未就绪' : wxFailed ? '微信登录未完成' : '取钥(三段固定顺序)' }}</div>
         <ol v-if="!wxFailed" class="keysteps" :data-testid="T.wxKeyProgress">
           <li>
             ⑥a 起 hook —— 已进入取钥流程
@@ -962,7 +968,7 @@ onUnmounted(() => {
           <div class="qt-row">
             <a-button v-if="!wxReadUnavailable && account?.state !== 'disabled'" type="primary" :loading="busy" :data-testid="T.wxKeyRetry" @click="keyRetry">重新取钥</a-button>
             <a-button v-if="!wxReadUnavailable && stateCode === 'KEY_FAIL'" :data-testid="T.wxKeyReinstall" @click="step = 1.5">用随包版本重装</a-button>
-            <a-button v-if="wxReadUnavailable" data-testid="qt-wechat-read-recheck" @click="loadWxStatus">重新检查读取服务</a-button>
+            <a-button v-if="wxReadUnavailable" data-testid="qt-wechat-read-recheck" :loading="busy" @click="recheckRead">重新检查读取服务</a-button>
             <a-button @click="go('/env')">去环境页导日志</a-button>
           </div>
         </div>

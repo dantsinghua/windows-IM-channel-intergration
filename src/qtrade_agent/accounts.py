@@ -103,6 +103,13 @@ class AccountService:
     def transition(self, id: str, state: str, *, state_code: Optional[str] = None, state_reason: str = "", login_session_id: str = "",
                    prompt: Optional[dict[str, Any]] = None, trace_id: Optional[str] = None, **kw: Any) -> dict[str, Any]:
         now = self._clock()
+        # R6-111:state/state_code/state_reason 都未变、无 prompt 且无额外 kw(deleted_ms/desired_state 等)时,不写库不 emit——根治重复 transition 刷屏。
+        cur = self._store.get_account_full(id)
+        if cur is not None and prompt is None and not kw and not login_session_id and not trace_id \
+                and cur["state"] == state \
+                and (cur.get("state_code") or "") == (state_code or "") \
+                and (cur.get("state_reason") or "") == (state_reason or ""):
+            return cur
         before, row = self._store.transition(id, state, state_code=state_code, state_reason=state_reason, now_ms=now, **kw)
         if state in LOGIN_PHASE:
             if login_session_id:
@@ -118,6 +125,8 @@ class AccountService:
             self._current_ls.pop(id, None)
             self._remind.pop(id, None)
         payload = self.view(row) | {"state_before": before, "login_session_id": login_session_id, "prompt": prompt}
+        trace_id = trace_id or ulid(now)
+        log.info("account_state account=%s from=%s to=%s code=%s trace_id=%s", id, before, state, state_code, trace_id)
         self._events.emit("account_state", payload=payload, account_id=id, channel=row["channel"], trace_id=trace_id, now_ms=now)
         return row
 
@@ -231,6 +240,8 @@ class AccountService:
             raise ApiError(409, "NOT_APPLICABLE", "账号已停用,先 enable", reason="account_disabled")
         if self.busy(id):
             raise ApiError(409, "NOT_APPLICABLE", "账号正在切换状态", reason="busy")
+        if row["channel"] == "wechat" and row["state"] == "degraded" and row.get("state_code") == "WECHAT_READ_FAILED":
+            return self._begin_read_retry(row, actor=actor)
         # R6-91:微信首登卡在取钥 / UI 树(degraded + KEY_FAIL|WAIT_UI_TREE)⇒ 允许 start 重跑登录流(**不登出微信**,
         # WinAgent 按「已登录」路径走:仪式可见即跳 → identified → 回填/绑定 → 取钥)。否则这类号只能删了重建。
         wechat_relogin = (row["channel"] == "wechat" and row["state"] == "degraded"
@@ -341,6 +352,42 @@ class AccountService:
                     and row and row.get("enabled") and not row.get("deleted_ms") and row["state"] in LOGIN_PHASE
                     and self._clock() < attempt["deadline"])
 
+    async def _qq_qrcode_failed(self, id: str, attempt: dict[str, Any]) -> None:
+        """N consecutive failures in an explicit login flow, with a persistent hourly cap."""
+        attempt["qr_failures"] = int(attempt.get("qr_failures", 0)) + 1
+        if attempt["qr_failures"] < self.cfg.qq.login_refresh_max_rounds:
+            return
+        def current() -> bool:
+            row = self._store.get_account_full(id)
+            return bool(self._qq_attempt_current(id, attempt) and row and row.get("auto_recover")
+                        and row.get("desired_state") == "running" and row.get("state") == "login_required"
+                        and not self.busy(id))
+        if not current():
+            return
+        budget = self._store.reserve_recovery_attempt("recovery.qq_qr." + id, now_ms=self._clock(),
+                                                      maximum=self.cfg.health.container_restart_max)
+        if not budget["allowed"]:
+            if budget["reason"] in ("recovery_budget_exhausted", "recovery_budget_invalid"):
+                self._alerts_firing("QQ_LOGIN_RECOVERY_EXHAUSTED", id, evidence=budget, hint_actions=["open_logs"])
+            return
+        attempt["qr_failures"] = 0
+        trace = ulid(self._clock())
+        result = "OK"
+        try:
+            if not await self._runtime.restart_napcat_qr(self.get(id), current):
+                result = "LOGIN_ATTEMPT_CANCELLED"
+        except asyncio.CancelledError:
+            result = "LOGIN_ATTEMPT_CANCELLED"
+            raise
+        except Exception as error:
+            result = "QQ_LOGIN_RECOVERY_FAILED"
+            log.warning("QQ QR recovery failed account=%s trace_id=%s type=%s", id, trace, type(error).__name__)
+        finally:
+            self._store.insert_audit(kind="system", transport="system", actor="system:qq_login",
+                                     action="qq.qrcode.recover", account_id=id, trace_id=trace, result_code=result,
+                                     detail={"attempt": budget["attempts"]}, now_ms=self._clock())
+
+
     async def _qq_refresh(self, id: str, attempt: dict[str, Any], *, refresh: bool) -> None:
         async with attempt["lock"]:
             if not self._qq_attempt_current(id, attempt) or self.get(id)["state"] != "login_required":
@@ -353,6 +400,9 @@ class AccountService:
                 png = await asyncio.wait_for(self._qq_login_backend.qrcode(self.get(id), refresh=refresh), 26)
                 if not valid_png(png):
                     raise ValueError("invalid_png")
+                attempt["qr_failures"] = 0
+                if self._alerts is not None:
+                    self._alerts.resolve("QQ_LOGIN_RECOVERY_EXHAUSTED", subject="account:" + id, account_id=id)
                 encoded = base64.b64encode(png).decode("ascii")
                 previous = (self._prompts.get(id) or {}).get("prompt", {}).get("qrcode_png_b64")
                 if refresh and encoded == previous:
@@ -368,6 +418,7 @@ class AccountService:
                 log.info("QQ 二维码未更新 account=%s: %s", id, type(exc).__name__)
                 reason = "二维码获取暂不可用，请重试；若持续失败请检查 NapCat 登录初始化"
                 prompt["text"] = reason
+                await self._qq_qrcode_failed(id, attempt)
             if not self._qq_attempt_current(id, attempt) or self.get(id)["state"] != "login_required":
                 return
             attempt["refresh_due"] = self._clock() + QR_REFRESH_MS
@@ -716,7 +767,7 @@ class AccountService:
                 self._note_login_probe_health(aid, report.get("reason"), report.get("stage"), recovered=matched)
                 if not matched:
                     continue
-                # self_uid 来自实际观察，不用登录名、手机号、邮箱作缺省 UID。
+                # self_uid 来自实际观察，不用登录名、手机号、邮件地址作缺省 UID。
                 profile = report.get("profile") or {}
                 if profile.get("selection") == "default" and profile.get("app_version"):
                     self.note_default_profile(aid, profile["app_version"])
@@ -1082,12 +1133,34 @@ class AccountService:
                 results[aid] = {"ok": False, "code": "INTERNAL", "reason": str(e)}
         return {"results": results}
 
+    def _begin_read_retry(self, row: dict[str, Any], *, actor: str) -> dict[str, Any]:
+        """Keep the slot and keys; retry only the failed read operation."""
+        id = row["id"]
+        async def run() -> None:
+            ad = self._adapters["wechat"]
+            acct = Account(id=id, channel="wechat", state=row["state"], state_code=row.get("state_code"),
+                           self_uid=row.get("self_uid"), self_nick=row.get("self_nick"))
+            await ad.retry_read(acct)
+            state, code, reason = await ad.probe_state(acct)
+            current = self._store.get_account_full(id)
+            if (current and current.get("enabled") and not current.get("deleted_ms")
+                    and current["state"] in ("running", "degraded")
+                    and current.get("desired_state") == row.get("desired_state")):
+                self.transition(id, state, state_code=code, state_reason=reason)
+        self._spawn(id, run())
+        self._store.insert_audit(kind="system", transport="system", actor=actor, action="wechat.read.retry",
+                                 account_id=id, result_code="ACCEPTED", now_ms=self._clock())
+        return {"state": row["state"], "read_retry": True}
+
+
     async def restart(self, id: str, *, actor: str) -> dict[str, Any]:
         row = self.get(id)
         if not row["enabled"]:
             raise ApiError(409, "NOT_APPLICABLE", "账号已停用", reason="account_disabled")
         if self.busy(id):
             raise ApiError(409, "NOT_APPLICABLE", "账号正在切换状态", reason="busy")
+        if row["channel"] == "wechat" and row["state"] == "degraded" and row.get("state_code") == "WECHAT_READ_FAILED":
+            return self._begin_read_retry(row, actor=actor)
         ok, reason, alts = self._pool.can_add(row["channel"], exclude_account_id=id) if row["state"] in ("stopped", "created", "error") else (True, "", [])
         if not ok:
             self._raise_exhausted(row["channel"], reason, alts, exclude_account_id=id)

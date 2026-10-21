@@ -72,11 +72,41 @@ const resChipText = computed(() => {
 const onlineByChannel = computed(() =>
   Object.fromEntries(CHANNELS.map((ch) => [ch, accounts.summary[ch].online])) as Record<string, number>)
 
-/** 门禁「重试」与事件流「重新取令牌」是一件事:先让主进程重取,再把 WS 拉起来 */
+const realtimeRetrying = ref(false)
+
+/** 认证失败和原门禁重试仍由主进程重取令牌。 */
 async function retryRealtime(): Promise<void> {
-  await session.retryToken()
-  events.retry()
+  if (realtimeRetrying.value) return
+  realtimeRetrying.value = true
+  try {
+    await session.retryToken()
+    events.retry()
+  } finally {
+    realtimeRetrying.value = false
+  }
 }
+
+/** 连接失败使用现有认证重连；没有认证失败证据时不要求重签令牌。 */
+async function retryEventStream(): Promise<void> {
+  if (events.authLost?.reason !== 'handshake' || session.authState !== 'ok') {
+    await retryRealtime()
+    return
+  }
+  if (realtimeRetrying.value) return
+  realtimeRetrying.value = true
+  try {
+    events.retry()
+    await session.pingAgent()
+  } finally {
+    realtimeRetrying.value = false
+  }
+}
+
+// 原15秒健康探测确认服务恢复时，仅恢复因连接失败而停下的事件流。
+watch(() => session.agentReachable && session.authState === 'ok', (ready, wasReady) => {
+  if (ready && wasReady === false && !realtimeRetrying.value && !events.connected
+      && events.authLost?.reason === 'handshake') events.retry()
+})
 
 /**
  * 门禁「去环境页」:环境页本身就是恢复入口(拉起 Agent / 重启 WSL / 看日志),到了那里门禁不能再盖着——
@@ -253,19 +283,17 @@ onUnmounted(() => {
               同步中——正在全量拉取账号、资源与邮件状态
             </div>
             <!--
-              事件流握手连败 / 4401:停止无限重连后,这里是唯一的出口提示。
+              事件流握手连败与4401分别提示；连接失败可在确认服务恢复后重连一次。
               HTTP 侧可能还好着,所以只挂横幅、不遮整页。
             -->
-            <div v-if="events.authLost" class="banner crit">
-              实时事件流连不上,需要重新取令牌
-              <span v-if="events.authLost.reason === 'handshake'">
-                (连续 {{ events.authLost.failures }} 次握手就断,最后关闭码 {{ events.authLost.code }};
-                已停止重连,避免无声空转)
-              </span>
-              <span v-else>
-                (服务端回 4401:令牌无效 —— 已停止重连,重取令牌前再连也是同一个结果)
-              </span>
-              <a-button size="small" @click="retryRealtime">重新取令牌并重连</a-button>
+            <div v-if="events.authLost && !events.connected" class="banner crit">
+              <template v-if="events.authLost.reason === 'handshake'">
+                <span>{{ session.agentReachable ? '实时事件流连接失败' : '采集服务暂时不可达，实时事件流无法连接' }}
+                  （连续 {{ events.authLost.failures }} 次握手失败，关闭码 {{ events.authLost.code }}）。已暂停重试。</span>
+                <span v-if="!session.agentReachable">采集服务恢复后会自动重连，也可手动重试。</span>
+              </template>
+              <span v-else>实时事件流认证失败（关闭码 4401），需要重新获取访问令牌。</span>
+              <a-button size="small" :loading="realtimeRetrying" @click="retryEventStream">{{ events.authLost.reason === 'handshake' ? '重试连接' : '重新取令牌并重连' }}</a-button>
             </div>
             <!--
               #82 drain:Agent 正在为升级排空,**指令类**写操作一律 503 draining
@@ -300,13 +328,17 @@ onUnmounted(() => {
             <!-- 426:把「要什么版本、现在是什么版本、该怎么办」一次说清(02 §3.8) -->
             <p v-if="session.gateDetail" class="qt-warn">{{ session.gateDetail }}</p>
             <p v-if="session.agentDownReason" class="qt-muted">{{ session.agentDownReason }}</p>
-            <!-- A-7:两处门禁共用的固定一句 -->
+            <p data-testid="qt-local-service-status">WinAgent 服务：{{ session.serviceStateText }} · 会话代理：{{ session.sessionStateText }} · 采集 API：{{ session.apiStateText }}</p>
             <p class="qt-warn" :data-testid="T.gateLoginHint">{{ session.GATE_LOGIN_HINT }}</p>
+            <p v-if="session.localServiceMessage" role="status">{{ session.localServiceMessage }}</p>
             <div class="qt-row">
               <a-button type="primary" :data-testid="T.gateRetry" @click="retryRealtime">重试</a-button>
-              <a-button v-if="!session.agentReachable" @click="session.startWsl()">让 WinAgent 拉起 Agent</a-button>
+              <a-button v-if="session.canStartLocalService" data-testid="qt-start-winagent" :loading="session.localServiceBusy" :disabled="session.localServiceBusy" @click="session.startLocalService()">启动 WinAgent 服务及会话代理</a-button>
+              <a-button v-if="!session.agentReachable" :disabled="!session.winagentOnline || session.userAgentOnline !== true" @click="session.startWsl()">启动受管 WSL 环境</a-button>
               <a-button @click="goEnvFromGate">去环境页</a-button>
             </div>
+            <p v-if="!session.canStartLocalService" class="qt-muted">当前窗口未提供本机服务启动能力，请使用更新后的 Electron 桌面端。</p>
+            <p class="qt-small qt-muted">启动 WSL 环境与启动 WinAgent 服务是独立操作；采集 API 状态以实际连接结果为准。</p>
             <p class="qt-small qt-muted">
               本页**不提供**手工粘贴令牌的入口——令牌一旦经剪贴板与渲染进程就失去了 DPAPI 保护。
             </p>

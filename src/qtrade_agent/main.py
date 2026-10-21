@@ -117,7 +117,7 @@ def build(cfg: AgentConfig, db_path: str | None = None, config_path: str | None 
 def init_db(cfg: AgentConfig, db_path: str | None) -> int:
     """``--init-db``:建库 + 迁移到最新 + 写 ``schema_version``,然后退出(03 §2.7.3 ②(d))。
 
-    **不起 HTTP、不起调度器、不连 WinAgent/dockerd/adb/邮箱**:只开 ``Store``,与正常启动走的是同一个
+    **不起 HTTP、不起调度器、不连 WinAgent/dockerd/adb/邮件账号**:只开 ``Store``,与正常启动走的是同一个
     ``Store.open()``(同一套 DDL、同一组 PRAGMA —— ``auto_vacuum=INCREMENTAL`` 必须建库时设,02 §2.8.4)。
     **幂等**:库已是最新 ⇒ 一条语句都不写、回 0;版本落后 ⇒ 跑迁移;损坏 / 版本比代码新 ⇒ 非 0 退出且**不动**该文件。
     退出码见本模块 ``EXIT_*``。
@@ -126,7 +126,15 @@ def init_db(cfg: AgentConfig, db_path: str | None) -> int:
     path = db_path or cfg.db.path
     parent = os.path.dirname(os.path.abspath(path))
     try:
-        os.makedirs(parent, mode=DB_DIR_MODE, exist_ok=True)
+        try:
+            os.makedirs(parent, mode=DB_DIR_MODE)
+        except FileExistsError:
+            if not os.path.isdir(parent):
+                raise
+        else:
+            # Apply the declared mode only to the directory this call created.
+            # Never change the process umask or an existing operator-owned path.
+            os.chmod(parent, DB_DIR_MODE)
     except OSError as e:
         log.error("建库失败:父目录 %s 建不出来:%s", parent, e)
         return EXIT_INIT_FAILED
@@ -190,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default="/etc/qtrade/agent.toml")
     ap.add_argument("--db", default=None)
     ap.add_argument("--log-level", default="INFO")
+    ap.add_argument("--logfile", default=None, help="Absolute operational log path; rotated daily, seven backups.")
     ap.add_argument("--bootstrap-runtime-contents", default=None,
                     help="Validate bundled assets and write runtime configuration, then exit.")
     ap.add_argument("--bootstrap-console-token-stdin", action="store_true",
@@ -223,27 +232,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.init_db:
         # `--config` 只用来取 `[db] path` 等建库参数;`[api]`/`[scheduler]` 这类运行期配置本次一律不生效。
         return init_db(cfg, args.db)
-    agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
-    _attach_screen(agent, cfg)
-    import uvicorn
-    server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
-                                           workers=1, log_level=args.log_level.lower()))
-    install_log_masking()
-
-    async def _graceful_shutdown() -> None:
-        """#83 `POST /system/shutdown` 的**生产**执行体(02 §2.6 优雅停机)。
-
-        🔴 缺省钩子 = `AgentApp.stop()`,它只收调度器/投递器/总线/库,**不会让进程退出** —— 光有它,
-        控制台点了「停止 Agent」以后 uvicorn 还在服务、`/system/health` 照回 200,与 #83 的语义对不上。
-        这里在生产入口把两步接起来:先 `stop()` 收干净,再让 uvicorn 退出监听循环(测试仍注入假钩子,不退进程)。
-        """
+    file_handler = None
+    if args.logfile:
+        from .operational_log import attach_file_log
         try:
-            await agent.stop()
-        finally:
-            server.should_exit = True
+            file_handler = attach_file_log(args.logfile)
+        except (OSError, ValueError) as error:
+            log.error("LOG_INIT_FAILED type=%s errno=%s; no services started", type(error).__name__, getattr(error, "errno", None))
+            return EXIT_INIT_FAILED
+    try:
+        agent, api = build(cfg, args.db, config_path=args.config if has_cfg else None)
+        _attach_screen(agent, cfg)
+        import uvicorn
+        server = uvicorn.Server(uvicorn.Config(api, host=cfg.api.bind, port=cfg.api.port, ws=cfg.api.ws_impl,
+                                               workers=1, log_level=args.log_level.lower()))
+        install_log_masking()
 
-    agent.shutdown_hook = _graceful_shutdown
-    server.run()
+        async def _graceful_shutdown() -> None:
+            """#83 `POST /system/shutdown` 的**生产**执行体(02 §2.6 优雅停机)。
+
+            🔴 缺省钩子 = `AgentApp.stop()`,它只收调度器/投递器/总线/库,**不会让进程退出** —— 光有它,
+            控制台点了「停止 Agent」以后 uvicorn 还在服务、`/system/health` 照回 200,与 #83 的语义对不上。
+            这里在生产入口把两步接起来:先 `stop()` 收干净,再让 uvicorn 退出监听循环(测试仍注入假钩子,不退进程)。
+            """
+            try:
+                await agent.stop()
+            finally:
+                server.should_exit = True
+
+        agent.shutdown_hook = _graceful_shutdown
+        server.run()
+    finally:
+        if file_handler is not None:
+            from .operational_log import detach_file_log
+            detach_file_log(file_handler)
     return 0
 
 

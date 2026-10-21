@@ -27,7 +27,8 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/qtrade/platform-tools:/opt/qtrade/agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/qtrade/agent/venv/bin/python -m qtrade_agent.main \
     --config /etc/qtrade/agent.toml \
-    --db /var/lib/qtrade/agent.db
+    --db /var/lib/qtrade/agent.db \
+    --logfile /var/log/qtrade/agent.log
 Restart=always
 RestartSec=5
 # ⚠️ StartLimitIntervalSec / StartLimitBurst 不在本段 —— 它们属 [Unit]（systemd ≥230），

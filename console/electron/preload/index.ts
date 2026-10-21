@@ -8,6 +8,10 @@ import { contextBridge, ipcRenderer } from 'electron'
 const agentOrigin: string = ipcRenderer.sendSync('qt:endpoint.agent')
 
 const qt = {
+  localService: {
+    status: () => ipcRenderer.invoke('qt:localService.status'),
+    start: () => ipcRenderer.invoke('qt:localService.start'),
+  },
   endpoint: { agent: agentOrigin },
   app: {
     version: () => ipcRenderer.invoke('qt:app.version'),

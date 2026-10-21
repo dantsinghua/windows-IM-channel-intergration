@@ -5,8 +5,8 @@
 ④ IMAP 终态 ``MOVE``/``COPY``+``\\Deleted``(``on_terminal``);⑤ POP3 ``cleanup_pop3`` 的 ``DELE`` 集合。
 (§2.1 ``run_cycle()`` 的 OVERSIZE 分支 ``continue`` 不落 move 队列,是门 ④ 的上游保证,在 ``fetcher`` 里。)
 
-⚠️ 两个「满」别混(§2.6.10):**邮箱满**(服务器侧配额 → 删远端)与**本地磁盘满**(→ 只清本地)。
-``delete_on_server`` **只能由邮箱侧配额水位触发**,本地磁盘水位永远不触发它(基线 §11.11 [DISK] R4-2)。
+⚠️ 两个「满」别混(§2.6.10):**邮件服务器容量满**(服务器侧配额 → 删远端)与**本地磁盘满**(→ 只清本地)。
+``delete_on_server`` **只能由邮件服务器侧配额水位触发**,本地磁盘水位永远不触发它(基线 §11.11 [DISK] R4-2)。
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class CleanupStats:
 
 
 class MailCleanup:
-    """一个邮箱一份;在 ``mail.inbound`` **同一条线程**里、每轮取信之后执行(§2.6.6,由 fetcher 的 ``cleanup_hook`` 调)。"""
+    """一个邮件账号一份;在 ``mail.inbound`` **同一条线程**里、每轮取信之后执行(§2.6.6,由 fetcher 的 ``cleanup_hook`` 调)。"""
 
     def __init__(self, mail_store: MailStore, route: MailRoute, cfg: MailConfig, *,
                  clock: Optional[Callable[[], int]] = None, alerts: Any = None,
@@ -305,7 +305,7 @@ class MailCleanup:
             return stats
         disk = self.disk_state()
         if disk == "critical":
-            # §2.6.10:整轮跳过归档与删除(本地盘满,该清的是本地,不动用户邮箱)
+            # §2.6.10:整轮跳过归档与删除(本地盘满,该清的是本地,不动用户邮件账号)
             stats.paused_disk = True
             stats.status = "PARTIAL"
             stats.error = "disk_critical"

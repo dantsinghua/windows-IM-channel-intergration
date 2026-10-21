@@ -74,6 +74,19 @@ class WechatAdapter:
         Agent 侧 ``start`` 只清一次该账号的读循环内存态,登录由 ``WechatLoginFlow`` 驱动。"""
         self._poller.state.pop(acct.id, None)
 
+    async def retry_read(self, acct: Account) -> None:
+        """An explicit read retry never restarts WeChat, Chatlog, or the key hook."""
+        state = self._poller.st(acct.id)
+        async with state.lock:
+            state.retry_attempts = 0
+            state.retry_started_ms = None
+            state.retry_exhausted = False
+            state.next_retry_ms = 0
+            # Preserve the safety guard until a read has actually succeeded.
+            state.read_fail_streak = max(state.read_fail_streak, 3)
+        await self._poller.poll(self._view(acct))
+
+
     async def stop(self, acct: Account, *, graceful: bool) -> None:
         """停止对该账号的 ``wechat/read`` 拉取(05 §2.4.5 第 2 步);**登出微信是 #34**,由槽位切换/`#16 logout` 发起,
         不在这里顺手做——``stop`` 也会被健康循环调用,顺手登出会误踢在用的号。"""
@@ -91,6 +104,7 @@ class WechatAdapter:
     async def probe_state(self, acct: Account) -> tuple[str, Optional[str], str]:
         """返回 ``(state, state_code, state_reason)``。判定顺序(实现口径,已登记 handoff「建议裁决」):
         会话代理/模块不可用 → 微信未登录 → **取钥失败优先于锁屏**(前者读写都拒、比后者严格)→ 锁屏 → running。"""
+        self._key_retry_needed[acct.id] = False
         try:
             st = await self._client.status()
         except WeChatNotReady as e:
@@ -111,10 +125,12 @@ class WechatAdapter:
         if not wx.get("running") or not wx.get("logged_in"):
             # 主窗口消失 / Weixin.exe 退出 ⇒ login_required(LOGGED_OUT);槽位 holder 保持为它(它仍是「该在线的那个」)
             return "login_required", "LOGGED_OUT", "微信已退出登录,请点「登录」重新扫码"
-        if not chatlog.get("key_ok"):
+        if chatlog.get("key_ok") is False:
             return "degraded", "KEY_FAIL", KEY_FAIL_MESSAGE
-        if not chatlog.get("running") or self._poller.degraded_key_fail(acct.id):
-            return "degraded", "KEY_FAIL", "密钥已就绪，但微信消息读取异常，无法确认送达，暂停发送；无需重新取钥或重装微信"
+        if chatlog.get("key_ok") is not True:
+            return "degraded", "WECHAT_READ_FAILED", "无法确认密钥与读取服务状态，不自动重新取钥"
+        if not chatlog.get("running") or self._poller.degraded_read_failed(acct.id):
+            return "degraded", "WECHAT_READ_FAILED", "密钥已就绪，但微信消息读取异常，无法确认送达，暂停发送；无需重新取钥或重装微信"
         if st.get("screen_locked"):
             return "degraded", "SCREEN_LOCKED", SCREEN_LOCKED_MESSAGE
         return "running", None, ""
@@ -125,6 +141,8 @@ class WechatAdapter:
     def write_guard(self, acct: Account) -> Optional[CommandResult]:
         """写类指令的前置:``degraded(KEY_FAIL)`` / ``degraded(SCREEN_LOCKED)`` 一律 ``NOT_READY``;可写回 ``None``。"""
         code = acct.state_code
+        if code == "WECHAT_READ_FAILED" or self._poller.degraded_read_failed(acct.id):
+            return _not_ready("微信消息读取未恢复，无法确认送达，已拒绝发送", "wechat_read_failed")
         if acct.state == "degraded" and code == "KEY_FAIL":
             return _not_ready(KEY_FAIL_MESSAGE, "key_fail")
         if acct.state == "degraded" and code == "SCREEN_LOCKED":

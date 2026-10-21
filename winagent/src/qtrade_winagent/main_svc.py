@@ -412,10 +412,23 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 def run_service(args: Any, stop_event: threading.Event, on_ready: Callable[[], None]) -> int:
+    from .startup import record_startup_failure, startup_diagnostic
+    phase = ["configuration"]
+    try:
+        return _run_service_impl(args, stop_event, on_ready, phase)
+    except Exception as error:
+        record_startup_failure(args.root or DEFAULT_ROOT, startup_diagnostic(error, phase[0]))
+        return 2
+
+
+def _run_service_impl(args: Any, stop_event: threading.Event, on_ready: Callable[[], None], phase: list[str]) -> int:
     root = args.root or DEFAULT_ROOT
     config_path = args.config or os.path.join(root, "winagent.toml")
+    if not args.dev and not os.path.isfile(config_path):
+        raise FileNotFoundError(config_path)
     cfg = load_cfg(read_toml(config_path))
     setup_logging(cfg.log.level, None if args.dev else os.path.join(root, "logs"))
+    phase[0] = "dependencies"
     d = build_real_deps(cfg, root=root, install_user_sid=args.install_user_sid, fake=args.dev)
     d.config_path = None if args.dev else config_path                    # R6-88:#43 写回真值;--dev 不落盘
     listeners = Listeners(cfg.api.port)
@@ -425,11 +438,13 @@ def run_service(args: Any, stop_event: threading.Event, on_ready: Callable[[], N
                                     endpoint_provider=d.netprobe.agent_endpoint)
 
     async def boot() -> None:
+        phase[0] = "vault"
         await load_tokens(d)
         alert = d.vault.startup_selfcheck()                            # 熵缺失 / ACL 放宽 ⇒ VAULT_ENTROPY_MISSING
         if alert:
             d.alerts.firing(alert["code"], subject=alert["subject"], severity=alert["severity"],
                             evidence=alert["evidence"])
+        phase[0] = "ipc"
         await d.hub.start()
         await console_pipe.start()
         if not args.dev:
@@ -451,6 +466,7 @@ def run_service(args: Any, stop_event: threading.Event, on_ready: Callable[[], N
     # 规格要求同时听 127.0.0.1 和 vEthernet (WSL)。uvicorn 单 host 只会绑 desired_listen()[0],
     # WSL 里的 Agent 打到网关地址会连不上。这里把期望集合里的每个地址都绑上;
     # vEthernet 此刻不存在就跳过(Listeners.open 记 warn),由周期任务补绑。
+    phase[0] = "http_bind"
     listeners.open((LOOPBACK,) if args.dev else d.netprobe.desired_listen())
     log.info("WinAgent 服务启动", extra={"op": "svc.start", "code": "OK",
                                         "kv": {"listen": ",".join(listeners.actual()), "port": cfg.api.port}})
@@ -471,6 +487,7 @@ def run_service(args: Any, stop_event: threading.Event, on_ready: Callable[[], N
                             raise RuntimeError("WinAgent pipe listener stopped")
                 if server.started and not ready and not stop_event.is_set():
                     ready = True
+                    phase[0] = "running"
                     on_ready()
                 await asyncio.sleep(0.05)
             await serving

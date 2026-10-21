@@ -87,6 +87,7 @@ def set_env(monkeypatch, option=None):
     for name, value in {
         "OSS_AUTH_MODE": "sts",
         "OSS_ENDPOINT": "https://oss.example.invalid",
+        "OSS_BUCKET": "qtrade-nyoss-lab",
         "OSS_STS_URL": MQ_URL,
         "OSS_STS_AUTH_KEY": AUTH_KEY,
         "OSS_STS_SM4_KEY": SM4_KEY.decode(),
@@ -109,7 +110,7 @@ def test_mq_opt_in_keeps_exact_gateway_path_and_token_only_in_header():
                                      clock=lambda: NOW, allow_http=True)
     assert capture.requests == []
     result = provider.get_credentials()
-    assert result.bucket == "synthetic-mq-bucket"
+    assert result.bucket == ""
     assert len(capture.requests) == 1
     request, timeout = capture.requests[0]
     headers = {name.lower(): value for name, value in request.header_items()}

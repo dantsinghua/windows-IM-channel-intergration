@@ -40,6 +40,8 @@ class OssV1Box:
             raise ValueError("oss_credentials_missing")
         if credentials_provider is not None and (key_id or secret or security_token):
             raise ValueError("oss_credentials_conflict")
+        if credentials_provider is not None and not bucket:
+            raise ValueError("oss_bucket_missing")
         if bucket and not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
             raise ValueError("oss_bucket_invalid")
         if any(any(ord(c) < 33 or ord(c) == 127 for c in value) for value in (key_id, secret, security_token)):
@@ -75,7 +77,7 @@ class OssV1Box:
             if http_option not in ("true", "false"):
                 raise ValueError("sts_http_option_invalid")
             provider = StsCredentialProvider(url, auth_key, sm4_key.encode("utf-8"),
-                                             expected_bucket=bucket or None, allow_http=http_option == "true")
+                                             allow_http=http_option == "true")
             return cls(endpoint=endpoint, bucket=bucket, credentials_provider=provider)
         key_id = os.environ.get("OSS_ACCESS_KEY_ID", "").strip()
         secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "").strip()
@@ -145,9 +147,8 @@ class OssV1Box:
     ) -> tuple[int, bytes]:
         # 每个请求只取得一次不可变凭据快照，避免并发刷新混用新 ID 与旧 secret/token。
         credentials = self._credentials_provider.get_credentials() if self._credentials_provider is not None else None
-        bucket = credentials.bucket if credentials is not None else self._bucket
-        if self._bucket and bucket != self._bucket:
-            raise RuntimeError("oss_bucket_mismatch")
+        # Destination must only come from the explicit OSS business profile.
+        bucket = self._bucket
         key_id = credentials.access_key_id if credentials is not None else self._key_id
         secret = credentials.access_key_secret if credentials is not None else self._secret
         security_token = credentials.security_token if credentials is not None else self._security_token

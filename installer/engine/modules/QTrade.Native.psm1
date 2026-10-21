@@ -615,7 +615,33 @@ function Invoke-QtHttp {
         if ((Test-QtHasProperty -Object $_.Exception -Name 'Response') -and $_.Exception.Response) {
             try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = 0 }
         }
-        return [pscustomobject]@{ Ok = $false; StatusCode = $code; Body = [string]$_.Exception.Message }
+        $cause = 'HTTP_TRANSPORT_FAILED'
+        $native = 0
+        $errorObject = $_.Exception
+        while ($null -ne $errorObject) {
+            if ($errorObject -is [Net.WebException]) {
+                switch ([string]$errorObject.Status) {
+                    'Timeout' { $cause='HTTP_TIMEOUT' }
+                    'NameResolutionFailure' { $cause='HTTP_DNS_FAILED' }
+                    'ProxyNameResolutionFailure' { $cause='HTTP_PROXY_DNS_FAILED' }
+                    'TrustFailure' { $cause='HTTP_TLS_TRUST_FAILED' }
+                    'SecureChannelFailure' { $cause='HTTP_TLS_FAILED' }
+                    'ConnectFailure' { $cause='HTTP_CONNECT_FAILED' }
+                }
+            }
+            if ($errorObject -is [Net.Sockets.SocketException]) {
+                $native=$errorObject.NativeErrorCode
+                switch ($native) {
+                    10061 { $cause='HTTP_CONNECTION_REFUSED' }
+                    10060 { $cause='HTTP_TIMEOUT' }
+                    11001 { $cause='HTTP_DNS_FAILED' }
+                    10013 { $cause='HTTP_ACCESS_DENIED' }
+                }
+            }
+            $errorObject=$errorObject.InnerException
+        }
+        if ($code -gt 0) { $cause='HTTP_'+[string]$code }
+        return [pscustomobject]@{Ok=$false;StatusCode=$code;Body='';Reason=$cause;NativeCode=$native}
     }
 }
 

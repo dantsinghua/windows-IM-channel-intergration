@@ -19,6 +19,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (-not $SourceRoot) { $SourceRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }
 
 # ── 载荷来源映射 ────────────────────────────────────────────────────────────
 # Sources :相对 $SourceRoot 的路径数组(或绝对路径;`EnvVar` 指定的环境变量优先)。
@@ -32,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 $PayloadMap = @(
     @{ Dest = 'kernel/bzImage-6.6'; Sources = @('kernel/out/bzImage'); Kind = 'file'; Critical = $true; Packed = $false
         Purpose = '自编 WSL2 内核(binder 内建 + 崩溃转储 L2 封装)'; EnvVar = 'QT_SRC_KERNEL'
-        Hint = '原机在 WSL 里:~/work/qtrade-redroid-installer/kernel/out/bzImage(现役 v4);用 -SourceRoot 或 QT_SRC_KERNEL 指到 Windows 可见的路径' }
+        Hint = 'Provide this pinned artifact below -SourceRoot or with the documented QT_SRC override; no developer directory is assumed.' }
 
     @{ Dest = 'wsl/kcheck-rootfs.tar'; Sources = @('rootfs/out/kcheck-rootfs.tar'); Kind = 'file'; Critical = $true; Packed = $false
         Purpose = '内核验证用微型发行版(busybox),验证后注销'; EnvVar = 'QT_SRC_KCHECK'
@@ -44,7 +45,7 @@ $PayloadMap = @(
 
     @{ Dest = 'wsl/rootfs.tar'; Sources = @('rootfs/out/rootfs.tar'); Kind = 'file'; Critical = $true; Packed = $false
         Purpose = '发行版 qtrade:Ubuntu 22.04 + docker + 预载镜像 + Agent'; EnvVar = 'QT_SRC_ROOTFS'
-        Hint = '原机在 WSL 里:~/work/qtrade-redroid-installer/rootfs/(Dockerfile 产出)' }
+        Hint = 'Provide this pinned artifact below -SourceRoot or with the documented QT_SRC override; no developer directory is assumed.' }
 
     @{ Dest = 'wsl/agent'; Sources = @('dist'); Kind = 'glob'; Pattern = 'qtrade_agent-*.whl'; Critical = $false; Packed = $false
         Purpose = 'Agent wheel(rootfs 构建输入;真值登记在 rootfs_contents.agent_wheel,G-10)'; EnvVar = 'QT_SRC_AGENT_WHEEL'
@@ -60,7 +61,7 @@ $PayloadMap = @(
 
     @{ Dest = 'pkg/chatlog'; Sources = @('third_party/chatlog'); Kind = 'tree'; Critical = $false; Packed = $false
         Purpose = 'chatlog_alpha + wx_key 取钥 DLL(wx_key1.dll / wx_key2.dll)'; EnvVar = 'QT_SRC_CHATLOG'
-        Hint = '原机在 /mnt/c/Users/anlin/Desktop/盈米/蜂鸟项目/南银理财/weChatlog/(SKILL §3「微信取钥」行)' }
+        Hint = 'Provide this pinned artifact below -SourceRoot or with the documented QT_SRC override; no developer directory is assumed.' }
 
     @{ Dest = 'pkg/wechat/weixin_4.1.12.26.exe'; Sources = @('third_party/wechat/weixin_4.1.12.26.exe'); Kind = 'file'; Critical = $true; Packed = $true
         Purpose = '随包微信 PC 安装包(B-1;sha256 已实测钉死,不一致即 PAYLOAD_CORRUPT)'; EnvVar = 'QT_SRC_WECHAT'

@@ -60,6 +60,11 @@ class QQAdapterConfig:
     heartbeat_timeout_s: int = 40
     reconnect_delay_s: int = 3
     history_backfill_on_reconnect: int = 50
+    login_refresh_max_rounds: int = 10
+
+    def __post_init__(self):
+        if type(self.login_refresh_max_rounds) is not int or not 1 <= self.login_refresh_max_rounds <= 100:
+            raise ValueError("login_refresh_max_rounds must be 1..100")
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,18 @@ class WechatAdapterConfig:
     poll_interval_s: int = 5
     confirm_poll_interval_ms: int = 1000
     switch_drain_timeout_s: int = 60
+    read_retry_backoff_base_s: int = 1
+    read_retry_backoff_max_s: int = 16
+    read_retry_max: int = 10
+    read_retry_window_s: int = 600
+
+    def __post_init__(self):
+        for name in ("read_retry_backoff_base_s", "read_retry_backoff_max_s", "read_retry_max", "read_retry_window_s"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 3600:
+                raise ValueError("Invalid WeChat retry setting: " + name)
+        if self.read_retry_backoff_base_s > self.read_retry_backoff_max_s:
+            raise ValueError("WeChat retry base exceeds maximum")
 
 
 @dataclass(frozen=True)
@@ -102,6 +119,14 @@ class HealthConfig:
     container_mem_warn_pct: int = 90
     container_restart_backoff_s: tuple[int, ...] = (60, 120, 300, 600)   # H04 退避重拉
     container_restart_max: int = 5              # 每小时上限,超限停止自愈(02 §5)
+    adb_selfheal_enabled: bool = True
+    adb_selfheal_max_per_hour: int = 3
+
+    def __post_init__(self):
+        if type(self.adb_selfheal_enabled) is not bool:
+            raise ValueError("adb_selfheal_enabled must be boolean")
+        if type(self.adb_selfheal_max_per_hour) is not int or not 0 <= self.adb_selfheal_max_per_hour <= 1000:
+            raise ValueError("adb_selfheal_max_per_hour must be 0..1000")
 
 
 @dataclass(frozen=True)

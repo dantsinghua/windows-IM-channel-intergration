@@ -17,7 +17,7 @@ PROFILE_QTRADE = "qtrade-v1"
 
 @dataclass
 class MailFallbackConfig:
-    """06 §7 ``[mail.inbound.fallback]``(E-1:IMAP 连不上/不支持时的 POP3 回落目标,同一邮箱账户)。"""
+    """06 §7 ``[mail.inbound.fallback]``(E-1:IMAP 连不上/不支持时的 POP3 回落目标,同一邮件账号)。"""
     enabled: bool = True
     host: str = ""                      # 如 pop.163.com;空 = 不回落只告警 MAIL_INBOUND_STALLED
     port: int = 995

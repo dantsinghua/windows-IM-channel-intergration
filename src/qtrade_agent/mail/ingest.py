@@ -186,7 +186,7 @@ class MailIngest:
 
         route = self.routes.route_for_inbox_account(mail.mailbox, pc.account_id, pc.channel)
         if route is None:
-            self._finish(inbox_id, ROUTE_MISMATCH, "route_unresolved:收到本封的邮箱没有可用路由")
+            self._finish(inbox_id, ROUTE_MISMATCH, "route_unresolved:收到本封的邮件账号没有可用路由")
             return IngestResult(status=ROUTE_MISMATCH, inbox_id=inbox_id)
         inb = route.inbound
         self.ms.inbox_update(inbox_id, route_id=route.id, effective_protocol=mail.protocol,

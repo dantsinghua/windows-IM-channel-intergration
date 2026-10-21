@@ -23,6 +23,8 @@ activities:
   search: "(?i)SearchActivity"        # [实测] 实为 GroupSearchActivity
   card: "(?i)Card"                    # [实测] 好友名片页
   chat: "(?i)ChatActivity|SplashActivity"   # [推测] 聊天页 Activity 名未实测;留 SplashActivity 是因为企点把会话页也挂在它下面
+  organization: "^com[.]tencent[.]qidian[.]org[.]activity[.]OrganizationActivity$"  # [实测 2026-10-20]
+  organization_search: "^com[.]tencent[.]mobileqq[.]search[.]activity[.]ContactSearchComponentActivity$"  # [实测 2026-10-20]
 
 # 控件锚点:id 全等 / text_any 子串 / desc_any 子串,取或;**坐标一律从命中节点的 bounds 算**。
 nodes:
@@ -39,7 +41,11 @@ nodes:
   login_submit:        {id: "com.tencent.qidian:id/login", text_any: ["登 录", "登录"]}  # [实测 6.9.7]
   main_marker:         {id: "com.tencent.qidian:id/recent_chat_list", desc_any: ["消息"]} # [推测] 会话列表可见 = 已登录
   search_entry:        {id: "com.tencent.qidian:id/et_search_keyword", desc_any: ["搜索"]} # [推测]
-  search_result_first: {id: "com.tencent.qidian:id/title"}                          # [推测] 搜索结果首条
+  organization_back: {id: "com.tencent.qidian:id/org_left_back_text"}            # [实测 2026-10-20]
+  organization_search_cancel: {id: "com.tencent.qidian:id/btn_cancel_search"}    # [实测 2026-10-20]
+  messages_tab: {id: "com.tencent.qidian:id/tab_item_title", text_any: ["消息"]}   # [实测 2026-10-20] 导航要求 id 与文字同时唯一命中
+  messages_title: {id: "com.tencent.qidian:id/ivTitleName", text_any: ["消息"]}    # [实测 2026-10-20]
+  search_result_first: {id: "com.tencent.qidian:id/item1"}                          # [实测 2026-10-20] 结果行；title 也用于分类标题
   card_identity:       {id: "com.tencent.qidian:id/account_uin"}                    # [推测] 名片页上的 uin/账号,发送前对象校验靠它
   card_send_msg:       {text_any: ["发消息", "发送消息"]}                          # [推测]
   chat_title:          {id: "com.tencent.qidian:id/title"}                          # [推测] 聊天页标题(= 闸门1/2 的判据)
@@ -58,7 +64,7 @@ timeouts:
   poll_interval_s: 1   # 05 §2.1.1 ⑪「每 1s」
   ui_settle_s: 0.5
   launch_s: 3.0
-  search_s: 2.0
+  search_s: 10.0       # 搜索结果出现的总预算，命中即继续
   dump_retries: 3
 
 # 输入后回读输入框、与待发文本逐字比对(参考实现 session.py 的做法);回读不上 ⇒ 不发。

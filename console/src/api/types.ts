@@ -43,12 +43,28 @@ export interface OssboxSettingsData {
 
 export interface OssboxSettingsResponse {
   data: OssboxSettingsData
+  mode?: 'its_relay'
+  legacy_available?: boolean
+  state?: 'pending_alignment' | 'running' | 'stopped' | 'error'
+  institution_runtime?: import('./institution-reporting').InstitutionReportingStatus
+  applied?: boolean
+  relay?: {
+    base_url: string
+    workbench_name?: string
+    workbench_id?: string
+    config_file?: 'config.yaml'
+    saved?: boolean
+    credential_error?: 'vault_unavailable' | 'collector_credentials_missing'
+    configured: boolean
+    key_configured: boolean
+    sm4_key_configured: boolean
+  }
   restart_required: boolean
   inquiry_configured: boolean
   catalog_configured: boolean
 }
 
-export interface OssboxSettingsInput {
+export interface OssboxLegacySettingsInput {
   sts_url: string
   allow_http: boolean
   endpoint: string
@@ -58,13 +74,61 @@ export interface OssboxSettingsInput {
   sm4_key?: string
 }
 
+export interface ItsRelaySettingsInput {
+  base_url: string
+  workbench_name: string
+  key?: string
+  sm4_key?: string
+}
+
+export interface ItsRelayCredentialsInput {
+  key?: string
+  sm4_key?: string
+}
+
+export type OssboxSettingsInput = OssboxLegacySettingsInput | ItsRelaySettingsInput | ItsRelayCredentialsInput
+
 export interface OssboxAuthenticationResult {
   authenticated: boolean
-  bucket: string
-  expiration: string
+  expiration?: string
+  carrier?: 'its-relay'
+  pending?: number
+  token_generated?: boolean
 }
 
 /* ── Account(00 §7.1;02「Account 序列化」R6-4) ── */
+
+export type SessionResetPhase = 'waiting_native' | 'barrier_ready' | 'complete' | 'blocked'
+
+export interface AccountSessionResetStatusData {
+  available: boolean
+  account_id: string
+  workbench_id?: string
+  account_uid?: string
+  account_epoch?: number
+  reset?: {
+    reset_id: string
+    phase: SessionResetPhase
+    account_epoch: number
+    snapshot_hash: string | null
+    snapshot: {
+      account_epoch: number
+      snapshot_at?: number
+      published_source_highwater?: number
+      peers?: Record<string, {
+        source_watermark: number
+        receiver_fence_id: string
+        receiver_fence_version: number
+        min_control_version: number
+      }>
+      unresolved_history?: unknown[]
+      old_native_tasks_running?: boolean | number
+      pending_inbound_count?: number
+      pending_echo_count?: number
+    } | null
+    code?: string | null
+  } | null
+}
 
 export interface AccountRuntime {
   kind?: 'redroid' | 'napcat' | 'wechat_pc'

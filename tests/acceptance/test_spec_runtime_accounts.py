@@ -1019,7 +1019,7 @@ async def test_ensure_root_only_touches_own_serial_never_kill_server(tmp_path):
         kinds = {c[0] for c in rig.adb.calls}
         assert not any("kill" in k for k in kinds), kinds
         assert not any("kill-server" in c[1] or "start-server" in c[1] for c in rig.adb.calls), rig.adb.calls
-        assert not hasattr(rig.adb, "kill_server")
+        assert callable(rig.adb.kill_server)  # The guarded coordinator owns this capability.
 
 
 async def test_ensure_root_marks_rooting_window_at_start(tmp_path):

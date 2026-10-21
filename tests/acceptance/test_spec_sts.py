@@ -238,10 +238,10 @@ def test_real_http_cache_refresh_boundary_and_frozen_credentials(sts_server):
         first, second = _credentials(), _credentials("two", expiration=NOW + 7200)
         server.reply(first)
         server.reply(second)
-        provider = server.provider(expected_bucket=BUCKET)
+        provider = server.provider()
         credentials = provider.get_credentials()
-        assert (credentials.access_key_id, credentials.access_key_secret, credentials.security_token, credentials.expiration, credentials.bucket) == (
-            first["access_key_id"], first["access_key_secret"], first["security_token"], NOW + 3600, BUCKET)
+        assert (credentials.access_key_id, credentials.access_key_secret, credentials.security_token, credentials.expiration) == (
+            first["access_key_id"], first["access_key_secret"], first["security_token"], NOW + 3600)
         with pytest.raises((AttributeError, TypeError)):
             credentials.bucket = "changed"
         server.clock.now = NOW + 3299
@@ -301,16 +301,15 @@ def test_real_401_revokes_usable_old_cache(sts_server):
 
 @pytest.mark.parametrize("bad", [
     _credentials(expiration=NOW),
-    _credentials(bucket="another-bucket"),
     {**_credentials(), "security_token": ""},
     {**_credentials(), "expiration": "not-a-date"},
     b"x" * (65536 + 1),
-], ids=["expired", "wrong-bucket", "empty-token", "invalid-expiration", "response-over-64k"])
+], ids=["expired", "empty-token", "invalid-expiration", "response-over-64k"])
 def test_bad_200_response_fails_closed(sts_server, bad):
     with sts_server() as server:
         server.reply(bad)
         with pytest.raises(Exception):
-            server.provider(expected_bucket=BUCKET).get_credentials()
+            server.provider().get_credentials()
         assert len(server.requests) == 1
 
 
@@ -350,7 +349,7 @@ def test_real_sts_to_fake_oss_all_operations_use_rotated_triplet(sts_server):
         first, second = _credentials(), _credentials("two", expiration=NOW + 7200)
         server.reply(first)
         server.reply(second)
-        box = OssV1Box(endpoint="https://oss.example.invalid", credentials_provider=server.provider())
+        box = OssV1Box(endpoint="https://oss.example.invalid", bucket=BUCKET, credentials_provider=server.provider())
         transport = CaptureOss((200, b"body"), (200, b""), (200, b"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>sample.bin</Key></Contents></ListBucketResult>"))
         box._opener = transport
         assert box.get("sample.bin") == b"body"
@@ -370,7 +369,7 @@ def test_explicit_oss_token_rejection_invalidates_without_same_request_retry(sts
         first, second = _credentials(), _credentials("two")
         server.reply(first)
         server.reply(second)
-        box = OssV1Box(endpoint="https://oss.example.invalid", credentials_provider=server.provider())
+        box = OssV1Box(endpoint="https://oss.example.invalid", bucket=BUCKET, credentials_provider=server.provider())
         transport = CaptureOss((403, f"<Error><Code>{code}</Code></Error>".encode()), (200, b"next"))
         box._opener = transport
         with pytest.raises(Exception):
@@ -385,7 +384,7 @@ def test_explicit_oss_token_rejection_invalidates_without_same_request_retry(sts
 def test_unknown_oss_network_failure_does_not_retry_or_discard_cache(sts_server):
     with sts_server() as server:
         server.reply()
-        box = OssV1Box(endpoint="https://oss.example.invalid", credentials_provider=server.provider())
+        box = OssV1Box(endpoint="https://oss.example.invalid", bucket=BUCKET, credentials_provider=server.provider())
         transport = CaptureOss(URLError("synthetic-disconnect"), (200, b"next"))
         box._opener = transport
         with pytest.raises(Exception):
@@ -410,7 +409,7 @@ def test_late_old_token_rejection_does_not_invalidate_new_cached_credentials(sts
                 return super().open(request, timeout)
 
         transport = LateOldTokenRejection((403, b"<Error><Code>SecurityTokenExpired</Code></Error>"), (200, b"new"))
-        box = OssV1Box(endpoint="https://oss.example.invalid", credentials_provider=provider)
+        box = OssV1Box(endpoint="https://oss.example.invalid", bucket=BUCKET, credentials_provider=provider)
         box._opener = transport
         with pytest.raises(Exception):
             box.get("sample.bin")
@@ -428,6 +427,7 @@ def test_env_sts_factory_is_lazy_and_reads_secret_files(sts_server, monkeypatch,
         sm4_file.write_text(SM4_KEY.decode("ascii"), encoding="utf-8")
         for key, value in {
             "OSS_ENDPOINT": "https://oss.example.invalid",
+            "OSS_BUCKET": BUCKET,
             "OSS_STS_URL": server.url,
             "OSS_STS_AUTH_KEY_FILE": str(key_file),
             "OSS_STS_SM4_KEY_FILE": str(sm4_file),

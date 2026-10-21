@@ -1,7 +1,12 @@
 /** `window.qt` —— preload 经 contextBridge 暴露的白名单(01 §2.2) */
 import type { LocalMetricsSnapshot } from './local-metrics'
+import type { RecoveryResult, RecoveryStatus } from '../../electron/main/winagent-recovery'
 
 export interface QtBridge {
+  localService?: {
+    status(): Promise<RecoveryStatus>
+    start(): Promise<RecoveryResult>
+  }
   app: {
     version(): Promise<{ console: string; electron: string }>
     minimizeToTray(): Promise<void>

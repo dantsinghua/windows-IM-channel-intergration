@@ -22,6 +22,7 @@ from ..models import Command, CommandError, CommandResult, RESULT_CODES, Message
 from ..settings_secrets import redact as redact_secrets
 from ..store import Store
 from .validate import validate_args
+from .native_guard import NativePermissionChanged, native_send_guard, require_native_permission
 
 log = logging.getLogger("qtrade.bus")
 
@@ -64,6 +65,7 @@ class _Job:
 
 
 class Bus:
+    supports_xunjia_v22_guard = True
     def __init__(self, *, store: Store, events: Events, adapters: dict[str, Adapter], cfg: AgentConfig, clock=None, gate=None):
         self.store = store
         self.events = events
@@ -284,6 +286,13 @@ class Bus:
             await self._rate_limit(acct.id)
             if job.done.done():
                 return
+            native_guard = getattr(cmd, '_xunjia_native_guard', None)
+            try:
+                require_native_permission(native_guard)
+            except NativePermissionChanged:
+                self._finalize(job, _err_result('GATE_BLOCKED', cmd.trace_id or '',
+                    CommandError('Native send permission changed', reason='xunjia_native_permission_changed')))
+                return
             session = cmd.args["session"]
             native = session.split(":", 1)[1] if session.startswith(acct.id + ":") else session
             kind = "group" if native.startswith("g_") or native.endswith("@chatroom") else "private"
@@ -293,7 +302,14 @@ class Bus:
                           trace_id=cmd.trace_id, idempotency_key=cmd.idempotency_key)
             r = self.store.ingest(out, now_ms=started)          # 出向先落库(经 store.ingest,先 upsert sessions)
             job.msg_id = r.id
-            res = await adapter.send(acct, cmd)                 # 点完即返回、让出队列
+            try:
+                with native_send_guard(native_guard):
+                    res = await adapter.send(acct, cmd)         # 点完即返回、让出队列
+            except NativePermissionChanged:
+                self.store.mark_out_state(job.msg_id, 'FAILED')
+                self._finalize(job, _err_result('GATE_BLOCKED', cmd.trace_id or '',
+                    CommandError('Native send permission changed', reason='xunjia_native_permission_changed')))
+                return
             if not res.ok:
                 if job.msg_id:
                     self.store.mark_out_state(job.msg_id, "FAILED")
@@ -345,7 +361,7 @@ class Bus:
         timeout = self.cfg.confirm_timeout_ms(acct.channel)
         interval = {"qidian": self.cfg.qidian.confirm_poll_interval_ms,
                     "wechat": self.cfg.wechat_adapter.confirm_poll_interval_ms}.get(acct.channel, 1000) / 1000
-        deadline = started + timeout
+        deadline = self.clock() + timeout
         while True:
             if job.done.done():
                 return

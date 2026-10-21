@@ -1204,7 +1204,7 @@ async def test_h08_持续离线升crit(tmp_path):
         await asyncio.wait_for(r.agent.qqhealth.check(), ASYNC_TIMEOUT)
         r.clock.advance(H08_OFFLINE_TO_LOGIN_REQUIRED_S * 1000 + 1000)
         await asyncio.wait_for(r.agent.qqhealth.check(), ASYNC_TIMEOUT)
-        assert alert_events(r, QQ)[-1]["severity"] == "crit"
+        assert [event for event in alert_events(r, QQ) if event["code"] == "H08_NAPCAT_HEARTBEAT_LOST"][-1]["severity"] == "crit"
 
 
 async def test_h08_恢复在线后告警resolved(tmp_path):
@@ -1953,9 +1953,10 @@ async def test_wx_chatlog挂但微信在线不算掉线(tmp_path):
         view = r.wx._view(wx_acct(r))
         for _ in range(3):
             await asyncio.wait_for(r.agent.wechat_poller.poll(view), ASYNC_TIMEOUT)
+            r.clock.advance(max(1, r.agent.wechat_poller.st(WX).next_retry_ms - r.clock()))
         assert r.agent.wechat_poller.degraded_key_fail(WX) is True
         state, code, _ = await asyncio.wait_for(r.wx.probe_state(wx_acct(r)), ASYNC_TIMEOUT)
-        assert (state, code) == ("degraded", "KEY_FAIL")
+        assert (state, code) == ("degraded", "WECHAT_READ_FAILED")
 
 
 async def test_wx_会话代理不在线时端点不可用(tmp_path):

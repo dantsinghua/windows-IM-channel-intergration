@@ -40,3 +40,12 @@ it("missing keys still offer the existing key recovery action",async()=>{
  keysReady=false;await start()
  expect(wrapper!.find(`[data-testid="${T.wxKeyRetry}"]`).exists()).toBe(true)
 })
+
+it("explicit read failure recheck calls the read recovery API without key actions",async()=>{
+ await start()
+ useAccountsStore().upsert({...account("degraded"),state_code:"WECHAT_READ_FAILED"});await flushPromises()
+ expect(wrapper!.text()).toContain("消息读取未就绪")
+ expect(wrapper!.find(`[data-testid="${T.wxKeyRetry}"]`).exists()).toBe(false)
+ await wrapper!.get("[data-testid=qt-wechat-read-recheck]").trigger("click");await flushPromises()
+ expect(accountsApi.start).toHaveBeenCalledWith("wx01")
+})

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GET /api/sts 接口调用说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --text: #1f2933;
+      --muted: #52606d;
+      --line: #e4e7eb;
+      --accent: #0f6f6a;
+      --code-bg: #f0f4f8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.65 "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 40px 20px 72px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+      line-height: 1.25;
+    }
+    .lead {
+      margin: 0 0 28px;
+      color: var(--muted);
+    }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 22px 24px;
+      margin: 0 0 16px;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 20px;
+    }
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 16px;
+    }
+    p { margin: 0 0 12px; }
+    p:last-child { margin-bottom: 0; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13.5px;
+    }
+    code {
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    pre {
+      background: #102a2a;
+      color: #e7f6f4;
+      padding: 14px 16px;
+      border-radius: 8px;
+      overflow: auto;
+      margin: 12px 0 0;
+    }
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px 8px 0;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    ol { margin: 8px 0 0; padding-left: 22px; }
+    li { margin: 4px 0; }
+    .method {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>GET /api/sts</h1>
+    <p class="lead">获取阿里云临时凭证。本地默认地址：<code>http://127.0.0.1:8080/api/sts</code></p>
+
+    <section>
+      <h2>请求</h2>
+      <p><span class="method">GET</span> <code>/api/sts</code></p>
+      <table>
+        <thead>
+          <tr><th>请求头</th><th>必填</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>access_token</code></td>
+            <td>是</td>
+            <td>SM4-CBC 加密后的 Base64 字符串，约 1 分钟内有效</td>
+          </tr>
+        </tbody>
+      </table>
+      <pre><code>curl -s http://127.0.0.1:8080/api/sts \
+  -H "access_token: &lt;按下方规则生成的 Base64&gt;"</code></pre>
+    </section>
+
+    <section>
+      <h2>成功响应</h2>
+      <p>HTTP <code>200</code>，响应头带 <code>Cache-Control: no-store</code>。</p>
+      <pre><code>{
+  "access_key_id": "STS.xxx",
+  "access_key_secret": "xxx",
+  "security_token": "xxx",
+  "expiration": "2026-10-12T10:08:50Z",
+  "bucket": "yingmi-dev-its-test"
+}</code></pre>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>access_key_id</code></td><td>临时 AccessKey ID</td></tr>
+          <tr><td><code>access_key_secret</code></td><td>临时 AccessKey Secret</td></tr>
+          <tr><td><code>security_token</code></td><td>安全令牌</td></tr>
+          <tr><td><code>expiration</code></td><td>失效时间，UTC，RFC3339。<code>08:12:10Z</code> 即北京时间 16:12:10</td></tr>
+          <tr><td><code>bucket</code></td><td>配置项 <code>aliyun.bucket</code></td></tr>
+        </tbody>
+      </table>
+      <p>凭证缓存在服务进程内存中。距离 <code>expiration</code> 超过 5 分钟时，重复请求返回同一份凭证；进入最后 5 分钟或已经过期时，下一次请求会向阿里云重新申请。</p>
+    </section>
+
+    <section>
+      <h2>失败响应</h2>
+      <pre><code>{"message":"错误说明"}</code></pre>
+      <table>
+        <thead>
+          <tr><th>HTTP 状态</th><th>message</th><th>原因</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>401</td><td>缺少 access_token</td><td>没有这个请求头，或值为空</td></tr>
+          <tr><td>401</td><td>access_token 无效</td><td>Base64、解密或 JSON 格式不对</td></tr>
+          <tr><td>401</td><td>key 不匹配</td><td>原文里的 <code>key</code> 与配置 <code>auth.key</code> 不一致</td></tr>
+          <tr><td>401</td><td>access_token 已过期</td><td><code>ts</code> 与服务器时间相差超过 60 秒</td></tr>
+          <tr><td>502</td><td>具体失败原因</td><td>校验已通过，但向阿里云申请 STS 失败</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>access_token 生成</h2>
+      <p>配置在服务的 <code>config.yaml</code>：</p>
+      <pre><code>auth:
+  key: "定制的业务字符串"
+  sm4_key: "16字节的SM4密钥"</code></pre>
+      <p><code>auth.sm4_key</code> 必须正好 16 字节。<code>auth.key</code> 是业务口令，和 SM4 密钥不是同一个值。</p>
+
+      <h3>原文</h3>
+      <pre><code>{"key":"定制的业务字符串","ts":"1760260320"}</code></pre>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>key</code></td><td>字符串</td><td>必须与 <code>auth.key</code> 完全一致</td></tr>
+          <tr><td><code>ts</code></td><td>字符串</td><td>Unix 时间戳，单位秒。不要用毫秒，也不能写成数字</td></tr>
+        </tbody>
+      </table>
+      <p>字段顺序和空格不影响校验。</p>
+
+      <h3>加密步骤</h3>
+      <ol>
+        <li>用 <code>auth.sm4_key</code> 的 16 字节作为 SM4 密钥。</li>
+        <li>随机生成 16 字节 IV。</li>
+        <li>对原文 UTF-8 字节做 PKCS7 填充，分组长度 16。</li>
+        <li>使用 SM4-CBC 加密。</li>
+        <li>拼接 <code>IV + 密文</code>。</li>
+        <li>对拼接结果做标准 Base64（带 <code>=</code> 填充），放入请求头 <code>access_token</code>。</li>
+      </ol>
+      <p>服务解密后检查：<code>key</code> 与 <code>auth.key</code> 一致；<code>ts</code> 与服务器当前 Unix 秒的差值绝对值不超过 60。同一条 <code>access_token</code> 不能长期复用。</p>
+    </section>
+  </main>
+</body>
+</html>

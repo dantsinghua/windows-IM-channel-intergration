@@ -2,7 +2,7 @@
 
 双钥(🔴 R-03,基线 §11.17 [MAILOPS]):
 - **指令签名钥** ``vault://mail/hmac/cmd/<短名>``:发起方持有,签指令邮件;回执也用它(让发起方验真是我们回的)。
-- **确认钥** ``vault://mail/hmac/confirm``:服务端生成、从不下发任何邮箱。
+- **确认钥** ``vault://mail/hmac/confirm``:服务端生成、从不下发任何邮件账号。
   🔴 **R6-7:v1 里这把钥只生成、只保管、无消费者**——``console`` 批准不用它签/验任何东西,本模块因此**不提供**任何用它签名的函数。
 """
 from __future__ import annotations

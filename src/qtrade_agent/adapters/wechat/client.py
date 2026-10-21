@@ -28,7 +28,8 @@ WECHAT_SEND_EXTRA_S = 5.0          # send 的 HTTP 超时 = confirm_timeout_ms/1
 WECHAT_LOGIN_START_TIMEOUT_S = 65.0     # svc TIMEOUT_S["wechat_login_start"]=60
 WECHAT_KEY_RETRY_TIMEOUT_S = 65.0       # svc 同用 wechat_login_start=60
 WECHAT_LOGOUT_TIMEOUT_S = 30.0          # WM_CLOSE 后 process_close_grace_s(默认 10)再强杀
-WECHAT_READ_TIMEOUT_S = 15.0            # svc TIMEOUT_S["wechat_read"]=10;无 talker 时要逐会话取
+WECHAT_STATE_TIMEOUT_S = 15.0          # State-driving calls keep their independent deadline.
+WECHAT_READ_TIMEOUT_S = 35.0            # R6-111: > svc wechat_read_scan(30s) + 余量;无 talker 时要逐会话取
 
 # #33 GET /wa/v1/wechat/login/status 的相位枚举(以 05 为准,R3-3;identified 是两钥取钥流程的枢纽相位)
 PHASES = ("idle", "narrator", "qrcode", "identified", "keytry", "ready", "key_failed")
@@ -101,7 +102,7 @@ class WeChatWinAgent:
     async def status(self) -> dict[str, Any]:
         """#28:``{enabled, wechat:{installed,version,running,logged_in,wxid,nickname,pid}, chatlog:{running,port,key_ok,dll},
         ritual_done, screen_locked, login_session?}``;模块关闭时 ``enabled:false`` 其余 null。"""
-        return await self._call("GET", "/wa/v1/wechat/status", timeout_s=WECHAT_READ_TIMEOUT_S)
+        return await self._call("GET", "/wa/v1/wechat/status", timeout_s=WECHAT_STATE_TIMEOUT_S)
 
     async def version_match(self) -> dict[str, Any]:
         """#29:``{match, action, current_version, bundled_version, dll, status}``(基线 §8.6)。"""
@@ -114,7 +115,7 @@ class WeChatWinAgent:
 
     async def login_status(self) -> dict[str, Any]:
         """#33:``{phase, wxid?, account_id?, nickname?, countdown_s?, narrator:{state,remaining_s}, key:{ok,dll,error}}``。"""
-        return await self._call("GET", "/wa/v1/wechat/login/status", timeout_s=WECHAT_READ_TIMEOUT_S)
+        return await self._call("GET", "/wa/v1/wechat/login/status", timeout_s=WECHAT_STATE_TIMEOUT_S)
 
     async def ui_visible(self) -> dict[str, Any]:
         """#36:``{visible, minimized, locked}`` 微信主窗口是否可自动化。"""
@@ -134,7 +135,7 @@ class WeChatWinAgent:
         if limit is not None:
             q.append(f"limit={int(limit)}")
         path = "/wa/v1/wechat/read" + ("?" + "&".join(q) if q else "")
-        body = await self._call("GET", path, retry=True, timeout_s=WECHAT_READ_TIMEOUT_S)
+        body = await self._call("GET", path, retry=False, timeout_s=WECHAT_READ_TIMEOUT_S)
         return list(body.get("data") or body.get("messages") or [])
 
     async def sessions(self, *, keyword: Optional[str] = None, limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -168,7 +169,7 @@ class WeChatWinAgent:
 
     async def login_cancel(self) -> dict[str, Any]:
         """#32:取消登录会话(扫码超时/用户放弃);**微信已登进去的不登出**(05 §2.4.2.1 失败回滚原则)。"""
-        return await self._call("POST", "/wa/v1/wechat/login/cancel", body={}, timeout_s=WECHAT_READ_TIMEOUT_S)
+        return await self._call("POST", "/wa/v1/wechat/login/cancel", body={}, timeout_s=WECHAT_STATE_TIMEOUT_S)
 
     async def bind(self, wxid: str, account_id: str) -> dict[str, Any]:
         """#33c:把取钥读到的 ``wxid`` 绑到 Agent 已建的 ``wxNN``(05 §2.4.2.1 第 4 步);同 ``wxid`` 重绑幂等,

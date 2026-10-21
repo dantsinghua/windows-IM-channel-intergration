@@ -30,11 +30,13 @@ const networkText = computed(() => {
   return state ? NET_STATE_TEXT[state] ?? state : '网络状态未知'
 })
 const winagentText = computed(() => {
+  if (session.localStatus) return session.serviceStateText
   if (!store.health) return '状态未知'
   const state = store.health.winagent
   return (typeof state === 'object' ? state.online : state) ? '已连接' : '未连接'
 })
 const userAgentText = computed(() => {
+  if (session.localStatus) return session.sessionStateText
   if (!store.health) return '状态未知'
   const state = store.health.winagent
   const online = typeof state === 'object' ? state.user_agent : store.health.user_agent
@@ -193,8 +195,12 @@ onMounted(async () => {
           <span class="environment-symbol">◇</span><div class="qt-eyebrow">WINDOWS / WINAGENT</div><h2>Windows 连接服务</h2>
           <p :data-testid="T.version('winagent')">WinAgent · {{ winagentText }}</p>
           <div class="environment-state" :data-testid="T.version('winagent-user')">用户会话代理 · {{ userAgentText }}</div>
+          <p data-testid="qt-local-api-state">采集 API · {{ session.apiStateText }}</p>
+          <a-button v-if="session.canStartLocalService" data-testid="qt-env-start-winagent" :loading="session.localServiceBusy" :disabled="session.localServiceBusy" @click="session.startLocalService()">启动 WinAgent 服务及会话代理</a-button>
+          <a-button data-testid="qt-local-service-refresh" :disabled="session.localServiceBusy" @click="session.refreshLocalStatus()">检查本机服务状态</a-button>
+          <p v-if="session.localServiceMessage" role="status">{{ session.localServiceMessage }}</p>
           <a-button :loading="selftestBusy" :data-testid="T.selfcheckRun" @click="runSelftest">检查系统环境</a-button>
-          <p class="qt-small qt-muted">会话代理需要 Windows 用户保持登录。</p>
+          <p class="qt-small qt-muted">服务、会话代理和采集 API 分别检查；未知状态不代表 Windows 用户未登录。</p>
         </section>
         <section id="network" class="environment-card qt-glass">
           <span class="environment-symbol">◎</span><div class="qt-eyebrow">NETWORK / CONNECTIVITY</div><h2>网络连接</h2>

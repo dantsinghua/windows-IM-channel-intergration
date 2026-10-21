@@ -169,7 +169,7 @@ class XunjiaInbox:
             pending.append(cmd_id)
             planned.append((name, cmd_id, ack_name))
         log.info(
-            "询价信箱文件 files=%s held=%s acked=%s pending=%s unnamed=%s",
+            "询价待处理文件 files=%s held=%s acked=%s pending=%s unnamed=%s",
             len(names), held, acked, pending, unnamed,
         )
         for name, cmd_id, ack_name in planned:

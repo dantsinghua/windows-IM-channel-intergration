@@ -64,12 +64,14 @@ class QQHealth:
                  on_login_required: Optional[LoginRequiredFn] = None,
                  status_probe: Optional[StatusProbe] = None,
                  busy: Callable[[str], bool] = lambda account_id: False,
+                 on_recovery: Optional[LoginRequiredFn] = None,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000)):
         self._adapter = adapter
         self._store = store
         self._alerts = alerts
         self.cfg = cfg
         self._on_login_required = on_login_required
+        self._on_recovery = on_recovery                # R6-111:H08 恢复后回调(transition running;不自动重登)
         self._status_probe = status_probe            # 备用通道(HTTP);None = 只走 WS,不发任何网络请求
         self._busy = busy
         self._clock = clock
@@ -120,7 +122,7 @@ class QQHealth:
                 online = await self._probe_status(sess.acct, sess)
             else:
                 status = client.last_status or {}
-                online = status.get("online") if "online" in status else None
+                online = status.get("online") if type(status.get("online")) is bool else None
             # 05 §2.5.4 QQ 行 ①:**WS 断连 `[accounts] qq_reconnect_grace_s`(60 s)内仍连不上 ⇒ login_required**。
             # 这是与「心跳丢 / get_status.online=false」并列的第三条判据(rulings R6-58 (n-qq));
             # 判在 H08 这一轮里(04 H08 行只管心跳与 get_status,但 `OneBotClient` 会一直退避重连、自己不会判)。
@@ -189,7 +191,7 @@ class QQHealth:
             try:
                 data = await sess.client.call_action("get_status")
                 if isinstance(data, dict) and "online" in data:
-                    return bool(data["online"])
+                    return data["online"] if type(data["online"]) is bool else None
             except (OneBotClosed, OneBotError) as e:
                 log.info("H08 WS get_status 未取到 account=%s: %s", acct.id, e)
         if self._status_probe is None:
@@ -200,7 +202,7 @@ class QQHealth:
             log.info("H08 备用 get_status 探测失败 account=%s: %s", acct.id, e)
             return None
         if isinstance(data, dict) and "online" in data:
-            return bool(data["online"])
+            return data["online"] if type(data["online"]) is bool else None
         return None
 
     async def _judge(self, account_id: str, subject: str, st: H08State, *, lost: bool, online: Optional[bool],
@@ -226,12 +228,21 @@ class QQHealth:
                                     evidence=evidence, hint_actions=["open_acct_detail"])
             return
         st.offline_since_ms = None
-        st.login_required_sent = False
         if lost:
             self._alerts.firing(H08_NAPCAT_HEARTBEAT_LOST, subject=subject, severity="warn", account_id=account_id,
                                 evidence=evidence, hint_actions=["open_acct_detail"])
             return
         self._alerts.resolve(H08_NAPCAT_HEARTBEAT_LOST, subject=subject, account_id=account_id)
+        # R6-111:H08 恢复后自动回 running(连接恢复≠自动重登,不触发扫码/重建登录会话,不违反 D-2)
+        row = self._store.get_account_full(account_id)
+        if (online is True and row is not None and row.get("state") == "login_required"
+                and row.get("state_code") == H08_LOGIN_REQUIRED_STATE_CODE
+                and row.get("enabled") and not row.get("deleted_ms")
+                and row.get("desired_state") == "running" and not self._busy(account_id)
+                and (st.login_required_sent or "H08" in (row.get("state_reason") or ""))
+                and self._on_recovery is not None):
+            await self._on_recovery(account_id, "RECOVERED")
+            st.login_required_sent = False
 
 
 __all__ = ["H08_INTERVAL_S", "H08_LOGIN_REQUIRED_STATE_CODE", "H08_NAPCAT_HEARTBEAT_LOST", "H08State", "QQHealth", "status_url"]

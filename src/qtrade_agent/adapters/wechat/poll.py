@@ -18,10 +18,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ...alerts import Alerts
 from ...config import AgentConfig
 from ...events import Events, message_payload
 from ...store import CursorUpdate, Store
@@ -49,6 +52,11 @@ class WechatAccountView:
 @dataclass
 class AccountPollState:
     """每微信账号各一份的内存态(wx01 与 wx02 互不共享;Agent 重启即丢,规格如此)。"""
+    retry_attempts: int = 0
+    retry_started_ms: Optional[int] = None
+    next_retry_ms: int = 0
+    retry_exhausted: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     read_fail_streak: int = 0
     confirm_until_ms: int = 0                       # 发送确认期截止(> now 时用 1 s 加速周期)
     last_error: Optional[str] = None
@@ -62,8 +70,9 @@ class WechatPoller:
         self.events = events
         self.client = client
         self.cfg = cfg
-        self.wechat_cfg = wechat_cfg or WechatAdapterConfig()
+        self.wechat_cfg = wechat_cfg or cfg.wechat_adapter
         self.clock = clock
+        self.alerts = Alerts(events, clock=clock)
         self.state: dict[str, AccountPollState] = {}
 
     # ------------------------------------------------------------------ 内存态与周期
@@ -80,6 +89,10 @@ class WechatPoller:
     def interval_s(self, account_id: str) -> float:
         """当前该账号的拉取周期:确认期内 ``confirm_poll_interval_ms``,否则 ``poll_interval_s``。"""
         s = self.st(account_id)
+        if s.retry_exhausted:
+            return float(self.wechat_cfg.poll_interval_s)
+        if s.retry_started_ms is not None:
+            return max(0.0, (s.next_retry_ms - self.clock()) / 1000)
         if self.clock() < s.confirm_until_ms:
             return self.wechat_cfg.confirm_poll_interval_ms / 1000
         return float(self.wechat_cfg.poll_interval_s)
@@ -100,25 +113,84 @@ class WechatPoller:
 
     # ------------------------------------------------------------------ 一轮
     async def poll(self, acct: WechatAccountView, only_sessions: Optional[list[str]] = None) -> int:
-        """一轮增量。``only_sessions`` = 确认窗内只查目标会话(与 ``Adapter.poll`` 协议同义);返回本轮入库/更新的行数。"""
+        """At most one bounded attempt; retries are owned here, not by the transport."""
         st = self.st(acct.id)
-        batches: list[tuple[Optional[str], int]] = []
-        if only_sessions:
-            batches = [(t, self.cursor_seq(acct.id, t)) for t in only_sessions]
-        else:
-            batches = [(None, self.account_seq(acct.id))]
-        rows: list[dict[str, Any]] = []
-        try:
-            for talker, since in batches:
-                rows.extend(await self.client.read(talker=talker, since_seq=since, limit=READ_LIMIT))
-        except (WeChatNotReady, WeChatCallFailed) as e:
-            st.read_fail_streak += 1
-            st.last_error = repr(e)
-            log.warning("微信 read 失败 account=%s streak=%d: %s", acct.id, st.read_fail_streak, e)
+        if st.lock.locked():
             return 0
-        st.read_fail_streak = 0
-        st.last_error = None
-        return self._ingest(acct, rows)
+        async with st.lock:
+            now = self.clock()
+            if st.retry_exhausted:
+                return 0
+            if st.retry_started_ms is not None and now - st.retry_started_ms >= self.wechat_cfg.read_retry_window_s * 1000:
+                self._exhaust_read(acct.id, "retry_window_exhausted")
+                return 0
+            if now < st.next_retry_ms:
+                return 0
+            before = self.store.get_account_full(acct.id)
+            started = now
+            batches = [(t, self.cursor_seq(acct.id, t)) for t in only_sessions] if only_sessions else [(None, self.account_seq(acct.id))]
+            rows: list[dict[str, Any]] = []
+            try:
+                for talker, since in batches:
+                    rows.extend(await self.client.read(talker=talker, since_seq=since, limit=READ_LIMIT))
+            except (WeChatNotReady, WeChatCallFailed) as error:
+                self._read_failed(acct.id, error, started)
+                return 0
+            current = self.store.get_account_full(acct.id)
+            if before and (not current or current.get("deleted_ms") or not current.get("enabled")
+                           or current.get("state") in ("stopped", "stopping", "disabled")
+                           or current.get("self_uid") != before.get("self_uid")
+                           or current.get("desired_state") != before.get("desired_state")):
+                return 0
+            result = self._ingest(acct, rows)
+            st.read_fail_streak = st.retry_attempts = 0
+            st.retry_started_ms = None
+            st.retry_exhausted = False
+            st.next_retry_ms = 0
+            st.last_error = None
+            self.alerts.resolve("WECHAT_READ_RETRY_EXHAUSTED", subject="account:" + acct.id, account_id=acct.id)
+            return result
+
+    def _read_failed(self, account_id: str, error: Exception, started_ms: int) -> None:
+        st = self.st(account_id)
+        body = getattr(error, "body", None)
+        detail = body.get("error") if isinstance(body, dict) else None
+        reason = getattr(error, "reason", None) or (detail.get("reason") if isinstance(detail, dict) else None)
+        if not isinstance(reason, str) or not re.fullmatch(r"[a-zA-Z0-9_]{1,80}", reason):
+            reason = "wechat_read_http_" + str(getattr(error, "status", "unavailable"))
+        st.last_error = reason
+        # A timeout cannot prove that a key is invalid; keep its actual layer/reason.
+        if not (isinstance(error, WeChatCallFailed) and error.status == 504) and reason != "wechat_read_catching_up":
+            st.read_fail_streak += 1
+        if st.retry_started_ms is None:
+            st.retry_started_ms = started_ms
+        st.retry_attempts += 1
+        delay = min(self.wechat_cfg.read_retry_backoff_max_s,
+                    self.wechat_cfg.read_retry_backoff_base_s * (2 ** min(st.retry_attempts - 1, 16)))
+        st.next_retry_ms = self.clock() + delay * 1000
+        row = self.store.get_account_full(account_id)
+        if row and not row.get("auto_recover"):
+            self._exhaust_read(account_id, "auto_recover_disabled")
+        elif st.retry_attempts >= self.wechat_cfg.read_retry_max:
+            self._exhaust_read(account_id, "retry_count_exhausted")
+        elif self.clock() - st.retry_started_ms >= self.wechat_cfg.read_retry_window_s * 1000:
+            self._exhaust_read(account_id, "retry_window_exhausted")
+        log.warning("WeChat read incomplete account=%s cause=%s attempt=%d exhausted=%s",
+                    account_id, reason, st.retry_attempts, st.retry_exhausted)
+
+    def _exhaust_read(self, account_id: str, stop_reason: str) -> None:
+        st = self.st(account_id)
+        st.retry_exhausted = True
+        self.alerts.firing("WECHAT_READ_RETRY_EXHAUSTED", subject="account:" + account_id, account_id=account_id,
+                          evidence={"cause": st.last_error, "stop_reason": stop_reason,
+                                    "attempts": st.retry_attempts, "cursor_unchanged": True},
+                          hint_actions=["open_logs", "restart"])
+
+    def degraded_read_failed(self, account_id: str) -> bool:
+        st = self.st(account_id)
+        return st.retry_exhausted or st.read_fail_streak >= READ_FAIL_STREAK or (
+            st.retry_attempts >= READ_FAIL_STREAK and st.last_error != "wechat_read_catching_up")
+
 
     def _ingest(self, acct: WechatAccountView, rows: list[dict[str, Any]]) -> int:
         """按 talker 分组:每组一次 ``ingest_batch``(会话 → 消息 → 该会话水位,同一事务)。"""

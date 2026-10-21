@@ -11,6 +11,7 @@ pool 校准/workflow/HMAC → 注册 scheduler 任务 → 启动恢复(02 §2.6:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -255,6 +256,7 @@ class AgentApp:
                                                  wa_raw=self._wa_media_raw))
         self.wechat_poller = WechatPoller(store=self.store, events=self.events, client=self.wechat_client, cfg=self.cfg,
                                           wechat_cfg=self.cfg.wechat_adapter, clock=self.clock)
+        self.wechat_poller.alerts = self.alerts
         # 企点 UI 执行层(05 §2.1.1 ⑥~⑪ 登录 / 06 §2.9.5 发送):**只有真机后端才自动装**,
         # 注了假 adb 的开发容器/测试一律保持未接(要测 UI 层就显式传 sender/login_fn)。凭据仍由 accounts 从 Vault 取后传进来。
         real_backend = self._adb is None
@@ -301,7 +303,8 @@ class AgentApp:
         self.healthloop.wechat_client = self.wechat_client
         self.qqhealth = QQHealth(adapter=self.adapters["qq"], store=self.store, alerts=self.alerts, cfg=self.cfg, clock=self.clock,
                                  busy=lambda aid: self.accounts.busy(aid) or self.accounts.qq_login_pending(aid),
-                                 on_login_required=self._qq_login_required)
+                                 on_login_required=self._qq_login_required,
+                                 on_recovery=self._qq_recovered)
         self.timesync = TimeSync(self.winagent, health=self.health, alerts=self.alerts, clock=self.clock, aligner=self._aligner, on_resume=self.on_host_resume)
         # ---- 横切:webhook / 保留期与磁盘 / 资源池自校准 / 工作流 / HMAC 公网入站
         self.http = self._http if self._http is not None else UrllibHttp(honor_env_proxy=self.cfg.net.honor_env_proxy)
@@ -372,20 +375,56 @@ class AgentApp:
         self.oss_settings = OssboxSettings(self.store, self.vault)
         self._oss_sender = sender
         self.oss_start_error = ""
+        from .ossbox.xunjia_v22 import collector_version
         try:
-            # A saved page profile is authoritative, including missing/invalid data.
-            # Its Vault access is asynchronous and happens before scheduler startup.
-            oss_box = OssV1Box.from_env() if not self.oss_settings.has_saved() else None
+            self._xunjia_version = collector_version()
+        except ValueError:
+            self._xunjia_version = "disabled"
+            self.oss_start_error = "xunjia_collector_version_invalid"
+        from .ossbox.relay_settings import RelaySettings
+        self.relay_settings = RelaySettings.from_env() if self._xunjia_version == "2.2" else None
+        self.collector_reporting_settings = None
+        if self._xunjia_version == "2.2":
+            from .ossbox.collector_settings import CollectorReportingSettings
+            seed = {"base_url": os.environ.get("XUNJIA_FILE_GATEWAY_URL", "")}
+            if self.relay_settings is not None:
+                try:
+                    _document, auth, _changed = self.relay_settings._prepare({})
+                    seed.update(base_url=self.relay_settings.base_url, key=auth.key,
+                                sm4_key=auth.sm4_key.decode("utf-8"))
+                except Exception:
+                    pass
+            try:
+                from pathlib import Path
+                source = Path(os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""))
+                if source.is_file() and source.stat().st_size <= 16384:
+                    document = json.loads(source.read_text())
+                    if isinstance(document, dict):
+                        seed["workbench_id"] = document.get("workbench_id", "")
+                network = Path(os.environ.get("XUNJIA_MQ_CONNECTION_CONFIG", ""))
+                if network.is_file() and network.stat().st_size <= 65536:
+                    metadata = json.loads(network.read_text())
+                    if isinstance(metadata, dict):
+                        seed.update({key: metadata[key] for key in ("hostname", "addresses") if key in metadata})
+            except (OSError, ValueError, TypeError):
+                pass
+            self.collector_reporting_settings = CollectorReportingSettings(self.store, self.vault, seed=seed)
+        try:
+            # The file gateway has no legacy STS/Vault/OSS configuration source.
+            oss_box = (OssV1Box.from_env() if self.relay_settings is None
+                       and not self.oss_settings.has_saved() else None)
         except ValueError:
             log.warning("对象存储配置无效，询价轮询与目录发布未启用")
             oss_box = None
+        self._xunjia_oss_box = oss_box
+        self.xunjia_v22_host = None
         self.xunjia_inbox = (XunjiaInbox.from_env(self.store, sender, clock=self.clock, box=oss_box, bus=self.bus)
-                             if oss_box is not None else None)
+                             if oss_box is not None and self._xunjia_version == "1" else None)
         self.scheduler.register("xunjia_inbox", POLL_INTERVAL_SEC, self.xunjia_inbox_tick, run_immediately=True)
         from .ossbox.catalog_publish import CatalogPublisher
         self.catalog_publisher = (CatalogPublisher.from_env(
             self.store, os.path.join(self.data_dir, "catalog-publish.json"), box=oss_box,
-        ) if oss_box is not None else None)
+        ) if oss_box is not None and self.relay_settings is None else None)
         self.scheduler.register("catalog_publish", 60, self.catalog_publish_tick)
         return self
 
@@ -418,6 +457,8 @@ class AgentApp:
     async def xunjia_inbox_tick(self) -> None:
         """拉 ``in/xunjia`` 指令。未装配时直接返回。正在跑的进程要下次启动才走这里。"""
         inbox = getattr(self, "xunjia_inbox", None)
+        if getattr(self, "_xunjia_version", "1") != "1":
+            return
         if inbox is None:
             return
         await inbox.poll()
@@ -484,12 +525,34 @@ class AgentApp:
         E-3 例外(§2.2.12):``NET_PUBLIC_ENDPOINT_CHANGED`` 必须推给**全部** ``enabled=1`` 登记方、不受订阅过滤。"""
         payload = kw.get("payload") or {}
         ignore = kw.get("event") == "net" and payload.get("code") == "NET_PUBLIC_ENDPOINT_CHANGED"
-        self.webhooks.fanout(ignore_filters=ignore, **kw)
+        try:
+            host = getattr(self, "xunjia_v22_host", None)
+            if host is not None:
+                host.observe(**kw)
+        finally:
+            self.webhooks.fanout(ignore_filters=ignore, **kw)
 
     async def _qq_login_required(self, account_id: str, state_code: str) -> None:
-        """04 H08:``online=false`` 持续 2 min ⇒ 置 ``login_required`` + 推 ``account_state`` 事件,**不自动重登**(D-2)。"""
-        self.accounts.transition(account_id, "login_required", state_code=state_code,
-                                 state_reason="napcat 报离线超过 2 分钟(H08)")
+        """Record an observed H08 outage without starting a login attempt."""
+        row = self.store.get_account_full(account_id)
+        if (not row or not row.get("enabled") or row.get("desired_state") != "running"
+                or self.accounts.busy(account_id) or self.accounts.qq_login_pending(account_id)):
+            return
+        if row.get("state") == "login_required" and row.get("state_code") == state_code:
+            return
+        self.accounts.mark_offline(account_id, state_code, reason="NapCat connection unavailable (H08)")
+
+    async def _qq_recovered(self, account_id: str, _state_code: str) -> None:
+        """Only reverse an H08-owned downgrade; manual stop and login always win."""
+        row = self.store.get_account_full(account_id)
+        if (row and not row.get("deleted_ms") and row.get("enabled") and row.get("self_uid")
+                and row.get("desired_state") == "running" and row.get("state") == "login_required"
+                and row.get("state_code") == "TOKEN_EXPIRED" and not self.accounts.busy(account_id)
+                and not self.accounts.qq_login_pending(account_id)
+                and (self.qqhealth.state_of(account_id).login_required_sent or "H08" in (row.get("state_reason") or ""))):
+            self.accounts.transition(account_id, "running", state_code=None, state_reason="NapCat heartbeat recovered (H08)")
+            self.alerts.resolve("ACCOUNT_OFFLINE", subject="account:" + account_id, account_id=account_id)
+
 
     def _maindb_for_uid(self, self_uid: str, acct: Optional[Account] = None) -> MainDb:
         acct = acct or self._current_qidian_account
@@ -539,7 +602,12 @@ class AgentApp:
         if ad is None:
             return
         now = self.clock()
-        for row in self.store.list_accounts(channel="wechat", state="running"):
+        # R6-111:degraded 也保留读轮询(只读),让回填能续读、读恢复自动回 running;旧实现只轮询 running 致降级后回填永久中断。
+        for row in self.store.list_accounts(channel="wechat"):
+            if (row["state"] not in ("running", "degraded") or not row.get("enabled")
+                    or row.get("desired_state") != "running" or self.accounts.busy(row["id"])
+                    or row.get("state_code") == "KEY_FAIL"):
+                continue
             if now < self._wechat_next_due.get(row["id"], 0):
                 continue
             acct = self._wechat_account(row)
@@ -872,6 +940,7 @@ class AgentApp:
     async def start(self, *, recover: bool = True) -> None:
         if not self._started:
             await self._configure_saved_ossbox()
+            await self._configure_xunjia_v22()
             await self.scheduler.start()
             self._started = True
             self._recovery_enabled = recover
@@ -902,18 +971,20 @@ class AgentApp:
         from .ossbox.catalog_publish import CatalogPublisher
         from .ossbox.settings import OssboxSettingsError
 
-        if not self.oss_settings.has_saved():
+        if self.relay_settings is not None or not self.oss_settings.has_saved():
             return
         self.xunjia_inbox = None
+        self._xunjia_oss_box = None
         self.catalog_publisher = None
         try:
             configured = await self.oss_settings.runtime()
             if configured is None:
                 return
             saved, box = configured
+            self._xunjia_oss_box = box
             if box is not None:
                 inbox = XunjiaInbox.from_env(self.store, self._oss_sender, clock=self.clock,
-                    box=box, workbench_id=saved["workbench_id"], bus=self.bus)
+                    box=box, workbench_id=saved["workbench_id"], bus=self.bus) if self._xunjia_version == "1" else None
                 # A new destination must not reuse the former destination's upload hashes.
                 state = os.path.join(self.data_dir, "catalog-publish-" + saved["revision"] + ".json")
                 publisher = CatalogPublisher.from_env(self.store, state,
@@ -928,6 +999,100 @@ class AgentApp:
             self.oss_start_error = "ossbox_configuration_unavailable"
             log.warning("Page OSS configuration unavailable; services disabled")
 
+    def _xunjia_v22_contacts(self, row):
+        from .adapters.qidian.contacts import list_private_contacts
+        if row.get("state") != "running" or not row.get("self_uid"):
+            raise RuntimeError("collector_contacts_account_not_running")
+        account = Account(id=row["id"], channel="qidian", state=row["state"], self_uid=row["self_uid"],
+            extra={"adb_serial": row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"})
+        source = self._maindb_for_uid(str(row["self_uid"]), account)
+        if not source.exists():
+            raise RuntimeError("collector_contacts_source_unavailable")
+        contacts = list_private_contacts(source.list_contact_source_rows())
+        from .adapters.qidian.org import OrgReadError, read_account_org
+        if not hasattr(self, "_xunjia_org_cache"):
+            self._xunjia_org_cache = {}
+        try:
+            organization = read_account_org(source, str(row["self_uid"]),
+                os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""), cache=self._xunjia_org_cache)
+        except OrgReadError as exc:
+            organization = {"org_state": exc.state, "org_error": exc.code}
+        return {"contacts": contacts, **organization}
+
+    async def _xunjia_institution_presence(self, row):
+        from .adapters.qidian.presence import NativePresenceProbe
+        if self.accounts.busy(row["id"]):return {"state":"unknown","code":"NATIVE_ACCOUNT_OPERATION_IN_PROGRESS"}
+        return await NativePresenceProbe(self.qidian_ui,clock=lambda:self.clock()/1000)(row)
+
+    def _xunjia_institution_history_source(self, row):
+        if row.get("state") not in ("running","degraded") or not row.get("self_uid"):
+            raise RuntimeError("collector_history_account_not_running")
+        account=Account(id=row["id"],channel="qidian",state=row["state"],self_uid=row["self_uid"],
+            extra={"adb_serial":row.get("adb_serial") or f"127.0.0.1:{16000+int(row['seq'])}"})
+        return self._maindb_for_uid(str(row["self_uid"]),account)
+
+    def _xunjia_institution_friends(self, row):
+        from .adapters.qidian.contacts import list_private_contacts
+        if row.get("state") not in ("running","degraded") or not row.get("self_uid"):
+            raise RuntimeError("collector_contacts_account_not_running")
+        account=Account(id=row["id"],channel="qidian",state=row["state"],self_uid=row["self_uid"],
+            extra={"adb_serial":row.get("adb_serial") or f"127.0.0.1:{16000+int(row['seq'])}"})
+        source=self._maindb_for_uid(str(row["self_uid"]),account)
+        if not source.exists():raise RuntimeError("collector_contacts_source_unavailable")
+        return list_private_contacts(source.list_contact_source_rows())
+
+
+    async def _configure_xunjia_v22(self) -> None:
+        if getattr(self, "_xunjia_version", "1") != "2.2":
+            return
+        institution_mode=os.environ.get("XUNJIA_INSTITUTION_COLLECTOR","0")
+        if institution_mode not in ("0","1"):
+            raise ValueError("institution_collector_flag_must_be_zero_or_one")
+        if institution_mode=="1":
+            from .ossbox.institution import InstitutionCollectorHost
+            try:
+                if self.xunjia_v22_host is not None and not isinstance(self.xunjia_v22_host,InstitutionCollectorHost):
+                    raise ValueError("legacy_host_requires_explicit_migration")
+                if self.xunjia_v22_host is None:
+                    self.xunjia_v22_host=await InstitutionCollectorHost.from_settings(
+                        self.collector_reporting_settings,store=self.store,bus=self.bus,loop=asyncio.get_running_loop(),
+                        data_dir=self.data_dir,legacy_inbox_disabled=lambda:self.xunjia_inbox is None,
+                        friends_provider=self._xunjia_institution_friends,organization_provider=self._xunjia_v22_contacts,
+                        history_provider=self._xunjia_institution_history_source,presence_provider=self._xunjia_institution_presence,
+                        clock=lambda:self.clock()/1000)
+                await self.xunjia_v22_host.start()
+                self.oss_start_error=""
+            except Exception as exc:
+                self.oss_start_error=getattr(exc,"reason","institution_collector_configuration_unavailable")
+                self.collector_reporting_settings.state="error"
+                log.error("Institution collector unavailable; old transport not activated")
+            return
+        from .ossbox.xunjia_v22 import XunjiaV22Host
+        try:
+            if self.xunjia_inbox is not None:
+                raise RuntimeError("legacy_xunjia_inbox_must_be_disabled")
+            if self.xunjia_v22_host is None:
+                self.xunjia_v22_host = XunjiaV22Host.from_env(
+                    store=self.store, bus=self.bus, loop=asyncio.get_running_loop(),
+                    box=self._xunjia_oss_box, data_dir=self.data_dir,
+                    legacy_inbox_disabled=lambda: self.xunjia_inbox is None,
+                    contacts_provider=self._xunjia_v22_contacts)
+            if self.xunjia_v22_host is not None:
+                saved = self.oss_settings.saved() if self.relay_settings is None else None
+                if saved and saved.get("workbench_id") != self.xunjia_v22_host.binding.workbench_id:
+                    self.xunjia_v22_host = None
+                    raise ValueError("collector_workbench_binding_mismatch")
+                await self.xunjia_v22_host.start()
+                if self.relay_settings is not None:
+                    if hasattr(self.relay_settings, "bind_host"):
+                        self.relay_settings.bind_host(self.xunjia_v22_host)
+                    else:
+                        applied = self.relay_settings.saved()
+                        self.relay_settings.applied_revision = applied["revision"] if applied else None
+        except Exception:
+            self.oss_start_error = "xunjia_v22_configuration_unavailable"
+            log.error("V2.2 collector unavailable; legacy inbox remains disabled")
+
     async def stop(self) -> None:
         """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""
         self._recovery_enabled = False
@@ -939,6 +1104,9 @@ class AgentApp:
         if self._started:
             await self.scheduler.stop()
             self._started = False
+        host = getattr(self, "xunjia_v22_host", None)
+        if host is not None:
+            await host.stop()
         await self._stop_quietly(self.webhooks.stop(), "webhook 投递器")
         for run_id, t in list(getattr(self.workflows, "tasks", {}).items()):
             t.cancel()

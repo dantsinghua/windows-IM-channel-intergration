@@ -411,8 +411,10 @@ class UserAgentLink:
         try:
             result = await asyncio.wait_for(h(frame.params), timeout=budget)
         except asyncio.TimeoutError:
+            # 补 reason:让上层区分「管道超时」与「业务错误」;wechat.read 超时游标不变=可续读(R6-111,防误判 KEY_FAIL)
+            _reason = "user_handler_timeout"  # A deadline does not prove resumable progress.
             await conn.send(PipeFrame(id=frame.id, ok=False,
-                                      error={"code": TIMEOUT, "message": f"会话代理超过 deadline_ms={frame.deadline_ms}"}))
+                                      error={"code": TIMEOUT, "reason": _reason, "message": f"会话代理超过 deadline_ms={frame.deadline_ms}"}))
             return
         except WaError as e:
             await conn.send(PipeFrame(id=frame.id, ok=False,

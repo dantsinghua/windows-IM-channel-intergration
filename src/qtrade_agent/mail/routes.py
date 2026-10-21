@@ -1,4 +1,4 @@
-"""邮件路由 ``mail_routes`` —— 规格:docs/06 §2.15(E-5「按通道配多邮箱;预留按登录账号配邮箱」)。
+"""邮件路由 ``mail_routes`` —— 规格:docs/06 §2.15(E-5「按通道配多邮件账号;预留按登录账号配邮件账号」)。
 
 查找顺序(§2.15.1)= 账号级 ``(channel, account_id)`` → 通道级 ``(channel, NULL)`` → 全局默认。
 ⚠️ 列形态以 **02 §3.1 DDL 为准**(``id`` INTEGER AUTOINCREMENT、全局行 ``channel IS NULL AND account_id IS NULL``);
@@ -174,14 +174,14 @@ class RouteTable:
         return [r for r in self.routes if r.enabled and r.inbound.enabled and r.inbound.host]
 
     def mailboxes(self) -> dict[str, list[MailRoute]]:
-        """§2.15.3:**按 ``mailbox_key`` 去重,一个物理邮箱一条读线程**;多条路由共用同一邮箱时共用那条线程。"""
+        """§2.15.3:**按 ``mailbox_key`` 去重,一个物理邮件账号一条读线程**;多条路由共用同一邮件账号时共用那条线程。"""
         out: dict[str, list[MailRoute]] = {}
         for r in self.inbound_routes():
             out.setdefault(r.mailbox_key, []).append(r)
         return out
 
     def route_for_inbox_account(self, mailbox: str, account_id: str, channel: Optional[str]) -> Optional[MailRoute]:
-        """§2.15.3:一封邮件落在哪条路由——同邮箱的路由里,按 ``账号`` 所属通道/账号归属。"""
+        """§2.15.3:一封邮件落在哪条路由——同邮件账号的路由里,按 ``账号`` 所属通道/账号归属。"""
         candidates = [r for r in self.inbound_routes() if r.mailbox_key == mailbox]
         for r in candidates:
             if r.account_id == account_id:
@@ -195,7 +195,7 @@ class RouteTable:
         return candidates[0] if candidates else None
 
     def scope_subject_prefixes(self, mailbox: str, prefixes_of: Any) -> list[str]:
-        """§2.15.3:清理范围仍按邮箱圈定,``scope_subject_prefix`` 取该邮箱上**所有路由**模板前缀的并集。"""
+        """§2.15.3:清理范围仍按邮件账号圈定,``scope_subject_prefix`` 取该邮件账号上**所有路由**模板前缀的并集。"""
         out: list[str] = []
         for r in self.inbound_routes():
             if r.mailbox_key != mailbox:

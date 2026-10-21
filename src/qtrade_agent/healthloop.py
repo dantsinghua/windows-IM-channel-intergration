@@ -6,11 +6,12 @@
 - **H05 boot_completed 稳态**(每 60 s,仅企点 running/degraded):``getprop sys.boot_completed`` 从 1 变非 1 = Android 重启 ⇒ ``H05_BOOT_INCOMPLETE``(crit),等它回来。
 - **H06 adb 连接与 root 态**(每 ``adb_check_s``=30 s,仅企点;R6-32 两个子判据互不影响):
   (a) 连接态:``adb devices`` 里该 serial 非 ``device`` ⇒ 先 ``disconnect`` + ``connect``,成功后追加 ``ensure_root``;``h06_fail_streak`` +1(内存态、按账号一个整数、不落库;成功一次清零),
-      达 3 ⇒ 该账号 crit(只动该账号,**绝不 kill-server**);**宽限窗内(``health.is_rooting``)不判定 (a)**:不递增、不清零、不发连接态告警。
+      达 3 ⇒ 该账号 crit；共享恢复仅允许 R6-112 持久化预算与全部参与者同意的专用协调器执行;**宽限窗内(``health.is_rooting``)不判定 (a)**:不递增、不清零、不发连接态告警。
   (b) root 态:``whoami != root`` ⇒ 触发一次 ``ensure_root``(它自己发 warn ``QIDIAN_NOT_ROOT``、单独计数),永不升 crit、不计入 (a)。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from typing import Any, Callable, Optional
 from .adapters.base import Account
 from .alerts import (ACCOUNT_OFFLINE, AUTO_RESTART_EXHAUSTED, CONTAINER_OOM_KILLED, H04_CONTAINER_EXITED,
                      H05_BOOT_INCOMPLETE, H06_ADB_OFFLINE, QIDIAN_NOT_ROOT)
+from .ids import ulid
 from .events import iso8601
 from .config import AgentConfig
 
@@ -47,6 +49,7 @@ class HealthLoop:
         self._health = health
         self.cfg = cfg
         self._clock = clock
+        self._adb_probe_lock = asyncio.Lock()
         self.restart: dict[str, RestartState] = {}
         self.h06_fail_streak: dict[str, int] = runtime.h06_fail_streak      # 04 owner 的内存态计数,与 runtime 共享同一 dict
         self.last: dict[str, dict[str, Any]] = {"H04": {}, "H05": {}, "H06": {}, "WECHAT": {}}
@@ -170,12 +173,17 @@ class HealthLoop:
             except Exception as e:                       # 会话代理抖动:本轮不判,下轮再看
                 log.info("微信健康探测未取到 account=%s: %s", aid, e)
                 continue
+            current = self._store.get_account_full(aid)
+            if (not current or current.get("deleted_ms") or not current.get("enabled")
+                    or current["state"] not in ("running", "degraded") or self._accounts.busy(aid)
+                    or current.get("desired_state") != row.get("desired_state")):
+                continue
             self.last["WECHAT"][aid] = {"state": state, "state_code": code, "checked_ms": now}
             if state != row["state"] or (code or "") != (row.get("state_code") or ""):
                 self._accounts.transition(aid, state, state_code=code, state_reason=reason)
             # R6-91:只对「曾经取钥成功、跑起来过」的号自动试钥(self_uid 已回填)。首登没走完的号自动 key/retry 毫无意义
             # (取钥要人重登),反而反复拆掉用户正在做的那一轮;它们由控制台「重新取钥」重跑登录流(含回填/绑定)。
-            if (code == "KEY_FAIL" and row.get("self_uid")
+            if (code == "KEY_FAIL" and row.get("self_uid") and row.get("auto_recover")
                     and getattr(ad, "key_retry_required", lambda _aid: False)(aid)):
                 await self._wechat_key_retry(aid, now)
             elif state == "running":
@@ -240,33 +248,105 @@ class HealthLoop:
 
     # ------------------------------------------------------------------ H06
     async def check_adb(self) -> None:
+        """Observe once, then at most one shared recovery per sweep."""
+        if self._adb_probe_lock.locked():
+            return
+        async with self._adb_probe_lock:
+            await self._check_adb_once()
+
+    async def _check_adb_once(self) -> None:
         now = self._clock()
         rows = [r for r in self._watched(H06_STATES) if r["channel"] == "qidian" and not self._accounts.busy(r["id"])]
         if not rows:
             return
         devices = await self._runtime._adb.devices()
+        failed = []
         for row in rows:
-            aid, serial, subject = row["id"], self._serial(row), f"account:{row['id']}"
+            aid, serial, subject = row["id"], self._serial(row), "account:" + row["id"]
             if self._health.is_rooting(aid):
                 self.last["H06"][aid] = {"skipped": "rooting_grace", "checked_ms": now}
-                continue                                             # 宽限窗内不判定 (a):不增不清不告警
+                continue
             state = devices.get(serial)
             self.last["H06"][aid] = {"adb_state": state or "missing", "checked_ms": now}
             if state != "device":
                 streak = self.h06_fail_streak[aid] = self.h06_fail_streak.get(aid, 0) + 1
                 self._alerts.firing(H06_ADB_OFFLINE, subject=subject, account_id=aid, severity="crit" if streak >= 3 else "warn",
                                     evidence={"adb_state": state or "missing", "h06_fail_streak": streak})
-                await self._runtime._adb.disconnect(serial)          # 只动该账号这一条连接(R6-12:不 kill-server)
-                if await self._runtime._adb.connect(serial):
-                    await self._runtime.ensure_root(row)             # reconnect 成功后复提权(R6-28)
+                failed.append(row)
                 continue
-            if self.h06_fail_streak.get(aid):
-                self.h06_fail_streak[aid] = 0
+            self.h06_fail_streak[aid] = 0
             self._alerts.resolve(H06_ADB_OFFLINE, subject=subject, account_id=aid)
-            # (b) root 态:独立子判据,永不 crit
             whoami = (await self._runtime._adb.shell(serial, "whoami")).strip()
             if whoami != "root":
                 await self._runtime.ensure_root(row)
             else:
                 self._runtime.qidian_root_fail_streak[aid] = 0
                 self._alerts.resolve(QIDIAN_NOT_ROOT, subject=subject, account_id=aid)
+        if failed and any(self.h06_fail_streak[r["id"]] >= 3 for r in failed):
+            if await self._recover_adb_shared(devices):
+                return
+        for row in failed:
+            current = self._store.get_account_full(row["id"])
+            if not self._adb_row_active(current) or self._accounts.busy(row["id"]):
+                continue
+            serial = self._serial(current)
+            await self._runtime._adb.disconnect(serial)
+            if await self._runtime._adb.connect(serial):
+                await self._runtime.ensure_root(current)
+
+    @staticmethod
+    def _adb_row_active(row) -> bool:
+        return bool(row and row.get("channel") == "qidian" and row.get("host") == "wsl"
+                    and row.get("enabled") and not row.get("deleted_ms")
+                    and row.get("desired_state") == "running" and row.get("state") in H06_STATES)
+
+    async def _recover_adb_shared(self, devices: dict[str, str]) -> bool:
+        """A daemon reset affects every serial, so every participant must consent."""
+        if not self.cfg.health.adb_selfheal_enabled:
+            return False
+        participants = [r for r in self._store.list_accounts(channel="qidian")
+                        if r.get("enabled") and r.get("desired_state") == "running"]
+        if not participants or any(not self._adb_row_active(r) or not r.get("auto_recover")
+                                   or self._accounts.busy(r["id"]) or self._health.is_rooting(r["id"])
+                                   for r in participants):
+            return False
+        serials = {self._serial(r) for r in participants}
+        expected = {"127.0.0.1:" + str(16000 + int(r["seq"])) for r in participants}
+        if serials != expected or set(devices) - serials:
+            log.warning("ADB shared recovery deferred: unowned or unexpected serial")
+            return False
+        budget = self._store.reserve_recovery_attempt(
+            "recovery.adb.16000", now_ms=self._clock(), maximum=self.cfg.health.adb_selfheal_max_per_hour)
+        if not budget["allowed"]:
+            if budget["reason"] in ("recovery_budget_exhausted", "recovery_budget_invalid"):
+                self._alerts.firing("ADB_SELFHEAL_EXHAUSTED", subject="adb:16000", severity="warn",
+                                    evidence=budget, hint_actions=["open_logs"])
+            return False
+        self._alerts.resolve("ADB_SELFHEAL_EXHAUSTED", subject="adb:16000")
+        trace = ulid(self._clock())
+        log.warning("ADB shared recovery attempt=%d trace_id=%s participants=%d", budget["attempts"], trace, len(participants))
+        reason = "OK"
+        try:
+            await self._runtime._adb.kill_server()
+            # Re-read desired state after the await; never reconnect an account just stopped.
+            current = [self._store.get_account_full(r["id"]) for r in participants]
+            current = [r for r in current if self._adb_row_active(r) and r.get("auto_recover") and not self._accounts.busy(r["id"])]
+            await self._runtime._adb.reconnect_all([self._serial(r) for r in current])
+            for row in current:
+                latest = self._store.get_account_full(row["id"])
+                if self._adb_row_active(latest) and not self._accounts.busy(row["id"]):
+                    if not await self._runtime.ensure_root(latest):
+                        reason = "ADB_ROOT_NOT_READY"
+        except asyncio.CancelledError:
+            reason = "ADB_RECOVERY_CANCELLED"
+            raise
+        except Exception as error:
+            reason = getattr(error, "reason", "ADB_RECOVERY_FAILED")
+            log.warning("ADB recovery incomplete trace_id=%s cause=%s type=%s", trace, reason, type(error).__name__)
+        finally:
+            self._store.insert_audit(kind="system", transport="system", actor="system:health",
+                                     action="adb.selfheal", result_code=reason, trace_id=trace,
+                                     detail={"attempt": budget["attempts"], "participants": [r["id"] for r in participants]},
+                                     now_ms=self._clock())
+        # Even a failed attempt owns this sweep; no duplicate reset or fallthrough.
+        return True

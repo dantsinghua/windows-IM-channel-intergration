@@ -73,6 +73,9 @@ async def test_read_is_retried_once(tmp_path):
     rig = make_wechat_rig(tmp_path)
     rig.fake.add_row(talker="t", content="a", seq=1)
     rig.fake.fail_next = 1
+    # The application now owns bounded retries; the transport must not multiply them.
+    with pytest.raises(WeChatNotReady):
+        await rig.client.read(talker="t", since_seq=0)
     assert len(await rig.client.read(talker="t", since_seq=0)) == 1
     rig.store.close()
 

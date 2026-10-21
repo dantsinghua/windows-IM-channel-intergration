@@ -56,7 +56,7 @@ CREATE TABLE accounts (
   capabilities_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(capabilities_json)),
   identity_json   TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(identity_json)),  -- QQ:qq_data 指纹摘要;微信:wxid;企点:见 device_profiles
   settings_json   TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(settings_json)),  -- 账号级设置(05 §2.5.5;PATCH /accounts/{id}/settings)
-                                                 -- 含 mail_route_id(E-5,05 §2.5.5:该账号专用邮箱路由;空=按通道级/全局兜底)
+                                                 -- 含 mail_route_id(E-5,05 §2.5.5:该账号专用邮件路由;空=按通道级/全局兜底)
                                                  -- 含 auto_stop_on_pressure(E-19,默认 false:内存水位 crit 时是否允许按 LRU 自动停用本账号;false 只建议不自动停,§2.2.5)
   wxid            TEXT,                          -- 微信:取钥成功后回填(R-23,基线 §11.23 [WXID]);建行时 NULL(id=wxNN 先建、state='created')。
                                                  --   非微信恒 NULL;回填后与 wechat_profiles.wxid 一一对应。查重/合并靠下方 ux_accounts_wxid。
@@ -542,7 +542,7 @@ CREATE INDEX ix_health_lookup ON health_samples (scope, subject, resolution, ts_
 CREATE INDEX ix_health_ts ON health_samples (resolution, ts_ms);   -- 降采样与清理
 
 -- ───────────────────────── 邮件摆渡(列名以 06 §3.1 为准,C-26;路由 E-5) ─────────────────────────
--- mail_routes:邮箱路由(安琳 E-5:按通道配多邮箱,预留按登录账号配)。键 (channel, account_id) 三级:
+-- mail_routes:邮件路由(安琳 E-5:按通道配多邮件账号,预留按登录账号配)。键 (channel, account_id) 三级:
 --   全局 = 两者 NULL;通道级 = channel 非空、account_id NULL;账号级 = 两者非空。查找顺序 account → channel → global(§2.2.9)。
 --   SQLite 的 UNIQUE 把 NULL 视为互不相等,故唯一性用 COALESCE 表达式索引(否则可以插两行全局路由)。
 --   inbound_json:{protocol:'imap|pop3', host, port, ssl, user, secret_ref, folders[], processed_folder, poll_interval_s, idle, keep_raw, allowed_senders[], require_signature, allow_ops[], scope_subject_prefix[]}(键名 = §7.1 [mail.inbound])
@@ -591,7 +591,7 @@ CREATE INDEX ix_mail_routes_enabled ON mail_routes (enabled, channel, account_id
 CREATE TABLE mail_inbox (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   route_id        INTEGER REFERENCES mail_routes(id) ON DELETE SET NULL,   -- 经哪条路由收到(E-5);路由删除后置 NULL、邮件行保留
-  mailbox         TEXT NOT NULL,                 -- 邮箱账户(user@host)
+  mailbox         TEXT NOT NULL,                 -- 邮件账号(user@host)
   protocol        TEXT NOT NULL CHECK (protocol IN ('imap','pop3')),   -- 🔴 R6-58 (i):本列 = **路由配置的**协议(`mail_routes.inbound_json.protocol`);E-1 回落期间实际用哪个看下面的 effective_protocol
   effective_protocol TEXT CHECK (effective_protocol IS NULL OR effective_protocol IN ('imap','pop3')),
                                                  -- 🔴 R6-58 (i) 新增(06 §3.1 v0.3 E-1):取信时**实际**用的协议。回落期间 = 'pop3' 而 protocol 仍是 'imap';
@@ -659,7 +659,7 @@ CREATE INDEX ix_inbox_idem ON mail_inbox (idempotency_key) WHERE idempotency_key
 CREATE INDEX ix_inbox_route ON mail_inbox (route_id, received_ms DESC) WHERE route_id IS NOT NULL;
 CREATE INDEX ix_inbox_confirm_pending ON mail_inbox (confirm_expires_ms) WHERE status = 'CONFIRM_REQUIRED';  -- R6-7:过期 reaper 每 60s 的扫描面,只覆盖待确认行
 -- 🔴 R6-7 待确认过期 reaper(规范 SQL;归 `scheduler` 注册的 `mail_confirm_reaper`,**每 60 s 一轮**——与 `wechat_slot_reaper`、
---    `jobs_reclaimer` 同一 60 s 节拍,§2.2.11;不是邮件收/发/清理那三条 per-route task,过期判定与邮箱连接无关、邮箱掉线也必须照常过期):
+--    `jobs_reclaimer` 同一 60 s 节拍,§2.2.11;不是邮件收/发/清理那三条 per-route task,过期判定与邮件账号连接无关、邮件账号掉线也必须照常过期):
 --      UPDATE mail_inbox
 --         SET status = 'CONFIRM_EXPIRED',
 --             reason = 'CONFIRM_EXPIRED:待确认超过 danger_confirm_ttl_s 未在控制台处理'
@@ -707,10 +707,10 @@ CREATE INDEX ix_outbox_mail_route ON mail_outbox (route_id, created_ms DESC) WHE
 -- mail_cleanup_log:每轮清理一行(06 §2.6.8);原 02 的 skipped_unprocessed/skipped_out_of_scope 计数进 detail_json
 -- 🔴 R6-1 清理判据(与 06 §2.6.1 eligible() 同一口径,本册凡涉及"删远端邮件"的动作都以此为前置):
 --   NEVER_DELETE = {OUT_OF_SCOPE, OVERSIZE};候选 ⟺ mail_inbox.status 是终态 AND **status ∉ NEVER_DELETE** AND 已过 retention_days。
---   OVERSIZE(超大信,只登记元数据未取正文)必须**留在原夹原位**——人要能在邮箱客户端里看到它并在提上限后重新解析;
+--   OVERSIZE(超大信,只登记元数据未取正文)必须**留在原夹原位**——人要能在邮件客户端里看到它并在提上限后重新解析;
 --   删了 = 人工重新解析变死路。**五处**一律同此前置(06 §2.6;R6-26/R6-31 由四处补为五处):
 --     ① eligible();② ②容量循环(trigger='capacity');③ IMAP 终态 MOVE|COPY+\Deleted;④ POP3 cleanup_pop3;
---     ⑤ **max_kept_count 按条数触发的那轮**(trigger='max_kept',06 §2.6.3 ③:邮箱只保留最近 N 封、超出即删远端)——
+--     ⑤ **max_kept_count 按条数触发的那轮**(trigger='max_kept',06 §2.6.3 ③:邮件账号只保留最近 N 封、超出即删远端)——
 --       它是第三条删远端的触发路径,漏掉它 = 超大信照样被「按条数」挤掉。
 CREATE TABLE mail_cleanup_log (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,

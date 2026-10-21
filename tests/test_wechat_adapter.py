@@ -41,7 +41,7 @@ async def test_probe_state_key_fail_from_chatlog_and_from_read_streak(tmp_path):
     assert (await rig.adapter.probe_state(rig.account()))[:2] == ("degraded", "KEY_FAIL")
     rig.fake.chatlog["key_ok"] = True
     rig.poller.st("wx01").read_fail_streak = 3
-    assert (await rig.adapter.probe_state(rig.account()))[:2] == ("degraded", "KEY_FAIL")
+    assert (await rig.adapter.probe_state(rig.account()))[:2] == ("degraded", "WECHAT_READ_FAILED")
     rig.store.close()
 
 

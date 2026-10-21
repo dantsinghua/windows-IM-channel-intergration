@@ -52,7 +52,7 @@ class FetchStats:
 
 
 class MailFetcher:
-    """一个物理邮箱(``mailbox_key``)一个实例 —— §2.15.3「一个物理邮箱一条读线程」。
+    """一个物理邮件账号(``mailbox_key``)一个实例 —— §2.15.3「一个物理邮件账号一条读线程」。
 
     ``ingest`` 回调 = ``ingest.MailIngest.ingest_raw``,返回该封的 ``mail_inbox.status``;
     ``cleanup_hook`` 在同一轮取信之后执行(§2.6.6:IMAP 在 ``run_cycle()`` 之后、进 IDLE 之前;POP3 同一会话)。

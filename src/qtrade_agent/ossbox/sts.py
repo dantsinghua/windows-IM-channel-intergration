@@ -47,7 +47,7 @@ class StsCredentials:
     access_key_secret: str = field(repr=False)
     security_token: str = field(repr=False)
     expiration: float
-    bucket: str
+    bucket: str = ""  # optional legacy response field; never selects an OSS destination
 
 
 def build_access_token(auth_key: str, sm4_key: bytes, *, now: float | None = None) -> str:
@@ -105,12 +105,11 @@ class StsCredentialProvider:
             raise ValueError("sts_auth_key_invalid")
         if not isinstance(sm4_key, bytes) or len(sm4_key) != 16:
             raise ValueError("sts_sm4_key_invalid")
-        if expected_bucket is not None and not _BUCKET.fullmatch(expected_bucket):
-            raise ValueError("sts_bucket_invalid")
+        # Bucket is independent OSS business configuration. This compatibility
+        # parameter is ignored and will be removed from callers.
         self._url = url
         self._auth_key = auth_key
         self._sm4_key = sm4_key
-        self._bucket = expected_bucket
         self._clock = clock or time.time
         self._opener = opener if opener is not None else build_opener(ProxyHandler({}), NoRedirect())
         self._lock = threading.Lock()
@@ -140,7 +139,6 @@ class StsCredentialProvider:
                 raise
             now = self._clock()
             self._cached = fresh
-            self._bucket = fresh.bucket  # 首次响应后固定目的；刷新不得悄悄换 bucket。
             self._refresh_at = min(max(now + 15, fresh.expiration - _REFRESH_BEFORE),
                                    fresh.expiration - _MIN_VALIDITY)
             return fresh
@@ -174,20 +172,19 @@ class StsCredentialProvider:
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError
-            fields = [data[name] for name in ("access_key_id", "access_key_secret", "security_token", "expiration", "bucket")]
+            fields = [data[name] for name in ("access_key_id", "access_key_secret", "security_token", "expiration")]
             if any(not isinstance(value, str) or not value or len(value) > 16384 or
                    any(ord(c) < 32 or ord(c) == 127 for c in value) for value in fields):
                 raise ValueError
-            key_id, secret, token, expiration, bucket = fields
+            key_id, secret, token, expiration = fields
             if not all(value.isascii() and not any(c.isspace() for c in value) for value in (key_id, secret, token)):
                 raise ValueError
-            if not _RFC3339.fullmatch(expiration) or not _BUCKET.fullmatch(bucket):
+            if not _RFC3339.fullmatch(expiration):
                 raise ValueError
             expires = datetime.fromisoformat(expiration.replace("Z", "+00:00")).timestamp()
         except (ValueError, KeyError, TypeError, OverflowError):
             raise StsError("sts_response_invalid") from None
-        if self._bucket is not None and bucket != self._bucket:
-            raise StsError("sts_bucket_mismatch")
         if expires <= self._clock() + _MIN_VALIDITY:
             raise StsError("sts_credentials_expired")
-        return StsCredentials(key_id, secret, token, expires, bucket)
+        # Intentionally ignore any legacy "bucket" field returned by STS.
+        return StsCredentials(key_id, secret, token, expires)

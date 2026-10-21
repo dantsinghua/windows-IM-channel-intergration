@@ -6,6 +6,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { configureHttp } from '@/api/http'
 import { systemApi } from '@/api/client'
+import type { RecoveryStatus } from '../../electron/main/winagent-recovery'
 
 export type AuthState = 'ok' | 'winagent_offline' | 'no_token'
 
@@ -19,6 +20,45 @@ export const useSessionStore = defineStore('session', () => {
   const userAgentOnline = ref<boolean | null>(true)
   const apiVersion = ref('')
   const appVersion = ref<{ console: string; electron: string } | null>(null)
+  const localStatus = ref<RecoveryStatus | null>(null)
+  const localServiceBusy = ref(false)
+  const localServiceMessage = ref('')
+  const canStartLocalService = computed(() => !!window.qt?.localService)
+  const localStateText = (state: string | undefined) => state === 'online' ? '在线' : state === 'offline' ? '离线' : '未知'
+  const serviceStateText = computed(() => localStateText(localStatus.value?.service))
+  const sessionStateText = computed(() => localStateText(localStatus.value?.session))
+  const apiStateText = computed(() => localStateText(localStatus.value?.api))
+  let localQuery: Promise<void> | null = null
+  function refreshLocalStatus(): Promise<void> {
+    if (localQuery) return localQuery
+    localQuery = (async () => {
+      if (!window.qt?.localService) { localStatus.value = null; return }
+      try { localStatus.value = await window.qt.localService.status() }
+      catch { localStatus.value = { service: 'unknown', session: 'unknown', api: 'unknown', code: 'QUERY_FAILED' } }
+    })().finally(() => { localQuery = null })
+    return localQuery
+  }
+  async function startLocalService(): Promise<void> {
+    if (localServiceBusy.value || !window.qt?.localService) return
+    localServiceBusy.value = true
+    localServiceMessage.value = '正在启动 WinAgent；需要时 Windows 会请求管理员确认。'
+    try {
+      const result = await window.qt.localService.start()
+      localStatus.value = result.status
+      const failure: Record<string, string> = {
+        UAC_CANCELLED: '已取消管理员确认，未完成启动。',
+        SERVICE_NOT_INSTALLED: '未找到已安装的 QTradeWinAgent 服务。',
+        IDENTITY_MISMATCH: '已安装服务身份校验失败，未执行启动。',
+        SESSION_IDENTITY_MISMATCH: '当前 Windows 用户与服务安装用户不一致，未启动会话代理。',
+        STARTING: '启动请求已执行，但服务或会话代理尚未核验就绪，请检查状态。',
+      }
+      localServiceMessage.value = result.ok
+        ? `WinAgent 服务与会话代理已核验在线。采集 API ${localStateText(result.status.api)}。`
+        : failure[result.code] ?? `启动未完成（${result.code}），请检查服务与安装状态。`
+      if (result.ok) { await window.qt.auth.refresh(); await refreshAuth(); await pingAgent() }
+    } catch { localServiceMessage.value = '启动操作失败，尚未确认服务已启动。' }
+    finally { localServiceBusy.value = false }
+  }
   /**
    * 版本协商失败(02 §3.8:`X-QT-Api-Min` 不被满足 ⇒ `426 UPGRADE_REQUIRED`)。
    * 一旦出现,任何请求都发不出去 —— 必须给一句能照着做的话,不能只弹「请求失败」。
@@ -40,7 +80,7 @@ export const useSessionStore = defineStore('session', () => {
     if (upgradeRequired.value) return 'API 版本不匹配,请用安装包整体升级'
     if (authState.value === 'winagent_offline') return '本机服务尚未就绪'
     if (authState.value === 'no_token') return '机器人采集终端令牌失效,请在 WinAgent 中重新签发'
-    if (!agentReachable.value) return 'Agent 未运行(WSL 发行版 qtrade 可能已停止)'
+    if (!agentReachable.value) return '采集 API 暂时不可达'
     return ''
   })
   /** 门禁正文第二行:426 时写清「控制台要什么、Agent 是什么」 */
@@ -51,7 +91,11 @@ export const useSessionStore = defineStore('session', () => {
   })
 
   /** A-7:两处门禁共用的固定一句 */
-  const GATE_LOGIN_HINT = '用户未登录 Windows 时服务不会自动拉起——请先登录 Windows 桌面'
+  // Compatibility name used by existing pages; the message follows measured state.
+  const GATE_LOGIN_HINT = computed(() => userAgentOnline.value === null
+    ? '无法确认会话代理状态，请检查 Windows 服务与会话连接。'
+    : userAgentOnline.value ? 'Windows 会话代理在线；采集 API 需要独立检查。'
+      : 'Windows 会话代理未连接，请检查当前桌面会话。')
 
   /** WinAgent 离线时要降级的面(§5.3) */
   const wechatDisabled = computed(() => !winagentOnline.value || !userAgentOnline.value)
@@ -88,12 +132,15 @@ export const useSessionStore = defineStore('session', () => {
       try {
         const r = (await window.qt?.wa.invoke('wa.health', {})) as { message?: string; user_agent?: boolean } | undefined
         agentDownReason.value = r?.message ?? null
-        userAgentOnline.value = r?.user_agent ?? false
+        userAgentOnline.value = r?.user_agent ?? null
         winagentOnline.value = !!r
       } catch {
         agentDownReason.value = null
         winagentOnline.value = false
+        userAgentOnline.value = null
       }
+    } finally {
+      await refreshLocalStatus()
     }
   }
 
@@ -142,6 +189,8 @@ export const useSessionStore = defineStore('session', () => {
 
   return {
     authState, agentReachable, agentDownReason, winagentOnline, userAgentOnline, apiVersion, appVersion,
+    localStatus, localServiceBusy, localServiceMessage, canStartLocalService,
+    serviceStateText, sessionStateText, apiStateText, refreshLocalStatus, startLocalService,
     upgradeRequired, draining,
     gateVisible, gateTitle, gateDetail, GATE_LOGIN_HINT, wechatDisabled, vaultDisabled, wslGroupDisabled,
     refreshAuth, retryToken, pingAgent, startWsl, install, uninstall,

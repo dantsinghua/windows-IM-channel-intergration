@@ -236,21 +236,21 @@ def test_probe_uses_entered_credentials_and_returns_only_authentication_summary(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["ok"] is True and body["authenticated"] is True
-    assert body["bucket"] == PUBLIC["bucket"] and body["expiration"]
+    assert "bucket" not in body and body["expiration"]
     assert len(calls) == 1 and calls[0]._auth_key == AUTH and calls[0]._sm4_key == SM4.encode()
     assert state(rig) is None and not rig.agent.vault.entries
     assert not rig.agent.scheduler._started
     assert_no_secrets(rig, response)
 
 
-def test_probe_with_omitted_passwords_reads_saved_credentials_without_saving_edits(rig, monkeypatch):
+def test_probe_omitted_passwords_must_not_use_saved_credentials(rig, monkeypatch):
     saved(rig)
     before = dict(state(rig))
     entries_before = {name: entry.value for name, entry in rig.agent.vault.entries.items()}
     calls = fake_credentials(monkeypatch)
     response = rig.client.post(URL + "/test", headers=H(), json={**PUBLIC, "workbench_id": "unsaved-change"})
-    assert response.status_code == 200, response.text
-    assert len(calls) == 1 and calls[0]._auth_key == AUTH
+    assert response.status_code == 400, response.text
+    assert len(calls) == 0
     assert state(rig) == before
     assert {name: entry.value for name, entry in rig.agent.vault.entries.items()} == entries_before
 

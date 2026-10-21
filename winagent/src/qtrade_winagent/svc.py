@@ -46,7 +46,7 @@ ACTOR_BY_ROLE = {ROLE_AGENT: ACTOR_AGENT, ROLE_CONSOLE: ACTOR_CONSOLE, ROLE_INST
 
 # 02 §2.5「超时」(Agent 侧的期望值;服务侧据此给管道 deadline_ms = 本值 − 1s)
 TIMEOUT_S = {"ping": 2.0, "health": 2.0, "time": 3.0, "vault": 3.0, "metrics": 3.0, "alerts": 3.0, "net": 3.0,
-             "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0,
+             "probe_target": 10.0, "probe_round": 60.0, "wsl": 30.0, "wechat_read": 10.0, "wechat_read_scan": 30.0,
              # 快捷键发送约数秒,再加上 10s 读回确认。15s 时消息已经发出,读回还没返回,服务就把会话代理判超时。
              "wechat_send": 45.0,
              "wechat_login_start": 60.0, "wechat_snapshot": 3.0}
@@ -797,7 +797,7 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         try:
             auth(request, (ROLE_AGENT,), action="wechat.read")
             return await via_pipe("wechat.read", {"talker": talker, "since_seq": since_seq, "limit": limit},
-                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
+                                  timeout_s=TIMEOUT_S["wechat_read_scan"], request=request)
         except WaError as e:
             return fail(e, request)
 

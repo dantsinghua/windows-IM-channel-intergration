@@ -11,6 +11,7 @@ import { accountsApi } from '@/api/client'
 import { ApiFailure } from '@/api/http'
 import StateDot from '@/components/StateDot.vue'
 import PromptCard from '@/components/PromptCard.vue'
+import AccountSessionResetStatus from '@/components/AccountSessionResetStatus.vue'
 import { ACCOUNT_STATES, ALERT_CODES, CHANNEL_TEXT, LOGIN_PHASE_TITLE, QIDIAN_READ_DEGRADED_CODES, STATE_CODES, stateCardSubtitle, stateCardTitle } from '@/i18n/zh-CN/codes'
 
 const AccountScreen = defineAsyncComponent(() => import('@/pages/screen/ScreenPage.vue'))
@@ -231,6 +232,7 @@ onUnmounted(() => { if (tick) clearInterval(tick); pwSecret.value = '' })
           <div v-else class="channel-preview"><div class="preview-orbit">企</div><h3>打开专属账号画面</h3><p>按需连接实时画面，完成登录、验证码与日常操作。</p><a-button type="primary" :data-testid="T.op('screen')" @click="screenOpen = true">连接企点画面</a-button></div>
         </section>
         <aside class="account-sidebar">
+          <AccountSessionResetStatus v-if="a.channel === 'qidian'" :account-id="a.id" />
           <section v-if="showStateCard" class="qt-card state-guide" :data-testid="T.stateCard">
             <div class="qt-row"><strong>{{ stateCardTitle(stateCode) }}</strong><span v-if="codeMeta?.group === 'wait'" class="workspace-label" :data-testid="T.stateCardLoginPhase">{{ LOGIN_PHASE_TITLE }}</span></div>
             <p v-if="stateCardSubtitle(stateCode)" class="qt-muted">{{ stateCardSubtitle(stateCode) }}</p><p>{{ prompt?.text || codeMeta?.zh || a.state_reason }}</p>

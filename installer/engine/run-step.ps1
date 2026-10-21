@@ -624,10 +624,11 @@ try {
                     -Message 'Local bootstrap credentials could not be obtained.'
             }
             $h = Wait-QtWinAgentHealthy -BaseUrl $names.base_url -Token $tokens.ConsoleToken -TimeoutSec 30
+            $healthCause = if ((Test-QtHasProperty -Object $h -Name 'Cause') -and $h.Cause) { [string]$h.Cause } else { 'WINAGENT_NOT_READY' }
             if (-not $h.Ok) {
-                Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason 'WINAGENT_NOT_READY') | Out-Null
+                Set-QtState -State $state -To (New-QtFailedState -Step 'WINAGENT_INSTALLED' -Reason $healthCause) | Out-Null
                 Write-QtInstallState -State $state -Path $paths.StateFile | Out-Null
-                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'WINAGENT_NOT_READY' -ExitName 'E_INSTALL_WINAGENT_NOT_READY' -Message '服务启动失败或 30 秒内未就绪'
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason $healthCause -ExitName 'E_INSTALL_WINAGENT_NOT_READY' -Message ('WinAgent health check failed: '+$healthCause)
             }
             $waToken = Write-QtWinAgentToken -Token $tokens.WinAgentToken -DistroName ([string]$state.distro.name)
             if (-not $waToken.Ok -or -not (Set-QtAgentConsoleToken -Token $tokens.ConsoleToken -DistroName ([string]$state.distro.name))) {
@@ -914,7 +915,7 @@ try {
         # ── DONE(§2.11 第 5 项)──────────────────────────────────────────────
         'DONE' {
             Clear-QtRunOnce -State $state | Out-Null
-            $shortcuts = Install-QtConsoleShortcuts -ConsoleDir $paths.Console
+            $shortcuts = Install-QtConsoleShortcuts -ConsoleDir $paths.Console -LauncherPath (Join-Path (Split-Path -Parent $paths.EngineExe) 'launch-installed.ps1')
             # A-6:删暂存 rootfs.tar,**不询问**
             $freed = Remove-QtStagedRootfs -WslDir $paths.Wsl
 

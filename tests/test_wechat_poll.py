@@ -126,7 +126,8 @@ async def test_read_failure_streak_reaches_key_fail_and_resets(tmp_path):
     rig.fake.offline = True
     for i in range(READ_FAIL_STREAK):
         assert await rig.poller.poll(view(rig)) == 0
-        assert rig.poller.degraded_key_fail("wx01") is (i + 1 >= READ_FAIL_STREAK)
+        assert rig.poller.degraded_read_failed("wx01") is (i + 1 >= READ_FAIL_STREAK)
+        rig.clock.advance(max(1, rig.poller.st("wx01").next_retry_ms - rig.clock()))
     assert rig.store.get_account_full("wx01")["state"] == "running"      # 状态不由 poller 改
     rig.fake.offline = False
     rig.fake.add_row(talker="p", content="回来了", seq=1, ts_ms=T0)

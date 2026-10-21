@@ -1,7 +1,7 @@
 """IMAP/POP3/SMTP 的可注入后端 —— 规格:docs/06 §2.1(两条收信循环 + SMTP 发送)、§2.6.5(删除动作的协议差异)。
 
 设计:协议(``Protocol``)定义动作面,``Fake*`` 供测试(不碰网络),``*LibBackend`` 是标准库真实现
-(``imaplib``/``poplib``/``smtplib``;**开发容器里绝不实例化、绝不连任何真实邮箱**)。
+(``imaplib``/``poplib``/``smtplib``;**开发容器里绝不实例化、绝不连任何真实邮件账号**)。
 
 异常分类是 §2.1.1 回落判据的**唯一依据**:
 - ``MailConnectError``  = 连不上/不支持(connect_refused / connect_timeout / tls_handshake_failed / imap_not_enabled)⇒ 计入回落计数;

@@ -12,6 +12,7 @@ files:
 asar: true
 asarUnpack: []
 win:
+  executableName: QTrade
   target:
     - target: dir
       arch:

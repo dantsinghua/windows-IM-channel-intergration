@@ -196,6 +196,7 @@ async def test_slot_reaper_releases_only_expired_pending(rig):
 async def test_wechat_poll_all_respects_per_account_interval(rig):
     """平时 ``[adapters.wechat] poll_interval_s``=5 s;每秒一轮的 scheduler 任务自己判到点,不到点不打扰 WinAgent。"""
     _wechat(rig, state="running")
+    rig.store.set_desired_state("wx01", "running")
     rig.wechat.add_row(talker="wxid_peer", content="你好")
     await rig.agent.scheduler.run_once("wechat_poll_all")
     first = len([c for c in rig.wechat.calls if "/wechat/read" in c[1]])

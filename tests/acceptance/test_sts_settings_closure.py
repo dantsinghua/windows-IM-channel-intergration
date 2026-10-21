@@ -297,9 +297,8 @@ def test_authentication_test_only_gets_sts_and_returns_public_triplet(rig, sts, 
     response = rig.http.post(PATH + "/test", json=body(sts.url, allow_http=True),
                              headers={"Authorization": f"Bearer {TOKEN}"})
     assert response.status_code == 200
-    assert set(public_response(response)) == {"ok", "authenticated", "bucket", "expiration"}
+    assert set(public_response(response)) == {"ok", "authenticated", "expiration"}
     assert response.json()["ok"] is True and response.json()["authenticated"] is True
-    assert response.json()["bucket"] == "acceptance-page-bucket"
     assert datetime.fromisoformat(response.json()["expiration"]) == datetime.fromisoformat(sts.expiration)
     assert snapshot(rig) == before
     assert len(sts.requests) == 1
@@ -315,12 +314,12 @@ def test_authentication_test_only_gets_sts_and_returns_public_triplet(rig, sts, 
     assert_no_secrets(rig, response.text, caplog.text)
 
 
-def test_authentication_test_can_read_saved_secrets_without_creating_revision(rig, sts):
+def test_authentication_test_requires_explicit_credentials_even_if_saved(rig, sts):
     assert request(rig, "PUT", body()).status_code == 200
     before = snapshot(rig)
     draft = {key: value for key, value in body(sts.url, allow_http=True).items() if key in PUBLIC}
     response = rig.http.post(PATH + "/test", json=draft, headers={"Authorization": f"Bearer {TOKEN}"})
-    assert response.status_code == 200 and response.json()["authenticated"] is True
+    assert response.status_code == 400
     assert snapshot(rig) == before
 
 
@@ -344,7 +343,7 @@ def test_missing_saved_secret_never_silently_uses_environment(rig, monkeypatch):
     monkeypatch.setenv("OSS_STS_SM4_KEY", SM4)
     draft = {key: value for key, value in body().items() if key in PUBLIC}
     response = rig.http.post(PATH + "/test", json=draft, headers={"Authorization": f"Bearer {TOKEN}"})
-    assert response.status_code == 503
+    assert response.status_code == 400
     assert not rig.vault.entries
 
 
@@ -432,7 +431,7 @@ def test_corrupt_persisted_profile_never_falls_back_or_crashes_agent(rig, monkey
 
 
 def test_new_agent_reads_saved_profile_and_applies_it_before_scheduler(rig, monkeypatch, tmp_path):
-    assert request(rig, "PUT", body(endpoint="oss.page.invalid", workbench_id="page-terminal")).status_code == 200
+    assert request(rig, "PUT", body(endpoint="oss.page.invalid", bucket="qtrade-nyoss-lab", workbench_id="page-terminal")).status_code == 200
     for key, value in {"OSS_WORKBENCH_ID": "wrong-environment-terminal",
                        "OSS_SEAL_KEY_XUNJIA": "ab" * 32, "OSS_SEAL_KEY_DEPOSIT": "cd" * 32}.items():
         monkeypatch.setenv(key, value)

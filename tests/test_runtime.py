@@ -58,7 +58,7 @@ async def test_ensure_root_three_steps_verbatim_and_no_kill_server(rig3):
     assert adb.calls == [("root", s), ("shell", f"{s}: stop adbd; start adbd"), ("disconnect", s), ("connect", s), ("shell", f"{s}: whoami")]
     assert health.is_rooting("qd01") and health.rooting_until("qd01") is not None      # 窗口起点 = ensure_root 开始
     assert not any("kill" in k for k, _ in adb.calls)
-    assert not hasattr(adb, "kill_server")                                              # 协议上就没有
+    assert callable(adb.kill_server)  # Capability exists, but ensure_root must never call it.                                              # 协议上就没有
     assert rt.qidian_root_fail_streak["qd01"] == 0
     assert not rig3.agent.alerts.is_firing(QIDIAN_NOT_ROOT, "account:qd01")
 

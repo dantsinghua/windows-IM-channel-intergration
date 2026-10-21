@@ -1,0 +1,16 @@
+---
+description: 每次改动都要有对应单元测试，改完跑相关全量并确认没有新的回归
+alwaysApply: true
+---
+
+# 开发标准
+
+安琳定的动作，每次改代码都照做：
+
+- 改动必须有对应的单元测试。测试锁的是规格行为，不迁就错误实现。
+- 改完先跑这次碰到的测试，再跑该模块的全量。新失败要修到没有新增回归。历史没跑过的套件不要拿旧绿灯充数。
+- 功能要符合这次说的要求。不把没执行的检查标成正常，不把明文当成已经加密。
+- 密钥、口令、令牌不写进测试输出、页面回显或仓库。
+- 给安琳在 Windows 里打开的页面，服务要听 `0.0.0.0`，并用 Windows 侧的 `curl.exe http://127.0.0.1:端口` 确认返回 200。只在 WSL 里 curl 自己的 `127.0.0.1` 不算打开成功。进程用 `setsid` 拉起，避免启动脚本结束后被一起收掉。
+- 工作台桌面窗口看的是 Electron，不是浏览器里的 5313。改 `App.vue`、根 store 或会热更新根组件的文件后，Electron 热更新失败会把窗口打成白屏，并且不会自己整页刷新。改完必须用 `C:\Users\anlin\qtrade-dev\start_electron.ps1` 重开（它会带上 `VITE_DEV_SERVER_URL=http://127.0.0.1:5313`）。禁止用 `restart_electron.ps1`。重开后读 `C:\Users\anlin\qtrade-dev\logs\electron-stderr.log`，出现 `Full reload required`、`Failed to reload /src/App.vue` 或渲染 `TypeError` 就是又白了，立刻重开。只在浏览器里看到页面不算控制台已打开。
+---

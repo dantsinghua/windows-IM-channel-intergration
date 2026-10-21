@@ -173,12 +173,12 @@ def load_org_sqlite(org_db: str | Path, member_db: str | Path) -> dict[str, list
         mem_con.close()
 
 
-def load_org_plain_bytes(org_plain: bytes, member_plain: bytes) -> dict[str, list[dict[str, Any]]]:
+def load_org_plain_bytes(org_plain: bytes, member_plain: bytes, *, allow_empty=False) -> dict[str, list[dict[str, Any]]]:
     """从内存中的明文库字节读组织。"""
     org_con = _memory_db(org_plain)
     mem_con = _memory_db(member_plain)
     try:
-        return _from_connections(org_con, mem_con)
+        return _from_connections(org_con, mem_con, allow_empty=allow_empty)
     finally:
         org_con.close()
         mem_con.close()
@@ -219,13 +219,14 @@ def decrypt_sqlcipher3(blob: bytes, password: bytes, *, kdf_iter: int = 64000, p
     return bytes(out)
 
 
-def read_encrypted_org(org_blob: bytes, member_blob: bytes, password: bytes) -> dict[str, list[dict[str, Any]]]:
+def read_encrypted_org(org_blob: bytes, member_blob: bytes, password: bytes, *, allow_empty=False) -> dict[str, list[dict[str, Any]]]:
     """解开两份加密库并解析。口令不对时抛错，不返回空组织。"""
     org = load_org_plain_bytes(
         decrypt_sqlcipher3(org_blob, password),
         decrypt_sqlcipher3(member_blob, password),
+        allow_empty=allow_empty,
     )
-    if not org["departments"] and not org["members"]:
+    if not allow_empty and not org["departments"] and not org["members"]:
         raise ValueError("组织库解开后是空的")
     return org
 
@@ -258,7 +259,7 @@ def _memory_db(blob: bytes) -> sqlite3.Connection:
     return con
 
 
-def _from_connections(org_con: sqlite3.Connection, mem_con: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+def _from_connections(org_con: sqlite3.Connection, mem_con: sqlite3.Connection, *, allow_empty=False) -> dict[str, list[dict[str, Any]]]:
     _require_tables(org_con, ("OrgDepartment", "OrgD2M"))
     _require_tables(mem_con, ("OrgMember",))
     departments = org_con.execute("SELECT uid, pid, name FROM OrgDepartment").fetchall()
@@ -266,7 +267,7 @@ def _from_connections(org_con: sqlite3.Connection, mem_con: sqlite3.Connection) 
     memberships = org_con.execute("SELECT did, mid, ord FROM OrgD2M").fetchall()
     people = mem_con.execute("SELECT uin, name, account FROM OrgMember").fetchall()
     org = build_org(departments, people, memberships, edges)
-    if not org["departments"] and not org["members"]:
+    if not allow_empty and not org["departments"] and not org["members"]:
         raise ValueError("组织库解开后是空的")
     return org
 
@@ -283,3 +284,99 @@ def _require_tables(con: sqlite3.Connection, needed: tuple[str, ...]) -> None:
     missing = [name for name in needed if name not in names]
     if missing:
         raise ValueError("组织库缺少表 " + ",".join(missing))
+
+
+class OrgReadError(RuntimeError):
+    def __init__(self, code, *, state='error'):
+        self.code, self.state = code, state
+        super().__init__(code)
+
+
+def read_account_org(source, account_uid, config_file, *, cache=None, clock=None):
+    """Read only this account's established org source and protected key reference.
+
+    No account operation or key capture occurs here. Missing credentials remain
+    distinguishable from a successfully read empty organization.
+    """
+    import json
+    import os
+    import re
+    import shlex
+    import subprocess
+    import time
+    clock = time.time if clock is None else clock
+    uid = str(account_uid)
+    if not re.fullmatch(r'[0-9]+', uid) or Path(str(source.path)).name != uid + '.db':
+        raise OrgReadError('ORG_ACCOUNT_MISMATCH')
+    try:
+        cfg_path = Path(config_file)
+        if cfg_path.stat().st_size > 16384:
+            raise OrgReadError('ORG_CONFIG_INVALID')
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+        if cfg.get('account_uid') != uid:
+            raise OrgReadError('ORG_ACCOUNT_MISMATCH')
+        reference = cfg.get('org_password_file')
+        if not reference:
+            raise OrgReadError('ORG_CREDENTIALS_NOT_CONFIGURED', state='unreported')
+        key_path = Path(reference)
+        if not key_path.is_absolute():
+            key_path = cfg_path.parent / key_path
+        if os.name != 'nt' and key_path.stat().st_mode & 0o077:
+            raise OrgReadError('ORG_CREDENTIALS_PERMISSIONS')
+        if not 0 < key_path.stat().st_size <= 4096:
+            raise OrgReadError('ORG_CREDENTIALS_INVALID')
+        password = key_path.read_bytes()
+        form = cfg.get('org_password_format', 'getPassword')
+        if form == 'getPassword':
+            password = read_password_blob(password)
+        elif form != 'raw':
+            raise OrgReadError('ORG_CREDENTIALS_INVALID')
+    except OrgReadError:
+        raise
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise OrgReadError('ORG_CREDENTIALS_UNAVAILABLE') from None
+    paths = [str(source.path)[:-3] + suffix for suffix in ('-org.db', '-org-member.db')]
+    remote = all(hasattr(source, key) for key in ('adb', 'serial', 'server_port', '_shell'))
+
+    def metadata():
+        if remote:
+            rows = source._shell('stat -c %s:%Y ' + ' '.join(shlex.quote(p) for p in paths)).splitlines()
+            if len(rows) != 2 or any(not re.fullmatch(r'[0-9]+:[0-9]+', row) for row in rows):
+                raise OrgReadError('ORG_SOURCE_UNAVAILABLE')
+            return tuple(tuple(int(v) for v in row.split(':')) for row in rows)
+        return tuple((Path(p).stat().st_size, Path(p).stat().st_mtime_ns) for p in paths)
+
+    def read(path):
+        if not remote:
+            return Path(path).read_bytes()
+        proc = subprocess.run([source.adb, '-P', str(source.server_port), '-s', source.serial,
+                               'exec-out', 'cat', path], capture_output=True, timeout=max(source.timeout_s, 30), check=False)
+        if proc.returncode:
+            raise OrgReadError('ORG_SOURCE_UNAVAILABLE')
+        return proc.stdout
+
+    try:
+        before = metadata()
+        if any(not 0 < size <= 64 * 1024 * 1024 for size, _ in before):
+            raise OrgReadError('ORG_SOURCE_SIZE_INVALID')
+        fingerprint = (uid, tuple(paths), before, hashlib.sha256(password).digest())
+        previous = (cache or {}).get(uid)
+        if previous and previous['fingerprint'] == fingerprint:
+            return dict(previous['result'])
+        blobs = [read(path) for path in paths]
+        if tuple(len(blob) for blob in blobs) != tuple(size for size, _ in before) or metadata() != before:
+            raise OrgReadError('ORG_SOURCE_CHANGED')
+        if all(blob.startswith(b'SQLite format 3\x00') for blob in blobs):
+            org = load_org_plain_bytes(*blobs, allow_empty=True)
+        else:
+            org = read_encrypted_org(*blobs, password, allow_empty=True)
+        observed = clock()
+        result = {'org': org, 'org_state': 'ready' if org['departments'] or org['members'] else 'empty',
+                  'org_updated_at': observed, 'org_error': None}
+        if cache is not None:
+            cache[uid] = {'fingerprint': fingerprint, 'result': result}
+        return result
+    except OrgReadError:
+        raise
+    except Exception:
+        raise OrgReadError('ORG_SOURCE_DECRYPT_OR_SCHEMA_ERROR') from None

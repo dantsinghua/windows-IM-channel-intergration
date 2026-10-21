@@ -14,6 +14,7 @@ import { loadWindowState, recordCrash, saveWindowState, clearCrashes } from './w
 import { resolvePath, WA_WHITELIST } from './wa-whitelist'
 import { createLocalMetricsReader } from './local-metrics'
 import { createPipeClient } from './winagent-pipe'
+import { createWinAgentRecovery, registerRecoveryIpc, runRecoveryPowerShell } from './winagent-recovery'
 
 const DEV_URL = app.isPackaged ? undefined : process.env.VITE_DEV_SERVER_URL
 const tokens = new TokenHolder(createPipeClient({ isPackaged: app.isPackaged }), Date.now, setTimeout, clearTimeout, {
@@ -28,6 +29,28 @@ let pendingRoute: string | null = null
 /** 正式 Agent 源只由认证管道发现;开发形态可配置回环地址。所有网络入口共用当前源。 */
 let agentOrigin = DEFAULT_AGENT_ORIGIN
 let winagentOrigin = DEFAULT_WINAGENT_ORIGIN
+const localService = createWinAgentRecovery({
+  platform: process.platform,
+  run: runRecoveryPowerShell,
+  refresh: () => tokens.refresh(),
+  delay: () => new Promise(resolve => setTimeout(resolve, 1000)),
+  probeWinAgent: async () => {
+    if (!tokens.winagentToken) return null
+    try {
+      const response = await fetch(`${winagentOrigin}/wa/v1/health`, { headers: { Authorization: `Bearer ${tokens.winagentToken}` }, signal: AbortSignal.timeout(5000) })
+      if (!response.ok) return null
+      const body = await response.json()
+      const health = body.data ?? body
+      return typeof health.user_agent === 'boolean' ? health.user_agent : null
+    } catch { return null }
+  },
+  probeAgent: async () => {
+    try {
+      const response = await fetch(`${agentOrigin}/api/v1/system/health`, { signal: AbortSignal.timeout(5000) })
+      return response.ok ? true : null
+    } catch { return false }
+  },
+})
 
 /* ── 单实例锁:第二次启动只把已有窗口 show()+focus(),并把 --route= 转给它 ── */
 const gotLock = app.requestSingleInstanceLock()
@@ -187,6 +210,10 @@ function loadRenderer(win: BrowserWindow): void {
 }
 
 function registerIpc(): void {
+  registerRecoveryIpc(ipcMain, localService, (candidate) => {
+    const event = candidate as Electron.IpcMainInvokeEvent
+    return event.sender === mainWindow?.webContents && event.senderFrame === event.sender.mainFrame
+  })
   // 固定只读 IPC:不接受来源或令牌参数,同步返回同份已验证源供每次 preload 加载。
   ipcMain.on('qt:endpoint.agent', (event) => { event.returnValue = agentOrigin })
   // Fixed local scope: packaged executable folder, or the development application folder.

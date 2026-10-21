@@ -16,9 +16,9 @@
 #        不重启 docker,不 `wsl --shutdown`。
 #
 # 用法:
-#   ./build-rootfs.sh --source-root /mnt/c/Users/anlin/qtrade-payload \
+#   ./build-rootfs.sh --source-root /path/to/payload \
 #                     --images-dir  ~/work/qtrade-payload-build/images \
-#                     --out         /mnt/c/Users/anlin/qtrade-payload/rootfs/out/rootfs.tar
+#                     --out         /path/to/payload/rootfs/out/rootfs.tar
 #
 #   --skip-images   不追加预载镜像(出一个只验流程的瘦 rootfs;contents 里两项标 absent)
 set -euo pipefail

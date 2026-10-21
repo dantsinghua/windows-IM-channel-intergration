@@ -97,7 +97,7 @@ def test_dev_logs_remain_stderr_without_a_user_profile(monkeypatch, user_entry, 
     assert not Path(root).exists()
 
 
-def test_service_logging_remains_in_the_service_owned_root(monkeypatch):
+def test_service_logging_remains_in_the_service_owned_root(monkeypatch, tmp_path):
     """The user path change must not relocate or relax the service log sink."""
     monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Alice\AppData\Local")
     monkeypatch.setattr(main_svc, "read_toml", lambda _: {})
@@ -110,7 +110,9 @@ def test_service_logging_remains_in_the_service_owned_root(monkeypatch):
     build = Mock(side_effect=AssertionError("must not construct real service dependencies"))
     monkeypatch.setattr(main_svc, "setup_logging", logging)
     monkeypatch.setattr(main_svc, "build_real_deps", build)
-    with pytest.raises(StopBeforeServiceStart):
-        main_svc.main(["--root", SERVICE_ROOT, "--install-user-sid", SID])
-    assert ntpath.normpath(logging.call_args.args[1]) == ntpath.join(SERVICE_ROOT, "logs")
+    root = tmp_path / "service-owned-root"
+    root.mkdir()
+    (root / "winagent.toml").write_text("", encoding="utf-8")
+    assert main_svc.main(["--root", str(root), "--install-user-sid", SID]) == 2
+    assert Path(logging.call_args.args[1]) == root / "logs"
     build.assert_not_called()

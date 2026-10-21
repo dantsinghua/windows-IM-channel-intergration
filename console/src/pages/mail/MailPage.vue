@@ -151,7 +151,7 @@ function rememberTransport(transport: 'oss' | 'imap'): void {
 
 async function saveMailbox(): Promise<boolean> {
   if (!mailbox.value.host.trim() || !mailbox.value.user.trim()) {
-    mailNote.value = '先填写收信服务器和邮箱账号'
+    mailNote.value = '先填写收信服务器和邮件账号'
     message.warning(mailNote.value)
     return false
   }
@@ -180,7 +180,7 @@ async function saveMailbox(): Promise<boolean> {
     mailbox.value.pass = ''
     rememberTransport('imap')
     mailNote.value = '邮件中转已保存。密码只进凭据库，页面不再显示。'
-    message.success('邮箱已保存')
+    message.success('邮件账号已保存')
     await store.reloadAll()
     return true
   } catch (e) {
@@ -200,8 +200,8 @@ async function testMailbox(): Promise<void> {
     const result = await mailApi.test('inbound')
     const imap = result.imap_ok ? 'IMAP 已连通' : 'IMAP 未连通'
     const pop3 = result.pop3_ok ? 'POP3 已连通' : 'POP3 未连通'
-    mailNote.value = `${imap}，${pop3}。这一步只登录邮箱，不会发信。`
-    message.success('邮箱测试完成')
+    mailNote.value = `${imap}，${pop3}。这一步只登录邮件账号，不会发信。`
+    message.success('邮件账号测试完成')
   } catch (e) {
     mailNote.value = e instanceof ApiFailure ? e.message : (e instanceof Error ? e.message : '测试失败')
     message.error(mailNote.value)
@@ -241,18 +241,18 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
       <article v-if="channel === 'imap'" class="link-card qt-glass">
         <div class="qt-eyebrow">MAIL</div>
         <h2>邮件中转</h2>
-        <p>存款系统按现有模板接收「微信群聊消息通知」。机器人采集终端用同一邮箱发信。</p>
+        <p>存款系统按现有模板接收「微信群聊消息通知」。机器人采集终端用同一邮件账号发信。</p>
         <label>收信服务器<input v-model="mailbox.host" autocomplete="off" placeholder="imap.example.com" /></label>
         <div class="link-row">
           <label>端口<input v-model="mailbox.port" inputmode="numeric" /></label>
           <label class="check"><input v-model="mailbox.ssl" type="checkbox" />使用加密连接</label>
         </div>
-        <label>邮箱账号<input v-model="mailbox.user" autocomplete="username" placeholder="name@example.com" /></label>
-        <label>邮箱密码<input v-model="mailbox.pass" type="password" autocomplete="new-password" placeholder="留空表示不修改已保存的密码" /></label>
+        <label>邮件账号<input v-model="mailbox.user" autocomplete="username" placeholder="name@example.com" /></label>
+        <label>邮件账号密码<input v-model="mailbox.pass" type="password" autocomplete="new-password" placeholder="留空表示不修改已保存的密码" /></label>
         <label>发信服务器<input v-model="mailbox.smtpHost" autocomplete="off" placeholder="smtp.example.com" /></label>
         <div class="link-row">
           <label>发信端口<input v-model="mailbox.smtpPort" inputmode="numeric" /></label>
-          <label>发件地址<input v-model="mailbox.smtpFrom" autocomplete="off" placeholder="与邮箱账号相同可留空" /></label>
+          <label>发件地址<input v-model="mailbox.smtpFrom" autocomplete="off" placeholder="与邮件账号相同可留空" /></label>
         </div>
         <div class="qt-row wrap">
           <a-button type="primary" :loading="busy" @click="saveMailbox">保存邮件中转</a-button>
@@ -270,7 +270,7 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
     <PageState :loading="store.loading && !store.status" :error="store.error" @retry="store.reloadAll()">
       <section v-if="!enabled" class="link-pending qt-glass">
         <h2 :data-testid="T.disabledHint">邮件往来还没开始</h2>
-        <p>上面保存并启用邮箱之后，收件、发件和待确认会显示在这里。</p>
+        <p>上面保存并启用邮件账号之后，收件、发件和待确认会显示在这里。</p>
       </section>
       <template v-else>
         <button v-if="banner" class="mail-banner" :data-testid="T.errorBanner" @click="openBanner">
@@ -279,7 +279,7 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
         <div v-if="!settings.requireSignature" class="mail-banner is-warning" :data-testid="T.testmodeBanner"><QtIcon name="shield" :size="18" />测试模式：当前不校验签名，仅允许内网白名单发件人。</div>
 
         <section class="mail-health qt-glass" :data-testid="T.block('health')">
-          <div class="health-heading"><span class="health-icon"><QtIcon name="mail" /></span><div><strong>邮箱连接</strong><span>来自当前邮件服务的状态</span></div></div>
+          <div class="health-heading"><span class="health-icon"><QtIcon name="mail" /></span><div><strong>邮件账号连接</strong><span>来自当前邮件服务的状态</span></div></div>
           <div class="route-list" :data-testid="T.healthCard">
             <div v-for="r in store.status?.routes ?? []" :key="r.route_id" class="route-status" :data-testid="T.healthRoute(r.scope)">
               <div><b>{{ mailRouteText(r.scope) }}</b><span class="status-chip" :class="{ attention: r.inbound.consecutive_failures > 0 || r.outbound.consecutive_failures > 0 }">{{ r.inbound.consecutive_failures > 0 || r.outbound.consecutive_failures > 0 ? '连接需关注' : r.inbound.last_success_at ? '收信正常' : '等待首次收信' }}</span></div>
@@ -287,7 +287,7 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
               <p v-if="r.inbound.protocol_configured === 'imap' && r.inbound.protocol_active === 'pop3'" class="protocol-note" :data-testid="T.healthProtoFallback">IMAP 不可用，已回落 POP3：{{ r.inbound.fallback?.reason ?? '原因暂不可用' }}</p>
               <p v-if="r.inbound.protocol_active === 'pop3'" class="protocol-note" :data-testid="T.healthJunkHint">垃圾邮件文件夹不可见，被拦截的指令邮件可能漏收。</p>
             </div>
-            <p v-if="!(store.status?.routes ?? []).length" class="qt-muted">尚未连接邮箱，暂无收发状态。</p>
+            <p v-if="!(store.status?.routes ?? []).length" class="qt-muted">尚未连接邮件账号，暂无收发状态。</p>
           </div>
         </section>
 
@@ -301,13 +301,13 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
           <div v-if="tab === 'inbox'" id="mail-panel-inbox" role="tabpanel" aria-labelledby="mail-tab-inbox" :data-testid="T.block('inbox')">
             <form class="qt-toolbar inbox-filters" @submit.prevent="runAction(() => store.reloadInbox())">
               <a-input :value="store.inboxFilter.q as string" :data-testid="T.inboxFilter('q')" class="search-field" placeholder="搜索发件人或邮件主题" allow-clear aria-label="搜索邮件" @change="(e: any) => store.inboxFilter.q = e.target.value"><template #prefix><QtIcon name="search" :size="17" /></template></a-input>
-              <a-select :value="store.inboxFilter.route as string" :data-testid="T.inboxFilter('route')" :options="routeOptions" placeholder="全部邮箱" allow-clear aria-label="按邮箱筛选" @change="(value: string) => store.inboxFilter.route = value" />
+              <a-select :value="store.inboxFilter.route as string" :data-testid="T.inboxFilter('route')" :options="routeOptions" placeholder="全部邮件账号" allow-clear aria-label="按邮件账号筛选" @change="(value: string) => store.inboxFilter.route = value" />
               <a-select :value="store.inboxFilter.status as string" :data-testid="T.inboxFilter('status')" :options="statusOptions" placeholder="全部状态" allow-clear aria-label="按邮件状态筛选" @change="(value: string) => store.inboxFilter.status = value" />
               <a-button :aria-expanded="dateFiltersOpen" @click="dateFiltersOpen = !dateFiltersOpen">时间范围</a-button><a-button type="primary" html-type="submit" :loading="busy">查询</a-button>
               <div v-if="dateFiltersOpen" class="date-filters"><label>开始时间<input type="datetime-local" :value="dateValue('since')" :data-testid="T.inboxFilter('since')" @change="setDate('since', $event)" /></label><span>至</span><label>结束时间<input type="datetime-local" :value="dateValue('until')" :data-testid="T.inboxFilter('until')" @change="setDate('until', $event)" /></label></div>
             </form>
             <div class="table-scroll">
-              <table class="mail-table"><thead><tr><th>邮件</th><th>所属邮箱</th><th>收到时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
+              <table class="mail-table"><thead><tr><th>邮件</th><th>所属邮件账号</th><th>收到时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
                 <tr v-for="(r, i) in store.inbox" :key="r.id" :data-testid="T.inboxRow(i)">
                   <td><button class="subject-link" :data-testid="T.inboxRowDetail(i)" @click="openDetail(r.id)">{{ r.subject || '无主题' }}</button><div class="row-secondary">{{ r.from_addr }}</div></td>
                   <td :data-testid="T.inboxRowRoute(i)">{{ mailRouteText(r.route) }}</td><td class="time-cell">{{ timeText(r.received_at) }}</td>
@@ -316,7 +316,7 @@ onUnmounted(() => { store.stopPolling(); if (tick) clearInterval(tick) })
                 </tr>
               </tbody></table>
             </div>
-            <div v-if="!store.inbox.length" class="list-empty"><QtIcon name="mail" :size="32" /><h3>还没有符合条件的邮件</h3><p>试试其他关键词，或调整邮箱与时间范围。</p></div>
+            <div v-if="!store.inbox.length" class="list-empty"><QtIcon name="mail" :size="32" /><h3>还没有符合条件的邮件</h3><p>试试其他关键词，或调整邮件账号与时间范围。</p></div>
             <footer class="list-footer"><span>已加载 {{ store.inbox.length }} 封邮件</span><a-button v-if="store.inboxCursor" :loading="busy" @click="runAction(() => store.reloadInbox(true))">加载更多</a-button></footer>
           </div>
 

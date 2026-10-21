@@ -49,15 +49,14 @@ export const useEventsStore = defineStore('events', () => {
   /** 断线时刻,用于 qt-acct-stale-banner 的「N 秒前」 */
   const disconnectedAt = ref<number | null>(null)
   /**
-   * 事件流「需要重新取令牌」:
-   * ① 服务端回 **4401**(令牌无效);② 连续 N 次握手就断(从未 open)。
+   * 事件流停止原因：4401 是认证失败；握手连败是连接失败，不能据此判断令牌失效。
    *
    * 🔴 ① 的时序按 02 §3.4.7 **R6-62 (a)**:服务端**先 `accept()` 再 `close(4401)`**,
    * 后端已经这么实现了 —— 所以 4401 是**看得到**的,不会再退化成 1006
    * (R6-52 原「accept 前关闭」已作废;旧注释说的「后端会改」这件事已经改完)。
-   * 处置 = 停止重连 + 顶部挂横幅 + 用户点按钮重取令牌(`retry()`),**界面不自动重连**:
+   * ① 的处置 = 停止重连 + 顶部挂横幅 + 用户点按钮重取令牌(`retry()`),不自动重取:
    * 令牌没换,重连只会再吃一次 4401。
-   * ② 仍保留:网络/代理/端口等传输层原因下关闭码通常是 1006,那种情况才靠连败计数停手。
+   * ② 网络/代理/端口等连接失败靠连败计数停手；上层确认服务恢复后可恢复一次连接。
    */
   const authLost = ref<{ reason: '4401' | 'handshake'; failures?: number; code?: number } | null>(null)
 
@@ -151,6 +150,7 @@ export const useEventsStore = defineStore('events', () => {
       onStatus: (s) => {
         status.value = s
         if (s === 'open') {
+          authLost.value = null
           disconnectedAt.value = null
         } else if (disconnectedAt.value === null) {
           disconnectedAt.value = Date.now()

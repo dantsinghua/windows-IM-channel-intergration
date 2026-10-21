@@ -1,4 +1,4 @@
-"""公网信箱第一期。纯逻辑，不连 OSS、不发邮件、不操作三通道。"""
+"""公网文件网关第一期。纯逻辑，不连 OSS、不发邮件、不操作三通道。"""
 
 from .bind import Dedup, command_allowed, deposit_allows, xunjia_allows
 from .bridge import POLL_INTERVAL_SEC, PlannedUpload, plan_uploads

@@ -133,6 +133,7 @@ def _sts():
 def _configure_sts(monkeypatch):
     for name, value in {
         "OSS_ENDPOINT": "oss-cn-hangzhou.aliyuncs.com",
+        "OSS_BUCKET": "qtrade-nyoss-lab",
         "OSS_AUTH_MODE": "sts",
         "OSS_STS_URL": _STS_URL,
         "OSS_STS_AUTH_KEY": "fixture-business-secret",
@@ -194,7 +195,7 @@ def test_sts_consumers_assemble_without_static_keys_or_network(monkeypatch, tmp_
         result = XunjiaInbox.from_env(object(), lambda *_: False)
     else:
         result = CatalogPublisher.from_env(object(), str(tmp_path / "catalog-state.json"))
-    assert result is not None, "STS 配置完整时不得继续要求静态 AK/SK 或 OSS_BUCKET"
+    assert result is not None, "STS 配置完整时只需要独立OSS_BUCKET，不需要静态AK/SK"
     assert isinstance(result.box, OssV1Box)
 
 
@@ -232,7 +233,7 @@ def test_provider_makes_get_with_fresh_token_and_parses_credentials():
     assert credential.access_key_secret == "fixture-oss-secret"
     assert credential.security_token == "fixture-security-token"
     assert credential.expiration == _NOW + 3600
-    assert credential.bucket == "fixture-bucket"
+    assert credential.bucket == ""
     for secret in (_AUTH_KEY, _SM4_KEY.decode(), "fixture-oss-secret", "fixture-security-token"):
         assert secret not in repr(provider)
         assert secret not in repr(credential)
@@ -304,7 +305,7 @@ def test_refresh_failure_does_not_return_cache_with_only_thirty_seconds_left():
         provider.get_credentials()
 
 
-@pytest.mark.parametrize("failure", ["401", "malformed", "bucket"])
+@pytest.mark.parametrize("failure", ["401", "malformed"])
 def test_authorization_or_schema_failure_never_falls_back_to_cached_credentials(failure):
     clock = FakeClock()
     bad = {
@@ -320,7 +321,7 @@ def test_authorization_or_schema_failure_never_falls_back_to_cached_credentials(
         provider.get_credentials()
 
 
-@pytest.mark.parametrize("field", ["access_key_id", "access_key_secret", "security_token", "expiration", "bucket"])
+@pytest.mark.parametrize("field", ["access_key_id", "access_key_secret", "security_token", "expiration"])
 @pytest.mark.parametrize("value", [None, "", 123])
 def test_response_rejects_missing_empty_or_non_string_required_fields(field, value):
     body = _credentials(**{field: value})
@@ -370,7 +371,7 @@ def test_provider_rejects_insecure_or_userinfo_urls_before_io(url):
 def test_provider_allows_explicit_loopback_http_for_fake_service(url):
     opener = FakeOpener(FakeResponse(_credentials()))
     result = _sts().StsCredentialProvider(url, _AUTH_KEY, _SM4_KEY, opener=opener, clock=FakeClock()).get_credentials()
-    assert result.bucket == "fixture-bucket"
+    assert result.bucket == ""
     assert opener.requests[0].full_url == url
 
 
@@ -442,7 +443,7 @@ def test_sts_factory_uses_explicit_url_and_server_bucket_lazily(monkeypatch, exp
     assert not sts.requests and not oss.requests, "只装配不能探测尚未上线的服务"
     assert box.get("fixture.bin") == b"object"
     assert sts.requests[0].full_url == _STS_URL
-    assert oss.requests[0].full_url == "https://fixture-bucket.oss-cn-hangzhou.aliyuncs.com/fixture.bin"
+    assert oss.requests[0].full_url == "https://qtrade-nyoss-lab.oss-cn-hangzhou.aliyuncs.com/fixture.bin"
 
 
 @pytest.mark.parametrize("url", [None, "", "   "])
@@ -506,7 +507,8 @@ def test_factory_without_any_oss_configuration_remains_disabled():
 
 def test_legacy_static_factory_keeps_original_signing_contract(monkeypatch):
     for name, value in {
-        "OSS_ENDPOINT": "oss-cn-hangzhou.aliyuncs.com", "OSS_BUCKET": "fixture-bucket",
+        "OSS_ENDPOINT": "oss-cn-hangzhou.aliyuncs.com",
+        "OSS_BUCKET": "fixture-bucket",
         "OSS_ACCESS_KEY_ID": "legacy-key-id", "OSS_ACCESS_KEY_SECRET": "legacy-secret",
     }.items():
         monkeypatch.setenv(name, value)
@@ -529,7 +531,7 @@ def test_oss_requests_take_key_secret_and_security_token_from_same_refresh(monke
         FakeResponse(_credentials(expiration=_NOW + 4000, access_key_id="STS.new", access_key_secret="new-secret", security_token="new-token")),
     )
     provider = _provider(sts, clock)
-    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", credentials_provider=provider)
+    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", bucket="qtrade-nyoss-lab", credentials_provider=provider)
     oss = FakeOpener(FakeResponse(b"first"), FakeResponse(b"second"))
     monkeypatch.setattr(box, "_opener", oss)
     assert box.get("fixture.bin") == b"first"
@@ -538,7 +540,7 @@ def test_oss_requests_take_key_secret_and_security_token_from_same_refresh(monke
     for request, key_id, secret, token in zip(oss.requests, ["STS.fixture-id", "STS.new"], ["fixture-oss-secret", "new-secret"], ["fixture-security-token", "new-token"]):
         headers = _headers(request)
         assert headers["x-oss-security-token"] == token
-        canonical = f"GET\n\n\n{headers['date']}\nx-oss-security-token:{token}\n/fixture-bucket/fixture.bin"
+        canonical = f"GET\n\n\n{headers['date']}\nx-oss-security-token:{token}\n/qtrade-nyoss-lab/fixture.bin"
         signature = base64.b64encode(hmac.new(secret.encode(), canonical.encode(), hashlib.sha1).digest()).decode()
         assert headers["authorization"] == f"OSS {key_id}:{signature}"
 
@@ -549,7 +551,7 @@ def test_oss_credential_rejection_does_not_retry_write_but_next_call_refreshes(m
         FakeResponse(_credentials(access_key_id="STS.refreshed")),
     )
     provider = _provider(sts)
-    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", credentials_provider=provider)
+    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", bucket="qtrade-nyoss-lab", credentials_provider=provider)
     error = HTTPError("https://fixture.invalid/object", 403, "Forbidden", {}, io.BytesIO(b"<Error><Code>SecurityTokenExpired</Code></Error>"))
     oss = FakeOpener(error, FakeResponse(b""))
     monkeypatch.setattr(box, "_opener", oss)
@@ -613,7 +615,7 @@ def test_old_request_invalidation_does_not_discard_newly_refreshed_credentials()
 def test_generic_oss_access_denied_does_not_force_credential_refresh(monkeypatch):
     sts = FakeOpener(FakeResponse(_credentials()))
     provider = _provider(sts)
-    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", credentials_provider=provider)
+    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", bucket="qtrade-nyoss-lab", credentials_provider=provider)
     error = HTTPError("https://fixture.invalid/object", 403, "Forbidden", {}, io.BytesIO(b"<Error><Code>AccessDenied</Code></Error>"))
     oss = FakeOpener(error, FakeResponse(b"object"))
     monkeypatch.setattr(box, "_opener", oss)
@@ -632,8 +634,7 @@ def test_provider_pins_first_server_bucket_across_refreshes():
     provider = _provider(opener, clock)
     provider.get_credentials()
     clock.now += 300
-    with pytest.raises((RuntimeError, ValueError)):
-        provider.get_credentials()
+    assert provider.get_credentials().bucket == ""
 
 
 def test_transient_backoff_can_refresh_after_short_recovery_window():
@@ -907,7 +908,7 @@ def test_oss_listing_budget_includes_time_spent_fetching_sts(monkeypatch):
             return _oss_page("", truncated=False)
 
     monkeypatch.setattr(time, "monotonic", clock)
-    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", credentials_provider=SlowCredentials())
+    box = OssV1Box(endpoint="oss-cn-hangzhou.aliyuncs.com", bucket="qtrade-nyoss-lab", credentials_provider=SlowCredentials())
     monkeypatch.setattr(box, "_opener", Opener())
     assert box.list_prefix("wb/fixture/") == []
     assert len(timeouts) == 1 and 0 < timeouts[0] <= 20, "申请 STS 的十秒必须计入本轮总预算"

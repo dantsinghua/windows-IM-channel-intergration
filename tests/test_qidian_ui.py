@@ -337,7 +337,8 @@ async def test_发送成功路径_点完即返回(rig):
                 node(text="发消息", bounds="[480,1070][580,1120]"))
     adb.dumps = [search,                                   # preflight:主界面,没有聊天页标题 ⇒ 不是目标会话
                  search,                                   # 点搜索框
-                 tree(node(rid=f"{PKG}:id/title", text="张三-华泰固收", bounds="[100,280][600,330]")),   # 搜索结果首条
+                 tree(node(rid=f"{PKG}:id/title", text="QQ好友", bounds="[100,230][600,270]"),
+                      node(rid=f"{PKG}:id/item1", text="张三-华泰固收", bounds="[100,280][600,330]")),   # 搜索结果整行
                  card,                                     # 名片页:校 native_id + 取标题期望值 + 点发消息
                  CHAT_TREE,                                # 闸门1
                  CHAT_TREE,                                # 点输入框
@@ -478,7 +479,8 @@ async def test_名片页身份不符_不进聊天页(rig):
     search = tree(node(rid=f"{PKG}:id/et_search_keyword", text="", bounds="[100,160][620,220]"))
     card = tree(node(rid=f"{PKG}:id/account_uin", text="99999", bounds="[100,200][600,250]"),
                 node(text="发消息", bounds="[480,1070][580,1120]"))
-    adb.dumps = [search, search, tree(node(rid=f"{PKG}:id/title", text="某人", bounds="[100,280][600,330]")), card]
+    adb.dumps = [search, search, tree(node(rid=f"{PKG}:id/title", text="QQ好友", bounds="[100,230][600,270]"),
+                                    node(rid=f"{PKG}:id/item1", text="某人", bounds="[100,280][600,330]")), card]
     out = await ui.send(acct(), "10001", "喂")
     assert out.ok is False and out.reason == "card_identity_mismatch"
     assert "input tap 530 1095" not in adb.taps                     # 没点「发消息」

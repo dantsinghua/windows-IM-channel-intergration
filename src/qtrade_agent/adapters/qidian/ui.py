@@ -24,6 +24,7 @@ import logging
 import re
 import shlex
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from importlib import resources
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from ...alerts import QIDIAN_PROFILE_FALLBACK
+from ...bus.native_guard import require_native_permission
 from ...text import has_control_chars
 from ...workflow.yaml_min import YamlError, safe_load
 from ..base import Account
@@ -245,8 +247,8 @@ class SendOutcome:
 #: 🔴 2026-10-10 真机(redroid11_x86_64,adb 1.0.41 非 tty 会话):``uiautomator dump /dev/tty`` **只回一行
 #: 「UI hierchary dumped to: /dev/tty」、XML 根本不进 stdout**,解析恒为空 ⇒ 登录界面永远「准备不好」。
 #: 改为先落文件再 ``cat``,与 2026-09-19 参考实现在同款 redroid 上的实跑路径一致。
-UI_DUMP_PATH = "/data/local/tmp/qtrade-ui.xml"
-UI_DUMP_CMD = f"uiautomator dump {UI_DUMP_PATH} >/dev/null 2>&1 && cat {UI_DUMP_PATH}"
+UI_DUMP_PATH = "/data/local/tmp/qtrade-ui-{nonce}.xml"
+UI_DUMP_CMD = f"uiautomator dump {UI_DUMP_PATH} >/dev/null && test -s {UI_DUMP_PATH} && cat {UI_DUMP_PATH}"
 
 
 def serial_of(account_id: str) -> str:
@@ -360,13 +362,21 @@ class QidianUi:
     async def _shell(self, acct: Account, cmd: str) -> str:
         return await self._adb.shell(serial_of(acct.id), cmd)
 
+    async def _dump_xml(self, acct: Account, *, read_only: bool = False) -> str:
+        """只读取本次独占文件；dump 未产出时不接受旧树，也不与其它调用共享落点。"""
+        nonce = uuid.uuid4().hex
+        path = UI_DUMP_PATH.format(nonce=nonce)
+        cmd = (UI_DUMP_CMD.format(nonce=nonce)
+               + f'; qtrade_ui_status=$?; rm -f {path}; exit "$qtrade_ui_status"')
+        return await (self._read_shell(acct, cmd) if read_only else self._shell(acct, cmd))
+
     async def _dump(self, acct: Account, p: Profile) -> list[Node]:
         """控件树。空读/解析失败按 ``timeouts.dump_retries`` 重试;仍不行 ⇒ ``ValueError``(调用方不盲点)。"""
         retries = max(1, int(p.timeout("dump_retries", 3)))
         last = "未执行"
         for i in range(retries):
             try:
-                nodes = parse_ui_xml(await self._shell(acct, UI_DUMP_CMD))
+                nodes = parse_ui_xml(await self._dump_xml(acct))
                 if nodes:
                     return nodes
                 last = "控件树为空"
@@ -398,11 +408,15 @@ class QidianUi:
         n = find_node(nodes, p.anchor(name))
         if n is not None:
             x, y = n.center
+            if name == 'chat_send':
+                require_native_permission()
             await self._tap(acct, x, y, p)
             return True
         xy = p.coord(name)
         if xy is not None:
             log.warning("锚点 %s 控件未命中,按 profile 显式开启的坐标兜底点击 %s", name, xy)
+            if name == 'chat_send':
+                require_native_permission()
             await self._tap(acct, xy[0], xy[1], p)
             return True
         return False
@@ -621,7 +635,7 @@ class QidianUi:
                     return LoginOutcome(None, reason="foreground_not_main")
                 stage = "ui"
                 try:
-                    nodes = parse_ui_xml(await self._read_shell(acct, UI_DUMP_CMD))
+                    nodes = parse_ui_xml(await self._dump_xml(acct, read_only=True))
                 except Exception:
                     nodes = None
                 if nodes is None:
@@ -720,19 +734,127 @@ class QidianUi:
         want = f"{acct.id}:{native_id}"
         for r in rows:
             if r.get("native_id") == native_id or r.get("id") == want:
-                return r.get("name") or None
+                name = r.get("name")
+                return name if name and name not in (native_id, search_key(native_id)) else None
         return None
+
+    async def _prepare_search_home(self, acct: Account, p: Profile) -> SendOutcome:
+        """Leave a verified organization search before using the shared search id."""
+        failed = SendOutcome(False, reason="search_context_unverified")
+        focus = await self._foreground(acct)
+        if focus[0] != p.package:
+            return SendOutcome(False, reason="anchor_not_found:search_entry")
+
+        def activity(key: str, current: tuple[str, str]) -> bool:
+            pattern = p.activities.get(key)
+            return bool(current[0] == p.package and pattern and re.search(pattern, current[1]))
+
+        if not any(activity(key, focus) for key in ("organization", "organization_search")):
+            return SendOutcome(True)
+
+        def matches(nodes: list[Node], name: str) -> list[Node]:
+            anchor = p.anchor(name)
+            rid = anchor.get("id")
+            if not rid:
+                return []
+            texts = anchor.get("text_any")
+            if name in ("messages_tab", "messages_title") and (not isinstance(texts, (list, tuple)) or not texts):
+                return []
+            return [n for n in nodes if n.rid == rid and (not texts or n.text in texts)
+                    and n.bounds[0] >= 0 and n.bounds[1] >= 0
+                    and n.bounds[2] > n.bounds[0] and n.bounds[3] > n.bounds[1]]
+
+        async def navigate(name: str, before: tuple[str, str]) -> bool:
+            nodes = await self._dump(acct, p)
+            if await self._foreground(acct) != before:
+                return False
+            choices = matches(nodes, name)
+            if len(choices) != 1:
+                return False
+            if not await self._tap_anchor(acct, p, name, choices):
+                return False
+            await self._sleep(p.timeout("ui_settle_s", 0.5))
+            return True
+
+        try:
+            async with asyncio.timeout(max(10.0, p.timeout("search_s", 10.0) * 2)):
+                if activity("organization_search", focus):
+                    if not await navigate("organization_search_cancel", focus):
+                        return failed
+                    focus = await self._foreground(acct)
+                if not activity("organization", focus):
+                    return failed
+                if not await navigate("organization_back", focus):
+                    return failed
+                focus = await self._foreground(acct)
+                if not activity("main", focus) or not await navigate("messages_tab", focus):
+                    return failed
+                focus = await self._foreground(acct)
+                if not activity("main", focus):
+                    return failed
+                nodes = await self._dump(acct, p)
+                if (await self._foreground(acct) != focus
+                        or len(matches(nodes, "messages_title")) != 1
+                        or len(matches(nodes, "main_marker")) != 1
+                        or find_node(nodes, p.anchor("chat_input")) is not None):
+                    return failed
+                return SendOutcome(True, evidence={"normalized_search": True})
+        except (ValueError, TimeoutError):
+            return failed
 
     async def _open_chat(self, acct: Account, p: Profile, native_id: str, expect: Optional[str]) -> SendOutcome:
         """已在目标会话 ⇒ 原地返回;否则 主界面 → 搜索 → 首条结果 → 名片页(校 ``native_id``)→ 发消息。"""
         if (await self._assert_session(acct, p, native_id, expect, where="preflight")).ok:
             return SendOutcome(True, evidence={"expect_title": expect, "reused": True})
         await self._launch(acct, p)                                                # 回主界面(比连点 BACK 确定)
+        prepared = await self._prepare_search_home(acct, p)
+        if not prepared.ok:
+            return prepared
         if not await self._tap_anchor(acct, p, "search_entry"):
-            return SendOutcome(False, reason="anchor_not_found:search_entry")
+            pkg, activity = await self._foreground(acct)
+            try:
+                current_nodes = await self._dump(acct, p)
+            except ValueError:
+                current_nodes = []
+            if (pkg != p.package or not re.search(p.activities["chat"], activity)
+                    or find_node(current_nodes, p.anchor("chat_input")) is None
+                    or await self._foreground(acct) != (pkg, activity)):
+                return SendOutcome(False, reason="anchor_not_found:search_entry")
+            # 已有 task 可能仍在聊天页；仅从已确认的本应用聊天页返回一次。
+            await self._shell(acct, "input keyevent 4")
+            await self._sleep(p.timeout("ui_settle_s", 0.5))
+            if not await self._wait_search_entry(acct, p):
+                return SendOutcome(False, reason="anchor_not_found:search_entry")
+        if prepared.evidence.get("normalized_search"):
+            package, activity = await self._foreground(acct)
+            if package != p.package or not re.search(p.activities["search"], activity):
+                return SendOutcome(False, reason="search_context_unverified")
+        await self._clear_text(acct, p)
         await self._input_text(acct, p, search_key(native_id))
-        await self._sleep(p.timeout("search_s", 2.0))
-        if not await self._tap_anchor(acct, p, "search_result_first"):
+        search_budget = max(0.1, p.timeout("search_s", 10.0))
+        search_deadline = self._clock() + int(search_budget * 1000)
+        result_title = None
+        try:
+            async with asyncio.timeout(search_budget):
+                while True:
+                    try:
+                        search_nodes = await self._dump(acct, p)
+                    except ValueError:
+                        search_nodes = []
+                    result = find_node(search_nodes, p.anchor("search_result_first"))
+                    if result is not None:
+                        x1, y1, x2, y2 = result.bounds
+                        inside = [n for n in search_nodes if x1 <= n.bounds[0] <= n.bounds[2] <= x2
+                                  and y1 <= n.bounds[1] <= n.bounds[3] <= y2]
+                        label = find_node(inside, p.anchor("chat_title"))
+                        result_title = (label.text if label else result.text) or None
+                    if await self._tap_anchor(acct, p, "search_result_first", search_nodes):
+                        break
+                    remaining = (search_deadline - self._clock()) / 1000
+                    if remaining <= 0:
+                        return SendOutcome(False, reason="anchor_not_found:search_result_first")
+                    await self._sleep(min(max(0.05, p.timeout("poll_interval_s", 1.0)), remaining))
+        except TimeoutError:
             return SendOutcome(False, reason="anchor_not_found:search_result_first")
         try:
             nodes = await self._dump(acct, p)
@@ -741,12 +863,50 @@ class QidianUi:
         ident = find_node(nodes, p.anchor("card_identity"))
         blob = "\n".join(n.text + "\u0000" + n.desc for n in nodes)
         key = search_key(native_id)
-        if not ((ident is not None and key in (ident.text + ident.desc)) or key in blob):
+        identity_text = ident.text + "\u0000" + ident.desc if ident is not None else blob
+        if not re.search(r"(?<!\d)" + re.escape(key) + r"(?!\d)", identity_text):
             return SendOutcome(False, reason="card_identity_mismatch", evidence={"want": key})
-        title = expect or (find_node(nodes, p.anchor("chat_title")).text if find_node(nodes, p.anchor("chat_title")) else None)
+        title = result_title or expect or (find_node(nodes, p.anchor("chat_title")).text if find_node(nodes, p.anchor("chat_title")) else None)
         if not await self._tap_anchor(acct, p, "card_send_msg", nodes):
             return SendOutcome(False, reason="anchor_not_found:card_send_msg")
         return SendOutcome(True, evidence={"expect_title": title})
+
+    async def _wait_search_entry(self, acct: Account, p: Profile) -> bool:
+        """一次 BACK 后只等待新界面，不再导航；外应用、登录/验证页立即停止。"""
+        budget = max(0.1, p.timeout("search_s", 10.0))
+        deadline = self._clock() + int(budget * 1000)
+
+        def allowed(fg: tuple[str, str]) -> bool:
+            return fg[0] == p.package and any(
+                re.search(p.activities.get(key, r"(?!)"), fg[1])
+                for key in ("main", "chat", "search"))
+
+        try:
+            async with asyncio.timeout(budget):
+                while True:
+                    before = await self._foreground(acct)
+                    if not allowed(before):
+                        return False
+                    try:
+                        nodes = await self._dump(acct, p)
+                    except ValueError:
+                        nodes = []
+                    after = await self._foreground(acct)
+                    if not allowed(after):
+                        return False
+                    blob = "\n".join(n.text + "\u0000" + n.desc for n in nodes)
+                    if (any(find_node(nodes, p.anchor(key)) is not None for key in (
+                            "agree_button", "login_account", "login_password", "relogin_button"))
+                            or any(word in blob for words in p.markers.values() for word in words)):
+                        return False
+                    if before == after and await self._tap_anchor(acct, p, "search_entry", nodes):
+                        return True
+                    remaining = (deadline - self._clock()) / 1000
+                    if remaining <= 0:
+                        return False
+                    await self._sleep(min(max(0.05, p.timeout("poll_interval_s", 1.0)), remaining))
+        except TimeoutError:
+            return False
 
     async def _assert_session(self, acct: Account, p: Profile, native_id: str, expect: Optional[str], *,
                               where: str) -> SendOutcome:

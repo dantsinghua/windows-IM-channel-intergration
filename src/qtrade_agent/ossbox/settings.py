@@ -116,7 +116,7 @@ class OssboxSettings:
             if not isinstance(sm4_key, str) or len(sm4_key.encode("utf-8")) != 16:
                 raise OssboxSettingsError("sts_sm4_key_invalid")
             provider = StsCredentialProvider(public["sts_url"], key, sm4_key.encode("utf-8"),
-                expected_bucket=public["bucket"] or None, allow_http=public["allow_http"])
+                allow_http=public["allow_http"])
         except UnicodeError:
             raise OssboxSettingsError("sts_credentials_invalid") from None
         return public, secrets, provider
@@ -149,7 +149,9 @@ class OssboxSettings:
 
     async def test(self, body: dict) -> dict:
         async with self._lock:
-            _public, _secrets, provider = await self._prepare(body, self.saved())
+            # STS test is stateless. All required secrets must be in this request;
+            # do not consult SQLite, Vault, or earlier successful test results.
+            _public, _secrets, provider = await self._prepare(body, None)
         try:
             credentials = await asyncio.wait_for(self._test_io.run(provider.get_credentials), timeout=15)
         except StsError as exc:
@@ -158,7 +160,7 @@ class OssboxSettings:
             raise OssboxSettingsError("sts_test_timeout", unavailable=True) from None
         except Exception:
             raise OssboxSettingsError("sts_test_unavailable", unavailable=True) from None
-        return {"authenticated": True, "bucket": credentials.bucket,
+        return {"authenticated": True,
                 "expiration": datetime.fromtimestamp(credentials.expiration, timezone.utc).isoformat().replace("+00:00", "Z")}
 
     async def runtime(self) -> tuple[dict, OssV1Box | None] | None:

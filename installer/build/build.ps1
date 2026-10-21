@@ -37,6 +37,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $BuildDir = $PSScriptRoot
+if (-not $SourceRoot) { $SourceRoot = Split-Path -Parent (Split-Path -Parent $BuildDir) }
 $InstallerRoot = Split-Path -Parent $BuildDir
 $EngineDir = Join-Path $InstallerRoot 'engine'
 if (-not $OutDir) { $OutDir = Join-Path $InstallerRoot 'out' }
@@ -492,6 +493,9 @@ if ($Sign) {
 
 Write-Section '步 1 编译安装引擎(Inno Setup 6)'
 $engineExe = ''
+if ($SkipEngine -and -not $AllowMissing) { throw "BUILD_ENGINE_REQUIRED" }
+if (-not $Iscc -and -not $SkipEngine) { throw "BUILD_TOOL_MISSING: ISCC.exe" }
+if (-not $SevenZip) { throw "BUILD_TOOL_MISSING: 7z.exe" }
 if ($SkipEngine) {
     Write-Warn2 '按 -SkipEngine 跳过引擎编译'
 } elseif (-not $Iscc) {
@@ -536,10 +540,12 @@ Write-Ok ('载荷已就位:{0}' -f $StageDir)
 
 # ── 步 3:7z 归档(§2.2.2 压缩参数)────────────────────────────────────────
 Write-Section '步 3 7z 归档'
-if (-not $SevenZip) {
-    Write-Warn2 '缺 7z.exe,无法归档 —— 到此为止(载荷 stage 已生成,可人工检查)'
-    exit 0
+. (Join-Path $BuildDir "portable-payload.ps1")
+if (-not $AllowMissing) {
+    $portableIssues=Get-QtPortablePayloadIssues -Stage $StageDir
+    if ($portableIssues.Count -gt 0) { throw ("PORTABLE_PAYLOAD_REJECTED: "+($portableIssues -join "; ")) }
 }
+if (-not $SevenZip) { throw "BUILD_TOOL_MISSING: 7z.exe" }
 if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
 
 $packedEntries = @()
@@ -604,12 +610,7 @@ Write-Ok ('归档:{0}({1:N0} 字节)' -f $ArchivePath, (Get-Item -LiteralPath $A
 
 # ── 步 4:拼 SFX 存根 + 配置 + 归档 = 单文件 EXE ────────────────────────────
 Write-Section '步 4 拼接自解压 EXE'
-if (-not $SfxStub) {
-    Write-Warn2 ('缺 SFX 存根({0}),无法拼单 EXE —— 归档已生成,可人工拼接' -f $StubKind)
-    Write-Host ''
-    Write-Host ('  copy /b "<存根>" + "{0}" + "{1}" "{2}"' -f (Join-Path $BuildDir $SfxConfigName), $ArchivePath, $FinalExe)
-    exit 0
-}
+if (-not $SfxStub) { throw "BUILD_TOOL_MISSING: SFX stub" }
 # 🔴 自编存根的二进制自证:防的是「把官方存根改名成 QTradeSD.sfx」这种最容易犯的错 ——
 #    那样 G5 会按 8 键白名单放行 InstallPath,而存根其实不认,载荷照样解到 %TEMP% 跑完即删。
 if ($StubKind -eq 'qtrade') {

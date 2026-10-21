@@ -502,6 +502,28 @@ def create_api(agent) -> FastAPI:
         request.state.account_id = account_id
         return {"ok": True, "data": account_view(row, _acct_caps(row))}
 
+    @app.get(f"{API_PREFIX}/accounts/{{account_id}}/session-reset")
+    async def get_account_session_reset(request: Request, account_id: str):
+        """Read this account's shared session reset phase; never initiate a reset."""
+        p = _principal(request, "read")
+        require_account(p, account_id)
+        row = agent.store.get_account_full(account_id)
+        if row is None or row.get("deleted_ms") or row["channel"] != "qidian":
+            raise ApiError(404, "TARGET_NOT_FOUND", "当前企点账号不存在")
+        request.state.account_id = account_id
+        host = getattr(agent, "xunjia_v22_host", None)
+        if host is None:
+            raise ApiError(503, "NOT_READY", "会话同步状态尚未接入",
+                           reason="session_reset_not_configured")
+        try:
+            data = await asyncio.to_thread(host.get_session_reset_status, account_id)
+        except Exception:
+            raise ApiError(503, "NOT_READY", "暂时无法读取会话同步状态",
+                           reason="session_reset_status_unavailable") from None
+        if data is None:
+            data = {"available": False, "account_id": account_id}
+        return {"ok": True, "data": data}
+
     @app.get(f"{API_PREFIX}/accounts/{{account_id}}/contacts")
     async def list_account_contacts(request: Request, account_id: str):
         """询价工作台通讯录。只读主库 Friends / QidianExternalInfo。未登录或主库打不开回 503,不回空列表冒充在线。"""
@@ -2024,7 +2046,7 @@ def create_api(agent) -> FastAPI:
         """#66,级别 A:``{which:'inbound'|'outbound', route_id?}`` 连通 + 登录测试;
         ``inbound`` 同时报 ``imap_ok``/``pop3_ok`` 两个结论(E-1 回落的前置判断)。
 
-        **只连配置里那一个邮箱**,不发任何邮件;开发容器里后端是 ``FakeImap``/``FakePop3``/``FakeSmtp``。"""
+        **只连配置里那一个邮件账号**,不发任何邮件;开发容器里后端是 ``FakeImap``/``FakePop3``/``FakeSmtp``。"""
         _principal(request, "admin")
         mail = _mail_or_503()
         body = await _json_or_empty(request)
@@ -2163,7 +2185,7 @@ def create_api(agent) -> FastAPI:
         used = agent.store.con.execute(
             "SELECT COUNT(*) FROM mail_routes WHERE outbound_template_id=? OR inbound_template_id=?", (tpl_id, tpl_id)).fetchone()[0]
         if used:
-            raise ApiError(409, "RESOURCE_EXHAUSTED", f"模板被 {used} 条邮箱路由引用,先改路由再删", reason="template_in_use",
+            raise ApiError(409, "RESOURCE_EXHAUSTED", f"模板被 {used} 条邮件路由引用,先改路由再删", reason="template_in_use",
                            extra={"routes": used})
         agent.store.con.execute("DELETE FROM mail_templates WHERE id=?", (tpl_id,))
         agent.store.insert_audit(kind="api", transport=p.transport, actor=p.actor, action="settings.update",

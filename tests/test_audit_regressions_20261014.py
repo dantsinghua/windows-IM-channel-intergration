@@ -10,10 +10,9 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 import httpx
 import pytest
-from qtrade_agent.config import AgentConfig, BusConfig, QidianAdapterConfig
 from qtrade_agent.hmac_inbound import canonical_string
 from qtrade_agent.models import Command, Message, Session
-from qtrade_agent.bus.bus import Bus, _Job, canonical_args_hash
+from qtrade_agent.bus.bus import _Job, canonical_args_hash
 from qtrade_agent.adapters.base import Account
 from qtrade_agent.mail.service import MailService
 from qtrade_agent.mail.config import MailConfig

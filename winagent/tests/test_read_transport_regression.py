@@ -14,7 +14,7 @@ def row(seq,talker="a",size=12):
  return {"seq":seq,"talker":talker,"content":"x"*size,"type":1,"time":1791900000,"isSelf":False}
 
 def fake_reader(monkeypatch,rows):
- wx=WinWeChat();calls=[]
+ wx=WinWeChat();wx._read_anchor=1791900000;calls=[]
  async def sessions(**kwargs):return [{"userName":name} for name in rows]
  monkeypatch.setattr(wx,"list_sessions",sessions)
  def fetch(path,query,**kwargs):

@@ -1272,6 +1272,8 @@ def test_h06_reconnect_command_success_does_not_clear_streak(tmp_path):
     `adb connect` 命令返回成功不算(connect 成功但状态仍 offline 是常态;00 §15g R6-57 ③ 钉死)**:两轮重连失败(streak=2)后,
     第三轮 `devices` 仍 offline、重连命令成功并进 ensure_root ⇒ 本轮 streak 仍 +1(=3、crit),清零要等下一轮看到 device。"""
     with rig_ctx(tmp_path, login_fn=login_ok) as rig, api_ctx(rig) as client:
+        from dataclasses import replace
+        rig.agent.healthloop.cfg = replace(rig.agent.cfg, health=replace(rig.agent.cfg.health, adb_selfheal_enabled=False))
         aid = up_running(client, rig)
         _past_grace(rig)
         orig = rig.adb.connect
@@ -1417,6 +1419,8 @@ def test_h06_root_regained_resolves_without_state_change(tmp_path):
 def test_h06_never_kill_server(tmp_path):
     """04 §2.3 H06 R6-12:三振 crit「只动该账号,不 kill-server」;拿不到 root 也不是 kill-server 时机——假 adb 没有该方法且调用记录里没有。"""
     with rig_ctx(tmp_path, login_fn=login_ok) as rig, api_ctx(rig) as client:
+        from dataclasses import replace
+        rig.agent.healthloop.cfg = replace(rig.agent.cfg, health=replace(rig.agent.cfg.health, adb_selfheal_enabled=False))
         aid = up_running(client, rig)
         _past_grace(rig)
         _fail_connect_for(rig, {SERIAL_01})
@@ -1424,7 +1428,7 @@ def test_h06_never_kill_server(tmp_path):
         for _ in range(4):
             _check_adb(client, rig)
         assert _attr(active(rig, H06_ADB_OFFLINE, f"account:{aid}"), "severity") == "crit"
-        assert not hasattr(rig.adb, "kill_server")
+        assert callable(rig.adb.kill_server)  # The guarded coordinator owns this capability.
         assert not any("kill" in c[0] or "kill-server" in c[1] for c in rig.adb.calls), rig.adb.calls
 
 

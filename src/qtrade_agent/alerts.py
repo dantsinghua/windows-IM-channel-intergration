@@ -49,6 +49,9 @@ NET_PUBLIC_ENDPOINT_CHANGED = "NET_PUBLIC_ENDPOINT_CHANGED"
 # 02 §3.7:企点四码永不 crit、不改 state、能力不减;H13 warn(04 F-13:仅对齐失败才告知);MEM_PRESSURE warn(crit 由水位升);
 # H04/H05 crit;H06 warn(3 次无效升 crit,由调用方传 severity);CONTAINER_OOM_KILLED warn;ACCOUNT_OFFLINE warn(05 §2.5.4:1 小时内第 3 次升 error)
 REGISTERED = {
+    "QQ_LOGIN_RECOVERY_EXHAUSTED": "warn",
+    "ADB_SELFHEAL_EXHAUSTED": "warn",
+    "WECHAT_READ_RETRY_EXHAUSTED": "warn",
     QIDIAN_NOT_ROOT: "warn",
     QIDIAN_DB_UNAVAILABLE: "warn",
     QIDIAN_TABLE_DECODE_STUCK: "warn",

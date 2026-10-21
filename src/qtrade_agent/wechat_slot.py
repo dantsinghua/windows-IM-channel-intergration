@@ -96,13 +96,14 @@ class WechatSlot:
         return bool(self._store.wechat_slot_claim(target, login_session_id, expires, now_ms=now))
 
     async def release_pending(self, target: Optional[str] = None, *, reason: str, actor: str = "system",
-                              audit: Optional[str] = None, now_ms: Optional[int] = None) -> int:
+                              audit: Optional[str] = None, now_ms: Optional[int] = None, purge: bool = True) -> int:
         """①失败即释放 / ③用户手动:三列一起清 + **同步回收该次绑定的中间产物**(否则下次绑定读到脏状态)。"""
         now = now_ms or self._clock()
         ls = self.view().pending_login_session_id
         n = self._store.wechat_slot_release_pending(target, now_ms=now)
         if n and target:
-            await self._purge_for(target)
+            if purge:
+                await self._purge_for(target)
             self._store.insert_audit(kind="system", transport="system", actor=actor, action=audit or CANCEL_AUDIT,
                                      account_id=target, result_code="OK", detail={"reason": reason, "login_session_id": ls}, now_ms=now)
         return n

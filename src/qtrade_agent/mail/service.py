@@ -1,4 +1,4 @@
-"""邮件服务装配 —— 规格:docs/06 §2.0(总览:一个邮箱一份连接)、§2.7(``GET /mail/status``)、§2.15.3(读线程按 ``mailbox_key`` 去重)。
+"""邮件服务装配 —— 规格:docs/06 §2.0(总览:一个邮件账号一份连接)、§2.7(``GET /mail/status``)、§2.15.3(读线程按 ``mailbox_key`` 去重)。
 
 本类把 ``routes``/``fetcher``/``ingest``/``sender``/``cleanup`` 串起来,给总控一个接线点:
 ``app.py`` 装一个 ``MailService``、``scheduler`` 注册三个周期任务(取信、发队列、confirm reaper),
@@ -73,7 +73,7 @@ class MailService:
                                         ingest=self.ingest, clock=self.clock)
         self.fetchers, self.cleaners = {}, {}
         for key, routes in self.routes.mailboxes().items():
-            route = routes[0]                       # 多条路由共用同一邮箱时共用那条线程(§2.15.3)
+            route = routes[0]                       # 多条路由共用同一邮件账号时共用那条线程(§2.15.3)
             cleaner = MailCleanup(self.ms, route, self.cfg, clock=self.clock, alerts=self.alerts,
                                   disk_state=self.disk_state)
             self.cleaners[key] = cleaner
@@ -95,7 +95,7 @@ class MailService:
 
     # ------------------------------------------------------------------ 周期动作
     def fetch_once(self) -> dict[str, Any]:
-        """每个邮箱跑一轮取信(清理在同一轮、同一连接里,§2.6.6)。"""
+        """每个邮件账号跑一轮取信(清理在同一轮、同一连接里,§2.6.6)。"""
         out: dict[str, Any] = {}
         for key, f in self.fetchers.items():
             out[key] = f.run_once()
@@ -155,8 +155,8 @@ class MailService:
         ``.omc/handoffs/backend-api-6.md`` §A:找不到可信源的键回 ``null``,不编值。
         """
         out = []
-        # mail_cleanup_log 没有 mailbox 列(02 DDL;06 §3.1 有 `mailbox_key`,见 backend-api-5 D-3)⇒ 只有一个物理邮箱时
-        # 才能把「最近一轮清理」归到它名下;多邮箱时归不了属,回 null,不把 A 邮箱的配额摆到 B 邮箱名下。
+        # mail_cleanup_log 没有 mailbox 列(02 DDL;06 §3.1 有 `mailbox_key`,见 backend-api-5 D-3)⇒ 只有一个物理邮件账号时
+        # 才能把「最近一轮清理」归到它名下;多邮件账号时归不了属,回 null,不把 A 邮件账号的配额摆到 B 邮件账号名下。
         attributable = len(self.fetchers) <= 1
         last_log = (self.ms.cleanup_log_list(limit=1) or [None])[0] if attributable else None
         last_round = self.ms.cleanup_log_last_round() if attributable else None

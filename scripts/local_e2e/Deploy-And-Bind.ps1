@@ -1,18 +1,22 @@
-param([Parameter(Mandatory=$true)][string]$PlanPath)
+﻿param([Parameter(Mandatory=$true)][string]$PlanPath)
 $ErrorActionPreference = "Stop"
 $plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$root = "C:\ProgramData\QTrade-E2E\winagent"
+$context = $plan.context
+if ($context.schema -ne 1 -or -not [IO.Path]::IsPathRooted([string]$context.service_root)) { throw "CONTEXT_INVALID: service_root" }
+if ($context.distro -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$' -or $context.linux_user -notmatch '^[a-z_][a-z0-9_-]{0,31}$') { throw "CONTEXT_INVALID: guest_identity" }
+$root = [IO.Path]::GetFullPath([string]$context.service_root)
 $live = Join-Path $root "app"
 $svcExe = Join-Path $live "qtrade-winagent-svc.exe"
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $identity = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "Administrator approval required." }
-if (Test-Path "C:\ProgramData\QTrade") { throw "Unexpected formal root." }
-$svc = Get-CimInstance Win32_Service -Filter "Name='QTradeWinAgent'"
-$expected = $svcExe + " --service --root " + $root + " --install-user-sid " + $sid
-if (-not $svc -or $svc.PathName -cne $expected) { throw "Service ownership mismatch." }
+if (Test-Path (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'QTrade')) { throw "FORMAL_INSTALLATION_CONFLICT" }
 $assets = Get-Content -LiteralPath (Join-Path $plan.base "artifacts.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($entry in $assets.PSObject.Properties) { if ((Get-FileHash -LiteralPath (Join-Path $plan.base $entry.Name) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.Value) { throw "Frozen artifact changed." } }
+Import-Module (Join-Path $plan.source "installer/engine/modules/QTrade.Native.psm1") -DisableNameChecking
+$svc = Get-CimInstance Win32_Service -Filter "Name='QTradeWinAgent'"
+$expected = (@($svcExe, "--service", "--root", $root, "--install-user-sid", $sid) | ForEach-Object { ConvertTo-QtProcessArgument -Value $_ }) -join " "
+if (-not $svc -or $svc.PathName -cne $expected) { throw "Service ownership mismatch." }
 $record = Join-Path $plan.base "deployment.json"
 $stamp = Get-Date -Format yyyyMMdd-HHmmss
 $backup = Join-Path $root ("app.before-local-e2e-"+$stamp)
@@ -42,7 +46,7 @@ try {
   $credentials = Get-QtBootstrapTokens -TimeoutSec 30
   if (-not $credentials.Ok) { throw ("Credential bootstrap failed: "+$credentials.Reason) }
   $guest = $plan.linux_release + "/source/scripts/local_e2e/guest.py"
-  $result = Invoke-QtProcess -FilePath "$env:WINDIR\System32\wsl.exe" -ArgumentList @("-d","Ubuntu-24.04","--user","anlin","--exec","/home/anlin/.venvs/qtrade/bin/python","-B",$guest,"bind") -StandardInput $credentials.WinAgentToken -TimeoutSec 40
+  $result = Invoke-QtProcess -FilePath "$env:WINDIR\System32\wsl.exe" -ArgumentList @("-d",$context.distro,"--user",$context.linux_user,"--exec",$context.linux_python,"-B",$guest,"bind","--context",($plan.linux_release+"/context.json")) -StandardInput $credentials.WinAgentToken -TimeoutSec 40
   if ($result.TimedOut -or $result.ExitCode -ne 0) { throw "Agent-role credential binding failed; no credential is included in this log." }
   $binding=$result.StdOut | ConvertFrom-Json
   if (-not $binding.bound -or $binding.agent_role_time -ne 200) { throw "Role-specific verification failed." }

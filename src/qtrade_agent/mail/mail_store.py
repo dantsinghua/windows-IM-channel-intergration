@@ -494,7 +494,7 @@ class MailStore:
         return int(r[0]) if r and r[0] is not None else None
 
     def inbox_archived_bytes(self, *, mailbox: str) -> int:
-        """#56 ``cleanup.archived_mb`` 的源:该邮箱已归档(``archived_path`` 仍在,§2.6.7 过期会置空)行的 ``size_bytes`` 之和。"""
+        """#56 ``cleanup.archived_mb`` 的源:该邮件账号已归档(``archived_path`` 仍在,§2.6.7 过期会置空)行的 ``size_bytes`` 之和。"""
         r = self.con.execute("SELECT COALESCE(SUM(size_bytes),0) FROM mail_inbox WHERE mailbox=? AND archived_path IS NOT NULL",
                              (mailbox,)).fetchone()
         return int(r[0] or 0)

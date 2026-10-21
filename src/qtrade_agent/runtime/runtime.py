@@ -7,7 +7,7 @@
 - ``_purge_ephemeral(acct)``:清可再生临时数据(①容器内 /data/local/tmp/* ②宿主 accounts/<id>/tmp/ ③media/tmp 里属于该账号的 ④frida 转发 ⑤/data/local/tmp/*.js);
   **绝不动** /data 卷、accounts/<id>/data/、agent.db、已入库 media、device_profiles、Vault;幂等;容器不在时跳过容器内那步;记审计 ``runtime.purge_ephemeral``。
 - ``ensure_root(acct)``(唯一出处 06 §2.9.5,三步逐字):``health.mark_rooting`` → ``adb root`` → 容器内 ``stop adbd; start adbd`` → 宿主只对本账号 ``disconnect/connect``
-  → 判据 ``whoami == root``。**绝不 kill-server**(AdbBackend 协议里根本没有这个方法)。失败只发 warn ``QIDIAN_NOT_ROOT``、state 仍 running(R6-32)。
+  → 判据 ``whoami == root``。**本路径绝不 kill-server**(共享恢复能力仅限 H06 受控协调器)。失败只发 warn ``QIDIAN_NOT_ROOT``、state 仍 running(R6-32)。
 """
 from __future__ import annotations
 
@@ -619,6 +619,34 @@ class Runtime:
         if info.exists and info.running:
             await self._containers.stop(info.container, timeout_s=30 if graceful else 5)
         return await self.inspect(acct, fresh=True)
+
+    async def restart_napcat_qr(self, acct: AccountRow, current_attempt: Callable[[], bool]) -> bool:
+        """Restart only the registered container, never rebuild it or purge its data."""
+        if acct.get("channel") != "qq":
+            raise ValueError("napcat_recovery_wrong_channel")
+        async with self._serial_ctx():
+            registered = self._store.get_runtime(acct["id"]) or {}
+            observed = await self._containers.inspect(container_name(acct["id"]))
+            cid = registered.get("container_id") or ""
+            if not (observed and observed.name == registered.get("container_name") == container_name(acct["id"])
+                    and observed.id and (cid == observed.id or len(observed.id) >= 12 and cid.startswith(observed.id))):
+                raise RuntimeError("napcat_recovery_owner_changed")
+            if not current_attempt():
+                return False
+            if observed.running:
+                await self._containers.stop(observed.name, timeout_s=10)
+            stopped = await self._containers.inspect(observed.name)
+            if not current_attempt():
+                return False
+            if not stopped or stopped.id != observed.id or stopped.running:
+                raise RuntimeError("napcat_recovery_stop_failed")
+            await self._containers.start(observed.name)
+            self._inspect_cache.pop(acct["id"], None)
+            live = await self._containers.inspect(observed.name)
+            if not live or live.id != observed.id or not live.running:
+                raise RuntimeError("napcat_recovery_start_failed")
+            return True
+
 
     async def restart(self, acct: AccountRow) -> RuntimeInfo:
         await self.stop(acct, graceful=True)

@@ -218,6 +218,7 @@ export const STATE_CODES: Record<string, StateCodeMeta> = {
   CONTAINER_EXIT: { group: 'fail', zh: '容器意外退出', actions: ['restart', 'open-env'] },
   NARRATOR_UNAVAILABLE: { group: 'fail', zh: '讲述人无法启动', actions: ['open-logs'] },
   KEY_FAIL: { group: 'fail', zh: '微信取钥失败:消息读取与发送均不可用', actions: ['key-retry', 'reinstall'] },
+  WECHAT_READ_FAILED: { group: 'fail', zh: '微信消息读取异常,暂停发送,自动重试中/需人工重启', actions: ['open-logs'] },
   SCREEN_LOCKED: { group: 'fail', zh: 'Windows 已锁屏,微信发送不可用', actions: ['unlock'] },
   WINAGENT_OFFLINE: {
     group: 'fail',
@@ -312,8 +313,8 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
 
   // ── MAIL_* 十四码(R6-33:一律用 02 §3.7 全集,小写 kind 名与 imap_fallback 作废)
   MAIL_INBOUND_STALLED: { severity: 'warn', event: 'mail', zh: '收信停滞' },
-  MAIL_AUTH_FAILED: { severity: 'crit', event: 'mail', zh: '邮箱认证失败,多半是密码/授权码过期' },
-  MAIL_QUOTA_HIGH: { severity: 'warn', event: 'mail', zh: '邮箱容量告急' },
+  MAIL_AUTH_FAILED: { severity: 'crit', event: 'mail', zh: '邮件账号认证失败,多半是密码/授权码过期' },
+  MAIL_QUOTA_HIGH: { severity: 'warn', event: 'mail', zh: '邮件服务器容量告急' },
   MAIL_SMTP_FAILING: { severity: 'warn', event: 'mail', zh: '发信连续失败' },
   MAIL_OUTBOX_DEAD: { severity: 'warn', event: 'mail', zh: '有邮件进死信' },
   MAIL_CLEANUP_FAILED: { severity: 'warn', event: 'mail', zh: '清理连续失败' },
@@ -337,6 +338,9 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   NET_PUBLIC_ENDPOINT_CHANGED: { severity: 'info', event: 'net' },
   WEBHOOK_DEAD: { severity: 'warn', event: 'alert' },
   EVENTS_QUEUE_OVERFLOW: { severity: 'warn', event: 'alert' },
+  ADB_SELFHEAL_EXHAUSTED: { severity: 'warn', event: 'alert', zh: 'ADB共享恢复额度已耗尽或不可验证，已停止自动重启，请检查日志' },
+  WECHAT_READ_RETRY_EXHAUSTED: { severity: 'warn', event: 'alert', zh: '微信消息读取重试已停止，请检查原始原因并手动重新检查读取服务；无需重复取钥' },
+  QQ_LOGIN_RECOVERY_EXHAUSTED: { severity: 'warn', event: 'alert', zh: 'QQ二维码恢复次数已达上限，已停止自动重启容器，请检查日志' },
   AUTO_RESTART_EXHAUSTED: { severity: 'crit', event: 'alert' },
   CONTAINER_OOM_KILLED: { severity: 'warn', event: 'alert' },
   MEM_PRESSURE: { severity: 'warn', event: 'resource' },
@@ -351,7 +355,7 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   QIDIAN_NOT_ROOT: {
     severity: 'warn',
     event: 'alert',
-    zh: '企点账号未取得 root,消息读取已降级(改走控件树;发送不受影响)',
+    zh: '企点账号未取得 root,消息读取不可用(不提供控件树降级;请检查root前置条件)',
   },
   // R6-50:只进铃与角标,codes.ts 不配文案、不上横幅
   QIDIAN_TABLE_DECODE_STUCK: { severity: 'warn', event: 'alert' },
@@ -359,7 +363,7 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
   QIDIAN_DB_UNAVAILABLE: {
     severity: 'warn',
     event: 'alert',
-    zh: '企点消息库暂不可读(路径或结构变化),消息读取已降级(改走控件树;发送不受影响)',
+    zh: '企点消息库暂不可读(路径或结构变化),消息读取不可用(不提供控件树降级;请检查root前置条件)',
   },
   QIDIAN_PROFILE_FALLBACK: { severity: 'info', event: 'alert' },
   WECHAT_SWITCH_FAILED: { severity: 'warn', event: 'alert' },
@@ -479,9 +483,9 @@ export const PROBE_RESULTS: Record<string, ProbeResultMeta> = {
 
 export const PROBE_TARGETS: Record<string, string> = {
   apk_url: '企点安装包地址',
-  mail_pop3: '邮箱 POP3',
-  mail_imap: '邮箱 IMAP',
-  mail_smtp: '邮箱 SMTP',
+  mail_pop3: '邮件账号 POP3',
+  mail_imap: '邮件账号 IMAP',
+  mail_smtp: '邮件账号 SMTP',
   qidian_msf: '企点私有协议',
   qq_servers: 'QQ 服务器',
   wechat_servers: '微信服务器',

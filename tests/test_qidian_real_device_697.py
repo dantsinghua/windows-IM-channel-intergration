@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import shlex
+
 from qtrade_agent.adapters.qidian.ui import UI_DUMP_CMD, UI_DUMP_PATH, find_node, load_profiles, parse_ui_xml
 from test_qidian_ui import PKG, acct, node, rig, tree  # noqa: F401  rig 夹具重导出
 
@@ -59,7 +61,15 @@ async def test_dump与probe都用落盘读回的命令(rig):
     ui, adb, _ = rig
     adb.dumps = [LOGIN_PAGE_697]
     await ui._dump(acct(), PROFILE)
-    assert UI_DUMP_CMD in adb.cmds
+    adb.fg = f"{PKG}/com.tencent.mobileqq.activity.SplashActivity"
+    await ui.probe_login(acct())
+    commands = [c for c in adb.cmds if c.startswith("uiautomator dump ")]
+    paths = [shlex.split(c)[2] for c in commands]
+    # 验证真实调用而非模板常量：普通读取与只读观察不能共用落点。
+    assert len(commands) == 2
+    assert len(set(paths)) == len(paths)
+    assert all(path.startswith("/data/local/tmp/") and "{" not in path for path in paths)
+    assert all(f"cat {path}" in command for command, path in zip(commands, paths))
     assert not any("uiautomator dump /dev/tty" in c for c in adb.cmds)
 
 

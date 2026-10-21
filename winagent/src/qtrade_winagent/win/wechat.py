@@ -34,7 +34,7 @@ NARRATOR = "narrator.exe"
 WX_KEY_REL = os.path.join("lib", "windows_x64", "wx_key.dll")
 
 
-CHATLOG_READ_DAYS = 2                     # 增量读的日期窗(跨零点也不丢);真正去重靠 (talker, seq)
+CHATLOG_READ_DAYS = 1                     # 增量读的日期窗:仅最近一天(time 参数只支持日期粒度);会话级用 nOrder 精确过滤降请求量(R6-111)
 CHATLOG_STOP_POLLS = 20                   # chatlog 优雅退出(卸载 hook)的等待轮数(×0.3 s ≈ 6 s),超时才兜底强杀
 CHATLOG_SERVER_START_TIMEOUT_S = 5.0      # Port check, launch, and health confirmation share this budget.
 
@@ -166,6 +166,15 @@ def chatlog_time_range(days: int = CHATLOG_READ_DAYS, *, today: Optional["object
     end = today or _dt.date.today()
     start = end - _dt.timedelta(days=max(0, days - 1))
     return f"{start.isoformat()}~{end.isoformat()}"
+
+
+def chatlog_read_window(anchor: float, *, now: float | None = None) -> tuple[str, float]:
+    """A fixed twelve-hour history floor, with a growing date-granularity envelope."""
+    from datetime import datetime
+    cutoff = anchor - 12 * 3600
+    end = max(anchor, time.time() if now is None else now)
+    period = datetime.fromtimestamp(cutoff).date().isoformat() + "~" + datetime.fromtimestamp(end).date().isoformat()
+    return period, cutoff
 
 
 _KEY_HEX_RE = None
@@ -340,6 +349,9 @@ class WinWeChat:
         self._chatlog_dir = chatlog_dir
         self._work_dir = chatlog_work_dir or os.path.join(tempfile.gettempdir(), "qtrade-chatlog")
         self._port = chatlog_port
+        from ..wechat_read_page import ResumableReads
+        self._read_progress = ResumableReads()
+        self._read_anchor: Optional[float] = None
         self._cls = main_wnd_class
         self._grace = process_close_grace_s
         self._wechat_pid: Optional[int] = None
@@ -846,6 +858,8 @@ class WinWeChat:
         卸载 inline hook,被改写的目标函数字节会**永久残留在微信进程里**,导致之后对同一进程取钥全部「模式匹配失败,
         找到 0 个结果」(我 22:10 强杀 chatlog 把 23424 弄脏、后续全败就是这么来的)。先发 ``CTRL_BREAK`` 让它优雅卸载,
         等它退出;只有赖着不走的才兜底强杀。"""
+        self._read_progress.reset()
+        self._read_anchor = None
         from .proc import WinProc
         p = self._chatlog_process
         if p is None:
@@ -907,6 +921,7 @@ class WinWeChat:
                         if remaining <= 0:
                             break
                         if await _blocking(self._chatlog_server_healthy, min(0.5, remaining)):
+                            self._read_anchor = time.time()
                             return p.pid
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -990,33 +1005,57 @@ class WinWeChat:
 
     # ---------------------------------------------------------------- 读写
     def _get_items(self, path: str, query: dict[str, Any], *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+        import socket
         import urllib.error
         import urllib.parse
         import urllib.request
         from ..errors import RESOURCE_EXHAUSTED
         url = f"http://127.0.0.1:{self._port}{path}?" + urllib.parse.urlencode({**query, "format": "json"})
         try:
-            with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(url, timeout=timeout_s) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise WaError(RESOURCE_EXHAUSTED, "Chatlog HTTP page too large", reason="wechat_read_response_too_large")
-                body = json.loads(raw.decode("utf-8") or "{}")
         except urllib.error.HTTPError as error:
             status = error.code
             error.close()
-            if status == 404: return []
-            raise WaError(NOT_READY, f"Chatlog read returned HTTP {status}; stored keys unchanged",
-                          reason="wechat_read_unavailable", retryable=True) from None
-        except (OSError, ValueError):
-            raise WaError(NOT_READY, "Chatlog read is unavailable or invalid; stored keys unchanged",
-                          reason="wechat_read_unavailable", retryable=True) from None
-        return body if isinstance(body, list) else (body or {}).get("items") or []
+            # The pinned Chatlog API uses 404 for an empty collection.
+            if status == 404 and path in {"/api/v1/session", "/api/v1/chatlog", "/api/v1/contact", "/api/v1/chatroom"}:
+                return []
+            raise WaError(NOT_READY, f"Chatlog returned HTTP {status}; stored keys unchanged",
+                          reason=f"wechat_read_http_{status}", retryable=status >= 500) from None
+        except (TimeoutError, socket.timeout):
+            raise WaError(TIMEOUT, "Chatlog request timed out", reason="wechat_read_timeout", retryable=True) from None
+        except (urllib.error.URLError, OSError) as error:
+            cause = error.reason if isinstance(error, urllib.error.URLError) else error
+            number = getattr(cause, "winerror", None) or getattr(cause, "errno", None)
+            if isinstance(cause, (TimeoutError, socket.timeout)) or number in (60, 110, 10060):
+                reason = "wechat_read_timeout"
+            elif isinstance(cause, ConnectionRefusedError) or number in (61, 111, 10061):
+                reason = "wechat_read_connection_refused"
+            elif isinstance(cause, PermissionError) or number in (5, 13, 10013):
+                reason = "wechat_read_access_denied"
+            else:
+                reason = "wechat_read_transport_error"
+            raise WaError(NOT_READY, reason + "; stored keys unchanged", reason=reason, retryable=True) from None
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            raise WaError(NOT_READY, "Invalid Chatlog JSON", reason="wechat_read_invalid_json") from None
+        rows = body if isinstance(body, list) else body.get("items") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise WaError(NOT_READY, "Invalid Chatlog page shape", reason="wechat_read_invalid_response")
+        return rows
 
     async def read_messages(self, *, talker: Optional[str], since_seq: Optional[int], limit: int) -> list[dict[str, Any]]:
         # Both "time" and "talker" are mandatory in each backend query.
-        from ..wechat_read_page import collect_messages
-        return await _blocking(lambda: collect_messages(self._get_items, time_range=chatlog_time_range(),
-                                                       talker=talker, since_seq=since_seq, limit=limit))
+        if self._read_anchor is None:
+            self._read_anchor = time.time()
+        period, cutoff = chatlog_read_window(self._read_anchor)
+        return await _blocking(lambda: self._read_progress.read(
+            self._get_items, time_range=period, talker=talker,
+            since_seq=since_seq, limit=limit, not_before=cutoff))
 
     def _resolve_send_target(self, talker: str) -> str:
         """talker(wxid / ``xxx@chatroom``)→ pyweixin 搜索用的显示名;找不到或**重名**一律抛 ``WaError``,不发。"""
@@ -1079,7 +1118,7 @@ class WinWeChat:
                                     search_pages=0, close_weixin=False)
 
     def _keyboard_send_text(self, name: str, text: str) -> None:
-        """控件树为空时的发送。先把唯一微信主窗口调到前台，再点会话搜索框和绿色发送按钮。
+        """先把唯一微信主窗口调到前台，再通过唯一 UIA 控件搜索目标并发送。
 
         微信 4 的 Ctrl+F 打开「搜一搜」，不会切到目标会话，所以不走那个快捷键。
         对象唯一性在 ``_resolve_send_target`` 已拒绝重名。是否写进该会话，由随后的 chatlog 读回判定。"""
@@ -1197,17 +1236,106 @@ def wechat_click_points(width: int, height: int) -> dict[str, tuple[int, int]]:
     }
 
 
+def _wechat_ui_call(stage: str, action, *, retry_read: bool = False):
+    """只对失效元素的完整只读操作重取一次；原生输入、点击绝不重放。"""
+    for attempt in range(2 if retry_read else 1):
+        try:
+            return action()
+        except Exception as exc:
+            hresult = getattr(exc, "hresult", None)
+            if hresult is None and exc.args and isinstance(exc.args[0], int):
+                hresult = exc.args[0]
+            hresult = hresult & 0xFFFFFFFF if isinstance(hresult, int) else None
+            # 不记录异常正文、源码行或局部变量：COM 消息和输入参数可能含联系人与正文。
+            stack = []
+            tb = exc.__traceback__
+            while tb is not None:
+                frame = tb.tb_frame
+                stack.append(f"{frame.f_code.co_filename}:{tb.tb_lineno}:{frame.f_code.co_name}")
+                tb = tb.tb_next
+            safe = RuntimeError(f"WeChat UI {type(exc).__name__}; HRESULT={hresult}")
+            log.warning("微信 UI 操作失败", exc_info=(RuntimeError, safe, None),
+                        extra={"op": "wechat.send", "kv": {"stage": stage,
+                               "hresult": f"0x{hresult:08X}" if hresult is not None else "none",
+                               "stack": " | ".join(stack)}})
+            if not retry_read or hresult != 0x80040201:
+                raise
+            if attempt == 1:
+                raise WaError(NOT_READY, "微信界面元素持续失效，已停止发送",
+                              reason="wechat_uia_element_unavailable") from exc
+
+
+def _ensure_wechat_foreground(hwnd: int) -> bool:
+    """每个原生步骤前核同一个唯一主窗；需要时复用正常前台切换并二次确认。"""
+    import win32gui
+
+    active = win32gui.GetForegroundWindow()
+    hwnds = wechat_main_hwnds(_visible_window_rows())
+    try:
+        _action, current = plan_wechat_foreground(active, hwnds)
+        if current != hwnd:
+            raise WeChatWindowError("wechat_window_changed", "微信主窗口已变化，已停止发送")
+        begin_wechat_input(active, hwnds, _claim_foreground, win32gui.GetForegroundWindow)
+    except WeChatWindowError as exc:
+        raise WaError(NOT_READY, str(exc), reason=exc.reason) from exc
+    return active != hwnd
+
+
 def _search_popup_entries(win) -> list[tuple[object, str]]:
-    """按界面顺序取出搜索下拉里的文字行。分组标题和结果行都保留，方便判断「功能」还是「搜索网络结果」。"""
-    entries: list[tuple[object, str]] = []
-    for ctrl in win.descendants():
-        kind = str(ctrl.element_info.control_type or "")
-        if kind not in ("ListItem", "Text"):
-            continue
-        text = " ".join((ctrl.window_text() or "").split())
-        if text:
-            entries.append((ctrl, text))
-    return entries
+    """完整重取文字行，不能略过失效分组或候选造成假唯一。"""
+    def read():
+        entries: list[tuple[object, str]] = []
+        for ctrl in win.descendants():
+            kind = str(ctrl.element_info.control_type or "")
+            if kind not in ("ListItem", "Text"):
+                continue
+            text = " ".join((ctrl.window_text() or "").split())
+            if text:
+                entries.append((ctrl, text))
+        return entries
+    return _wechat_ui_call("search_snapshot", read, retry_read=True)
+
+
+def _unique_wechat_control(win, role: str, *, require_enabled: bool = True,
+                           expected_name: str | None = None):
+    """只接受主窗口内唯一可见的实际控件；不能定位时不向猜测的位置输入。"""
+    def read():
+        controls = win.descendants()
+
+        def unique(wanted: str, enabled: bool):
+            kind, class_name = {
+                "search": ("Edit", "mmui::XValidatorTextEdit"),
+                "composer": ("Edit", "mmui::ChatInputField"),
+                "send": ("Button", "mmui::XOutlineButton"),
+            }[wanted]
+            matches = []
+            for ctrl in controls:
+                info = ctrl.element_info
+                if info.control_type != kind or info.class_name != class_name:
+                    continue
+                if wanted == "send" and ctrl.window_text().strip() not in {"发送", "Send", "傳送"}:
+                    continue
+                if ctrl.is_visible():
+                    matches.append(ctrl)
+            if len(matches) != 1:
+                raise WaError(NOT_READY, "微信发送控件不存在或不唯一", reason=f"wechat_{wanted}_control_not_unique")
+            ctrl = matches[0]
+            box, outer = ctrl.rectangle(), win.rectangle()
+            if (box.right <= box.left or box.bottom <= box.top
+                    or box.left < outer.left or box.top < outer.top
+                    or box.right > outer.right or box.bottom > outer.bottom):
+                raise WaError(NOT_READY, "微信发送控件位置无效", reason=f"wechat_{wanted}_control_bounds_invalid")
+            if enabled and not ctrl.is_enabled():
+                raise WaError(NOT_READY, "微信发送控件不可用", reason=f"wechat_{wanted}_control_disabled")
+            return ctrl
+
+        composer = None
+        if expected_name is not None:
+            composer = unique("composer", True)
+            if composer.window_text() != expected_name:
+                raise WaError(NOT_READY, "当前微信会话与发送目标不一致", reason="wechat_session_mismatch")
+        return composer if role == "composer" and composer is not None else unique(role, require_enabled)
+    return _wechat_ui_call(f"{role}_control", read, retry_read=True)
 
 
 def _click_send_in_open_wechat(hwnd: int, name: str, text: str) -> None:
@@ -1216,6 +1344,7 @@ def _click_send_in_open_wechat(hwnd: int, name: str, text: str) -> None:
     import time
     import win32clipboard
     import win32con
+    import win32gui
     from pywinauto import Desktop
 
     try:
@@ -1223,51 +1352,89 @@ def _click_send_in_open_wechat(hwnd: int, name: str, text: str) -> None:
     except Exception:
         pass
     win = Desktop(backend="uia").window(handle=hwnd)
-    rect = win.rectangle()
-    points = wechat_click_points(rect.width(), rect.height())
 
-    def paste(value: str) -> None:
+    def control(role: str, *, enabled: bool = True):
+        return _unique_wechat_control(win, role, require_enabled=enabled,
+                                      expected_name=name if role != "search" else None)
+
+    def foreground():
+        return _wechat_ui_call("foreground", lambda: _ensure_wechat_foreground(hwnd))
+
+    def check_foreground():
+        if win32gui.GetForegroundWindow() != hwnd:
+            raise WaError(NOT_READY, "微信未保持前台，已停止发送", reason="wechat_not_foreground")
+
+    def click(stage: str, locate):
+        foreground()
+        ctrl = locate()
+        if foreground():
+            ctrl = locate()
+        check_foreground()
+        _wechat_ui_call(stage, ctrl.click_input)
+
+    def prepare_input(role: str) -> bool:
+        restored = foreground()
+        ctrl = control(role)
+        restored = foreground() or restored
+        if restored:
+            # 调回前台后，旧焦点可能已经移到浏览器；只重聚焦当前已验证的输入控件。
+            ctrl = control(role)
+            check_foreground()
+            _wechat_ui_call(f"{role}_refocus", ctrl.click_input)
+        check_foreground()
+        return restored
+
+    def paste(role: str, value: str) -> None:
         win32clipboard.OpenClipboard()
         try:
             win32clipboard.EmptyClipboard()
             win32clipboard.SetClipboardText(value, win32clipboard.CF_UNICODETEXT)
         finally:
             win32clipboard.CloseClipboard()
+        prepare_input(role)
         user32 = ctypes.windll.user32
         user32.keybd_event(0x11, 0, 0, 0)
         user32.keybd_event(0x56, 0, 0, 0)
         user32.keybd_event(0x56, 0, win32con.KEYEVENTF_KEYUP, 0)
         user32.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-    def select_all_and_delete() -> None:
+    def select_all_and_delete(role: str) -> None:
         user32 = ctypes.windll.user32
-        user32.keybd_event(0x11, 0, 0, 0)
-        user32.keybd_event(0x41, 0, 0, 0)
-        user32.keybd_event(0x41, 0, win32con.KEYEVENTF_KEYUP, 0)
-        user32.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
+        for attempt in range(2):
+            prepare_input(role)
+            user32.keybd_event(0x11, 0, 0, 0)
+            user32.keybd_event(0x41, 0, 0, 0)
+            user32.keybd_event(0x41, 0, win32con.KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+            if not prepare_input(role):
+                break
+            # 恢复后的聚焦会丢失 Ctrl+A 选择；最多重选一次，绝不重复粘贴。
+            if attempt == 1:
+                raise WaError(NOT_READY, "微信前台持续变化，已停止发送", reason="wechat_not_foreground")
         user32.keybd_event(0x2E, 0, 0, 0)
         user32.keybd_event(0x2E, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-    from ..errors import NOT_READY, WaError
-
-    win.click_input(coords=points["search"])
+    click("search_click", lambda: control("search"))
     time.sleep(0.2)
-    select_all_and_delete()
-    paste(name)
+    _wechat_ui_call("search_clear", lambda: select_all_and_delete("search"))
+    _wechat_ui_call("search_paste", lambda: paste("search", name))
     time.sleep(0.45)
     entries = _search_popup_entries(win)
     hit = pick_wechat_search_hit([label for _ctrl, label in entries], name)
     if hit is None:
         raise WaError(NOT_READY, "搜索结果里没有唯一的功能、联系人或群，已拒绝点网络结果", reason="wechat_search_not_function")
-    entries[hit][0].click_input()
+    click("search_result_click", lambda: entries[hit][0])
     time.sleep(0.45)
-    win.click_input(coords=points["composer"])
+    control("composer")
+    # 空输入区的发送按钮可以禁用；粘贴后必须重新确认已经启用。
+    control("send", enabled=False)
+    click("composer_click", lambda: control("composer"))
     time.sleep(0.2)
-    select_all_and_delete()
-    paste(text)
+    _wechat_ui_call("composer_clear", lambda: select_all_and_delete("composer"))
+    _wechat_ui_call("composer_paste", lambda: paste("composer", text))
     time.sleep(0.25)
-    win.click_input(coords=points["send"])
+    click("send_click", lambda: control("send"))
 
 
 def foreground_threads_to_attach(current: int, foreground: int, target: int) -> tuple[int, ...]:

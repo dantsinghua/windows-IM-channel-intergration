@@ -184,83 +184,70 @@ function Register-QtWinAgentUserTask {
 }
 
 function Get-QtWinAgentHealth {
-    <#
-    .SYNOPSIS
-        Authenticated health with a ready Vault; the user agent may be offline.
-    #>
     [CmdletBinding()]
-    param(
-        [string] $BaseUrl = 'http://127.0.0.1:17610',
-        [ValidateRange(1, 120)][int] $TimeoutSec = 5,
-        [AllowEmptyString()][string] $Token = ''
-    )
+    param([string] $BaseUrl = 'http://127.0.0.1:17610', [int] $TimeoutSec = 3, [AllowEmptyString()][string] $Token = '')
+    $result = [pscustomobject]@{Ok=$false;StatusCode=0;UserAgent=$false;UserAgentKnown=$false;Vault='';Version='';Raw='';Cause='WINAGENT_TRANSPORT_UNAVAILABLE';NativeCode=0}
     $deadline = (Get-QtNow).AddSeconds($TimeoutSec)
     if (-not $Token) {
         $bootstrap = Get-QtBootstrapTokens -TimeoutSec $TimeoutSec
-        if (-not $bootstrap.Ok) {
-            return [pscustomobject]@{ Ok = $false; StatusCode = 0; UserAgent = $false; Vault = ''; Version = ''; Raw = '' }
-        }
+        if (-not $bootstrap.Ok) { $result.Cause=$bootstrap.Reason; return $result }
         $Token = $bootstrap.ConsoleToken
     }
-    $remaining = [int][Math]::Ceiling(($deadline - (Get-QtNow)).TotalSeconds)
-    if ($remaining -le 0) {
-        return [pscustomobject]@{ Ok = $false; StatusCode = 0; UserAgent = $false; Vault = ''; Version = ''; Raw = '' }
+    $remaining = [int][Math]::Ceiling(($deadline-(Get-QtNow)).TotalSeconds)
+    if ($remaining -le 0) { $result.Cause='WINAGENT_HEALTH_TIMEOUT'; return $result }
+    $reply = Invoke-QtHttp -Uri ($BaseUrl+'/wa/v1/health') -Method GET -Headers @{Authorization=('Bearer '+$Token)} -TimeoutSec $remaining
+    $result.StatusCode = $reply.StatusCode
+    if (Test-QtHasProperty -Object $reply -Name 'NativeCode') { $result.NativeCode=$reply.NativeCode }
+    if ($reply.StatusCode -eq 401) { $result.Cause='WINAGENT_AUTH_FAILED'; return $result }
+    if ($reply.StatusCode -eq 403) { $result.Cause='WINAGENT_FORBIDDEN'; return $result }
+    if (-not $reply.Ok -or $reply.StatusCode -ne 200) {
+        if ($reply.StatusCode -gt 0) { $result.Cause='WINAGENT_HTTP_'+[string]$reply.StatusCode }
+        elseif ((Test-QtHasProperty -Object $reply -Name 'Reason') -and $reply.Reason) { $result.Cause=$reply.Reason }
+        return $result
     }
-    $r = Invoke-QtHttp -Uri ($BaseUrl + '/wa/v1/health') -Method GET -Headers @{ Authorization = ('Bearer ' + $Token) } -TimeoutSec $remaining
-    $userAgent = $false
-    $vault = ''
-    $version = ''
-    $healthy = $false
-    if ($r.Ok -and $r.StatusCode -eq 200 -and $r.Body) {
-        try {
-            $j = $r.Body | ConvertFrom-Json
-            if ((Test-QtHasProperty -Object $j -Name 'user_agent') -and $j.user_agent -is [bool]) { $userAgent = $j.user_agent }
-            if ((Test-QtHasProperty -Object $j -Name 'modules') -and
-                (Test-QtHasProperty -Object $j.modules -Name 'vault') -and $j.modules.vault -is [string]) { $vault = $j.modules.vault }
-            if ((Test-QtHasProperty -Object $j -Name 'version') -and $j.version -is [string]) { $version = $j.version }
-            $healthy = ((Test-QtHasProperty -Object $j -Name 'ok') -and $j.ok -is [bool] -and $j.ok -and
-                (Test-QtHasProperty -Object $j -Name 'user_agent') -and $j.user_agent -is [bool] -and $vault -ceq 'ok')
-        } catch { }
-    }
-    return [pscustomobject]@{
-        Ok         = $healthy
-        StatusCode = $r.StatusCode
-        UserAgent  = $userAgent
-        Vault      = $vault
-        Version    = $version
-        Raw        = $r.Body
-    }
+    $result.Cause = 'WINAGENT_HEALTH_INVALID'
+    try {
+        $body = $reply.Body | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $body -or $body -is [array] -or $body -isnot [pscustomobject]) { return $result }
+        if ((Test-QtHasProperty -Object $body -Name 'user_agent') -and $body.user_agent -is [bool]) {
+            $result.UserAgentKnown=$true; $result.UserAgent=$body.user_agent
+        }
+        if ((Test-QtHasProperty -Object $body -Name 'version') -and $body.version -is [string]) { $result.Version=$body.version }
+        if ((Test-QtHasProperty -Object $body -Name 'modules') -and (Test-QtHasProperty -Object $body.modules -Name 'vault') -and $body.modules.vault -is [string]) {
+            $result.Vault=$body.modules.vault
+        }
+        if (-not (Test-QtHasProperty -Object $body -Name 'ok') -or $body.ok -isnot [bool] -or -not $result.UserAgentKnown) { return $result }
+        if (-not $body.ok) { $result.Cause='WINAGENT_HEALTH_REPORTED_FAILURE'; return $result }
+        if ($result.Vault -cne 'ok') { $result.Cause='WINAGENT_VAULT_NOT_READY'; return $result }
+        $result.Ok=$true; $result.Cause=''; $result.Raw=$reply.Body
+    } catch { return $result }
+    return $result
 }
 
 function Wait-QtWinAgentHealthy {
-    <#
-    .SYNOPSIS
-        Wait for authenticated service health and Vault readiness.
-        An offline user agent remains supported for unattended installation.
-    .OUTPUTS
-        {Ok, UserAgent, Reason}
-    #>
     [CmdletBinding()]
-    param(
-        [string] $BaseUrl = 'http://127.0.0.1:17610',
-        [ValidateRange(1, 120)][int] $TimeoutSec = 30,
-        [ValidateRange(1, 120)][int] $IntervalSec = 2,
-        [AllowEmptyString()][string] $Token = ''
-    )
-    $deadline = (Get-QtNow).AddSeconds($TimeoutSec)
-    $last = $null
+    param([string] $BaseUrl='http://127.0.0.1:17610', [ValidateRange(1,120)][int] $TimeoutSec=30,
+          [ValidateRange(1,120)][int] $IntervalSec=2, [AllowEmptyString()][string] $Token='')
+    $deadline=(Get-QtNow).AddSeconds($TimeoutSec)
+    $last=$null
     while ((Get-QtNow) -lt $deadline) {
-        $remaining = [int][Math]::Ceiling(($deadline - (Get-QtNow)).TotalSeconds)
+        $remaining=[int][Math]::Ceiling(($deadline-(Get-QtNow)).TotalSeconds)
         if ($remaining -le 0) { break }
-        $last = Get-QtWinAgentHealth -BaseUrl $BaseUrl -Token $Token -TimeoutSec ([Math]::Min(5, $remaining))
-        if ($last.Ok) { return [pscustomobject]@{ Ok = $true; UserAgent = $last.UserAgent; Reason = '' } }
-        $remaining = [int][Math]::Floor(($deadline - (Get-QtNow)).TotalSeconds)
+        $last=Get-QtWinAgentHealth -BaseUrl $BaseUrl -Token $Token -TimeoutSec ([Math]::Min(5,$remaining))
+        if ($last.Ok) { return [pscustomobject]@{Ok=$true;UserAgent=$last.UserAgent;Reason='';Cause='';StatusCode=$last.StatusCode} }
+        if ((Test-QtHasProperty -Object $last -Name 'Cause') -and $last.Cause -in @('WINAGENT_AUTH_FAILED','WINAGENT_FORBIDDEN','BOOTSTRAP_PIPE_UNTRUSTED')) { break }
+        $remaining=[int][Math]::Floor(($deadline-(Get-QtNow)).TotalSeconds)
         if ($remaining -le 0) { break }
-        Start-QtSleep -Seconds ([Math]::Min($IntervalSec, $remaining))
+        Start-QtSleep -Seconds ([Math]::Min($IntervalSec,$remaining))
     }
-    $ua = $false
-    if ($null -ne $last) { $ua = $last.UserAgent }
-    return [pscustomobject]@{ Ok = $false; UserAgent = $ua; Reason = 'WINAGENT_NOT_READY' }
+    $userAgent=$false; $cause='WINAGENT_HEALTH_TIMEOUT'; $http=0
+    if ($null -ne $last) {
+        $userAgent=$last.UserAgent
+        if (Test-QtHasProperty -Object $last -Name 'StatusCode') { $http=$last.StatusCode }
+        if ((Test-QtHasProperty -Object $last -Name 'Cause') -and $last.Cause) { $cause=$last.Cause }
+    }
+    # Reason preserves the public legacy exit-code family. Cause names the actual failure.
+    return [pscustomobject]@{Ok=$false;UserAgent=$userAgent;Reason='WINAGENT_NOT_READY';Cause=$cause;StatusCode=$http}
 }
 
 function Test-QtWinAgentInstalled {
@@ -278,7 +265,7 @@ function Test-QtWinAgentInstalled {
 
 function Invoke-QtBootstrapPipe {
     [CmdletBinding()]
-    param([ValidateRange(1, 120)][int] $TimeoutSec = 30)
+    param([ValidateRange(1, 120)][int] $TimeoutSec = 30, [ValidateSet('issue_bootstrap','issue_console_token')][string] $Operation = 'issue_bootstrap')
     $result = [pscustomobject]@{ Ok = $false; Reason = 'BOOTSTRAP_PIPE_FAILED'; Response = $null }
     $pipe = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -304,7 +291,7 @@ namespace QTrade {
         if (-not [QTrade.InstallerPipeIdentity]::GetNamedPipeServerProcessId($pipe.SafePipeHandle.DangerousGetHandle(), [ref]$serverPid) -or $serverPid -ne $servicePid -or $serverPid -ne (Get-QtServiceProcessId -Name $script:QtServiceName)) {
             $result.Reason = 'BOOTSTRAP_PIPE_UNTRUSTED'; return $result
         }
-        $request = [Text.Encoding]::UTF8.GetBytes('{"op":"issue_bootstrap"}' + "`n")
+        $request = [Text.Encoding]::UTF8.GetBytes((@{op=$Operation}|ConvertTo-Json -Compress) + "`n")
         $write = $pipe.WriteAsync($request, 0, $request.Length)
         if (-not $write.Wait([Math]::Max(0, $TimeoutSec * 1000 - [int]$clock.ElapsedMilliseconds))) { $result.Reason = 'BOOTSTRAP_PIPE_TIMEOUT'; return $result }
         $bytes = New-Object 'System.Collections.Generic.List[byte]'
@@ -417,3 +404,37 @@ Export-ModuleMember -Function Get-QtWinAgentNames, Install-QtVcRedist, Merge-QtW
 Install-QtWinAgentService, Register-QtWinAgentUserTask, Get-QtWinAgentHealth, Wait-QtWinAgentHealthy,
 Test-QtWinAgentInstalled, Write-QtWinAgentToken, Uninstall-QtWinAgent,
 Get-QtBootstrapTokens, Set-QtAgentConsoleToken
+
+function Get-QtConsoleBundle {
+    [CmdletBinding()]
+    param([ValidateRange(1,120)][int] $TimeoutSec=5)
+    $out=[pscustomobject]@{Ok=$false;Reason='CONSOLE_PIPE_INVALID';ConsoleToken='';AgentToken=$null;AgentBaseUrl=$null}
+    $reply=Invoke-QtBootstrapPipe -TimeoutSec $TimeoutSec -Operation 'issue_console_token'
+    if (-not $reply.Ok) { $out.Reason=$reply.Reason; return $out }
+    $body=$reply.Response
+    if (Test-QtHasProperty -Object $body -Name 'error') {
+        if ([string]$body.error -in @('FORBIDDEN','NOT_READY')) { $out.Reason='CONSOLE_PIPE_'+[string]$body.error }
+        return $out
+    }
+    if (-not (Test-QtHasProperty -Object $body -Name 'winagent_token') -or $body.winagent_token -isnot [string] -or $body.winagent_token -cnotmatch '^[A-Za-z0-9_-]{32,4096}$') { return $out }
+    if (-not (Test-QtHasProperty -Object $body -Name 'expires_at') -or $body.expires_at -is [string] -or [double]$body.expires_at -le [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) { return $out }
+    $out.ConsoleToken=$body.winagent_token
+    if ((Test-QtHasProperty -Object $body -Name 'agent_token') -and (Test-QtHasProperty -Object $body -Name 'agent_base_url') -and $null -eq $body.agent_token -and $null -eq $body.agent_base_url) {
+        $out.Ok=$true; $out.Reason=''; return $out
+    }
+    if (-not (Test-QtHasProperty -Object $body -Name 'agent_token') -or $body.agent_token -isnot [string] -or $body.agent_token -cnotmatch '^[A-Za-z0-9_-]{32,4096}$') { return $out }
+    try {
+        $uri=[Uri]([string]$body.agent_base_url)
+        if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'http' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -notin @('','/')) { return $out }
+        $ip=$null
+        if (-not [Net.IPAddress]::TryParse($uri.Host,[ref]$ip) -or $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { return $out }
+        $b=$ip.GetAddressBytes()
+        if (-not ([Net.IPAddress]::IsLoopback($ip) -or $b[0] -eq 10 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168))) { return $out }
+        $out.AgentBaseUrl=$uri.GetLeftPart([UriPartial]::Authority)
+    } catch { return $out }
+    $out.AgentToken=$body.agent_token
+    $out.Ok=$true; $out.Reason=''
+    return $out
+}
+
+Export-ModuleMember -Function Get-QtConsoleBundle

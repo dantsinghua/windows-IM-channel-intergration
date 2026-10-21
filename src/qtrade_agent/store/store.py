@@ -379,6 +379,37 @@ class Store:
                             (json.dumps(value, ensure_ascii=False), now, actor, key, old_json))
             return cur.rowcount == 1
 
+    def reserve_recovery_attempt(self, key: str, *, now_ms: int, maximum: int, cooldown_ms: int = 60_000) -> dict:
+        """Atomically reserve a disruptive attempt before performing any side effect.
+
+        Failed attempts count. A process restart or healthy probe does not reset the
+        rolling hour. Corrupt/future budget data never silently grants a new quota.
+        """
+        if not key.startswith("recovery.") or type(maximum) is not int or not 0 <= maximum <= 1000:
+            raise ValueError("Invalid recovery budget")
+        with self._tx() as con:
+            row = con.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+            try:
+                history = json.loads(row[0]) if row else []
+                if not isinstance(history, list) or len(history) > 1000 or any(type(t) is not int or t < 0 for t in history):
+                    raise ValueError("Invalid history")
+            except (ValueError, TypeError):
+                return {"allowed": False, "reason": "recovery_budget_invalid", "attempts": 0}
+            history = sorted(t for t in history if now_ms - t < 3_600_000)
+            if len(history) >= maximum:
+                return {"allowed": False, "reason": "recovery_budget_exhausted", "attempts": len(history)}
+            if history and now_ms - history[-1] < cooldown_ms:
+                return {"allowed": False, "reason": "recovery_cooldown", "attempts": len(history)}
+            history.append(now_ms)
+            con.execute(
+                "INSERT INTO settings(key,value_json,updated_ms,updated_by) VALUES (?,?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, "
+                "updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                (key, json.dumps(history), now_ms, "system:recovery"),
+            )
+            return {"allowed": True, "reason": "", "attempts": len(history)}
+
+
     def _next_seq(self, c: sqlite3.Connection, channel: str, now: int) -> int:
         """settings.seq.<channel> 单调递增(含已删除的不复用;05 §2.1.1 ②);在调用方的 BEGIN IMMEDIATE 里。"""
         r = c.execute("SELECT value_json FROM settings WHERE key=?", (f"seq.{channel}",)).fetchone()

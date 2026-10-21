@@ -130,7 +130,7 @@ def _decode_header_value(raw: Optional[str]) -> str:
 def _html_to_text(html: str) -> str:
     """§2.1 三级解码的第三级:HTML 剥标签(``<br>``/块级闭标签断行、script/style 整段删、实体还原)。
 
-    ibquote 2026-08-14 生产实证:腾讯企业邮箱程序发信只有 ``text/html``,本系统对端也只发 ``MIMEText(html)``,
+    ibquote 2026-08-14 生产实证:腾讯企业邮件服务程序发信只有 ``text/html``,本系统对端也只发 ``MIMEText(html)``,
     故 HTML 路径**不是兜底而是主路径**。
     """
     s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", html)

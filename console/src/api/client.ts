@@ -9,7 +9,7 @@ import {
 } from './http'
 import { normalizeMailStatus, selftestRows } from './types'
 import type {
-  Account, AdoptProbeResult, ApiClientRow, AuditRow, CapabilityDef, CommandOutcome,
+  Account, AccountSessionResetStatusData, AdoptProbeResult, ApiClientRow, AuditRow, CapabilityDef, CommandOutcome,
   CommandResult, DeviceProfileTemplate, Job, MailCleanupRow, MailInboxDetail, MailInboxRow,
   MailOutboxRow, MailRouteOverride, MailTemplate, Message, MetricsSnapshot,
   ObservedProbeRow, OssboxAuthenticationResult, OssboxSettingsData, OssboxSettingsInput,
@@ -35,6 +35,9 @@ export const accountsApi = {
   }) => requestList<Account>('/accounts', { query: q as Record<string, unknown> }),
 
   get: (id: string) => request<Account>(`/accounts/${id}`),
+
+  sessionResetStatus: (id: string, options: { signal?: AbortSignal } = {}) =>
+    request<AccountSessionResetStatusData>(`/accounts/${encodeURIComponent(id)}/session-reset`, { signal: options.signal }),
 
   /**
    * #2 `{channel,label,profile_key?,login:{mode,account?,secret?,remember?}}`。
@@ -588,13 +591,45 @@ export const mailApi = {
 
 /* ───────────────── 设置 ───────────────── */
 
-async function ossboxSettingsRequest(body?: OssboxSettingsInput, signal?: AbortSignal): Promise<OssboxSettingsResponse> {
-  const env = await requestEnvelope<OssboxSettingsData>('/settings/ossbox', {
+import { normalizeInstitutionReporting } from './institution-reporting'
+
+async function ossboxSettingsRequest(body?: OssboxSettingsInput, signal?: AbortSignal, contract?: 'legacy' | 'collector'): Promise<OssboxSettingsResponse> {
+  const env = await requestEnvelope<OssboxSettingsData>('/settings/ossbox' + (contract ? `?contract=${contract}` : ''), {
     method: body ? 'PUT' : 'GET', body, signal,
   })
-  if (!env.data || env.group !== 'ossbox') throw new Error('Invalid OSS settings response')
+  if (env.group !== 'ossbox' || (!env.data && env.mode !== 'its_relay')) throw new Error('Invalid OSS settings response')
+  let relay: OssboxSettingsResponse['relay']
+  if (env.mode === 'its_relay') {
+    const value = env.relay
+    if (!value || typeof value !== 'object' || !('base_url' in value) || typeof value.base_url !== 'string') {
+      throw new Error('Invalid relay settings response')
+    }
+    relay = {
+      base_url: value.base_url,
+      ...('workbench_name' in value && typeof value.workbench_name === 'string' ? { workbench_name: value.workbench_name } : {}),
+      ...('workbench_id' in value && typeof value.workbench_id === 'string' ? { workbench_id: value.workbench_id } : {}),
+      ...('config_file' in value && value.config_file === 'config.yaml' ? { config_file: 'config.yaml' as const } : {}),
+      ...('saved' in value && typeof value.saved === 'boolean' ? { saved: value.saved } : {}),
+      ...('credential_error' in value && (value.credential_error === 'vault_unavailable' || value.credential_error === 'collector_credentials_missing')
+        ? { credential_error: value.credential_error } : {}),
+      configured: 'configured' in value && value.configured === true,
+      key_configured: 'key_configured' in value && value.key_configured === true,
+      sm4_key_configured: 'sm4_key_configured' in value && value.sm4_key_configured === true,
+    }
+  }
+  if (contract === 'collector' && relay?.workbench_name === undefined) throw new Error('服务端尚不支持独立工作台配置')
+  if (contract === 'legacy' && relay?.config_file !== 'config.yaml') throw new Error('服务端尚不支持旧部署认证编辑')
   return {
-    data: env.data,
+    data: env.data ?? {
+      sts_url: '', allow_http: false, endpoint: '', bucket: '', workbench_id: '',
+      auth_key_configured: false, sm4_key_configured: false, saved: false,
+    },
+    ...(relay ? {
+      mode: 'its_relay' as const, relay, applied: env.applied === true,
+      ...(typeof env.legacy_available === 'boolean' ? { legacy_available: env.legacy_available } : {}),
+      ...(['pending_alignment', 'running', 'stopped', 'error'].includes(String(env.state)) ? { state: env.state as OssboxSettingsResponse['state'] } : {}),
+      ...(normalizeInstitutionReporting(env.institution_runtime) ? { institution_runtime: normalizeInstitutionReporting(env.institution_runtime) } : {}),
+    } : {}),
     restart_required: env.restart_required === true,
     inquiry_configured: env.inquiry_configured === true,
     catalog_configured: env.catalog_configured === true,
@@ -602,6 +637,10 @@ async function ossboxSettingsRequest(body?: OssboxSettingsInput, signal?: AbortS
 }
 
 export const ossboxApi = {
+  getForContract: (contract: 'legacy' | 'collector', signal?: AbortSignal) => ossboxSettingsRequest(undefined, signal, contract),
+  putForContract: (contract: 'legacy' | 'collector', body: OssboxSettingsInput, signal?: AbortSignal) => ossboxSettingsRequest(body, signal, contract),
+  testForContract: (contract: 'legacy' | 'collector', body: OssboxSettingsInput, signal?: AbortSignal) =>
+    request<OssboxAuthenticationResult>(`/settings/ossbox/test?contract=${contract}`, { method: 'POST', body, signal }),
   get: (signal?: AbortSignal) => ossboxSettingsRequest(undefined, signal),
   put: (body: OssboxSettingsInput, signal?: AbortSignal) => ossboxSettingsRequest(body, signal),
   test: (body: OssboxSettingsInput, signal?: AbortSignal) =>
