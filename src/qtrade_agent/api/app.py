@@ -513,15 +513,16 @@ def create_api(agent) -> FastAPI:
         request.state.account_id = account_id
         host = getattr(agent, "xunjia_v22_host", None)
         if host is None:
-            raise ApiError(503, "NOT_READY", "会话同步状态尚未接入",
-                           reason="session_reset_not_configured")
+            return {"ok": True, "data": {"available": False, "account_id": account_id,
+                    "connection_state": "not_connected", "reset": None}}
         try:
             data = await asyncio.to_thread(host.get_session_reset_status, account_id)
         except Exception:
             raise ApiError(503, "NOT_READY", "暂时无法读取会话同步状态",
                            reason="session_reset_status_unavailable") from None
         if data is None:
-            data = {"available": False, "account_id": account_id}
+            data = {"available": False, "account_id": account_id,
+                    "connection_state": "account_not_bound", "reset": None}
         return {"ok": True, "data": data}
 
     @app.get(f"{API_PREFIX}/accounts/{{account_id}}/contacts")

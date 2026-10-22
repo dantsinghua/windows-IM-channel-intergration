@@ -81,6 +81,10 @@ class Bus:
         self._jobs: dict[str, _Job] = {}
         self.random = random.Random()
 
+    def account_quiescent(self, account_id: str) -> bool:
+        """No queued/native/confirmation job remains for this physical account slot."""
+        return not any(job.cmd.account_id == account_id for job in self._jobs.values())
+
     # ------------------------------------------------------------------ 队列
     def _queue(self, account_id: str) -> asyncio.Queue:
         q = self._queues.get(account_id)
@@ -262,6 +266,10 @@ class Bus:
         if current is None:
             self._finalize(job, _err_result("TARGET_NOT_FOUND", job.cmd.trace_id or "", CommandError("Account no longer exists")))
             return
+        if job.cmd.op.startswith("send_") and current.self_uid != job.acct.self_uid:
+            self._finalize(job, _err_result("GATE_BLOCKED", job.cmd.trace_id or "",
+                CommandError("Native account changed; old command was not sent", reason="native_account_changed")))
+            return
         job.acct = current
         cmd, acct, adapter = job.cmd, job.acct, self.adapters[job.acct.channel]
         if self.gate is not None and cmd.op.startswith("send_"):
@@ -317,7 +325,7 @@ class Bus:
                 # 抹掉后上层按「可重试」处理,而规格要的是明确告诉人「现在不能发」(05 §2.4.7 / §2.5.4)。
                 code = res.code if res.code in ("NOT_READY", "GATE_BLOCKED", "LOGIN_REQUIRED") else "SEND_FAILED"
                 retryable, needs_human = RESULT_CODES.get(code, (True, False))
-                self._finalize(job, CommandResult(ok=False, code=code, trace_id=cmd.trace_id, source=res.source,
+                self._finalize(job, CommandResult(ok=False, code=code, trace_id=cmd.trace_id, source=res.source, data=res.data,
                                                   error=(res.error or CommandError("发送动作失败", retryable=retryable, needs_human=needs_human)),
                                                   cost_ms=self.clock() - started))
                 return

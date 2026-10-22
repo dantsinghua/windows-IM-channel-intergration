@@ -1,12 +1,13 @@
 """工作台与存款、询价两侧的 AES-GCM 密封包必须能互解。
 
 不连接 nyoss.yingmi.com，不读取环境变量里的真实密钥。
-存款侧用它自己的解释器调用 cryptography；询价侧是纯 Python，直接加载。
+存款侧用它自己的解释器调用 cryptography；询价侧验证当前共享协议 Codec。
 """
 from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 
@@ -19,7 +20,6 @@ _KEY = b"0123456789abcdef0123456789abcdef"
 _PLAIN = "固收群报价 3M 1.52 可谈".encode()
 _DEPOSIT = Path("/home/anlin/work/qtrade/ibquote/src/njcb_deposit_agent/wechat_collect/crypto.py")
 _DEPOSIT_PY = Path("/home/anlin/work/qtrade/ibquote/.venv/bin/python")
-_XUNJIA = Path("/home/anlin/work/xunjia-agent/imlink/crypto.py")
 _PEER = """
 import base64, importlib.util, sys
 path, op = sys.argv[1], sys.argv[2]
@@ -31,17 +31,6 @@ spec.loader.exec_module(module)
 out = module.open_sealed(key, data) if op == "open" else module.seal(key, data)
 sys.stdout.buffer.write(base64.b64encode(out))
 """
-
-
-def _load_xunjia():
-    if not _XUNJIA.is_file():
-        pytest.skip(f"询价密封模块不在本机: {_XUNJIA}")
-    spec = importlib.util.spec_from_file_location("xunjia_oss_crypto", _XUNJIA)
-    if spec is None or spec.loader is None:
-        pytest.skip(f"无法加载 {_XUNJIA}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _deposit_call(op: str, data: bytes) -> bytes:
@@ -66,12 +55,20 @@ def test_workbench_and_deposit_open_each_other() -> None:
 
 
 def test_workbench_and_xunjia_open_each_other() -> None:
-    peer = _load_xunjia()
-    outbound = seal(_KEY, _PLAIN)
-    assert peer.open_sealed(_KEY, outbound) == _PLAIN
-    inbound = peer.seal(_KEY, _PLAIN)
-    assert open_sealed(_KEY, inbound) == _PLAIN
-    assert _PLAIN not in inbound
+    from relay.protocol import Binding, Codec, canonical, envelope
+    binding=Binding('synthetic-owner','synthetic-account','synthetic-workbench',_KEY,b's'*32)
+    codec=Codec(binding,clock=lambda:100)
+    value=envelope(binding,'event',{'event_id':'synthetic-native','peer_id':'synthetic-peer',
+        'direction':'in','text':_PLAIN.decode(),'source_seq':1,'occurred_at':100},
+        message_id='synthetic-native',peer_id='synthetic-peer',created_at=100,expires_at=200)
+    inbound=codec.pack(value)
+    signed_plain=open_sealed(_KEY,inbound)
+    signed=json.loads(signed_plain)
+    assert signed.pop('signature').startswith('hmac-sha256=')
+    assert signed==value
+    outbound=seal(_KEY,signed_plain)
+    assert codec.unpack(outbound)==value
+    assert _PLAIN not in inbound and _KEY not in inbound
 
 
 def test_planned_upload_opens_on_deposit() -> None:

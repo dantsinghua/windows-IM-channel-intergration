@@ -179,7 +179,8 @@ class AndroidIdentityAdb(UiFakeAdb):
         super().__init__()
         self.fg = f"{PKG}/com.tencent.mobileqq.activity.SplashActivity"
         self.dumps = [MAIN_TREE]
-        self.metadata = f"1758240000 /data/data/{PKG}/databases/{UID}.db\n"
+        self.metadata = "unused database metadata"
+        self.login_identity_xml = f'<map><string name="uin">{UID}</string></map>'
 
     async def shell(self, serial, cmd):
         if "--time-style" in cmd:
@@ -195,13 +196,14 @@ class AndroidIdentityAdb(UiFakeAdb):
         return AdbShellResult(2 if "--time-style" in cmd else 0, output)
 
 
-async def test_uid_discovery_uses_android_supported_file_metadata():
+async def test_uid_discovery_reads_only_current_login_preference():
     adb = AndroidIdentityAdb()
     ui = QidianUi(adb=adb)
 
     assert await ui.discover_self_uid(acct()) == UID, "Android拒绝ls --time-style，不能因此永远发现不了已登录UID"
     assert not any("--time-style" in cmd for cmd in adb.cmds)
-    assert not any("sqlite3" in cmd or "cat " in cmd for cmd in adb.cmds)
+    assert not any("sqlite3" in cmd or "find " in cmd or "stat " in cmd for cmd in adb.cmds)
+    assert f"cat /data/data/{PKG}/shared_prefs/Last_Login.xml" in adb.cmds
 
 
 async def test_profile_degraded_account_with_uid_still_participates_in_read_poll(manual_rig, monkeypatch):
@@ -249,9 +251,9 @@ async def test_unproven_ui_or_identity_is_never_reported_running(scenario):
     elif scenario == "sms-overlay":
         adb.dumps = [tree(node(rid=f"{PKG}:id/recent_chat_list"), node(text="短信验证"))]
     elif scenario == "missing-uid":
-        adb.metadata = ""
+        adb.login_identity_xml = "<map/>"
     else:
-        adb.metadata += f"1758240000 /data/data/{PKG}/databases/9000000001.db\n"
+        adb.login_identity_xml = f'<map><string name="uin">{UID}</string><string name="uin">9000000001</string></map>'
 
     result = await QidianUi(adb=adb).probe_login(acct())
 
@@ -260,15 +262,12 @@ async def test_unproven_ui_or_identity_is_never_reported_running(scenario):
     assert not any(cmd.startswith(("ime ", "am ")) for cmd in adb.cmds)
 
 
-async def test_uid_prefers_latest_wal_and_refuses_ties():
-    adb = AndroidIdentityAdb()
-    adb.metadata = (f"1758240000 /data/data/{PKG}/databases/{UID}.db\n"
-                    f"1758240100 /data/data/{PKG}/databases/{UID}.db-wal\n"
-                    f"1758240090 /data/data/{PKG}/databases/9000000001.db-wal\n"
-                    f"1758240999 /data/data/{PKG}/databases/9000000001.db\n")
-    ui = QidianUi(adb=adb)
-    assert await ui.discover_self_uid(acct()) == UID
-    adb.metadata = adb.metadata.replace("1758240090", "1758240100")
+async def test_uid_tracks_explicit_login_change_not_database_age():
+    adb=AndroidIdentityAdb();ui=QidianUi(adb=adb)
+    assert await ui.discover_self_uid(acct())==UID
+    adb.login_identity_xml='<map><string name="uin">9000000001</string></map>'
+    assert await ui.discover_self_uid(acct())=='9000000001'
+    adb.login_identity_xml='<map/>'
     assert await ui.discover_self_uid(acct()) is None
 
 
@@ -325,7 +324,7 @@ def test_degraded_account_keeps_group_gap_detection(poll_env):
     assert poll_env["alerts"].is_firing(QIDIAN_MSG_GAP, "account:qd01")
 
 
-@pytest.mark.parametrize("stage", ["dumpsys window", "uiautomator dump", "stat "])
+@pytest.mark.parametrize("stage", ["dumpsys window", "uiautomator dump", "cat /data/data/com.tencent.qidian/shared_prefs/Last_Login.xml"])
 async def test_read_errors_cannot_confirm_login_or_expose_raw_output(monkeypatch, stage):
     adb = AndroidIdentityAdb()
     original = adb.shell_result

@@ -1,18 +1,20 @@
-"""Legacy auth and explicit workstation configuration remain separate contracts."""
+"""One collector-owned contract; retired files and uncertain state stay unchanged."""
 from tests.test_collector_reporting_settings import collector_rig, FIELDS, URL, H
 from relay.file_gateway import FileGatewayClient
 
 
-def test_deployed_legacy_config_is_not_replaced_by_empty_local_draft(collector_rig):
+def test_retired_configuration_is_not_loaded_or_exposed_as_current(collector_rig):
     rig = collector_rig
     data = rig.client.get(URL, headers=H()).json()
-    assert data["relay"]["config_file"] == "config.yaml"
-    assert data["relay"]["configured"] is True
-    assert "workbench_name" not in data["relay"]
+    assert data["mode"] == "its_relay"
+    assert "workbench_name" in data["relay"]
+    assert "config_file" not in data["relay"] and "data" not in data
+    assert "legacy_available" not in data
+    assert data["relay"]["configured"] is False
     assert rig.agent.collector_reporting_settings.saved() is None
 
 
-def test_explicit_workstation_save_and_later_key_rotation_preserve_legacy_files(collector_rig):
+def test_current_save_and_key_rotation_preserve_retired_files_and_unknown_state(collector_rig):
     rig = collector_rig
     before = {p: p.read_bytes() for p in rig.protected_paths}
     assert rig.client.put(URL, headers=H(), json=FIELDS).status_code == 200
@@ -25,7 +27,7 @@ def test_explicit_workstation_save_and_later_key_rotation_preserve_legacy_files(
     assert rig.agent.xunjia_v22_host is None
 
 
-def test_new_form_draft_test_does_not_persist_or_switch_legacy_configuration(collector_rig, monkeypatch):
+def test_draft_pending_does_not_persist_or_activate_retired_configuration(collector_rig, monkeypatch):
     rig = collector_rig
     monkeypatch.setattr(FileGatewayClient, "_request", lambda *a, **k: (200, {}, b'{"pending":0}'))
     before = {p: p.read_bytes() for p in rig.protected_paths}
@@ -33,14 +35,12 @@ def test_new_form_draft_test_does_not_persist_or_switch_legacy_configuration(col
     assert response.status_code == 200
     assert response.json()["authenticated"] is True
     assert rig.agent.collector_reporting_settings.saved() is None
-    assert rig.client.get(URL, headers=H()).json()["relay"]["config_file"] == "config.yaml"
+    assert rig.client.get(URL, headers=H()).json()["relay"]["configured"] is False
     assert {p: p.read_bytes() for p in rig.protected_paths} == before
 
 
-def test_explicit_institution_mode_never_falls_back_to_legacy_auth(collector_rig, monkeypatch):
-    rig = collector_rig
-    monkeypatch.setenv("XUNJIA_INSTITUTION_COLLECTOR", "1")
-    data = rig.client.get(URL, headers=H()).json()
-    assert "workbench_name" in data["relay"]
-    assert "config_file" not in data["relay"]
+def test_unsetting_institution_flag_cannot_restore_old_settings_contract(collector_rig, monkeypatch):
+    monkeypatch.setenv("XUNJIA_INSTITUTION_COLLECTOR", "0")
+    data = collector_rig.client.get(URL, headers=H()).json()
+    assert "workbench_name" in data["relay"] and "config_file" not in data["relay"]
     assert data["applied"] is False

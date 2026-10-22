@@ -23,11 +23,11 @@ def _cfg(tmp_path) -> AgentConfig:
 
 
 def test_真机后端下_sender与login_fn都装上(tmp_path):
-    """不注入假后端 = 生产路径:`QidianUi.send_text` 装为 sender、`QidianUi.login` 装为 login_fn。"""
+    """不注入假后端 = 生产路径:`QidianUi.send` 装为 sender、`QidianUi.login` 装为 login_fn。"""
     app = AgentApp(_cfg(tmp_path), clock=Clock()).open()
     try:
         assert isinstance(app.qidian_ui, QidianUi)
-        assert app.adapters["qidian"]._sender == app.qidian_ui.send_text        # 不再是 _sender_not_wired
+        assert app.adapters["qidian"]._sender == app.qidian_ui.send        # 不再是 _sender_not_wired
         assert app.accounts._login_fn is not None
         assert app.accounts._login_fn.__qualname__.startswith("QidianUi.login_fn")
         assert app.qidian_ui._adb is app.runtime._adb                           # runtime 与 UI 层共用同一条 adb
@@ -63,7 +63,7 @@ def test_显式注入的sender与login_fn优先(tmp_path):
 
 def test_装上去的两个回调签名与契约一致():
     """`SendFn` = (acct, native_id, text) -> bool;`LoginFn` = (row, account, secret) -> str|None。"""
-    assert list(inspect.signature(QidianUi.send_text).parameters) == ["self", "acct", "native_id", "text"]
+    assert list(inspect.signature(QidianUi.send).parameters) == ["self", "acct", "native_id", "text"]
     fn = QidianUi(adb=FakeAdb()).login_fn()
     assert list(inspect.signature(fn).parameters) == ["row", "account", "secret"]
 

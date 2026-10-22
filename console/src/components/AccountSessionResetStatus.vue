@@ -18,6 +18,14 @@ const labels: Record<SessionResetPhase, string> = {
   complete: '双端会话状态已对齐',
   blocked: '会话同步受阻',
 }
+const channel = computed(() => data.value?.channel_status)
+const nativeLabel = computed(() => channel.value?.native_state === 'online' ? '在线' : channel.value?.native_state === 'offline' ? '未登录或已退出' : '尚未确认')
+function operationLabel(key: string): string {
+  if (key.startsWith('directory')) return '目录心跳上传'
+  if (key.startsWith('contacts:')) return '通讯录上传'
+  if (key.startsWith('history:')) return '历史消息上传'
+  return '原生登录核验'
+}
 const phase = computed(() => data.value?.reset?.phase)
 const statusText = computed(() => phase.value ? labels[phase.value] ?? '状态未识别，请刷新' : '')
 const historyCount = computed(() => {
@@ -79,14 +87,21 @@ onUnmounted(() => {
 
 <template>
   <section class="session-reset-status qt-glass" data-testid="account-session-reset-status" aria-live="polite">
-    <header><div><h3>会话状态同步</h3><p>范围：当前采集端、本账号的全部会话。由询价工作台发起。</p></div>
+    <header><div><h3>询价文件通道</h3><p>企点登录、文件中转和询价会话重置分别显示；进程运行不等于文件通道可用。</p></div>
       <a-button size="small" :loading="loading" @click="refresh">刷新状态</a-button>
     </header>
-    <p v-if="failed" role="alert">暂时无法读取当前账号的会话同步状态，请刷新重试。</p>
-    <p v-else-if="!data">正在读取会话同步状态…</p>
-    <p v-else-if="!data.available">当前账号未绑定会话状态同步。</p>
+    <p v-if="failed" role="alert">无法读取本机询价会话重置记录，请检查采集 API 或本地账本；这不表示企点已退出登录。</p>
+    <p v-else-if="!data">正在读取询价会话重置记录…</p>
+    <p v-else-if="!data.available">{{ data.connection_state === 'not_connected' ? '询价文件通道尚未接入；当前没有可读取的重置记录。请在采集通道配置并连接。' : '当前账号尚未接入询价文件通道，企点登录和历史查询不受本卡影响。' }}</p>
     <template v-else>
-      <p v-if="!data.reset">尚未发起会话清空。</p>
+      <div v-if="channel" data-testid="institution-channel-health">
+        <p data-testid="native-login-state">企点原生界面：{{ nativeLabel }}</p>
+        <p v-if="!channel.heartbeat_fresh">目录心跳已过期或尚未发布，请检查文件中转连接；不据此判定企点掉线。</p>
+        <p v-else-if="!channel.intake_ready">目录心跳正常，询价收发执行端尚未就绪。</p>
+        <p v-else>目录心跳正常，询价收发执行端已连接。</p>
+        <p v-for="(detail, operation) in channel.errors" :key="operation" role="alert">文件中转异常：{{ operationLabel(operation) }}，{{ detail }}</p>
+      </div>
+      <p v-if="!data.reset">当前没有会话重置任务。</p>
       <template v-else>
         <strong data-testid="session-reset-phase">{{ statusText }}</strong>
         <p v-if="phase === 'waiting_native'">本机仍在收敛执行与入站进度，双端尚未完成对齐。</p>

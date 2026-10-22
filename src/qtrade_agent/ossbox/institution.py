@@ -1,14 +1,25 @@
 """Institutional Qidian host; existing QQ/WeChat and native send guards stay intact."""
 from __future__ import annotations
+import uuid
 import asyncio
 from contextlib import contextmanager
 import hashlib
 import json
+import re
 from pathlib import Path
 import sqlite3
 import threading
 import time
 from .xunjia_v22 import XunjiaV22Host
+
+def publication_error(exc):
+    """Expose fixed error codes/status, never upstream bodies or credentials."""
+    code=getattr(exc,"code",None)
+    if not isinstance(code,str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}",code) is None:
+        code=type(exc).__name__
+    status=getattr(exc,"status",None)
+    return code+(f" (HTTP {status})" if type(status) is int and 100<=status<=599 else "")
+
 
 class SnapshotPublisher:
     def __init__(self, root, keys, workbench, name, client, *, clock=time.time):
@@ -101,14 +112,14 @@ class InstitutionCollectorHost:
         self.settings=settings; self.workbench=settings.workbench_id; self.clock=clock
         self.legacy_inbox_disabled=legacy_inbox_disabled
         self.friends_provider=friends_provider; self.organization_provider=organization_provider
-        self.client=client_factory or (lambda path:connection_client(config,config["auth"],allow_http=config["allow_http"],path=path))
+        self.client=client_factory or (lambda path:connection_client(config,config["auth"],path=path))
         self.root=Path(data_dir)/"institution-path-v1"/keys.institution_id/self.workbench
         self.publisher=SnapshotPublisher(self.root,keys,self.workbench,config["workbench_name"],self.client,clock=clock)
         self._factory=host_factory; self.hosts={}; self.active=False; self._tasks=[]; self._lease=None
         self._wake=asyncio.Event(); self._contacts_wake=asyncio.Event(); self.errors={}
         self.last_directory_at=0; self.applied_revision=None
         self.history_provider=history_provider; self.histories={}; self._history_wake=asyncio.Event(); self._history_next=0
-        self.presence_provider=presence_provider;self.presence={};self._presence_wake=asyncio.Event()
+        self.presence_provider=presence_provider;self.presence={};self._presence_wake=asyncio.Event();self._identity_candidates={}
     @classmethod
     async def from_settings(cls,settings,**kwargs):
         from relay.file_gateway import GatewayAuth
@@ -116,7 +127,7 @@ class InstitutionCollectorHost:
         from urllib.parse import urlsplit
         public,secrets=await settings._prepare({})
         auth=GatewayAuth(secrets["key"],secrets["sm4_key"].encode("utf8"))
-        config={**public,"auth":auth,"contract":CONTRACT,"allow_http":urlsplit(public["base_url"]).scheme=="http"}
+        config={**public,"auth":auth,"contract":CONTRACT}
         if urlsplit(public["base_url"]).hostname==settings._seed.get("hostname"):
             for key in ("hostname","addresses"):
                 if key in settings._seed:config[key]=settings._seed[key]
@@ -159,6 +170,16 @@ class InstitutionCollectorHost:
         from relay.gateway_paths import CONTRACT
         from relay.protocol import ProtocolError
         p=data["payload"]
+        if p.get("contract")==CONTRACT and p.get("op")=="activate_context":
+            host=next((h for pair,h in self.hosts.items() if pair[1]==uid),None)
+            if host is None:raise ProtocolError("CONTEXT_ACCOUNT_NOT_READY")
+            channel=host.bridge.adapters["oss"]
+            state=host.ledger.activate_context(p.get("context_id"),p.get("context_version"),
+                published_source_highwater=channel.store.source_highwater)
+            channel.publish_manifest({"contract":CONTRACT,"op":"context_ready",**state})
+            self.publisher.request_sync(uid,False)
+            self.loop.call_soon_threadsafe(self._contacts_wake.set)
+            return
         if p.get("contract")!=CONTRACT or p.get("op")!="sync_contacts" or type(p.get("organization",False)) is not bool:
             raise ProtocolError("COLLECTOR_SYNC_REQUEST_UNSUPPORTED")
         self.publisher.request_sync(uid,p.get("organization",False))
@@ -185,7 +206,7 @@ class InstitutionCollectorHost:
             online=bool(len(rows)==1 and self.online(row["id"],uid) and host and host._active and host._intake_ok)
             result.append({"account_id":row["id"],"account_uid":uid,"channel":"qidian",
                 "account_nick":row.get("self_nick") or row.get("label") or uid,"online":online,
-                "capabilities":["negotiation-v22-watermark","negotiation-v22-session-reset"] if online else [],
+                "capabilities":["negotiation-v22-watermark","negotiation-v22-session-reset","negotiation-v22-fresh-context"] if online else [],
                 "paths":account_paths(self.workbench,uid)})
         return result
     def observe(self, **event):
@@ -196,8 +217,24 @@ class InstitutionCollectorHost:
             self.loop.call_soon_threadsafe(self._wake.set)
             self.loop.call_soon_threadsafe(self._contacts_wake.set)
     def get_session_reset_status(self,account_id):
+        from relay.gateway_paths import OFFLINE_SECONDS
         for pair,host in list(self.hosts.items()):
-            if pair[0]==account_id:return host.get_session_reset_status(account_id)
+            if pair[0]!=account_id:continue
+            data=host.get_session_reset_status(account_id)
+            if data is None:return None
+            now=self.clock();native=self.presence.get(pair,{})
+            state=native.get("state","unknown")
+            if state not in ("online","offline") or not 0<=now-native.get("checked_at",0)<OFFLINE_SECONDS:
+                state="unknown"
+            if state=="online" and not 0<=now-native.get("confirmed_at",0)<OFFLINE_SECONDS:
+                state="unknown"
+            relevant={"directory","directory_shutdown","contacts:"+pair[1],"history:"+pair[1],"presence:"+pair[1]}
+            channel={"native_state":state,"native_checked_at":native.get("checked_at"),
+                "heartbeat_published_at":self.last_directory_at or None,
+                "heartbeat_fresh":bool(self.last_directory_at and 0<=now-self.last_directory_at<OFFLINE_SECONDS),
+                "intake_ready":bool(host._active and host._intake_ok),
+                "errors":{k:v for k,v in self.errors.items() if k in relevant}}
+            return {**data,"channel_status":channel}
         return None
     async def _presence_loop(self):
         from relay.gateway_paths import HEARTBEAT_SECONDS
@@ -209,7 +246,7 @@ class InstitutionCollectorHost:
                     self.publisher.name=self.settings.view()["workbench_name"]
                     await asyncio.to_thread(self.publisher.directory,self.directory_rows())
                     self.last_directory_at=self.clock();self.errors.pop("directory",None)
-            except Exception as exc:self.errors["directory"]=type(exc).__name__
+            except Exception as exc:self.errors["directory"]=publication_error(exc)
             try:await asyncio.wait_for(self._wake.wait(),timeout=1)
             except asyncio.TimeoutError:pass
     def metadata_once(self):
@@ -225,7 +262,7 @@ class InstitutionCollectorHost:
                     self.publisher.organization(self.organization_provider(row));org_due=False
                 if request:self.publisher.complete_sync(uid,request["requested"],request["generation"])
                 self.errors.pop("contacts:"+uid,None)
-            except Exception as exc:self.errors["contacts:"+uid]=type(exc).__name__
+            except Exception as exc:self.errors["contacts:"+uid]=publication_error(exc)
     async def probe_presence_once(self):
         if self.presence_provider is None:return
         semaphore=asyncio.Semaphore(3)
@@ -239,6 +276,46 @@ class InstitutionCollectorHost:
             old=self.presence.get(pair,{})
             if not isinstance(report,dict):report={"state":"unknown","code":"NATIVE_PRESENCE_INVALID"}
             state=report.get("state")
+            observed=report.get("self_uid")
+            if report.get("code")=="NATIVE_ACCOUNT_CHANGED":
+                # Invalidate the old lease immediately, including before the second
+                # observation. No queued command may execute using the new login.
+                self.presence[pair]={"state":"offline","code":"NATIVE_ACCOUNT_CHANGED","checked_at":self.clock()}
+                self.errors["presence:"+pair[1]]="NATIVE_ACCOUNT_CHANGED"
+                candidate=(observed,self.clock())
+                previous=self._identity_candidates.get(pair)
+                self._identity_candidates[pair]=candidate
+                if (isinstance(observed,str) and observed.isascii() and observed.isdigit()
+                        and 5<=len(observed)<=20 and observed!=pair[1]
+                        and previous and previous[0]==observed and 0<self.clock()-previous[1]<=30):
+                    old_host=self.hosts.get(pair)
+                    if old_host is not None:
+                        await old_host.stop()
+                        port=getattr(old_host,"port",None)
+                        if port is not None and not port.quiescent():
+                            self.errors["presence:"+pair[1]]="NATIVE_OLD_TASK_FINISHING"
+                            return
+                        if self.bus is not None and not self.bus.account_quiescent(pair[0]):
+                            self.errors["presence:"+pair[1]]="NATIVE_OLD_TASK_FINISHING"
+                            return
+                        ledger=getattr(old_host,"ledger",None)
+                        if ledger is not None:
+                            ledger.activate_context(uuid.uuid4().hex,int(self.clock()*1000000))
+                        self.hosts.pop(pair,None)
+                    self.histories.pop(pair,None)
+                    updated=self.store.observe_qidian_identity(pair[0],pair[1],observed)
+                    if updated:
+                        self._identity_candidates.pop(pair,None)
+                        self.errors.pop("presence:"+pair[1],None)
+                        new_pair=(pair[0],observed)
+                        self.presence[new_pair]={"state":"online","code":"NATIVE_ACCOUNT_CHANGED","confirmed_at":self.clock(),"checked_at":self.clock()}
+                        self.publisher.request_sync(observed,False)
+                        if self.bus is not None:
+                            self.bus.events.emit("account_updated",payload={"id":pair[0],"self_uid":observed,"reason":"native_account_changed"},account_id=pair[0],channel="qidian")
+                        self._contacts_wake.set();self._history_wake.set()
+                self._wake.set()
+                return
+            self._identity_candidates.pop(pair,None)
             if state=="online" and report.get("self_uid")!=pair[1]:state="unknown"
             if state=="online":self.presence[pair]={"state":"online","code":report.get("code"),"confirmed_at":self.clock(),"checked_at":self.clock()}
             elif state=="offline":self.presence[pair]={"state":"offline","code":report.get("code"),"checked_at":self.clock()}

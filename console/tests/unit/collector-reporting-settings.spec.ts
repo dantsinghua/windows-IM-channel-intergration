@@ -12,11 +12,22 @@ import { useSettingsStore } from '@/stores/settings'
 import { useSessionStore } from '@/stores/session'
 
 const NAME = '上海采集工作台'
-const BASE = 'https://collector.example.invalid/its-relay'
-const DRAFT = 'https://draft.example.invalid/its-relay'
+const BASE = 'https://collector.example.invalid'
+const DRAFT = 'https://draft.example.invalid'
 const KEY = 'synthetic-independent-collector-key'
 const SM4 = '0123456789abcdef'
 const pages: VueWrapper[] = []
+const GOOD: OssboxAuthenticationResult = { authenticated: true, pending: 0 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(yes => { resolve = yes })
+  return { resolve, promise }
+}
+function inputValue(wrapper: VueWrapper, suffix: string) {
+  return (field(wrapper, suffix).element as HTMLInputElement).value
+}
+
 
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 
@@ -26,7 +37,7 @@ function response(configured = true): OssboxSettingsResponse {
     relay: { workbench_name: configured ? NAME : '', workbench_id: 'stable-synthetic-workbench',
       base_url: BASE, configured, key_configured: configured, sm4_key_configured: configured,
       saved: configured,
-      state: 'pending_alignment', config_file: 'config.yaml' },
+    },
     restart_required: false, inquiry_configured: false, catalog_configured: false,
   } as unknown as OssboxSettingsResponse
 }
@@ -60,9 +71,90 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   configureHttp({})
+  vi.useRealTimers()
 })
 
 describe('采集工作台配置', () => {
+  it('只提供当前工作台与TLS字段，不提供旧配置切换或STS/OSS输入', async () => {
+    const wrapper = await page()
+    for (const suffix of ['relay-key', 'relay-sm4-key']) {
+      expect((field(wrapper, suffix).element as HTMLInputElement).type).toBe('password')
+      expect(inputValue(wrapper, suffix)).toBe('')
+    }
+    for (const testid of ['reporting-edit-legacy', 'reporting-edit-collector', 'ossbox-sts-url',
+      'ossbox-endpoint', 'ossbox-bucket', 'ossbox-allow-http', 'ossbox-auth-key', 'ossbox-workbench']) {
+      expect(wrapper.find(`[data-testid="${testid}"]`).exists()).toBe(false)
+    }
+    for (const testid of ['relay-client-cert', 'relay-client-key', 'relay-ca-file']) {
+      expect(wrapper.get(`[data-testid="${testid}"]`).element).toBeInstanceOf(HTMLInputElement)
+    }
+    expect(wrapper.find('input[type="file"]').exists()).toBe(false)
+  })
+
+  it('证书路径回读并提交完整当前配置，清空旧路径是显式清空', async () => {
+    const current = response()
+    Object.assign(current.relay, { client_cert_file: '/synthetic/client.crt', client_key_file: '/synthetic/client.key', ca_file: '/synthetic/ca.crt' })
+    vi.mocked(ossboxApi.get).mockResolvedValue(current)
+    const wrapper = await page()
+    expect((wrapper.get('[data-testid="relay-client-cert"]').element as HTMLInputElement).value).toBe('/synthetic/client.crt')
+    await wrapper.get('[data-testid="relay-client-cert"]').setValue('/synthetic/new.crt')
+    await wrapper.get('[data-testid="relay-client-key"]').setValue('/synthetic/new.key')
+    await wrapper.get('[data-testid="relay-ca-file"]').setValue('')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(ossboxApi.put).toHaveBeenCalledWith({ workbench_name: NAME, base_url: BASE,
+      client_cert_file: '/synthetic/new.crt', client_key_file: '/synthetic/new.key', ca_file: '' }, expect.any(AbortSignal))
+    expect(ossboxApi.test).not.toHaveBeenCalled()
+  })
+
+  it('认证结果必须明确为true，失败正文与秘密不进入页面', async () => {
+    vi.mocked(ossboxApi.test).mockResolvedValue({ authenticated: false })
+    const wrapper = await page()
+    await field(wrapper, 'test').trigger('click'); await flushPromises()
+    expect(wrapper.find('[data-testid="ossbox-auth-result"]').exists()).toBe(false)
+  })
+
+  it('读取403锁定所有配置操作', async () => {
+    vi.mocked(ossboxApi.get).mockRejectedValue(new ApiFailure('FORBIDDEN', 403, 'synthetic-trace', {
+      message: KEY, retryable: false, needs_human: false,
+    }))
+    const wrapper = await page()
+    expect((wrapper.get('fieldset').element as HTMLFieldSetElement).disabled).toBe(true)
+    expect((field(wrapper, 'test').element as HTMLButtonElement).disabled).toBe(true)
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(true)
+    expect(wrapper.text()).toContain('管理员')
+    expect(wrapper.text()).not.toContain(KEY)
+  })
+
+  it('实际客户端只向稳定路径JSON体发送当前配置，不自动选旧合同或存浏览器秘密', async () => {
+    vi.mocked(ossboxApi.get).mockRestore()
+    vi.mocked(ossboxApi.put).mockRestore()
+    const store = vi.spyOn(Storage.prototype, 'setItem')
+    const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ ok: true, group: 'ossbox', ...response() })))
+    vi.stubGlobal('fetch', fetch)
+    const current = await ossboxApi.get()
+    expect(current.relay.workbench_name).toBe(NAME)
+    expect(current.relay.workbench_id).toBe('stable-synthetic-workbench')
+    await ossboxApi.put({ workbench_name: NAME, base_url: DRAFT, key: KEY, sm4_key: SM4 })
+    const [url, init] = fetch.mock.calls[1] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/v1/settings/ossbox')
+    expect(init.method).toBe('PUT')
+    expect(JSON.parse(String(init.body))).toEqual({ workbench_name: NAME, base_url: DRAFT, key: KEY, sm4_key: SM4 })
+    expect(JSON.stringify(init.headers)).not.toContain(KEY)
+    expect(store).not.toHaveBeenCalled()
+    expect('getForContract' in ossboxApi || 'putForContract' in ossboxApi || 'testForContract' in ossboxApi).toBe(false)
+  })
+
+  it.each([
+    { mode: 'sts', data: { sts_url: 'https://obsolete.invalid', bucket: 'obsolete' } },
+    { mode: 'its_relay', relay: { base_url: BASE, config_file: 'config.yaml', configured: true } },
+  ])('实际客户端拒绝旧格式响应且不进行格式回退', async old => {
+    vi.mocked(ossboxApi.get).mockRestore()
+    const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ ok: true, group: 'ossbox', ...old })))
+    vi.stubGlobal('fetch', fetch)
+    await expect(ossboxApi.get()).rejects.toThrow('Invalid collector settings response')
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
   it('回读工作台名称和统一公网URL，两个字段可编辑', async () => {
     const wrapper = await page()
     const name = field(wrapper, 'workbench-name').element as HTMLInputElement
@@ -72,6 +164,25 @@ describe('采集工作台配置', () => {
     expect(url).toBeInstanceOf(HTMLInputElement)
     expect(url.value).toBe(BASE)
     expect(name.readOnly || name.disabled || url.readOnly || url.disabled).toBe(false)
+  })
+
+  it.each(['https://collector.example.invalid/its-relay', 'http://collector.example.invalid'])('旧当前草稿地址可修复但不能继续认证或保存：%s', async oldUrl => {
+    const old = response()
+    Object.assign(old.relay, { base_url: oldUrl, configured: false })
+    vi.mocked(ossboxApi.get).mockResolvedValue(old)
+    const wrapper = await page()
+    expect(inputValue(wrapper, 'relay-url')).toBe(oldUrl)
+    expect((field(wrapper, 'relay-url').element as HTMLInputElement).disabled).toBe(false)
+    await field(wrapper, 'test').trigger('click')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(ossboxApi.test).not.toHaveBeenCalled()
+    expect(ossboxApi.put).not.toHaveBeenCalled()
+    await field(wrapper, 'relay-url').setValue(DRAFT)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(ossboxApi.put).toHaveBeenCalledWith({ workbench_name: NAME, base_url: DRAFT, key: KEY, sm4_key: SM4 }, expect.any(AbortSignal))
+    expect(field(wrapper, 'workbench-id').text()).toContain('stable-synthetic-workbench')
   })
 
   it('首次保存要求非空工作台名称，即使两钥均已填写', async () => {
@@ -96,7 +207,7 @@ describe('采集工作台配置', () => {
     expect(ossboxApi.test).not.toHaveBeenCalled()
   })
 
-  it('新建配置提交名称URL和config.yaml的两项字段，不要求导入文件', async () => {
+  it('新建配置提交名称URL和两项凭据，不要求导入文件', async () => {
     vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
     const wrapper = await page()
     await field(wrapper, 'workbench-name').setValue(NAME)
@@ -180,7 +291,9 @@ describe('采集工作台配置', () => {
     expect(wrapper.emitted('saved')).toBeUndefined()
   })
 
-  it.each(['', 'ftp://collector.example.invalid', 'https://user:pass@example.invalid/its-relay', 'https://collector.example.invalid/?token=private'])('无效URL不发送请求：%s', async (url) => {
+  it.each(['', 'ftp://collector.example.invalid', 'https://user:pass@example.invalid/its-relay', 'https://collector.example.invalid/?token=private',
+    'http://127.0.0.1', 'http://collector.example.invalid', 'https://collector.example.invalid/its-relay',
+    'https://collector.example.invalid/api/files', 'https://collector.example.invalid/other'])('无效URL不发送请求：%s', async (url) => {
     const wrapper = await page()
     await field(wrapper, 'relay-url').setValue(url)
     await wrapper.get('form').trigger('submit')
@@ -258,4 +371,134 @@ describe('采集工作台配置', () => {
     expect(wrapper.find('input[placeholder="imap.example.com"]').exists()).toBe(true)
     expect(wrapper.text()).not.toMatch(/信箱/)
   })
+
+  it('超时已取消的请求即使随后返回成功也不得显示绿灯', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const pending = deferred<OssboxAuthenticationResult>()
+    vi.mocked(ossboxApi.test).mockReturnValue(pending.promise)
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await field(wrapper, 'test').trigger('click')
+    const signal = vi.mocked(ossboxApi.test).mock.calls[0][1]!
+    await vi.advanceTimersByTimeAsync(45_000)
+    expect(signal.aborted).toBe(true)
+    expect(field(wrapper, 'note').text()).toContain('超时')
+    expect((field(wrapper, 'test').element as HTMLButtonElement).disabled).toBe(false)
+    pending.resolve(GOOD)
+    await flushPromises()
+    expect(wrapper.find('[data-testid="ossbox-auth-result"]').exists()).toBe(false)
+  })
+
+  it('保存超时提示结果待核实并锁定覆盖，晚到成功不能冒充确认', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const pending = deferred<OssboxSettingsResponse>()
+    vi.mocked(ossboxApi.put).mockReturnValue(pending.promise)
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit')
+    const signal = vi.mocked(ossboxApi.put).mock.calls[0][1]!
+    await vi.advanceTimersByTimeAsync(45_000)
+    expect(signal.aborted).toBe(true)
+    expect(field(wrapper, 'note').text()).toMatch(/超时.*(读取|核实)/)
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(true)
+    pending.resolve(response(true))
+    await flushPromises()
+    expect(wrapper.emitted('saved')).toBeUndefined()
+    expect(field(wrapper, 'save-status').text()).toContain('尚未保存配置')
+    expect(field(wrapper, 'note').text()).toContain('超时')
+  })
+
+  it('400 明确校验拒绝保留输入供修正，也不显示已配置', async () => {
+    vi.mocked(ossboxApi.put).mockRejectedValue(new ApiFailure('INVALID_ARGS', 400, 'fake-trace', {
+      message: 'invalid configuration', retryable: false, needs_human: false,
+    }))
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(inputValue(wrapper, 'relay-key')).toBe(KEY)
+    expect(inputValue(wrapper, 'relay-sm4-key')).toBe(SM4)
+    expect(wrapper.emitted('saved')).toBeUndefined()
+    expect(field(wrapper, 'note').text()).toMatch(/格式|检查/)
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(false)
+    expect(wrapper.emitted('saved')).toBeUndefined()
+  })
+
+  it.each([
+    ['断线', new TypeError('Failed to fetch')],
+    ['坏 JSON', new SyntaxError('Unexpected end of JSON input')],
+    ['无效响应', new Error('Invalid collector settings response')],
+    ['HTTP 500', new ApiFailure('INTERNAL', 500, 'fake-trace', { message: 'server error', retryable: true, needs_human: false })],
+    ['HTTP 503', new ApiFailure('NOT_READY', 503, 'fake-trace', { message: 'temporarily unavailable', retryable: true, needs_human: false })],
+  ])('保存遇到%s时结果待核实，重新读取前禁止再次覆盖', async (_name, error) => {
+    vi.mocked(ossboxApi.put).mockRejectedValue(error)
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(field(wrapper, 'note').text()).toMatch(/结果待核实.*重新读取/)
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(true)
+    expect((field(wrapper, 'test').element as HTMLButtonElement).disabled).toBe(true)
+    expect((wrapper.get('fieldset').element as HTMLFieldSetElement).disabled).toBe(true)
+    expect(wrapper.emitted('saved')).toBeUndefined()
+    expect(ossboxApi.put).toHaveBeenCalledOnce()
+  })
+
+  it('后端已提交但响应断线，重新读取核实已保存后才解锁且不重发 PUT', async () => {
+    vi.mocked(ossboxApi.put).mockImplementation(async () => {
+      // 假服务器已提交；浏览器只收到断线，下一次 GET 才提供持久化事实。
+      vi.mocked(ossboxApi.get).mockResolvedValue(response(true))
+      throw new TypeError('Failed to fetch after commit')
+    })
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(true)
+    const reload = wrapper.findAll('button').find(button => button.text() === '重新读取')
+    expect(reload).toBeDefined()
+    await reload!.trigger('click')
+    await flushPromises()
+    expect(ossboxApi.get).toHaveBeenCalledTimes(2)
+    expect(ossboxApi.put).toHaveBeenCalledOnce()
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(false)
+    expect(field(wrapper, 'save-status').text()).toMatch(/已有保存|已保存/)
+    expect(inputValue(wrapper, 'relay-key')).toBe('')
+    expect(inputValue(wrapper, 'relay-sm4-key')).toBe('')
+    expect(field(wrapper, 'save-status').text()).toMatch(/已有保存|已保存/)
+  })
+
+  it.each([401, 403])('保存收到%d权限拒绝后锁定操作，不能继续保存或测试', async (status) => {
+    vi.mocked(ossboxApi.put).mockRejectedValue(new ApiFailure('FORBIDDEN', status, 'fake-trace', {
+      message: 'permission denied', retryable: false, needs_human: false,
+    }))
+    vi.mocked(ossboxApi.get).mockResolvedValue(response(false))
+    const wrapper = await page()
+    await field(wrapper, 'workbench-name').setValue(NAME)
+    await field(wrapper, 'relay-key').setValue(KEY)
+    await field(wrapper, 'relay-sm4-key').setValue(SM4)
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect((field(wrapper, 'save').element as HTMLButtonElement).disabled).toBe(true)
+    expect((field(wrapper, 'test').element as HTMLButtonElement).disabled).toBe(true)
+    expect((wrapper.get('fieldset').element as HTMLFieldSetElement).disabled).toBe(true)
+    expect(wrapper.emitted('saved')).toBeUndefined()
+  })
+
+
 })

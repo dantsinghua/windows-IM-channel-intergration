@@ -1,7 +1,7 @@
 """Opt-in V2.2 collector host. It never starts an IM account or a native sender.
 
-The existing Agent owns this worker and its event hook. Protocol dependencies
-are imported only when V2.2 is explicitly configured; no legacy fallback occurs.
+The existing Agent owns this worker and its event hook. The institution collector
+supplies the transport; this core owns guarded receiver execution and durable state.
 """
 from __future__ import annotations
 
@@ -26,26 +26,6 @@ def collector_version(env=None):
     if value not in ('1', '2.2'):
         raise ValueError('xunjia_collector_version_invalid')
     return value
-
-
-class _ObjectStore:
-    def __init__(self, box):
-        self.box = box
-
-    def list(self, prefix):
-        return self.box.list_prefix(prefix)
-
-    def get(self, name):
-        return self.box.get(name)
-
-    def request(self, method, name, body=None):
-        if method == 'GET':
-            value = self.box.get(name)
-            return (404, b'') if value is None else (200, value)
-        if method == 'PUT':
-            self.box.put(name, body)
-            return 200, b''
-        raise ValueError('unsupported_collector_oss_operation')
 
 
 class XunjiaV22Host:
@@ -105,67 +85,6 @@ class XunjiaV22Host:
                 yield db
         finally:
             db.close()
-
-    @classmethod
-    def from_env(cls, *, store, bus, loop, box, data_dir, legacy_inbox_disabled, contacts_provider=None):
-        if collector_version() != '2.2':
-            return None
-        if not legacy_inbox_disabled():
-            raise RuntimeError('legacy_xunjia_inbox_must_be_disabled')
-        config_path = os.environ.get('XUNJIA_COLLECTOR_CONFIG_FILE', '')
-        if not config_path:
-            raise ValueError('NOT_CONFIGURED: XUNJIA_COLLECTOR_CONFIG_FILE or OSS')
-        # Production QTrade boxes must use STS. Synthetic boxes are explicit test injection.
-        try:
-            path = Path(config_path)
-            if path.stat().st_size > 16384:
-                raise ValueError
-            config = json.loads(path.read_text(encoding='utf-8'))
-            required = {'owner_user_id', 'account_uid', 'workbench_id', 'seal_key_file', 'sign_key_file'}
-            if not isinstance(config, dict) or not required <= config.keys() or set(config) - required - {'file_gateway', 'org_password_file', 'org_password_format'}:
-                raise ValueError
-            def key(name):
-                target = Path(config[name])
-                if not target.is_absolute():
-                    target = path.parent / target
-                if target.stat().st_size > 4096:
-                    raise ValueError
-                return bytes.fromhex(target.read_text(encoding='ascii').strip())
-            seal, sign = key('seal_key_file'), key('sign_key_file')
-        except Exception:
-            raise ValueError('NOT_CONFIGURED: invalid_private_collector_configuration') from None
-        try:
-            from relay.protocol import Binding
-            from relay.collector_bridge import CollectorBridge
-            from relay.qtrade_native_port import QTradeNativePort
-            from server.receiver_ledger import ReceiverLedger
-        except ImportError:
-            raise RuntimeError('NOT_CONFIGURED: xunjia_v22_protocol_package_not_installed') from None
-        binding = Binding(config['owner_user_id'], config['account_uid'], config['workbench_id'], seal, sign)
-        workbench = os.environ.get('OSS_WORKBENCH_ID')
-        if workbench and workbench != binding.workbench_id:
-            raise ValueError('collector_workbench_binding_mismatch')
-        root = Path(data_dir) / 'xunjia-v22'
-        ledger = ReceiverLedger(root / 'receiver.sqlite3', binding)
-        objects = None
-        if 'file_gateway' in config:
-            from server.file_gateway_transport import FileGatewayTransport
-            transport = FileGatewayTransport.from_config(binding, config['file_gateway'], root / 'publication.sqlite3', role='collector', config_dir=path.parent)
-        else:
-            from server.transports import OSSTransport
-            if box is None:
-                raise ValueError('NOT_CONFIGURED: collector_OSS')
-            if hasattr(box, '_credentials_provider') and box._credentials_provider is None:
-                raise ValueError('NOT_CONFIGURED: collector_requires_OSS_STS')
-            objects = _ObjectStore(box)
-            transport = OSSTransport(binding, objects, root / 'publication.sqlite3')
-        port = QTradeNativePort(binding=binding, store=store, bus=bus, loop=loop,
-            legacy_inbox_disabled=legacy_inbox_disabled, execution_permission=ledger.permission)
-        bridge = CollectorBridge(ledger=ledger, adapters={'oss': transport}, object_store=objects,
-            native_send=port.native_send, native_reconcile=port.native_reconcile)
-        return cls(store=store, bus=bus, loop=loop, binding=binding, bridge=bridge, port=port,
-            state_path=root / 'host.sqlite3', legacy_inbox_disabled=legacy_inbox_disabled,
-            contacts_provider=contacts_provider)
 
     def permission(self, command):
         return bool(self._active and self._intake_ok

@@ -1,8 +1,7 @@
 """企点适配器(02 §2.2.3 qidian 条)。
 
 本期只落地能在无 redroid 环境下编码的部分:``poll``(读库正线)与 ``send`` 的阻塞语义。
-真正的 UI 执行层(xunjia-agent/relay/side_a 七件套:搜索/打开会话/ADBKeyboard 输入/点发送/发后对象校验)以 ``sender`` 回调注入,
-容器里用假回调;真机接入时把 ``qidian_cold_start.sh`` 的动作包成同签名的回调即可。
+原生 UI 执行层由 QidianUi 注入，保留发送前失败原因；测试显式注入本地回调。
 
 🔴 发送确认的阻塞语义(R6-38):``send`` 点完发送键、做完发后对象校验**即返回并让出账号串行队列**,adapter 内不同步 scrape、不在队列里等读回;
 读回 = ``poll`` 的 ingest 合并,由 bus 在队列外等(bus/bus.py)。
@@ -15,8 +14,9 @@ from typing import Awaitable, Callable, Optional
 from ...models import Command, CommandError, CommandResult
 from ..base import Account
 from .poll import QidianAccountView, QidianPoller
+from .ui import SendOutcome
 
-SendFn = Callable[[Account, str, str], Awaitable[bool]]     # (acct, native_id, text) -> 点了发送键且发后对象校验通过
+SendFn = Callable[[Account, str, str], Awaitable[bool | SendOutcome]]     # (acct, native_id, text) -> 点了发送键且发后对象校验通过
 ScreenshotFn = Callable[[str], Awaitable[bytes]]           # (account_id) -> 当前画面 PNG;取不到回 b""
 #: 容器在跑、能抓到画面的状态(登录阶段也要能看画面,00 §8.1 R-06)
 SCREEN_STATES = frozenset({"running", "degraded", "login_required", "logging_in"})
@@ -73,8 +73,15 @@ class QidianAdapter:
 
     async def send(self, acct: Account, cmd: Command) -> CommandResult:
         native_id = cmd.args["session"].split(":", 1)[1] if cmd.args["session"].startswith(acct.id + ":") else cmd.args["session"]
-        ok = await self._sender(acct, native_id, cmd.args["text"])
+        outcome = await self._sender(acct, native_id, cmd.args["text"])
+        ok = outcome.ok if isinstance(outcome, SendOutcome) else outcome is True
         if not ok:
+            if isinstance(outcome, SendOutcome):
+                # QidianUi only returns a negative outcome before clicking send;
+                # exceptions during/after a tap remain uncertain at the Bus.
+                return CommandResult(ok=False, code="SEND_FAILED", trace_id=cmd.trace_id or "", source="ui",
+                    data={"native_action_attempted": False, "reason": outcome.reason},
+                    error=CommandError("企点未执行发送：" + outcome.reason, reason=outcome.reason, retryable=False))
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=cmd.trace_id or "", source="ui")
         # 点完即返回:确认由 bus 在队列外等 poll 的 ingest 合并
         return CommandResult(ok=True, code="OK", trace_id=cmd.trace_id or "", source="qidian_db", data={"native_id": native_id})

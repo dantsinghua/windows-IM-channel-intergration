@@ -29,68 +29,42 @@ export interface Envelope<T> {
   [k: string]: unknown
 }
 
-/** STS 配置只返回凭据是否已保存，永不返回密钥或临时凭据。 */
+/** 采集端配置只返回凭据是否已保存，永不返回密钥或认证令牌。 */
 export interface OssboxSettingsData {
-  sts_url: string
-  allow_http: boolean
-  endpoint: string
-  bucket: string
+  client_cert_file?: string
+  client_key_file?: string
+  ca_file?: string
+  base_url: string
+  workbench_name: string
   workbench_id: string
-  auth_key_configured: boolean
-  sm4_key_configured: boolean
   saved: boolean
+  credential_error?: 'vault_unavailable' | 'collector_credentials_missing'
+  configured: boolean
+  key_configured: boolean
+  sm4_key_configured: boolean
 }
 
 export interface OssboxSettingsResponse {
-  data: OssboxSettingsData
-  mode?: 'its_relay'
-  legacy_available?: boolean
+  mode: 'its_relay'
+  relay: OssboxSettingsData
   state?: 'pending_alignment' | 'running' | 'stopped' | 'error'
   institution_runtime?: import('./institution-reporting').InstitutionReportingStatus
-  applied?: boolean
-  relay?: {
-    base_url: string
-    workbench_name?: string
-    workbench_id?: string
-    config_file?: 'config.yaml'
-    saved?: boolean
-    credential_error?: 'vault_unavailable' | 'collector_credentials_missing'
-    configured: boolean
-    key_configured: boolean
-    sm4_key_configured: boolean
-  }
+  applied: boolean
   restart_required: boolean
-  inquiry_configured: boolean
-  catalog_configured: boolean
 }
 
-export interface OssboxLegacySettingsInput {
-  sts_url: string
-  allow_http: boolean
-  endpoint: string
-  bucket: string
-  workbench_id: string
-  auth_key?: string
-  sm4_key?: string
-}
-
-export interface ItsRelaySettingsInput {
+export interface OssboxSettingsInput {
   base_url: string
   workbench_name: string
+  client_cert_file?: string
+  client_key_file?: string
+  ca_file?: string
   key?: string
   sm4_key?: string
 }
-
-export interface ItsRelayCredentialsInput {
-  key?: string
-  sm4_key?: string
-}
-
-export type OssboxSettingsInput = OssboxLegacySettingsInput | ItsRelaySettingsInput | ItsRelayCredentialsInput
 
 export interface OssboxAuthenticationResult {
   authenticated: boolean
-  expiration?: string
   carrier?: 'its-relay'
   pending?: number
   token_generated?: boolean
@@ -101,8 +75,17 @@ export interface OssboxAuthenticationResult {
 export type SessionResetPhase = 'waiting_native' | 'barrier_ready' | 'complete' | 'blocked'
 
 export interface AccountSessionResetStatusData {
+  channel_status?: {
+    native_state: 'online' | 'offline' | 'unknown'
+    native_checked_at?: number | null
+    heartbeat_published_at?: number | null
+    heartbeat_fresh: boolean
+    intake_ready: boolean
+    errors: Record<string, string>
+  }
   available: boolean
   account_id: string
+  connection_state?: 'not_connected' | 'account_not_bound'
   workbench_id?: string
   account_uid?: string
   account_epoch?: number

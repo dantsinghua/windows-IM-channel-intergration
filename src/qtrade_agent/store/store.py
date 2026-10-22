@@ -481,6 +481,36 @@ class Store:
                 c.execute("UPDATE account_runtime SET last_started_ms=? WHERE account_id=?", (now, id))
         return before, self.get_account_full(id)
 
+    def observe_qidian_identity(self, account_id: str, expected_uid: str, observed_uid: str,
+                                *, now_ms: Optional[int] = None) -> Optional[dict[str, Any]]:
+        """Commit a passively verified APK account change, never reuse old messages.
+
+        The caller first closes the old receiver and invalidates its native guard.
+        A compare-and-set prevents delayed observations from replacing a newer login.
+        Native Android databases and unrelated account slots are never modified.
+        """
+        if (not isinstance(observed_uid, str) or not observed_uid.isascii()
+                or not observed_uid.isdigit() or not 5 <= len(observed_uid) <= 20
+                or observed_uid == expected_uid):
+            return None
+        now = self._clock() if now_ms is None else now_ms
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if (row is None or row['channel'] != 'qidian' or row['self_uid'] != expected_uid
+                    or row['deleted_ms'] or not row['enabled'] or row['state'] not in ('running','degraded')):
+                return None
+            # Slot-local caches must never become the new native user's history.
+            db.execute("DELETE FROM messages WHERE account_id=?", (account_id,))
+            db.execute("DELETE FROM sessions WHERE account_id=?", (account_id,))
+            db.execute("DELETE FROM cursors WHERE owner=?", (account_id,))
+            db.execute("DELETE FROM idempotency WHERE account_id=?", (account_id,))
+            db.execute("DELETE FROM commands WHERE account_id=?", (account_id,))
+            db.execute("UPDATE accounts SET self_uid=?,self_nick=NULL,identity_json=?,"
+                       "login_mode='manual',remember=0,credential_ref=NULL,settings_json='{}',"
+                       "updated_ms=?,last_seen_ms=? WHERE id=?",
+                       (observed_uid,json.dumps({'login_account':observed_uid}),now,now,account_id))
+        return self.get_account_full(account_id)
+
     ACCOUNT_PATCHABLE = ("label", "quota_mb", "capture_text", "retention_days", "media_policy_json", "remember", "credential_ref", "auto_recover", "settings_json")
 
     def patch_account(self, id: str, *, now_ms: Optional[int] = None, **cols: Any) -> dict[str, Any]:
@@ -1005,6 +1035,14 @@ class Store:
             c.execute("UPDATE command_results SET confirmed_by=COALESCE(confirmed_by, ?), confirm_ms=COALESCE(confirm_ms, ?) WHERE trace_id=?",
                       (m["confirmed_by"], m["confirmed_ms"], trace_id))
             return dict(m)
+
+    def confirmed_outbound_for_trace(self, trace_id: str) -> Optional[dict[str, Any]]:
+        """Exact immutable trace correlation only; never writes or matches text/time."""
+        rows = self.con.execute(
+            "SELECT * FROM messages WHERE trace_id=? AND dir='out' AND state='DELIVERED' "
+            "AND ext_msg_id IS NOT NULL AND confirmed_by IS NOT NULL LIMIT 2", (trace_id,)
+        ).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
 
     def get_command_result(self, trace_id: str) -> Optional[dict[str, Any]]:
         r = self.con.execute("SELECT * FROM command_results WHERE trace_id=?", (trace_id,)).fetchone()

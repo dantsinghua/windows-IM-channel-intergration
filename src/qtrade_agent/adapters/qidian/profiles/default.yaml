@@ -45,9 +45,14 @@ nodes:
   organization_search_cancel: {id: "com.tencent.qidian:id/btn_cancel_search"}    # [实测 2026-10-20]
   messages_tab: {id: "com.tencent.qidian:id/tab_item_title", text_any: ["消息"]}   # [实测 2026-10-20] 导航要求 id 与文字同时唯一命中
   messages_title: {id: "com.tencent.qidian:id/ivTitleName", text_any: ["消息"]}    # [实测 2026-10-20]
+  contacts_tab: {id: "com.tencent.qidian:id/tab_item_title", text_any: ["通讯录"]}  # Verified 2026-10-22; require both ID and exact text.
+  contacts_title: {id: "com.tencent.qidian:id/ivTitleName", text_any: ["通讯录"]}
   search_result_first: {id: "com.tencent.qidian:id/item1"}                          # [实测 2026-10-20] 结果行；title 也用于分类标题
   card_identity:       {id: "com.tencent.qidian:id/account_uin"}                    # [推测] 名片页上的 uin/账号,发送前对象校验靠它
   card_send_msg:       {text_any: ["发消息", "发送消息"]}                          # [推测]
+  chat_back:           {id: "com.tencent.qidian:id/ivTitleBtnLeft"}                # [实测 2026-10-22] 聊天工具栏返回消息页，不被键盘吞掉
+  chat_message_list:   {id: "com.tencent.qidian:id/listView1"}                     # [实测 2026-10-22] 空输入时发送按钮隐藏
+  chat_input_bar:      {id: "com.tencent.qidian:id/qdui_aio_inputbar"}
   chat_title:          {id: "com.tencent.qidian:id/title"}                          # [推测] 聊天页标题(= 闸门1/2 的判据)
   chat_input:          {id: "com.tencent.qidian:id/input", id_any: ["com.tencent.qidian:id/qdui_aio_inputbar_edittext"]}
   chat_send:           {id: "com.tencent.qidian:id/fun_btn", id_any: ["com.tencent.qidian:id/qdui_aio_inputbar_send_btn"], text_any: ["发送"]}

@@ -585,35 +585,32 @@ class QidianUi:
             await self._sleep(interval)
 
     async def discover_self_uid(self, acct: Account, p: Optional[Profile] = None) -> Optional[str]:
-        """05 §2.1.1 ⑪a(R6-39/R6-40):``self_uid`` = 登录 uin,取 databases 下 ``^[0-9]+\\.db$`` 的那个。
+        """Read the APK's current login identity, never infer it from database mtime.
 
-        多个时取 ``-wal`` 修改时间最新的;``-wal`` 都不存在时取 ``.db`` 本身最新的;**仍并列则留空、不得猜**
-        (取错一次的代价是 06 §2.9.5 ③ 把该账号全部水位删掉重建)。
+        Last_Login.xml/uin was verified on the running Qidian APK. A retained WAL
+        from another account is not evidence of the current login. Unknown or
+        malformed identity stays unknown; the presence caller also verifies the
+        native logged-in layout and unchanged foreground before trusting this UID.
         """
+        import xml.etree.ElementTree as ET
         pkg = (p or self.profile_for(acct)).package
-        directory = f"/data/data/{pkg}/databases"
-        # Android Toybox 没有 GNU ls --time-style；只取文件名及 Unix mtime，不读库内容。
-        cmd = f"find {shlex.quote(directory)} -maxdepth 1 -type f -name '*.db*' -exec stat -c '%Y %n' {{}} +"
+        path = f"/data/data/{pkg}/shared_prefs/Last_Login.xml"
         try:
-            out = await self._read_shell(acct, cmd)
-        except Exception:
+            raw = await self._read_shell(acct, f"cat {shlex.quote(path)}")
+            if len(raw) > 16384 or "<!DOCTYPE" in raw or "<!ENTITY" in raw:
+                return None
+            root = ET.fromstring(raw)
+            if root.tag != 'map':
+                return None
+            values = [node.text for node in root if node.tag == 'string' and node.get('name') == 'uin']
+            if len(values) != 1:
+                return None
+            uid = values[0]
+            return uid if isinstance(uid,str) and uid.isascii() and uid.isdigit() and 5 <= len(uid) <= 20 else None
+        except (ValueError, ET.ParseError):
+            # Malformed identity is unknown. Read failures propagate so callers
+            # can report the actual identity-read stage, without logging contents.
             return None
-        db: dict[str, int] = {}
-        wal: dict[str, int] = {}
-        for line in out.replace("\r", "").splitlines():
-            m = re.fullmatch(rf"([0-9]+) {re.escape(directory)}/([0-9]+)\.db(-wal)?", line)
-            if not m:
-                continue
-            (wal if m.group(3) else db)[m.group(2)] = int(m.group(1))
-        pool = {uid: stamp for uid, stamp in wal.items() if uid in db} or db
-        if not pool:
-            return None
-        best = max(pool.values())
-        winners = [uin for uin, ts in pool.items() if ts == best]
-        if len(winners) != 1:
-            log.warning("self_uid 并列(account=%s 候选数=%s),按 R6-40 留空、不猜", acct.id, len(winners))
-            return None
-        return winners[0]
 
     async def _read_shell(self, acct: Account, cmd: str) -> str:
         """只读观察使用可取消 CLI，并检查 Android 命令退出码。"""
@@ -802,6 +799,50 @@ class QidianUi:
         except (ValueError, TimeoutError):
             return failed
 
+    async def _open_contacts_search(self, acct: Account, p: Profile) -> bool:
+        """The verified messages page has no search field in Qidian 6.9.7.
+
+        Navigate via the uniquely identified contacts tab, then verify its title
+        and search field. Never use a coordinate fallback or an unrelated tab.
+        """
+        def exact(nodes: list[Node], name: str) -> list[Node]:
+            anchor = p.anchor(name)
+            rid, texts = anchor.get("id"), anchor.get("text_any")
+            if not rid or not isinstance(texts, (list, tuple)) or not texts:
+                return []
+            return [n for n in nodes if n.rid == rid and n.text in texts
+                    and n.bounds[0] >= 0 and n.bounds[1] >= 0
+                    and n.bounds[2] > n.bounds[0] and n.bounds[3] > n.bounds[1]]
+        try:
+            before = await self._foreground(acct)
+            if before[0] != p.package or not re.search(p.activities["main"], before[1]):
+                return False
+            nodes = await self._dump(acct, p)
+            tabs = exact(nodes, "contacts_tab")
+            if (len(tabs) != 1 or len(exact(nodes, "messages_title")) != 1
+                    or find_node(nodes, p.anchor("main_marker")) is None
+                    or find_node(nodes, p.anchor("chat_input")) is not None
+                    or await self._foreground(acct) != before):
+                return False
+            await self._tap(acct, *tabs[0].center, p)
+            budget = max(.1, p.timeout("search_s", 10.0))
+            deadline = self._clock() + int(budget * 1000)
+            async with asyncio.timeout(budget):
+                while self._clock() < deadline:
+                    focus = await self._foreground(acct)
+                    if focus != before:
+                        return False
+                    nodes = await self._dump(acct, p)
+                    if (len(exact(nodes, "contacts_title")) == 1
+                            and find_node(nodes, p.anchor("chat_input")) is None
+                            and await self._foreground(acct) == focus
+                            and await self._tap_anchor(acct, p, "search_entry", nodes)):
+                        return True
+                    await self._sleep(max(.05, min(.2, p.timeout("poll_interval_s", 1.0))))
+        except (ValueError, TimeoutError):
+            return False
+        return False
+
     async def _open_chat(self, acct: Account, p: Profile, native_id: str, expect: Optional[str]) -> SendOutcome:
         """已在目标会话 ⇒ 原地返回;否则 主界面 → 搜索 → 首条结果 → 名片页(校 ``native_id``)→ 发消息。"""
         if (await self._assert_session(acct, p, native_id, expect, where="preflight")).ok:
@@ -810,7 +851,8 @@ class QidianUi:
         prepared = await self._prepare_search_home(acct, p)
         if not prepared.ok:
             return prepared
-        if not await self._tap_anchor(acct, p, "search_entry"):
+        if (not await self._tap_anchor(acct, p, "search_entry")
+                and not await self._open_contacts_search(acct, p)):
             pkg, activity = await self._foreground(acct)
             try:
                 current_nodes = await self._dump(acct, p)
@@ -820,8 +862,10 @@ class QidianUi:
                     or find_node(current_nodes, p.anchor("chat_input")) is None
                     or await self._foreground(acct) != (pkg, activity)):
                 return SendOutcome(False, reason="anchor_not_found:search_entry")
-            # 已有 task 可能仍在聊天页；仅从已确认的本应用聊天页返回一次。
-            await self._shell(acct, "input keyevent 4")
+            # Prefer the verified chat toolbar: a hardware BACK may only hide
+            # the IME and leave this same chat open. Never use fixed coordinates.
+            if not await self._tap_anchor(acct, p, "chat_back", current_nodes):
+                await self._shell(acct, "input keyevent 4")
             await self._sleep(p.timeout("ui_settle_s", 0.5))
             if not await self._wait_search_entry(acct, p):
                 return SendOutcome(False, reason="anchor_not_found:search_entry")
@@ -899,7 +943,8 @@ class QidianUi:
                             "agree_button", "login_account", "login_password", "relogin_button"))
                             or any(word in blob for words in p.markers.values() for word in words)):
                         return False
-                    if before == after and await self._tap_anchor(acct, p, "search_entry", nodes):
+                    if before == after and (await self._tap_anchor(acct, p, "search_entry", nodes)
+                                            or await self._open_contacts_search(acct, p)):
                         return True
                     remaining = (deadline - self._clock()) / 1000
                     if remaining <= 0:

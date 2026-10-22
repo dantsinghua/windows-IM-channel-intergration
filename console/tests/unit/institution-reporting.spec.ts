@@ -10,9 +10,8 @@ const buttons = { props: ['disabled'], template: '<button :disabled="disabled"><
 function response(): OssboxSettingsResponse {
   return {
     mode: 'its_relay', state: 'running', applied: true,
-    data: { sts_url: '', allow_http: false, endpoint: '', bucket: '', workbench_id: '', auth_key_configured: false, sm4_key_configured: false, saved: false },
     relay: { base_url: 'https://synthetic.invalid', workbench_name: 'existing', workbench_id: 'wb', configured: true, key_configured: true, sm4_key_configured: true, saved: true },
-    restart_required: false, inquiry_configured: true, catalog_configured: true,
+    restart_required: false,
     institution_runtime: { contract: 'its-relay-path-v1', active: true, account_workers: 1, last_directory_at: 0, errors: { directory: 'FILE_GATEWAY_HTTP_ERROR' }, history: { '10001': { scanned: 12, published: 0, media_bytes: 0, error: null } }, native_presence: { '10001': { state: 'online', code: 'NATIVE_MAIN_VISIBLE', confirmed_at: Date.now() / 1000 } } },
   }
 }

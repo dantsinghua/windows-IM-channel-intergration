@@ -46,8 +46,6 @@ from .monitor import JobsReclaimer, ProcReader, PublicEndpointProbe, Sampler
 from .mail.backends import ImapLibBackend, PopLibBackend, SmtpLibBackend
 from .mail.route_secrets import migrate_plaintext as migrate_mail_route_secrets
 from .mail.service import MailService
-from .ossbox.bridge import POLL_INTERVAL_SEC
-from .ossbox.inbox import XunjiaInbox
 from .pool import Pool
 from .pool_calibrate import PoolCalibrator
 from .pressure import MemoryWatermark
@@ -264,7 +262,7 @@ class AgentApp:
         # lambda 延迟取 self.accounts —— 它在本行之后才建(装配顺序:适配器 → accounts)。
         self.qidian_ui = QidianUi(adb=adb_backend, store=self.store, alerts=self.alerts, clock=self.clock,
                                   on_default_profile=lambda aid, ver: self.accounts.note_default_profile(aid, ver))
-        sender = self._sender or (self.qidian_ui.send_text if real_backend else _sender_not_wired)
+        sender = self._sender or (self.qidian_ui.send if real_backend else _sender_not_wired)
         login_fn = self._login_fn or (
             self.qidian_ui.login_fn(on_self_uid=lambda aid, uid: self.accounts.note_self_uid(aid, uid))
             if real_backend else None)
@@ -369,11 +367,8 @@ class AgentApp:
         self.scheduler.register("jobs_reclaimer", self.cfg.jobs.reclaim_interval_s, self.reclaimer.reclaim_once)               # 02 §3.1 R6-16
         self.scheduler.register("public_endpoint_probe", 60, self.endpoint_probe.tick)                                         # E-3;默认关
         self.scheduler.register("media_fetch", 5, self.media_tick)                                                             # 02 §2.8.2
-        # 询价下行：环境变量不齐则 inbox 为 None，本轮空转，不连 OSS、不发企点。
-        from .ossbox.oss_http import OssV1Box
-        from .ossbox.settings import OssboxSettings
-        self.oss_settings = OssboxSettings(self.store, self.vault)
-        self._oss_sender = sender
+        # Only the institution collector owns Xunjia transport and configuration.
+        from .ossbox.collector_settings import CollectorReportingSettings
         self.oss_start_error = ""
         from .ossbox.xunjia_v22 import collector_version
         try:
@@ -381,51 +376,25 @@ class AgentApp:
         except ValueError:
             self._xunjia_version = "disabled"
             self.oss_start_error = "xunjia_collector_version_invalid"
-        from .ossbox.relay_settings import RelaySettings
-        self.relay_settings = RelaySettings.from_env() if self._xunjia_version == "2.2" else None
-        self.collector_reporting_settings = None
-        if self._xunjia_version == "2.2":
-            from .ossbox.collector_settings import CollectorReportingSettings
-            seed = {"base_url": os.environ.get("XUNJIA_FILE_GATEWAY_URL", "")}
-            if self.relay_settings is not None:
-                try:
-                    _document, auth, _changed = self.relay_settings._prepare({})
-                    seed.update(base_url=self.relay_settings.base_url, key=auth.key,
-                                sm4_key=auth.sm4_key.decode("utf-8"))
-                except Exception:
-                    pass
-            try:
-                from pathlib import Path
-                source = Path(os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""))
-                if source.is_file() and source.stat().st_size <= 16384:
-                    document = json.loads(source.read_text())
-                    if isinstance(document, dict):
-                        seed["workbench_id"] = document.get("workbench_id", "")
-                network = Path(os.environ.get("XUNJIA_MQ_CONNECTION_CONFIG", ""))
-                if network.is_file() and network.stat().st_size <= 65536:
-                    metadata = json.loads(network.read_text())
-                    if isinstance(metadata, dict):
-                        seed.update({key: metadata[key] for key in ("hostname", "addresses") if key in metadata})
-            except (OSError, ValueError, TypeError):
-                pass
-            self.collector_reporting_settings = CollectorReportingSettings(self.store, self.vault, seed=seed)
+        seed = {"base_url": os.environ.get("XUNJIA_FILE_GATEWAY_URL", "")}
         try:
-            # The file gateway has no legacy STS/Vault/OSS configuration source.
-            oss_box = (OssV1Box.from_env() if self.relay_settings is None
-                       and not self.oss_settings.has_saved() else None)
-        except ValueError:
-            log.warning("对象存储配置无效，询价轮询与目录发布未启用")
-            oss_box = None
-        self._xunjia_oss_box = oss_box
+            from pathlib import Path
+            source = Path(os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""))
+            if source.is_file() and source.stat().st_size <= 16384:
+                document = json.loads(source.read_text())
+                if isinstance(document, dict):
+                    seed["workbench_id"] = document.get("workbench_id", "")
+            network = Path(os.environ.get("XUNJIA_INSTITUTION_CONFIG", ""))
+            if network.is_file() and network.stat().st_size <= 65536:
+                metadata = json.loads(network.read_text())
+                if isinstance(metadata, dict):
+                    from relay.file_gateway_connection import resolve_tls_files
+                    metadata = resolve_tls_files(metadata, network.parent)
+                    seed.update({key: metadata[key] for key in ("hostname", "addresses", "client_cert_file", "client_key_file", "ca_file") if key in metadata})
+        except (OSError, ValueError, TypeError):
+            log.warning("Collector seed metadata unavailable; local configuration remains editable")
+        self.collector_reporting_settings = CollectorReportingSettings(self.store, self.vault, seed=seed)
         self.xunjia_v22_host = None
-        self.xunjia_inbox = (XunjiaInbox.from_env(self.store, sender, clock=self.clock, box=oss_box, bus=self.bus)
-                             if oss_box is not None and self._xunjia_version == "1" else None)
-        self.scheduler.register("xunjia_inbox", POLL_INTERVAL_SEC, self.xunjia_inbox_tick, run_immediately=True)
-        from .ossbox.catalog_publish import CatalogPublisher
-        self.catalog_publisher = (CatalogPublisher.from_env(
-            self.store, os.path.join(self.data_dir, "catalog-publish.json"), box=oss_box,
-        ) if oss_box is not None and self.relay_settings is None else None)
-        self.scheduler.register("catalog_publish", 60, self.catalog_publish_tick)
         return self
 
     async def _wa_media_raw(self, path: str) -> bytes:
@@ -443,25 +412,6 @@ class AgentApp:
             log.warning("微信截图落 media 失败 account=%s: %s", acct.id, e)
             return {}
         return {k: out[k] for k in ("media_id", "sha256") if out.get(k) is not None}
-
-    async def catalog_publish_tick(self) -> None:
-        """上传变了的总索引和按账号文件。未装配时直接返回。不写 catalog.json。"""
-        publisher = getattr(self, "catalog_publisher", None)
-        if publisher is None:
-            return
-        try:
-            await publisher.publish()
-        except Exception:
-            log.exception("目录分片上传失败")
-
-    async def xunjia_inbox_tick(self) -> None:
-        """拉 ``in/xunjia`` 指令。未装配时直接返回。正在跑的进程要下次启动才走这里。"""
-        inbox = getattr(self, "xunjia_inbox", None)
-        if getattr(self, "_xunjia_version", "1") != "1":
-            return
-        if inbox is None:
-            return
-        await inbox.poll()
 
     async def media_tick(self) -> None:
         """02 §2.8.2:把 ``messages.media_json`` 里新出现的引用建成 ``media`` 行,再把 ``policy=eager`` 的下下来。
@@ -939,7 +889,6 @@ class AgentApp:
     # ------------------------------------------------------------------ 生命周期
     async def start(self, *, recover: bool = True) -> None:
         if not self._started:
-            await self._configure_saved_ossbox()
             await self._configure_xunjia_v22()
             await self.scheduler.start()
             self._started = True
@@ -967,37 +916,9 @@ class AgentApp:
                 log.exception("Dependency-ready account recovery failed; retry after readiness probe")
         self._recovery_task = asyncio.create_task(run(), name="recover")
 
-    async def _configure_saved_ossbox(self) -> None:
-        from .ossbox.catalog_publish import CatalogPublisher
-        from .ossbox.settings import OssboxSettingsError
-
-        if self.relay_settings is not None or not self.oss_settings.has_saved():
-            return
-        self.xunjia_inbox = None
-        self._xunjia_oss_box = None
-        self.catalog_publisher = None
-        try:
-            configured = await self.oss_settings.runtime()
-            if configured is None:
-                return
-            saved, box = configured
-            self._xunjia_oss_box = box
-            if box is not None:
-                inbox = XunjiaInbox.from_env(self.store, self._oss_sender, clock=self.clock,
-                    box=box, workbench_id=saved["workbench_id"], bus=self.bus) if self._xunjia_version == "1" else None
-                # A new destination must not reuse the former destination's upload hashes.
-                state = os.path.join(self.data_dir, "catalog-publish-" + saved["revision"] + ".json")
-                publisher = CatalogPublisher.from_env(self.store, state,
-                    box=box, workbench_id=saved["workbench_id"])
-                self.xunjia_inbox, self.catalog_publisher = inbox, publisher
-            self.oss_settings.applied_revision = saved["revision"]
-            self.oss_start_error = ""
-        except OssboxSettingsError as exc:
-            self.oss_start_error = exc.reason
-            log.warning("Page OSS configuration unavailable; services disabled (%s)", exc.reason)
-        except Exception:
-            self.oss_start_error = "ossbox_configuration_unavailable"
-            log.warning("Page OSS configuration unavailable; services disabled")
+    def _xunjia_org_config(self, uid):
+        from pathlib import Path
+        return str(Path(self.data_dir) / "organization" / (uid + ".json"))
 
     def _xunjia_v22_contacts(self, row):
         from .adapters.qidian.contacts import list_private_contacts
@@ -1014,7 +935,7 @@ class AgentApp:
             self._xunjia_org_cache = {}
         try:
             organization = read_account_org(source, str(row["self_uid"]),
-                os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""), cache=self._xunjia_org_cache)
+                self._xunjia_org_config(str(row["self_uid"])), cache=self._xunjia_org_cache)
         except OrgReadError as exc:
             organization = {"org_state": exc.state, "org_error": exc.code}
         return {"contacts": contacts, **organization}
@@ -1048,50 +969,25 @@ class AgentApp:
         institution_mode=os.environ.get("XUNJIA_INSTITUTION_COLLECTOR","0")
         if institution_mode not in ("0","1"):
             raise ValueError("institution_collector_flag_must_be_zero_or_one")
-        if institution_mode=="1":
-            from .ossbox.institution import InstitutionCollectorHost
-            try:
-                if self.xunjia_v22_host is not None and not isinstance(self.xunjia_v22_host,InstitutionCollectorHost):
-                    raise ValueError("legacy_host_requires_explicit_migration")
-                if self.xunjia_v22_host is None:
-                    self.xunjia_v22_host=await InstitutionCollectorHost.from_settings(
-                        self.collector_reporting_settings,store=self.store,bus=self.bus,loop=asyncio.get_running_loop(),
-                        data_dir=self.data_dir,legacy_inbox_disabled=lambda:self.xunjia_inbox is None,
-                        friends_provider=self._xunjia_institution_friends,organization_provider=self._xunjia_v22_contacts,
-                        history_provider=self._xunjia_institution_history_source,presence_provider=self._xunjia_institution_presence,
-                        clock=lambda:self.clock()/1000)
-                await self.xunjia_v22_host.start()
-                self.oss_start_error=""
-            except Exception as exc:
-                self.oss_start_error=getattr(exc,"reason","institution_collector_configuration_unavailable")
-                self.collector_reporting_settings.state="error"
-                log.error("Institution collector unavailable; old transport not activated")
+        if institution_mode != "1":
             return
-        from .ossbox.xunjia_v22 import XunjiaV22Host
+        from .ossbox.institution import InstitutionCollectorHost
         try:
-            if self.xunjia_inbox is not None:
-                raise RuntimeError("legacy_xunjia_inbox_must_be_disabled")
+            if self.xunjia_v22_host is not None and not isinstance(self.xunjia_v22_host,InstitutionCollectorHost):
+                raise ValueError("legacy_host_requires_explicit_migration")
             if self.xunjia_v22_host is None:
-                self.xunjia_v22_host = XunjiaV22Host.from_env(
-                    store=self.store, bus=self.bus, loop=asyncio.get_running_loop(),
-                    box=self._xunjia_oss_box, data_dir=self.data_dir,
-                    legacy_inbox_disabled=lambda: self.xunjia_inbox is None,
-                    contacts_provider=self._xunjia_v22_contacts)
-            if self.xunjia_v22_host is not None:
-                saved = self.oss_settings.saved() if self.relay_settings is None else None
-                if saved and saved.get("workbench_id") != self.xunjia_v22_host.binding.workbench_id:
-                    self.xunjia_v22_host = None
-                    raise ValueError("collector_workbench_binding_mismatch")
-                await self.xunjia_v22_host.start()
-                if self.relay_settings is not None:
-                    if hasattr(self.relay_settings, "bind_host"):
-                        self.relay_settings.bind_host(self.xunjia_v22_host)
-                    else:
-                        applied = self.relay_settings.saved()
-                        self.relay_settings.applied_revision = applied["revision"] if applied else None
-        except Exception:
-            self.oss_start_error = "xunjia_v22_configuration_unavailable"
-            log.error("V2.2 collector unavailable; legacy inbox remains disabled")
+                self.xunjia_v22_host=await InstitutionCollectorHost.from_settings(
+                    self.collector_reporting_settings,store=self.store,bus=self.bus,loop=asyncio.get_running_loop(),
+                    data_dir=self.data_dir,legacy_inbox_disabled=lambda:True,
+                    friends_provider=self._xunjia_institution_friends,organization_provider=self._xunjia_v22_contacts,
+                    history_provider=self._xunjia_institution_history_source,presence_provider=self._xunjia_institution_presence,
+                    clock=lambda:self.clock()/1000)
+            await self.xunjia_v22_host.start()
+            self.oss_start_error=""
+        except Exception as exc:
+            self.oss_start_error=getattr(exc,"reason","institution_collector_configuration_unavailable")
+            self.collector_reporting_settings.state="error"
+            log.error("Institution collector unavailable")
 
     async def stop(self) -> None:
         """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""

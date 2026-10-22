@@ -104,7 +104,7 @@ async def test_a_valid_xml_login_or_verification_page_is_not_overruled_by_fallba
 
 async def test_fallback_does_not_bind_a_different_uid(manual_rig, monkeypatch):
     adb = StructureAdb()
-    adb.metadata = f"1758240000 /data/data/{PKG}/databases/9000000001.db\n"
+    adb.login_identity_xml = '<map><string name="uin">9000000001</string></map>'
     monkeypatch.setattr(manual_rig.agent.accounts, "_login_probe_fn", QidianUi(adb=adb).login_probe_fn())
 
     await probe_tick(manual_rig)

@@ -15,7 +15,7 @@ from uuid import uuid4
 from ..vault_client import VaultUnavailable
 from .keys import book_object_name, index_object_name
 from .object_io import ObjectIO
-from .settings import OssboxSettingsError
+from .errors import OssboxSettingsError
 
 SETTINGS_KEY = "collector.reporting"
 IDENTITY_KEY = "collector.identity"
@@ -23,7 +23,9 @@ _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 log = logging.getLogger(__name__)
 
 
-def public_values(values):
+def public_values(values, *, stored_draft=False):
+    # A stored draft may be displayed for explicit correction. Every save,
+    # authentication test and runtime application uses the current URL contract.
     name, base = values.get("workbench_name"), values.get("base_url")
     if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 128
             or any(ord(c) < 32 or ord(c) == 127 for c in name)):
@@ -34,6 +36,7 @@ def public_values(values):
         base = base.strip().rstrip("/")
         url = urlsplit(base)
         if (url.scheme not in ("https", "http") or not url.hostname
+                or (not stored_draft and (url.scheme != "https" or url.path not in ("", "/")))
                 or url.username is not None or url.password is not None
                 or "?" in base or "#" in base or "%" in url.path
                 or ".." in url.path.split("/") or any(c.isspace() for c in base)
@@ -42,7 +45,15 @@ def public_values(values):
         _ = url.port
     except ValueError:
         raise OssboxSettingsError("collector_url_invalid") from None
-    return {"workbench_name": name.strip(), "base_url": base}
+    public = {"workbench_name": name.strip(), "base_url": base}
+    for field in ("client_cert_file", "client_key_file", "ca_file"):
+        value = values.get(field)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or len(value) > 4096 or any(ord(c) < 32 for c in value):
+            raise OssboxSettingsError("file_tls_path_invalid")
+        public[field] = value
+    return public
 
 
 class CollectorReportingSettings:
@@ -77,7 +88,7 @@ class CollectorReportingSettings:
                     or value["workbench_id"] != self.workbench_id
                     or value["credentials_ref"] != f"vault://settings/collector-reporting/{revision}/credentials"):
                 raise ValueError()
-            public_values(value)
+            public_values(value, stored_draft=True)
             return value
         except (KeyError, TypeError, ValueError):
             raise OssboxSettingsError("collector_configuration_invalid", unavailable=True) from None
@@ -94,7 +105,7 @@ class CollectorReportingSettings:
             configured = has_keys
         except OssboxSettingsError:
             pass
-        return {"workbench_id": self.workbench_id, "workbench_name": name, "base_url": base,
+        return {**{k:source[k] for k in ("client_cert_file", "client_key_file", "ca_file") if source.get(k)}, "workbench_id": self.workbench_id, "workbench_name": name, "base_url": base,
                 "saved": saved is not None, "configured": configured,
                 "key_configured": has_keys, "sm4_key_configured": has_keys}
 
@@ -127,11 +138,11 @@ class CollectorReportingSettings:
             raise OssboxSettingsError("collector_credentials_missing", unavailable=True) from None
 
     async def _prepare(self, body):
-        if not isinstance(body, dict) or set(body) - {"workbench_name", "base_url", "key", "sm4_key"}:
+        if not isinstance(body, dict) or set(body) - {"workbench_name", "base_url", "key", "sm4_key", "client_cert_file", "client_key_file", "ca_file"}:
             raise OssboxSettingsError("collector_unknown_field")
         source = self.saved() or self._seed
         public = public_values({key: body.get(key, source.get(key, ""))
-                                for key in ("workbench_name", "base_url")})
+                                for key in ("workbench_name", "base_url", "client_cert_file", "client_key_file", "ca_file")})
         if {"key", "sm4_key"} <= body.keys():
             secret = {key: body[key] for key in ("key", "sm4_key")}
         else:
@@ -145,6 +156,14 @@ class CollectorReportingSettings:
                 raise OssboxSettingsError("file_auth_sm4_length_invalid")
         except UnicodeError:
             raise OssboxSettingsError("collector_credentials_missing") from None
+        if any(public.get(k) for k in ("client_cert_file", "client_key_file", "ca_file")) or urlsplit(public["base_url"]).hostname == "its-relay.yingmi.cn":
+            try:
+                from relay.file_gateway import GatewayAuth
+                from relay.file_gateway_connection import connection_client
+                connection_client(public, GatewayAuth(key, sm4.encode("utf-8")))
+            except Exception as exc:
+                code = getattr(exc, "code", "FILE_TLS_CONFIG_INVALID")
+                raise OssboxSettingsError(code.lower()) from None
         return public, secret
 
     async def save(self, body, *, actor):
@@ -181,22 +200,19 @@ class CollectorReportingSettings:
         async with self._lock:
             public, secret = await self._prepare(body)
         try:
-            from relay.file_gateway import FileGatewayClient, FileGatewayError, GatewayAuth
+            from relay.file_gateway import GatewayAuth
             auth = GatewayAuth(secret["key"], secret["sm4_key"].encode("utf-8"))
-            options = {}
-            # A deployment DNS pin is reused only for the same hostname. It is
-            # never applied to a different address entered in the draft.
-            if urlsplit(public["base_url"]).hostname == self._seed.get("hostname"):
-                from relay.file_gateway_connection import pinned_opener
-                options["opener"] = pinned_opener({**self._seed, **public})
+            from relay.file_gateway_connection import connection_client
             from relay.gateway_paths import DIRECTORY_PATH
-            client = FileGatewayClient(public["base_url"], auth, path=DIRECTORY_PATH,
-                allow_http=urlsplit(public["base_url"]).scheme == "http", timeout=10, **options)
+            config = dict(public)
+            if urlsplit(public["base_url"]).hostname == self._seed.get("hostname"):
+                config.update({k:self._seed[k] for k in ("hostname", "addresses") if k in self._seed})
+            client = connection_client(config, auth, path=DIRECTORY_PATH)
             pending = await asyncio.wait_for(self._io.run(client.pending), timeout=15)
         except TimeoutError:
             raise OssboxSettingsError("collector_test_timeout", unavailable=True) from None
         except Exception as exc:
-            reason = "file_auth_rejected" if getattr(exc, "code", "") == "FILE_AUTH_REJECTED" else "collector_test_unavailable"
+            reason = getattr(exc, "code", "").lower() if getattr(exc, "code", "").startswith(("FILE_AUTH_", "FILE_TLS_")) else "collector_test_unavailable"
             raise OssboxSettingsError(reason, unavailable=True) from None
         return {"authenticated": True, "carrier": "its-relay", "pending": pending, "token_generated": True}
 

@@ -46,20 +46,22 @@ describe('正式发行环境隔离', () => {
   })
 })
 
-describe('新机器没有个人工作台或实验桶配置', () => {
+describe('新机器没有个人工作台或实验占位配置', () => {
   it('选择公网上报后，三个现场配置均为空且无开发占位值', async () => {
     vi.spyOn(ossboxApi, 'get').mockResolvedValue({
-      data: { sts_url: '', allow_http: false, endpoint: '', bucket: '', workbench_id: '',
-        auth_key_configured: false, sm4_key_configured: false, saved: false },
-      restart_required: false, inquiry_configured: false, catalog_configured: false,
+      mode: 'its_relay', state: 'pending_alignment', applied: false,
+      relay: { base_url: '', workbench_name: '', workbench_id: 'synthetic-new-workbench',
+        configured: false, key_configured: false, sm4_key_configured: false, saved: false },
+      restart_required: false,
     })
     wrapper = shallowMount(MailPage, { global: { renderStubDefaultSlot: true, stubs: { OssboxConfig: false } } })
     await flushPromises()
     await wrapper.get('input[type="radio"][value="oss"]').setValue()
     await flushPromises()
-    const inputs = wrapper.findAll('[data-testid="ossbox-workbench"], [data-testid="ossbox-bucket"], [data-testid="ossbox-endpoint"]')
+    const inputs = wrapper.findAll('[data-testid="ossbox-workbench-name"], [data-testid="ossbox-relay-url"], [data-testid="ossbox-relay-key"]')
     expect(inputs).toHaveLength(3)
     expect(inputs.map(input => (input.element as HTMLInputElement).value)).toEqual(['', '', ''])
+    expect((wrapper.get('[data-testid="ossbox-relay-sm4-key"]').element as HTMLInputElement).value).toBe('')
     expect(wrapper.html()).not.toMatch(/anlin-dev|qtrade-nyoss-lab/)
   })
 })

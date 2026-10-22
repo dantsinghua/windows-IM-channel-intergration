@@ -86,9 +86,9 @@ def install_exact_profile(ui):
 async def test_failed_default_profile_observation_does_not_taint_a_later_exact_profile_login(manual_rig, monkeypatch, failure):
     rig = manual_rig
     ui, adb = bind_probe(rig, monkeypatch)
-    original_shell, original_focus, original_metadata = adb.shell_result, adb.fg, adb.metadata
+    original_shell, original_focus, original_identity = adb.shell_result, adb.fg, adb.login_identity_xml
     if failure == "wrong_uid":
-        adb.metadata = adb.metadata.replace(UID, "9000000001")
+        adb.login_identity_xml = adb.login_identity_xml.replace(UID, "9000000001")
     elif failure == "not_main":
         adb.fg = "other.app/.SplashActivity"
     else:
@@ -101,7 +101,7 @@ async def test_failed_default_profile_observation_does_not_taint_a_later_exact_p
     assert (rig.agent.accounts.get("qd01")["state"], rig.agent.accounts.get("qd01")["state_code"]) == ("login_required", "WAIT_SMS")
     assert rig.store.list_events(event="account_state", account_id="qd01") == []
     install_exact_profile(ui)
-    adb.fg, adb.metadata = original_focus, original_metadata
+    adb.fg, adb.login_identity_xml = original_focus, original_identity
     monkeypatch.setattr(adb, "shell_result", original_shell)
     await probe_tick(rig)
     assert (rig.agent.accounts.get("qd01")["state"], rig.agent.accounts.get("qd01")["state_code"]) == ("running", None)
@@ -203,7 +203,7 @@ async def test_distinct_read_failure_stage_is_reported_without_echoing_exception
     failed_stage = "foreground"
 
     async def fail_selected_read(serial, cmd, *, timeout_s):
-        if failed_stage == "foreground" or "stat " in cmd:
+        if failed_stage == "foreground" or "shared_prefs/Last_Login.xml" in cmd:
             raise RuntimeError(PRIVATE_MARKER)
         return await original(serial, cmd, timeout_s=timeout_s)
 

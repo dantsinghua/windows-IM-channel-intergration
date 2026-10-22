@@ -2,24 +2,8 @@
 import asyncio
 from unittest.mock import AsyncMock
 import pytest
-from qtrade_agent.ossbox.inbox import XunjiaInbox
 from qtrade_agent.ossbox.bind import Dedup
 from qtrade_agent.store import Store, StoreCorrupt
-from test_ossbox_xunjia_send import FakeBox, _command, _put_command, _open_ack, _XUNJIA, _WB
-
-@pytest.mark.asyncio
-async def test_oss_uses_shared_bus_gate_before_external_sender(rig3):
-    rig3.store.ensure_account("qd01","qidian",state="running",self_uid="12345678")
-    rig3.store.settings_set("gate.blocklist",["synthetic-blocked"])
-    box=FakeBox(); send=AsyncMock(return_value=True)
-    _put_command(box,_command(account_uid="12345678",text="synthetic-blocked",idempotency_key="audit-oss-gate"))
-    inbox=XunjiaInbox(box,_XUNJIA,_WB,send,rig3.store,clock=rig3.clock)
-    inbox.bus=rig3.agent.bus
-    await inbox.poll()
-    send.assert_not_awaited()
-    assert _open_ack(box,"cmd_new01")["ok"] is False
-    rows=rig3.store.list_commands("qd01")
-    assert len(rows)==1 and rows[0]["code"]=="GATE_BLOCKED"
 
 def test_dedup_recent_cache_has_a_hard_capacity():
     cache=Dedup()
@@ -27,12 +11,6 @@ def test_dedup_recent_cache_has_a_hard_capacity():
         cache.seen_command(str(i)); cache.seen_event(str(i))
     assert len(cache._commands)<=4096 and len(cache._events)<=4096
     assert cache.seen_command("9999") is False
-
-def test_oss_outcome_recent_cache_has_a_hard_capacity():
-    inbox=XunjiaInbox(FakeBox(),b"x"*32,"synthetic",lambda *_:False,object())
-    for i in range(10000): inbox._remember(str(i),ok=False,code="failed")
-    assert len(inbox._outcome)<=4096
-    assert "9999" in inbox._outcome
 
 @pytest.mark.asyncio
 async def test_docker_late_ready_recovers_once(rig3,monkeypatch):

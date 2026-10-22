@@ -36,6 +36,7 @@ class UiFakeAdb:
         self.ime_list = "com.android.adbkeyboard/.AdbIME\ncom.android.inputmethod/.Ime\n"
         self.ime_default = "com.android.adbkeyboard/.AdbIME\n"
         self.databases_ls = ""
+        self.login_identity_xml = "<map/>"
         self._dump_i = 0
 
     async def shell(self, serial: str, cmd: str) -> str:
@@ -54,6 +55,8 @@ class UiFakeAdb:
             return self.ime_list
         if cmd.startswith("settings get secure default_input_method"):
             return self.ime_default
+        if cmd == f"cat /data/data/{PKG}/shared_prefs/Last_Login.xml":
+            return self.login_identity_xml
         if cmd.startswith("ls -l"):
             return self.databases_ls
         return ""
@@ -238,6 +241,7 @@ async def test_免登命中_直接running且不填账密(rig):
     ui, adb, _ = rig
     adb.dumps = [MAIN_TREE]
     adb.databases_ls = "-rw------- 1 u0 u0 40960 1758240000 3007373675.db\n"
+    adb.login_identity_xml = '<map><string name="uin">3007373675</string></map>'
     out = await ui.login(acct(), "13800000000", "pw")
     assert out.result == "running" and out.self_uid == "3007373675"
     assert adb.typed == []                                       # 免登就不该去填账号密码
@@ -305,27 +309,20 @@ async def test_登录页控件树拿不到_不盲点(rig):
 
 
 # ---- ⑪a self_uid(R6-39 / R6-40)
-async def test_self_uid_多个时取wal最新(rig):
-    ui, adb, _ = rig
-    adb.databases_ls = ("-rw- 1 u0 u0 4096 1758240000 3007373675.db\n"
-                        "-rw- 1 u0 u0 4096 1758240100 3007373675.db-wal\n"
-                        "-rw- 1 u0 u0 4096 1758240900 8001234567.db-wal\n"
-                        "-rw- 1 u0 u0 4096 1758240001 8001234567.db\n"
-                        "-rw- 1 u0 u0 4096 1758240999 contact.db\n")
-    assert await ui.discover_self_uid(acct()) == "8001234567"
+async def test_self_uid_uses_active_login_preference_not_database_times(rig):
+    ui,adb,_=rig
+    adb.databases_ls="9999999999 /data/data/com.tencent.qidian/databases/9000000001.db-wal"
+    adb.login_identity_xml='<map><string name="uin">8001234567</string></map>'
+    assert await ui.discover_self_uid(acct())=='8001234567'
+    assert not any('stat ' in cmd or 'find ' in cmd for cmd in adb.cmds)
 
-
-async def test_self_uid_无wal时取db最新_并列则留空(rig):
-    ui, adb, _ = rig
-    adb.databases_ls = ("-rw- 1 u0 u0 4096 1758240100 3007373675.db\n"
-                        "-rw- 1 u0 u0 4096 1758240900 8001234567.db\n")
-    assert await ui.discover_self_uid(acct()) == "8001234567"
-    adb.databases_ls = ("-rw- 1 u0 u0 4096 1758240900 3007373675.db\n"
-                        "-rw- 1 u0 u0 4096 1758240900 8001234567.db\n")
-    assert await ui.discover_self_uid(acct()) is None              # 并列 ⇒ 留空,不得猜
-    adb.databases_ls = ""
+@pytest.mark.parametrize('xml',['','<map/>','broken','<map><string name="uin">abc</string></map>',
+    '<map><string name="uin">8001234567</string><string name="uin">9000000001</string></map>',
+    '<!DOCTYPE x><map><string name="uin">8001234567</string></map>'])
+async def test_missing_or_ambiguous_active_identity_never_uses_retained_database(rig,xml):
+    ui,adb,_=rig;adb.login_identity_xml=xml
+    adb.databases_ls='9999999999 /data/data/com.tencent.qidian/databases/9000000001.db-wal'
     assert await ui.discover_self_uid(acct()) is None
-
 
 # ---------------------------------------------------------------------------- 发送(00 §11.3 [GATE] 对象校验)
 async def test_发送成功路径_点完即返回(rig):
@@ -512,6 +509,7 @@ async def test_login_fn_签名与返回值对齐accounts契约(rig):
     ui, adb, _ = rig
     adb.dumps = [MAIN_TREE]
     adb.databases_ls = "-rw- 1 u0 u0 4096 1758240000 3007373675.db\n"
+    adb.login_identity_xml = '<map><string name="uin">3007373675</string></map>'
     got: list[tuple[str, str]] = []
     fn = ui.login_fn(on_self_uid=lambda aid, uid: got.append((aid, uid)))
     row = {"id": "qd01", "channel": "qidian", "state": "logging_in", "app_version": None}

@@ -13,19 +13,29 @@ from urllib.request import OpenerDirector
 
 import pytest
 
-from qtrade_agent.ossbox.settings import OssboxSettingsError
+from qtrade_agent.ossbox.errors import OssboxSettingsError
 from qtrade_agent.store import Store
 from qtrade_agent.vault_client import FakeVault, VaultUnavailable
 from tests.test_api_ext import H, P, TOK_R, TOK_W, Rig
 
 
 NAME = "上海采集工作台"
-BASE = "https://collector.example.invalid/its-relay"
-DRAFT = "https://draft.example.invalid/its-relay"
+BASE = "https://collector.example.invalid"
+DRAFT = "https://draft.example.invalid"
 KEY = "synthetic-independent-reporting-key"
 SM4 = "0123456789abcdef"
 FIELDS = {"workbench_name": NAME, "base_url": BASE, "key": KEY, "sm4_key": SM4}
 URL = f"{P}/settings/ossbox"
+
+
+def synthetic_pending_connection(monkeypatch):
+    """Settings unit edge only; this intentionally provides no mTLS evidence."""
+    from relay.file_gateway import FileGatewayClient
+    from relay import file_gateway_connection
+    from urllib.request import build_opener
+    def factory(config, auth, *, path=None):
+        return FileGatewayClient(config["base_url"], auth, path=path, opener=build_opener())
+    monkeypatch.setattr(file_gateway_connection, "connection_client", factory)
 
 
 def reporting_class():
@@ -48,6 +58,7 @@ class LocalWorkbench(SimpleNamespace):
 @pytest.fixture
 def local(tmp_path, monkeypatch):
     monkeypatch.setattr(OpenerDirector, "open", forbidden)
+    synthetic_pending_connection(monkeypatch)
     store = Store(str(tmp_path / "collector.sqlite3")).open()
     vault = FakeVault()
     yield LocalWorkbench(store=store, vault=vault)
@@ -56,6 +67,7 @@ def local(tmp_path, monkeypatch):
 
 @pytest.fixture
 def collector_rig(tmp_path, monkeypatch, request):
+    synthetic_pending_connection(monkeypatch)
     for key in tuple(os.environ):
         if key.startswith(("OSS_", "OSSBOX_", "XUNJIA_")):
             monkeypatch.delenv(key)
@@ -76,10 +88,9 @@ def collector_rig(tmp_path, monkeypatch, request):
         db.execute("CREATE TABLE host_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         db.execute("INSERT INTO host_meta VALUES('binding', ?)",
             (json.dumps(["unrelated-owner", "old-bound-account", "old-bound-workbench"]),))
-    from relay.file_gateway_journal import Journal
     unknown = state / "publication.sqlite3"
-    journal = Journal(unknown, None)
-    with journal.db() as db:
+    with sqlite3.connect(unknown) as db:
+        db.execute("CREATE TABLE receive(state TEXT,h TEXT,name TEXT,body BLOB)")
         db.execute("INSERT INTO receive(state,h,name,body) VALUES(?,?,?,?)",
             ("UNKNOWN", "synthetic-unknown-hash", "synthetic-uncertain.bin", b"preserve-uncertain-payload"))
     monkeypatch.setenv("XUNJIA_COLLECTOR_VERSION", "2.2")
@@ -132,13 +143,17 @@ def test_save_reads_back_editable_url_and_name_without_original_config_file(loca
 
 
 @pytest.mark.parametrize("url", ["", "ftp://example.invalid", "https://user:pass@example.invalid/its-relay",
-    "https://example.invalid/?token=private", "https://example.invalid/#private", "https://exa mple.invalid"])
+    "https://example.invalid/?token=private", "https://example.invalid/#private", "https://exa mple.invalid",
+    "http://127.0.0.1", "http://example.invalid", "https://example.invalid/its-relay",
+    "https://example.invalid/api/files", "https://example.invalid/other"])
 def test_invalid_url_is_rejected_without_changing_saved_profile(local, url):
     save(local.settings, FIELDS)
     before = public_state(local)
+    vault_before = {name: entry.value for name, entry in local.vault.entries.items()}
     with pytest.raises(OssboxSettingsError):
         save(local.settings, {"base_url": url})
     assert public_state(local) == before
+    assert {name: entry.value for name, entry in local.vault.entries.items()} == vault_before
 
 
 def test_secrets_only_exist_in_vault_not_sqlite_audit_or_get(local, caplog):
@@ -287,9 +302,9 @@ def test_each_pending_check_generates_fresh_access_token_without_saving_or_expos
             super().__init__(b'{"pending":0}')
     def open_pending(opener, request, timeout=None):
         assert request.get_method() == "GET"
-        assert request.full_url == DRAFT + "/api/files/pending"
+        assert request.full_url == DRAFT + "/api/files/pending?path=xj_dir_v1"
         assert request.data is None
-        token = {name.lower(): value for name, value in request.header_items()}["access_token"]
+        token = {name.lower(): value for name, value in request.header_items()}["accesstoken"]
         assert token and KEY not in token and SM4 not in token
         tokens.append(token)
         return Pending()
@@ -387,3 +402,69 @@ def test_nonadmin_cannot_read_write_or_test_collector_config(collector_rig, toke
         ("post", URL + "/test", {"json": FIELDS})):
         response = getattr(collector_rig.client, method)(path, headers=H(token), **kwargs)
         assert response.status_code == 403, response.text
+
+
+def test_incomplete_draft_may_save_but_real_connection_factory_rejects_missing_mtls(tmp_path, monkeypatch):
+    """No synthetic factory here: missing mTLS must fail before any socket opens."""
+    import socket
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(OpenerDirector, "open", forbidden)
+    store = Store(str(tmp_path / "tls-boundary.sqlite3")).open()
+    try:
+        settings = reporting_class()(store, FakeVault())
+        save(settings, FIELDS)
+        before = settings.saved()
+        with pytest.raises(OssboxSettingsError) as caught:
+            asyncio.run(settings.test({}))
+        assert caught.value.reason == "file_tls_client_cert_required"
+        assert settings.saved() == before
+        assert settings.applied_revision is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("invalid", [{"client_cert_file": "synthetic-cert.pem"},
+    {"client_key_file": "synthetic-key.pem"}, {"ca_file": "synthetic-ca.pem"}])
+def test_explicit_incomplete_tls_fields_are_rejected_before_persistence(tmp_path, monkeypatch, invalid):
+    import socket
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    store = Store(str(tmp_path / "tls-draft.sqlite3")).open()
+    vault = FakeVault()
+    try:
+        settings = reporting_class()(store, vault)
+        before = store.settings_list_prefix("")
+        with pytest.raises(OssboxSettingsError):
+            save(settings, {**FIELDS, **invalid})
+        assert store.settings_list_prefix("") == before
+        assert not vault.entries
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("old_url", ["https://collector.example.invalid/its-relay", "http://collector.example.invalid"])
+def test_stored_current_draft_is_editable_but_cannot_run_until_url_is_explicitly_repaired(local, tmp_path, old_url):
+    save(local.settings, FIELDS)
+    stored = {**local.settings.saved(), "base_url": old_url}
+    local.store.settings_set("collector.reporting", stored)
+    external = tmp_path / "historical-external-auth.yaml"
+    external.write_bytes(b"synthetic-old-external-state-preserve\n")
+    reopened = reporting_class()(local.store, local.vault)
+    view = reopened.view()
+    assert view["saved"] is True and view["configured"] is False
+    assert view["base_url"] == old_url
+    assert view["workbench_id"] == stored["workbench_id"]
+    before = public_state(local)
+    vault_before = {name: entry.value for name, entry in local.vault.entries.items()}
+    for operation in (lambda: save(reopened, {"workbench_name": "仅更名不能启用旧地址"}),
+        lambda: asyncio.run(reopened.test({})), lambda: asyncio.run(reopened._prepare({}))):
+        with pytest.raises(OssboxSettingsError) as caught:
+            operation()
+        assert caught.value.reason == "collector_url_invalid"
+        assert public_state(local) == before
+        assert {name: entry.value for name, entry in local.vault.entries.items()} == vault_before
+    save(reopened, {**FIELDS, "base_url": DRAFT})
+    repaired = reopened.view()
+    assert repaired["base_url"] == DRAFT and repaired["configured"] is True
+    assert repaired["workbench_id"] == stored["workbench_id"]
+    assert reopened.saved()["revision"] != stored["revision"]
+    assert external.read_bytes() == b"synthetic-old-external-state-preserve\n"

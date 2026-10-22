@@ -68,3 +68,29 @@ def test_timeout_does_not_renew_last_confirmed_online_lease(tmp_path):
   answer.update(state='offline',code='NATIVE_RELOGIN_REQUIRED');await m.probe_presence_once();assert not m.online('qd01','10001')
   assert m.presence[('qd01','10001')]['code']=='NATIVE_RELOGIN_REQUIRED'
  asyncio.run(case())
+
+EMPTY_CHAT_IDS=['qdui_aio_inputbar_edittext','title','listView1','qdui_aio_inputbar']
+
+def test_empty_chat_composer_is_online_without_a_send_button():
+ assert classify_nodes(P,[node(P.package+':id/'+v) for v in EMPTY_CHAT_IDS])==('online','NATIVE_CHAT_VISIBLE')
+
+@pytest.mark.parametrize('missing',EMPTY_CHAT_IDS)
+def test_incomplete_empty_chat_layout_is_not_online(missing):
+ assert classify_nodes(P,[node(P.package+':id/'+v) for v in EMPTY_CHAT_IDS if v!=missing])[0]=='unknown'
+
+def test_chat_labels_or_foreign_resources_cannot_spoof_native_chat():
+ for nodes in ([node(text=v) for v in EMPTY_CHAT_IDS],[node('other.package:id/'+v) for v in EMPTY_CHAT_IDS]):
+  assert classify_nodes(P,nodes)[0]=='unknown'
+
+def test_login_controls_override_a_stale_chat_layout():
+ nodes=[node(P.package+':id/'+v) for v in EMPTY_CHAT_IDS+['password','login']]
+ assert classify_nodes(P,nodes)==('offline','NATIVE_LOGIN_REQUIRED')
+
+@pytest.mark.parametrize('native_uid,expected',[('10001','online'),('10002','offline')])
+def test_empty_chat_still_requires_current_native_identity(native_uid,expected):
+ class EmptyChat(FakeUI):
+  async def _dump_xml(self,a,read_only=False):
+   assert read_only
+   return '<hierarchy>'+''.join('<node resource-id="'+P.package+':id/'+v+'" bounds="[0,0][100,100]"/>' for v in EMPTY_CHAT_IDS)+'</hierarchy>'
+ result=asyncio.run(NativePresenceProbe(EmptyChat(uid=native_uid))(row()))
+ assert result['state']==expected
