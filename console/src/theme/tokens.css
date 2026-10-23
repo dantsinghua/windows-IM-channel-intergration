@@ -1,0 +1,219 @@
+/* 设计令牌全表(01 §2.9;基线 §9 给定的色值为准) */
+:root {
+  /* 品牌与状态 */
+  --qt-primary: #7547A8;
+  --qt-primary-strong: #583180;
+  --qt-primary-soft: #F0EAF8;
+  --qt-accent: #F2AD38;
+  --qt-accent-soft: #FFF4DC;
+  --qt-state-running: #52C41A;  --qt-state-login_required: #FAAD14;
+  --qt-state-starting: #1677FF; --qt-state-stopped: #8C8C8C;
+  --qt-state-error: #F5222D;    --qt-state-degraded: #FA8C16;
+  /* 通道 */
+  --qt-ch-qidian: #13C2C2;  --qt-ch-qq: #1677FF;  --qt-ch-wechat: #07C160;
+  /* 结果码语义 */
+  --qt-code-ok: var(--qt-state-running);  --qt-code-pending: #FAAD14;
+  --qt-code-fail: var(--qt-state-error);  --qt-code-blocked: #722ED1;  --qt-code-na: #BFBFBF;
+  /* 告警级别:复用状态色,不新增色值 */
+  --qt-sev-info: var(--qt-state-starting);  --qt-sev-warn: var(--qt-state-login_required);
+  --qt-sev-crit: var(--qt-state-error);
+  /* 中性色(浅色) */
+  --qt-bg: #F5F4F7;  --qt-bg-elevated: #FFFFFF;  --qt-border: #E6E2EC;
+  --qt-text: #272131;  --qt-text-secondary: #706878;  --qt-text-disabled: #928A9A;
+  /* 间距 / 字号 / 圆角 / 阴影 */
+  --qt-space-1: 4px; --qt-space-2: 8px; --qt-space-3: 12px; --qt-space-4: 16px;
+  --qt-space-6: 24px; --qt-space-8: 32px;
+  --qt-font-xs: 12px; --qt-font-sm: 14px; --qt-font-md: 14px; --qt-font-lg: 16px;
+  --qt-font-xl: 24px; --qt-font-xxl: 30px;
+  --qt-font-mono: "Cascadia Mono","JetBrains Mono",Consolas,monospace;
+  --qt-radius-sm: 8px; --qt-radius-md: 16px; --qt-radius-lg: 24px;
+  --qt-shadow-1: 0 4px 24px rgba(61,38,85,.035);  --qt-shadow-2: 0 12px 36px rgba(61,38,85,.09);
+  /* 布局 */
+  --qt-nav-w: 220px; --qt-nav-w-collapsed: 72px; --qt-header-h: 88px;
+  /* 光大理财外壳：紫 + 黄 */
+  --qt-shell-bg: radial-gradient(ellipse at 85% 4%, #f4d68d30 0, transparent 38%), radial-gradient(ellipse at 30% 18%, #ccb2ed29 0, transparent 46%), #f5f4f7;
+  --qt-nav-bg: rgba(251,250,253,.65);
+  --qt-nav-border: #e8e3ef;
+  --qt-nav-text: #766b80;
+  --qt-nav-hover: #eee7f5;
+  --qt-nav-active: linear-gradient(115deg,#885fb3,#6d419f);
+  --qt-nav-active-shadow: 0 6px 14px #6d419f28;
+  --qt-workspace-bg: linear-gradient(110deg,#ebe2f7,#fbf2df);
+  --qt-avatar-bg: #ebe4f3;
+  --qt-focus: #a080c9;
+  --qt-table-head: #f6f4f9;
+  --qt-table-hover: #fcfaff;
+  --qt-toolbar-bg: #faf9fc;
+  --qt-tint: #e9def4;
+  --qt-tint-fg: #7b55a0;
+  --qt-tint-qq: #eae1f7;
+  --qt-tint-wechat: #faedce;
+  --qt-tint-wechat-fg: #ac812b;
+  --qt-glow: #c3a3e842;
+  --qt-glow-wechat: #f3d59c4f;
+  --qt-glow-qq: #c5ace247;
+  --qt-card-hover: #bb9fd6;
+  --qt-primary-shadow: #7547a81c;
+  --qt-primary-shadow-soft: #7547a813;
+  --qt-primary-shadow-tab: #7547a82b;
+  --qt-grad-soft: linear-gradient(135deg,#e9e1f4,#f7f3fc);
+  --qt-grad-strong: linear-gradient(110deg,#8960b5,#704a9e);
+  --qt-icon: #967db0;
+  --qt-icon-soft: #eae0f4;
+  --qt-icon-fg: #9265b5;
+  --qt-node-border: #c2a6d8;
+  --qt-node-shadow: #7547a817;
+  --qt-node-focus: #8e66ae;
+  --qt-node-strong-shadow: #7547a824;
+  --qt-usage: linear-gradient(90deg,#b899d9,#7547a8);
+  --qt-usage-accent: linear-gradient(90deg,#f9d88c,#f2ad38);
+  --qt-badge: #f3b849;
+  --qt-badge-fg: #4d3516;
+  --qt-msg-hover: #fcfaff;
+  --qt-scroll-thumb: rgba(117, 71, 168, .45);
+  --qt-scroll-thumb-hover: #7547A8;
+  --qt-scroll-track: rgba(117, 71, 168, .08);
+}
+
+/* 南银理财：红 + 金 */
+:root[data-brand="ny"] {
+  --qt-primary: #B01C24;
+  --qt-primary-strong: #87141A;
+  --qt-primary-soft: #F8EBE8;
+  --qt-accent: #C4A574;
+  --qt-accent-soft: #F8F1E4;
+  --qt-bg: #F6F1EC;
+  --qt-bg-elevated: #FFFFFF;
+  --qt-border: #E7DCD4;
+  --qt-text: #2B2320;
+  --qt-text-secondary: #6E6258;
+  --qt-text-disabled: #A8988C;
+  --qt-shadow-1: 0 4px 24px rgba(90,32,28,.04);
+  --qt-shadow-2: 0 12px 36px rgba(90,32,28,.1);
+  --qt-shell-bg: radial-gradient(ellipse at 85% 4%, #e7c99a33 0, transparent 38%), radial-gradient(ellipse at 30% 18%, #e7b2aa29 0, transparent 46%), #f6f1ec;
+  --qt-nav-bg: rgba(255,250,246,.72);
+  --qt-nav-border: #eadfd6;
+  --qt-nav-text: #6E6258;
+  --qt-nav-hover: #F8EBE8;
+  --qt-nav-active: linear-gradient(135deg,#C2333B,#8E1620);
+  --qt-nav-active-shadow: 0 6px 14px #b01c2428;
+  --qt-workspace-bg: linear-gradient(110deg,#F8EBE8,#F8F1E4);
+  --qt-avatar-bg: #F8EBE8;
+  --qt-focus: #C47A74;
+  --qt-table-head: #F8F1EA;
+  --qt-table-hover: #FBF6F1;
+  --qt-toolbar-bg: #FBF7F3;
+  --qt-tint: #F8EBE8;
+  --qt-tint-fg: #B01C24;
+  --qt-tint-qq: #F3E4E1;
+  --qt-tint-wechat: #F8F1E4;
+  --qt-tint-wechat-fg: #8A6A32;
+  --qt-glow: #e7b2aa55;
+  --qt-glow-wechat: #e7c99a55;
+  --qt-glow-qq: #e7b2aa40;
+  --qt-card-hover: #d4a8a4;
+  --qt-primary-shadow: #b01c241c;
+  --qt-primary-shadow-soft: #b01c2413;
+  --qt-primary-shadow-tab: #b01c242b;
+  --qt-grad-soft: linear-gradient(135deg,#f8ebe8,#fbf6f1);
+  --qt-grad-strong: linear-gradient(135deg,#C2333B,#8E1620);
+  --qt-icon: #C2333B;
+  --qt-icon-soft: #F8EBE8;
+  --qt-icon-fg: #B01C24;
+  --qt-node-border: #e0b4ae;
+  --qt-node-shadow: #b01c2417;
+  --qt-node-focus: #C2333B;
+  --qt-node-strong-shadow: #b01c2424;
+  --qt-usage: linear-gradient(90deg,#C2333B,#8E1620);
+  --qt-usage-accent: linear-gradient(90deg,#e7d3a8,#C4A574);
+  --qt-badge: #C4A574;
+  --qt-badge-fg: #3d2e16;
+  --qt-msg-hover: #F8E6E4;
+  --qt-scroll-thumb: rgba(176, 28, 36, .42);
+  --qt-scroll-thumb-hover: #B01C24;
+  --qt-scroll-track: rgba(176, 28, 36, .08);
+}
+
+/* 深色留 M5;状态色深浅同值(状态灯是跨页面的语义信号) */
+:root[data-theme="dark"] {
+  --qt-bg: #141414; --qt-bg-elevated: #1F1F1F; --qt-border: #303030;
+  --qt-text: #E6E6E6; --qt-text-secondary: #A6A6A6; --qt-text-disabled: #595959;
+  --qt-shadow-1: 0 1px 2px rgba(0,0,0,.4);  --qt-shadow-2: 0 4px 12px rgba(0,0,0,.5);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app, .content, .nav-menu {
+  scrollbar-width: thin;
+  scrollbar-color: var(--qt-scroll-thumb) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+*::-webkit-scrollbar-track { background: var(--qt-scroll-track); border-radius: 999px; margin: 10px 3px; }
+*::-webkit-scrollbar-thumb {
+  background-color: var(--qt-scroll-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--qt-scroll-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner { background: transparent; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--qt-bg);
+  color: var(--qt-text);
+  font-size: var(--qt-font-md);
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+.qt-mono { font-family: var(--qt-font-mono); }
+.qt-muted { color: var(--qt-text-secondary); }
+.qt-small { font-size: var(--qt-font-xs); }
+.qt-card { background: var(--qt-bg-elevated); border: 1px solid var(--qt-border); border-radius: var(--qt-radius-md); box-shadow: var(--qt-shadow-1); }
+.qt-section-title { font-size: var(--qt-font-lg); font-weight: 600; margin-bottom: var(--qt-space-3); }
+.qt-row { display: flex; align-items: center; gap: var(--qt-space-2); }
+.qt-col { display: flex; flex-direction: column; gap: var(--qt-space-2); }
+.qt-grow { flex: 1 1 auto; min-width: 0; }
+.qt-danger { color: var(--qt-state-error); }
+.qt-warn { color: var(--qt-sev-warn); }
+.qt-ok { color: var(--qt-state-running); }
+.qt-page { padding: 28px 36px 40px; max-width: 1760px; margin: 0 auto; }
+.qt-stack > * + * { margin-top: 22px; }
+.qt-page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.qt-page-heading h1, .qt-page-heading h2 { margin: 0; font-size: 28px; line-height: 1.4; letter-spacing: -.8px; font-weight: 650; }
+.qt-page-heading p { color: var(--qt-text-secondary); margin: 8px 0 0; }
+.qt-eyebrow { display: block; font-size: 12px; font-weight: 600; letter-spacing: 1.6px; color: var(--qt-primary); margin-bottom: 8px; }
+.qt-glass { background: rgba(255,255,255,.66); border: 1px solid rgba(255,255,255,.94); box-shadow: var(--qt-shadow-1), inset 0 1px 0 #fff; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border-radius: var(--qt-radius-lg); }
+.qt-surface { background: white; border: 1px solid var(--qt-border); border-radius: var(--qt-radius-lg); padding: 24px; }
+.qt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 18px; background: var(--qt-toolbar-bg); border: 1px solid var(--qt-border); border-radius: 16px; }
+.qt-stat { font-size: 32px; font-weight: 600; letter-spacing: -1.5px; }
+button, a, input, select, summary { -webkit-tap-highlight-color: transparent; }
+button { font: inherit; }
+button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 3px solid var(--qt-focus); outline-offset: 3px; }
+a { color: var(--qt-primary); }
+summary { cursor: pointer; }
+.content .tbl { background: white; border-radius: 16px; overflow: hidden; }
+.content .tbl thead { background: var(--qt-table-head); color: var(--qt-text-secondary); }
+.content .tbl th { font-weight: 500; }
+.content .tbl th, .content .tbl td { padding: 14px 16px; line-height: 1.65; border-bottom: 1px solid #efedf2; }
+.content .tbl tbody tr:hover { background: var(--qt-table-hover); }
+.content .qt-card.box { padding: 24px; }
+.content .ant-collapse { border-color: var(--qt-border); }
+.content .ant-tabs-nav::before { border-bottom-color: var(--qt-border); }
+.content .ant-tabs-tab { padding: 14px 4px; }
+.ant-modal-mask { backdrop-filter: blur(6px); }
+.ant-drawer-mask { backdrop-filter: blur(4px); }
+.ant-modal-content, .ant-drawer-content { box-shadow: 0 18px 80px #29154126; }
+.ant-table-wrapper, .qt-mono { font-variant-numeric: tabular-nums; }
+@supports not (backdrop-filter: blur(1px)) { .qt-glass { background: #fff; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
+@media (max-width: 1000px) { .qt-page { padding: 22px; } .qt-page-heading h1, .qt-page-heading h2 { font-size: 24px; } }
+@media (max-width: 640px) { .qt-page { padding: 16px; } .qt-page-heading { align-items: flex-start; flex-wrap: wrap; } .qt-row { flex-wrap: wrap; } .qt-surface, .content .qt-card.box { padding: 16px; } }

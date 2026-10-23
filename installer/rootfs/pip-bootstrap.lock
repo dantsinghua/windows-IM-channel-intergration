@@ -1,0 +1,7 @@
+# 发行版 venv 里 pip 自身的版本钉(E3-O1)—— Dockerfile 在装运行期依赖之前,先用 venv 自带 pip
+# (python3.12 ensurepip 的 25.0.1)按本文件把 pip 升到钉死的版本,之后所有 --require-hashes 校验
+# 都由这个版本执行。只登记 wheel 的 hash(不登记 sdist)+ 安装时带 --only-binary=:all:,
+# ⇒ 只有这一个文件能通过,hash 不符即构建失败。版本取值 = 上一版 rootfs(b9771c36…)里实际装着的 pip。
+# 更新方法见 README.md §8「pip 钉版本」。
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e

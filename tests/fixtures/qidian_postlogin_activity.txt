@@ -1,0 +1,16 @@
+TASK com.tencent.qidian id=42
+  ACTIVITY com.tencent.qidian/com.tencent.mobileqq.activity.SplashActivity 1a2b pid=456
+    Local Activity:
+      mResumed=true mStopped=false mFinished=false
+    View Hierarchy:
+      DecorView{100 V.E...... 0,0-720,1280}
+        android.widget.FrameLayout{101 V.E...... 0,0-720,1280 android:id/content}
+          com.tencent.mobileqq.widget.QQTabHost{102 VFED..... 0,0-720,1280 android:id/tabhost}
+            com.tencent.mobileqq.activity.recent.cur.DragFrameLayout{103 V.ED..... 0,0-720,1280 app:id/contentFrame}
+              android.widget.FrameLayout{104 V.E...... 0,0-720,1280 android:id/tabcontent}
+                android.widget.RelativeLayout{105 V.E...... 0,0-720,1280 app:id/root}
+                  android.widget.RelativeLayout{106 V.E...... 0,0-720,1280 app:id/statustitle}
+                    android.widget.RelativeLayout{107 V.E...... 0,0-720,1280 app:id/conversation_activity_title}
+                      com.tencent.qidian.widget.QDHeaderSlideBtnView{108 G.E...... 0,0-720,1280 app:id/recent_list_tab}
+                    com.tencent.widget.OlympicListView{109 VFED.VC.. 0,0-720,1280 app:id/recent_chat_list}
+            com.tencent.mobileqq.widget.QQTabWidget{10a V.E...... 0,0-720,1280 android:id/tabs}

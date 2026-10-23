@@ -1,0 +1,30 @@
+;!@Install@!UTF-8!
+; ============================================================================
+;  QTrade 自解压外壳(7-Zip 官方 SfxSetup 存根)配置 —— docs/03 §2.1
+;
+;  🔴🔴 这里**只允许出现官方 SfxSetup 认识的 7 个键**:
+;       Title / BeginPrompt / Progress / Directory / RunProgram / ExecuteFile / ExecuteParameters
+;       (证据:LZMA SDK 的 CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp 里只对这 7 个名字调
+;        GetTextConfigValue/FindTextConfigItem;对 7zSD.sfx 二进制做 strings 也只有这 7 个。)
+;       `InstallPath` / `GUIMode` / `OverwriteMode` / `ExtractTitle` / `ExtractDialogText` /
+;       `GUIFlags` 等等**是 7zsfxmm(第三方改版)的键,官方存根会静默忽略** ——
+;       写了不报错、也不生效,这是最难发现的一类错。
+;       build.ps1 的 G5 门会逐键校验,写错直接中止出包。
+;
+;  🔴 官方存根的三条硬行为(已用哑 EXE 实测坐实,见 build/README §8):
+;    1. **解压到 `%TEMP%\7zS<随机>\`**,不是我们要的 `%ProgramData%\QTrade`;
+;    2. `RunProgram` 跑完,**整个临时目录被删**(SfxSetup.cpp 的 CTempDir 析构里 Remove());
+;    3. **退出码不透传** —— 源码末尾硬编码 `return 0`,子进程退 26 它照样退 0。
+;
+;  因此 §2.1 要的「解压到 %ProgramData%\QTrade 并留存」由 `precheck-disk.cmd` 承担:
+;  它在临时目录里先判空间,再把载荷**搬**到 `%ProgramData%\QTrade\`(同卷是改名,O(1)),
+;  然后从那里拉起引擎。第 3 条(退出码)外层解决不了,已提交裁决,见 handoff。
+;
+;  RunProgram 的路径**相对临时目录根**(SfxSetup 先 SetCurrentDir(tempDir) 再 CreateProcess),
+;  命令行参数会原样附加到 RunProgram 之后(实测 `/QT_MODE=install /PROBE=1` 完整到达)。
+; ============================================================================
+
+Title="QTrade 安装程序"
+Progress="yes"
+RunProgram="install\\engine\\precheck-disk.cmd"
+;!@InstallEnd@!

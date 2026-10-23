@@ -1,0 +1,10 @@
+;!@Install@!UTF-8!
+; QTrade native SFX only. The token selects the Windows known-folder base.
+; Each launch creates a protected, random child under QTrade-Staging.
+; The live QTrade root is never an extraction destination.
+; Stage files remain for diagnostics; the engine owns clean installation.
+Title="QTrade Setup"
+Progress="yes"
+InstallPath="%ProgramData%\\QTrade-Staging"
+RunProgram="install\\engine\\run-engine.cmd"
+;!@InstallEnd@!

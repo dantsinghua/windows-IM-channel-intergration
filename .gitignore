@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+*.egg-info/
+.venv/
+.env
+.omc/
+**/.omc/
+
+# Playwright 失败截图/trace 落点
+console/tests/e2e-pw/.pw-results/
+
+# 浏览器抓包(可能含登录 Cookie 与持牌行情数据),一律不进库
+*.har
+
+# 与本项目无关的个人脚本(羿珩 DM 行情旁路),误入过一次
+qb_tap.user.js
+
+# Claude Code 子 agent 的 worktree 目录,不入库
+.claude/worktrees/
+
+# Codex/OMX 本机运行态；项目规范、skills 和迁移说明仍可入库。
+.omx/
+.codex/handoffs/
+.codex/
+.agents/

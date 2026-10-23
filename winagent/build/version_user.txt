@@ -1,0 +1,16 @@
+# PyInstaller 版本资源(exe 的 VersionInfo)—— 三件套各自语义化版本(02 §3.8)
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=(0, 1, 0, 0), prodvers=(0, 1, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('080404b0', [
+        StringStruct('CompanyName', 'QTrade'),
+        StringStruct('FileDescription', 'QTrade WinAgent 用户会话代理(随用户登录,不提权)'),
+        StringStruct('FileVersion', '0.1.0.0'),
+        StringStruct('InternalName', 'qtrade-winagent-user'),
+        StringStruct('OriginalFilename', 'qtrade-winagent-user.exe'),
+        StringStruct('ProductName', 'QTrade 多实例 IM 控制台'),
+        StringStruct('ProductVersion', '0.1.0.0')])]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

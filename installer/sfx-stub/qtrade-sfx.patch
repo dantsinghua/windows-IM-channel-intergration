@@ -1,0 +1,575 @@
+--- a/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
++++ b/CPP/7zip/Bundles/SFXSetup/SfxSetup.cpp
+@@ -29,6 +29,8 @@
+ using namespace NWindows;
+ using namespace NFile;
+ using namespace NDir;
++
++#include "QTradeStage.h"
+ 
+ extern
+ HINSTANCE g_hInstance;
+@@ -116,6 +118,11 @@
+ #define NT_CHECK_FAIL_ACTION ShowErrorMessage(L"Unsupported Windows version"); return 1;
+ #endif
+ 
++// QTrade preserves the child exit code and checks space before extraction.
++static const int kQTradeExitDiskLow = 26;
++static const wchar_t * const kQTradeDiskLowMessage =
++    L"QTrade: Not enough free disk space. Installation has not started.";
++
+ static void ShowErrorMessageSpec(const UString &name)
+ {
+   UString message = NError::MyFormatMessage(::GetLastError());
+@@ -174,6 +181,7 @@
+ 
+   UString dirPrefix ("." STRING_PATH_SEPARATOR);
+   UString appLaunched;
++  UString installPath;
+   bool showProgress = true;
+   if (!config.IsEmpty())
+   {
+@@ -199,6 +207,8 @@
+         return 0;
+     }
+     appLaunched = GetTextConfigValue(pairs, "RunProgram");
++
++    installPath = GetTextConfigValue(pairs, "InstallPath");
+     
+     #ifdef MY_SHELL_EXECUTE
+     executeFile = GetTextConfigValue(pairs, "ExecuteFile");
+@@ -206,12 +216,30 @@
+     #endif
+   }
+ 
++  // Keep the exact stage and its protected ancestor handles alive until exit.
++  CQTradeStage stage;
+   CTempDir tempDir;
+-  if (!tempDir.Create(kTempDirPrefix))
+-  {
+-    if (!assumeYes)
+-      ShowErrorMessage(L"Cannot create temp folder archive");
+-    return 1;
++  FString destPath;
++  if (!installPath.IsEmpty())
++  {
++    UString uniqueStage;
++    if (!stage.Create(installPath, uniqueStage))
++    {
++      if (!assumeYes)
++        ShowErrorMessage(L"QTRADE_UNIQUE_STAGE_V1: unsafe or unavailable staging directory");
++      return 1;
++    }
++    destPath = us2fs(uniqueStage);
++  }
++  else
++  {
++    if (!tempDir.Create(kTempDirPrefix))
++    {
++      if (!assumeYes)
++        ShowErrorMessage(L"Cannot create temp folder archive");
++      return 1;
++    }
++    destPath = tempDir.GetPath();
+   }
+ 
+   CCodecs *codecs = new CCodecs;
+@@ -225,14 +253,21 @@
+     }
+   }
+ 
+-  const FString tempDirPath = tempDir.GetPath();
+-  // tempDirPath = L"M:\\1\\"; // to test low disk space
+   {
+     bool isCorrupt = false;
++    bool noSpace = false;
+     UString errorMessage;
+-    HRESULT result = ExtractArchive(codecs, fullPath, tempDirPath, showProgress,
+-      isCorrupt, errorMessage);
+-    
++    HRESULT result = ExtractArchive(codecs, fullPath, destPath, showProgress,
++      !installPath.IsEmpty(), isCorrupt, noSpace, errorMessage);
++
++    // Low space leaves an empty private stage, never a partially written live root.
++    if (noSpace)
++    {
++      if (!assumeYes)
++        ::MessageBoxW(NULL, kQTradeDiskLowMessage, L"QTrade", MB_ICONERROR);
++      return kQTradeExitDiskLow;
++    }
++
+     if (result != S_OK)
+     {
+       if (!assumeYes)
+@@ -255,7 +290,7 @@
+ 
+   #ifndef UNDER_CE
+   CCurrentDirRestorer currentDirRestorer;
+-  if (!SetCurrentDir(tempDirPath))
++  if (!SetCurrentDir(destPath))
+     return 1;
+   #endif
+   
+@@ -315,14 +350,14 @@
+     }
+     
+     {
+-      FString s2 = tempDirPath;
++      FString s2 = destPath;
+       NName::NormalizeDirPathPrefix(s2);
+       appLaunched.Replace(L"%%T" WSTRING_PATH_SEPARATOR, fs2us(s2));
+     }
+     
+     const UString appNameForError = appLaunched; // actually we need to rtemove parameters also
+ 
+-    appLaunched.Replace(L"%%T", fs2us(tempDirPath));
++    appLaunched.Replace(L"%%T", fs2us(destPath));
+ 
+     if (!switches.IsEmpty())
+     {
+@@ -359,10 +394,22 @@
+     ::CloseHandle(processInformation.hThread);
+     hProcess = processInformation.hProcess;
+   }
++  // The child inherits stage cwd; the waiting stub releases its cwd lock.
++  if (!installPath.IsEmpty())
++  {
++    FString sysDir;
++    if (GetSystemDir(sysDir))
++      SetCurrentDir(sysDir);
++  }
++
++  // Missing child exit status is failure, never a synthetic success.
++  DWORD exitCode = 1;
+   if (hProcess)
+   {
+     WaitForSingleObject(hProcess, INFINITE);
++    if (!::GetExitCodeProcess(hProcess, &exitCode))
++      exitCode = 1;
+     ::CloseHandle(hProcess);
+   }
+-  return 0;
++  return (int)exitCode;
+ }
+--- a/CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp
++++ b/CPP/7zip/Bundles/SFXSetup/ExtractEngine.cpp
+@@ -11,6 +11,10 @@
+ #include "../../UI/FileManager/FormatUtils.h"
+ #include "../../UI/FileManager/LangUtils.h"
+ 
++// [QTrade] 解压前空间判据需要读归档里每一项的 kpidSize
++#include "../../../Windows/PropVariant.h"
++#include "../../PropID.h"
++
+ #include "ExtractCallbackSfx.h"
+ #include "ExtractEngine.h"
+ 
+@@ -21,6 +25,75 @@
+ static LPCSTR const kCantFindArchive = "Cannot find archive file";
+ static LPCSTR const kCantOpenArchive = "Cannot open the file as archive";
+ 
++/* ========================= [QTrade 补丁 a-2] =========================
++   docs/03 §2.1 要求「解压前」判目标卷可用空间,不足则不解压。
++   官方存根没有 pre-extract 钩子,但归档被 Open 之后、Extract 之前这一刻
++   就已经能读到每一项的解包大小了 —— 判据放在这里,是「真的一个字节都没写」。
++
++   门槛 = max(6 GiB, 解包总大小 x 1.1)。
++     - 6 GiB 来自 docs/03 §2.1 的硬下限;
++     - x1.1 是解压期的余量(目录项、簇对齐、以及引擎随后要落的少量文件)。
++   取不到可用空间时放行(fail-open):判据是保护,不该变成新的失败源。
++   ==================================================================== */
++
++static const UInt64 kQTradeMinFreeBytes = ((UInt64)6) << 30;  // 6 GiB = 6442450944
++
++static UInt64 QTrade_GetRequiredBytes(UInt64 unpackSize)
++{
++  const UInt64 withMargin = unpackSize + unpackSize / 10;  // x1.1
++  return (withMargin > kQTradeMinFreeBytes) ? withMargin : kQTradeMinFreeBytes;
++}
++
++/* 不用 ConvertPropVariantToUInt64:它对预料之外的 vt 会 `throw 151199`,
++   而 showProgress=false 那条路径上的 Process2() 没有 try/catch 包着。
++   这里的语义是「算不出来就当 0」,不该变成一个能把进程掀掉的异常。*/
++static UInt64 QTrade_PropToUInt64(const NWindows::NCOM::CPropVariant &prop)
++{
++  switch (prop.vt)
++  {
++    case VT_UI8: return (UInt64)prop.uhVal.QuadPart;
++    case VT_UI4: return prop.ulVal;
++    case VT_UI2: return prop.uiVal;
++    case VT_UI1: return prop.bVal;
++    default: return 0;
++  }
++}
++
++static HRESULT QTrade_GetUnpackSize(IInArchive *archive, UInt64 &total)
++{
++  total = 0;
++  UInt32 numItems = 0;
++  RINOK(archive->GetNumberOfItems(&numItems))
++  for (UInt32 i = 0; i < numItems; i++)
++  {
++    {
++      NWindows::NCOM::CPropVariant propDir;
++      RINOK(archive->GetProperty(i, kpidIsDir, &propDir))
++      if (propDir.vt == VT_BOOL && propDir.boolVal != VARIANT_FALSE)
++        continue;
++    }
++    NWindows::NCOM::CPropVariant prop;
++    RINOK(archive->GetProperty(i, kpidSize, &prop))
++    total += QTrade_PropToUInt64(prop);
++  }
++  return S_OK;
++}
++
++/* 目标目录此刻通常还不存在,GetDiskFreeSpaceEx 对不存在的路径会失败,
++   所以先用 GetVolumePathName 求出它所在卷的挂载根(这也正确处理挂载点)。*/
++static bool QTrade_GetFreeSpace(const FString &dirPath, UInt64 &freeBytes)
++{
++  freeBytes = 0;
++  WCHAR volume[MAX_PATH + 2];
++  if (!GetVolumePathNameW(fs2us(dirPath).Ptr(), volume, (DWORD)(MAX_PATH + 1)))
++    return false;
++  ULARGE_INTEGER avail, totalBytes, totalFree;
++  if (!GetDiskFreeSpaceExW(volume, &avail, &totalBytes, &totalFree))
++    return false;
++  freeBytes = (UInt64)avail.QuadPart;
++  return true;
++}
++
+ struct CThreadExtracting
+ {
+   CCodecs *Codecs;
+@@ -33,6 +106,10 @@
+   CArchiveLink ArchiveLink;
+   HRESULT Result;
+   UString ErrorMessage;
++
++  // [QTrade] 空间判据:入参 CheckSpace,出参 NoSpace
++  bool CheckSpace;
++  bool NoSpace;
+ 
+   void Process2()
+   {
+@@ -59,6 +136,27 @@
+       return;
+     }
+ 
++    /* [QTrade] 判空间。位置很关键:必须在 CreateComplexDir 之前 ——
++       空间不足时,本次判据不会创建目标目录,也不会有任何一个字节被解出来。
++       (无 InstallPath 的官方路径下,临时目录此前已由 CTempDir::Create 建好,
++        但它会在 CTempDir 析构里被整个删掉,同样不留残留。)*/
++    IInArchive * const archive = ArchiveLink.GetArchive();
++    if (CheckSpace && archive)
++    {
++      UInt64 unpackSize = 0;
++      if (QTrade_GetUnpackSize(archive, unpackSize) == S_OK)
++      {
++        const UInt64 required = QTrade_GetRequiredBytes(unpackSize);
++        UInt64 freeBytes = 0;
++        if (QTrade_GetFreeSpace(DestFolder, freeBytes) && freeBytes < required)
++        {
++          NoSpace = true;
++          Result = E_FAIL;
++          return;
++        }
++      }
++    }
++
+     FString dirPath = DestFolder;
+     NName::NormalizeDirPathPrefix(dirPath);
+     
+@@ -94,14 +192,17 @@
+ };
+ 
+ HRESULT ExtractArchive(CCodecs *codecs, const FString &fileName, const FString &destFolder,
+-    bool showProgress, bool &isCorrupt, UString &errorMessage)
++    bool showProgress, bool checkSpace, bool &isCorrupt, bool &noSpace, UString &errorMessage)
+ {
+   isCorrupt = false;
++  noSpace = false;
+   CThreadExtracting t;
+ 
+   t.Codecs = codecs;
+   t.FileName = fileName;
+   t.DestFolder = destFolder;
++  t.CheckSpace = checkSpace;
++  t.NoSpace = false;
+ 
+   t.ExtractCallbackSpec = new CExtractCallbackImp;
+   t.ExtractCallback = t.ExtractCallbackSpec;
+@@ -131,5 +232,6 @@
+   if (errorMessage.IsEmpty())
+     errorMessage = t.ExtractCallbackSpec->_message;
+   isCorrupt = t.ExtractCallbackSpec->_isCorrupt;
++  noSpace = t.NoSpace;
+   return t.Result;
+ }
+--- a/CPP/7zip/Bundles/SFXSetup/ExtractEngine.h
++++ b/CPP/7zip/Bundles/SFXSetup/ExtractEngine.h
+@@ -5,7 +5,13 @@
+ 
+ #include "../../UI/Common/LoadCodecs.h"
+ 
++/* [QTrade]
++   checkSpace:是否做解压前的空间判据。🔴 只在走 InstallPath 时传 true ——
++     没有 InstallPath 的包要与官方存根**逐字同行为**,不能凭空多出一个 6 GiB 门槛
++     把人家一个 200 MB 的普通 SFX 包拦下来。
++   noSpace(出参):空间不足时置 true。此时归档虽已打开,但**一个字节都没有解压**、
++     目标目录也没有创建。调用方据此退 26(docs/03 §3.4)。*/
+ HRESULT ExtractArchive(CCodecs *codecs, const FString &fileName, const FString &destFolder,
+-    bool showProgress, bool &isCorrupt, UString &errorMessage);
++    bool showProgress, bool checkSpace, bool &isCorrupt, bool &noSpace, UString &errorMessage);
+ 
+ #endif
+--- a/CPP/7zip/Bundles/SFXSetup/resource.rc
++++ b/CPP/7zip/Bundles/SFXSetup/resource.rc
+@@ -4,6 +4,11 @@
+ MY_VERSION_INFO_APP("7z Setup SFX", "7zS.sfx")
+ 
+ IDI_ICON  ICON "setup.ico"
++
++/* [QTrade] CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24).
++   Declares requireAdministrator explicitly instead of relying on the
++   Windows Installer Detection heuristic.  See installer/sfx-stub/README.md. */
++1 24 "qtrade-sfx.manifest"
+ 
+ STRINGTABLE
+ BEGIN
+--- /dev/null
++++ b/CPP/7zip/Bundles/SFXSetup/qtrade-sfx.manifest
+@@ -0,0 +1,39 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <assemblyIdentity type="win32" name="QTrade.Setup.Sfx" version="1.0.0.0"
++                    processorArchitecture="x86" />
++
++  <!-- The engine requires administrator (Inno: PrivilegesRequired=admin) and the
++       installer writes to %ProgramData%, HKLM, services and the firewall.
++       Declare it instead of relying on UAC Installer Detection heuristics.
++       uiAccess is intentionally omitted (defaults to false): it would require a
++       signed binary in a secure location and we never drive another app's UI. -->
++  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
++    <security>
++      <requestedPrivileges>
++        <requestedExecutionLevel level="requireAdministrator" />
++      </requestedPrivileges>
++    </security>
++  </trustInfo>
++
++  <!-- Without this, GetVersionEx() reports 6.2 on Windows 10/11. -->
++  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
++    <application>
++      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" /><!-- Win 10 / 11 -->
++      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" /><!-- Win 8.1 -->
++      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" /><!-- Win 8 -->
++      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" /><!-- Win 7 -->
++    </application>
++  </compatibility>
++
++  <application xmlns="urn:schemas-microsoft-com:asm.v3">
++    <windowsSettings>
++      <!-- System DPI aware only.  The progress dialog is a plain Win32 dialog that
++           does not handle WM_DPICHANGED, so declaring PerMonitorV2 would make it
++           mis-scale when the window moves between monitors.
++           longPathAware is deliberately NOT declared: the patched code uses fixed
++           MAX_PATH-sized buffers and the install root is short. -->
++      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
++    </windowsSettings>
++  </application>
++</assembly>
+--- /dev/null
++++ b/CPP/7zip/Bundles/SFXSetup/QTradeStage.h
+@@ -0,0 +1,192 @@
++// QTrade secure staging v2. No payload is extracted into the live install root.
++#ifndef QTRADE_STAGE_H
++#define QTRADE_STAGE_H
++
++#include <aclapi.h>
++#include <sddl.h>
++#include <shlobj.h>
++
++class CQTradeStage
++{
++  HANDLE _locks[MAX_PATH];
++  unsigned _numLocks;
++  PSECURITY_DESCRIPTOR _security;
++  PSID _system;
++  PSID _admins;
++  PSID _trustedInstaller;
++
++  bool IsTrusted(PSID sid, bool stage) const
++  {
++    return sid && (EqualSid(sid, _system) || EqualSid(sid, _admins)
++        || (!stage && EqualSid(sid, _trustedInstaller)));
++  }
++
++  bool IsSafeAcl(HANDLE handle, bool stage) const
++  {
++    PSECURITY_DESCRIPTOR descriptor = NULL;
++    PSID owner = NULL;
++    PACL acl = NULL;
++    if (GetSecurityInfo(handle, SE_FILE_OBJECT,
++        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
++        &owner, NULL, &acl, NULL, &descriptor) != ERROR_SUCCESS)
++      return false;
++    bool safe = IsTrusted(owner, stage) && acl && IsValidAcl(acl);
++    SECURITY_DESCRIPTOR_CONTROL control = 0;
++    DWORD revision = 0;
++    if (stage && (!GetSecurityDescriptorControl(descriptor, &control, &revision)
++        || !(control & SE_DACL_PROTECTED)))
++      safe = false;
++    for (DWORD index = 0; safe && index < acl->AceCount; index++)
++    {
++      void *rawAce = NULL;
++      if (!GetAce(acl, index, &rawAce))
++      {
++        safe = false;
++        break;
++      }
++      const ACE_HEADER *header = (const ACE_HEADER *)rawAce;
++      // An ancestor's inherit-only ACE does not grant rights to that ancestor.
++      // A stage's inherit-only ACE can weaken extracted child files: inspect it.
++      if (!stage && (header->AceFlags & INHERIT_ONLY_ACE))
++        continue;
++      if (header->AceType == ACCESS_DENIED_ACE_TYPE)
++        continue;
++      if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
++      {
++        safe = false;
++        break;
++      }
++      const ACCESS_ALLOWED_ACE *ace = (const ACCESS_ALLOWED_ACE *)rawAce;
++      const PSID sid = (PSID)&ace->SidStart;
++      DWORD unsafeMask = WRITE_DAC | WRITE_OWNER | DELETE | FILE_DELETE_CHILD
++          | GENERIC_ALL;
++      if (stage)
++        unsafeMask |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA
++            | FILE_WRITE_ATTRIBUTES | GENERIC_WRITE;
++      if (!IsValidSid(sid) || (!IsTrusted(sid, stage) && (ace->Mask & unsafeMask)))
++        safe = false;
++    }
++    LocalFree(descriptor);
++    return safe;
++  }
++
++  bool LockDirectory(const UString &path, bool stage)
++  {
++    if (_numLocks == Z7_ARRAY_SIZE(_locks))
++      return false;
++    // Never follow a reparse point. Keep every ancestor pinned through launch.
++    // Do not share write/delete: an attacker cannot replace or reparse it later.
++    HANDLE handle = CreateFileW(path.Ptr(), READ_CONTROL | FILE_READ_ATTRIBUTES,
++        FILE_SHARE_READ, NULL, OPEN_EXISTING,
++        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
++    if (handle == INVALID_HANDLE_VALUE)
++      return false;
++    BY_HANDLE_FILE_INFORMATION info;
++    const bool safe = GetFileInformationByHandle(handle, &info)
++        && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++        && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
++        && IsSafeAcl(handle, stage);
++    if (!safe)
++    {
++      CloseHandle(handle);
++      return false;
++    }
++    _locks[_numLocks++] = handle;
++    return true;
++  }
++
++public:
++  CQTradeStage(): _numLocks(0), _security(NULL), _system(NULL),
++      _admins(NULL), _trustedInstaller(NULL) {}
++
++  ~CQTradeStage()
++  {
++    while (_numLocks != 0)
++      CloseHandle(_locks[--_numLocks]);
++    LocalFree(_security);
++    LocalFree(_system);
++    LocalFree(_admins);
++    LocalFree(_trustedInstaller);
++    // Keep only this run's stage for diagnostics. Never recursively delete here.
++  }
++
++  bool Create(const UString &configuredPath, UString &dest)
++  {
++    dest.Empty();
++    // This token describes a known-folder base, not a caller-controlled path.
++    if (wcscmp(configuredPath.Ptr(), L"%ProgramData%\\QTrade-Staging") != 0)
++      return false;
++    WCHAR programData[MAX_PATH];
++    if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL,
++        SHGFP_TYPE_CURRENT, programData) != S_OK)
++      return false;
++    UString parent(programData);
++    while (parent.Len() > 3 && parent.Back() == L'\\')
++      parent.DeleteBack();
++    // No UNC/device/relative paths, dot components, alternate streams or overflow.
++    if (!NName::IsDrivePath(parent.Ptr()) || parent.Len() <= 3
++        || parent.Len() + 1 + 14 + 1 + 36 >= MAX_PATH)
++      return false;
++    if (!ConvertStringSidToSidW(L"S-1-5-18", &_system)
++        || !ConvertStringSidToSidW(L"S-1-5-32-544", &_admins)
++        || !ConvertStringSidToSidW(
++            L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
++            &_trustedInstaller)
++        || !ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
++            SDDL_REVISION_1, &_security, NULL))
++      return false;
++    UString current(parent.Left(3));
++    if (!LockDirectory(current, false))
++      return false;
++    unsigned start = 3;
++    for (unsigned i = 3; i <= parent.Len(); i++)
++    {
++      const wchar_t ch = parent.Ptr()[i];
++      if (ch == L'/' || ch == L':')
++        return false;
++      if (ch != L'\\' && ch != 0)
++        continue;
++      const UString component(parent.Mid(start, i - start));
++      if (component.IsEmpty() || component.Back() == L'.' || component.Back() == L' ')
++        return false;
++      current = parent.Left(i);
++      if (!LockDirectory(current, false))
++        return false;
++      start = i + 1;
++    }
++    UString base(parent);
++    base += L"\\QTrade-Staging";
++    SECURITY_ATTRIBUTES attributes;
++    attributes.nLength = sizeof(attributes);
++    attributes.lpSecurityDescriptor = _security;
++    attributes.bInheritHandle = FALSE;
++    if (!CreateDirectoryW(base.Ptr(), &attributes) && GetLastError() != ERROR_ALREADY_EXISTS)
++      return false;
++    if (!LockDirectory(base, true))
++      return false;
++    for (unsigned attempt = 0; attempt != 8; attempt++)
++    {
++      GUID id;
++      WCHAR text[40];
++      if (CoCreateGuid(&id) != S_OK || StringFromGUID2(id, text, Z7_ARRAY_SIZE(text)) == 0)
++        return false;
++      UString candidate(base);
++      candidate += L'\\';
++      candidate += UString(text + 1).Left(36);
++      if (!CreateDirectoryW(candidate.Ptr(), &attributes))
++      {
++        if (GetLastError() == ERROR_ALREADY_EXISTS)
++          continue;
++        return false;
++      }
++      if (!LockDirectory(candidate, true))
++        return false;
++      dest = candidate;
++      return true;
++    }
++    return false;
++  }
++};
++
++#endif

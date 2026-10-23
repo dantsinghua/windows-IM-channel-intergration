@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "code": "UNAUTHORIZED",
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "\u7f3a\u5c11\u6216\u65e0\u6548\u7684 Bearer \u4ee4\u724c",
+    "reason": "bad_token",
+    "retryable": false,
+    "needs_human": false
+  },
+  "trace_id": "fixture-trace"
+}

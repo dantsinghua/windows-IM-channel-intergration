@@ -1,0 +1,335 @@
+{
+  "ok": true,
+  "agent": {
+    "version": "0.1.0",
+    "api_version": "1.0",
+    "uptime_s": 0,
+    "db_mb": 0.0,
+    "wal_mb": 0.53
+  },
+  "dockerd": true,
+  "winagent": {
+    "online": true,
+    "version": "fixture-wa",
+    "user_agent": false
+  },
+  "accounts": {
+    "running": 0,
+    "n": 0
+  },
+  "disk_free_mb": null,
+  "checks": {
+    "H13": "unknown",
+    "H02": "ok",
+    "H03": "ok",
+    "H04": "unknown",
+    "H05": "unknown",
+    "H06": "unknown",
+    "H24": "unknown",
+    "accounts": {}
+  },
+  "mem": {
+    "level": "unknown",
+    "avail_mb": null
+  },
+  "alerts": [],
+  "scheduler": {
+    "qidian_poll_all": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "qidian_login_probe": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "qq_login_probe": {
+      "interval_s": 1,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "qq_webui_expiry": {
+      "interval_s": 1,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "qidian_gaps_all": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "outbox_ws_retention": {
+      "interval_s": 3600,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "winagent_probe": {
+      "interval_s": 30,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "dockerd_probe": {
+      "interval_s": 30,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "h13_clock_sync": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "health_containers": {
+      "interval_s": 10,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "health_adb": {
+      "interval_s": 30,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "health_boot": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "login_remind": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "health_napcat": {
+      "interval_s": 15,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "health_wechat": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "wechat_slot_reaper": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "wechat_poll_all": {
+      "interval_s": 1,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "webhook_dispatch": {
+      "interval_s": 0.5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "disk_watermark": {
+      "interval_s": 15,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "pool_calibrate_drift": {
+      "interval_s": 300,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "retention_cleanup": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "db_backup": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "mail_inbound": {
+      "interval_s": 180,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "mail_outbound": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "mail_confirm_reaper": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "mail_route_secret_migrate": {
+      "interval_s": 300,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "settings_secret_migrate": {
+      "interval_s": 300,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "monitor_sample": {
+      "interval_s": 10,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "jobs_reclaimer": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "public_endpoint_probe": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "media_fetch": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "xunjia_inbox": {
+      "interval_s": 5,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    },
+    "catalog_publish": {
+      "interval_s": 60,
+      "runs": 0,
+      "skipped": 0,
+      "errors": 0,
+      "last_started_ms": null,
+      "last_finished_ms": null,
+      "last_error": null
+    }
+  }
+}

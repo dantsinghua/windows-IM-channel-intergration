@@ -1,0 +1,251 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  QTrade 测试虚拟机 —— Windows 11 无人值守应答文件【模板】
+
+  🔴 这是模板,不能直接用。里面的 {{...}} 占位符由 02b-制作应答ISO.ps1 在运行时替换,
+     生成的真文件写到虚拟机目录(默认 D:\HyperV\QTrade-Test\),【不进 git 仓库】。
+  🔴 管理员账号的密码由脚本运行时向安琳询问后写入,仓库里【不存任何密码】。
+
+  这份应答文件做的事:
+    · 全程中文(zh-CN),时区中国标准时间
+    · 自动分区(GPT:EFI 300MB + MSR 16MB + 剩余全给 C 盘)并自动选版本安装
+    · 跳过联机账号页与联网要求(BypassNRO),不建微软账号、不加入域
+    · 建一个本地管理员账号 {{ADMIN_USER}}
+    · 关闭首次登录动画
+    · 装机阶段写入 LabConfig 绕过键,作为 vTPM 不可用时的保险
+    · 首次登录后关闭休眠(省下与内存等大的 hiberfil.sys)、放开脚本执行策略、
+      建好 C:\QTrade-Test 目录给 04 脚本当落点
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- ================= 阶段 1:windowsPE(装机前) ================= -->
+  <settings pass="windowsPE">
+
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage>
+        <UILanguage>zh-CN</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>0804:00000804</InputLocale>
+      <SystemLocale>zh-CN</SystemLocale>
+      <UILanguage>zh-CN</UILanguage>
+      <UserLocale>zh-CN</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <!-- Windows 11 硬件检查绕过键:vTPM / 安全启动在家庭版 Hyper-V 上不保证可用时的保险。
+           若虚拟机已正常开出 vTPM,这几条写了也不影响。 -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>绕过 TPM 检查</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>绕过安全启动检查</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>绕过内存检查</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>绕过 CPU 检查</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>绕过磁盘容量检查</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+
+      <!-- 自动分区:整块虚拟磁盘按 UEFI/GPT 布局重建。
+           🔴 WillWipeDisk=true 会抹掉 DiskID 0 上的一切 —— 在虚拟机里这就是那块空的
+              120 GB 虚拟磁盘;绝不要把这份应答文件拿到物理机上用。 -->
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order><Type>EFI</Type><Size>300</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order><Type>MSR</Type><Size>16</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order><Type>Primary</Type><Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID><Label>System</Label><Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order><PartitionID>3</PartitionID><Label>Windows</Label><Letter>C</Letter><Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>{{IMAGE_NAME}}</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>QTrade Test</FullName>
+        <Organization>QTrade</Organization>
+        <ProductKey>
+          <Key>{{PRODUCT_KEY}}</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+      </UserData>
+
+      <EnableFirewall>true</EnableFirewall>
+      <EnableNetwork>true</EnableNetwork>
+    </component>
+  </settings>
+
+  <!-- ================= 阶段 2:specialize(首次配置) ================= -->
+  <settings pass="specialize">
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>{{COMPUTER_NAME}}</ComputerName>
+      <TimeZone>China Standard Time</TimeZone>
+    </component>
+
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+          <Description>跳过 OOBE 的联网要求(25H2 已移除 bypassnro.cmd,只能改这个键)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableFirstLogonAnimation /t REG_DWORD /d 0 /f</Path>
+          <Description>关闭首次登录动画</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <!-- ================= 阶段 3:oobeSystem(开箱体验) ================= -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>0804:00000804</InputLocale>
+      <SystemLocale>zh-CN</SystemLocale>
+      <UILanguage>zh-CN</UILanguage>
+      <UserLocale>zh-CN</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <NetworkLocation>Work</NetworkLocation>
+      </OOBE>
+
+      <!-- 本地管理员账号。密码为 base64 混淆形式(PlainText=false),
+           由 02b 脚本在运行时按安琳输入的密码生成。仓库里没有密码。 -->
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>{{ADMINISTRATOR_PASSWORD_B64}}</Value>
+          <PlainText>false</PlainText>
+        </AdministratorPassword>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{{ADMIN_USER}}</Name>
+            <DisplayName>{{ADMIN_USER}}</DisplayName>
+            <Description>QTrade 测试用本地管理员</Description>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>{{USER_PASSWORD_B64}}</Value>
+              <PlainText>false</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <TimeZone>China Standard Time</TimeZone>
+
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powercfg.exe /hibernate off</CommandLine>
+          <Description>关闭休眠,省下与内存等大的 hiberfil.sys</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>powershell.exe -NoProfile -Command "Set-ExecutionPolicy -Scope LocalMachine RemoteSigned -Force"</CommandLine>
+          <Description>放开脚本执行策略,便于后续测试脚本运行</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <CommandLine>cmd.exe /c md C:\QTrade-Test</CommandLine>
+          <Description>建好落点目录,04 脚本会把安装包拷到这里</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <CommandLine>reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /f</CommandLine>
+          <Description>清掉自动登录残留的密码值</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

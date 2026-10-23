@@ -1,0 +1,5 @@
+pyweixin (pywechat127) bundled for QTrade WinAgent user agent (WeChat 4.x UI automation, send path).
+Upstream : https://github.com/Hello-Mr-Crab/pywechat
+Commit   : 8589baa049bb91d3a500602c167f07b2f8397a13
+Fetched  : 2026-10-10T21:21:19.5506852+08:00
+License  : LGPL (see LICENSE); full upstream source shipped alongside in third_party/pywechat-src.

@@ -1,0 +1,44 @@
+{
+  "op": "vault_write",
+  "kind": "admin",
+  "danger": true,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "op": {
+        "type": "string",
+        "enum": [
+          "put",
+          "delete"
+        ]
+      }
+    },
+    "required": [
+      "name",
+      "op"
+    ]
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

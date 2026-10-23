@@ -1,28 +1,34 @@
 ---
 name: qtrade-redroid-resume
-description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 + 统一 RPA」项目(企点/QQ/微信三通道、WSL2+redroid+自编 binder 内核、单 EXE 离线安装)。新 session 接手本项目、或需要那套设计文档知识库时读本 skill。含设计文档索引、六轮评审决策脉络、企点读库(主库)/微信取钥/内核切换的实操指针、禁区与已踩坑。
+description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 + 统一 RPA」项目(企点/QQ/微信三通道、WSL2+redroid+自编 binder 内核、单 EXE 离线安装)。新 session 接手本项目、或需要那套设计文档知识库时读本 skill。项目**已离开设计阶段:全部部件已编码,正在做端到端验证与出包**——顶层目录 `src/`(Agent)+ `winagent/` + `console/` + `installer/`(含 `sfx-stub/`、`signing/`、`rootfs/`)+ `fieldtest/`(真机验收手册与本机测试虚拟机脚本)+ `tests/e2e/`(控制台↔真 Agent 联调)。含设计文档索引(裁决表至 R6-62)、决策脉络、企点读库(主库)/微信取钥/内核切换的实操指针、**出包 / 签名 / 真机验收 / 端到端联调**指针、禁区、多 agent 编排纪律,以及端到端测试揪出的「单测全绿 ≠ 装得上」教训与当前待办。
 ---
 
 # QTrade redroid 多实例 IM 控制台 —— 工作交接 / 断点续接
 
-> 2026-09-19 创建、当日多次更新(最新:**R6-38~R6-42 收第七轮 cursor 评审(终审 REVISE×4→ACCEPT);R6-43~R6-46 企点消息类型路由 + `[图片]`/`[表情]` 占位(终审 REVISE×3→ACCEPT)**,详见 §5 顶部「🔴 最新状态」)。这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读桌面知识库。
+> 🔴 **头等规范(安琳 2026-09-19 定,优先级高于本文其它一切)**:**所有思考与所有交流一律使用中文**——工具输出/代码/报错是英文也不切换;标识符、命令、路径、错误原文原样保留,说明用中文。此规范同时钉在仓库 `CLAUDE.md`(project scope)、`~/.claude/CLAUDE.md`(user scope)与项目 memory 目录(随仓库快照 = `reference/zh-only-rule.md`);换机器接手时先把三处带过去。
+
+> 2026-09-19 创建,**2026-09-21 最近更新**。**项目阶段已变:从「设计 + 分批编码」进入「全部部件已编码,正做端到端验证与出包」。**
+> 顶层目录现在是:`docs/`(设计文档)、`src/qtrade_agent/`(Agent)、`winagent/`、`console/`、`installer/`(内含 `sfx-stub/` 自编 SFX 存根、`signing/` 代码签名工程、`rootfs/` 发行版构建工程、`out/` 产物)、`fieldtest/`(真机验收手册 + `vm-lab/` 本机 Hyper-V 测试虚拟机脚本)、`tests/e2e/`(控制台↔真 Agent 联调与形状对账)。
+> **一句话现状**:13 项载荷齐全的正式包**出过一版**,但随后的端到端测试证明那一版**装上必定起不来**;缺陷已修、**修复后的包还没重出**,真装验证尚未开始。详见 §5「🔴 最新状态」。
+> 裁决表已到 **R6-62**;此前 R6-58/R6-59 = 第五批接线与验收,R6-51~R6-57 = 前四批的编码口径与独立验收,R6-47~R6-50 收第八轮 cursor 评审 8.4/10,R6-38~R6-46 收第七轮 + 企点消息类型路由。
+> 这是**独立于 ibquote(南银报价平台)** 的另一个项目。接手先读本文件全部,再按需读 `docs/`。
 > ⚠️ 本 skill 是**入口与指针**,不复述文档内容 —— 每个主题都指向"看哪个文件的哪一节",省 token。
 
 ## 🧳 跨机器迁移(换一台机器接手本项目时先读这一段)
 
 本文件是在**安琳的原机(WSL2 box,redroid 容器 + 企点/微信 RPA 就跑在这台)**上写的,里面有大量本机绝对路径。搬到别的机器时,先分清哪些跟着走、哪些留在原机:
 
-- **✅ 跟着 GitHub 走(别的机器要的就是这些)**:设计文档 = 私有仓库 **`git@github.com:dantsinghua/windows-IM-channel-intergration.git`**(分支 `main`),文档在克隆目录的 `docs/` 下。**本 skill 与两份核心记忆已一并提交进该仓库的 `.claude/skills/qtrade-redroid-resume/`**(`SKILL.md` + `reference/*.md`),所以 `git clone` 一次就全拿到。文中凡写 `Desktop\work\docs\` 的,在别的机器一律理解为 **`<你的克隆目录>/docs/`**。
+- **✅ 跟着 GitHub 走(别的机器要的就是这些)**:设计文档 = 私有仓库 **`git@github.com:dantsinghua/windows-IM-channel-intergration.git`**(分支 `main`),文档在克隆目录的 `docs/` 下。**本 skill 与五份记忆/教训快照已一并提交进该仓库的 `.claude/skills/qtrade-redroid-resume/`**(`SKILL.md` + `reference/*.md`);仓库根另有 `HANDOFF.md`(第一入口)、`README.md`(目录地图)、`CLAUDE.md`(项目级规范),所以 `git clone` 一次就全拿到。文中凡写 `Desktop\work\docs\` 的,在别的机器一律理解为 **`<你的克隆目录>/docs/`**。
 - **⛔ 只在原机、搬不走(除非你要在新机上真跑 redroid/RPA)**:`~/work/xunjia-agent/`(企点 RPA 七件套、`echo_loop_maindb.py`、`qidian_msgdata_decode.py`)、`~/work/qtrade-redroid-installer/{kernel,rootfs}`(自编内核、redroid rootfs)、`/mnt/c/.../weChatlog/`(微信取钥工具)、`~/.claude/projects/-home-anlin-work-qtrade-ibquote/memory/`(全部记忆原件)。**只想续设计/评审工作 → 这些全不需要**;要在新机真跑收发,得先把整套 WSL2+redroid+内核环境复刻过去,那是另一件事,不在本 skill 范围。
 - **别的机器上装本 skill,三选一**:
   1. **仓库内自动加载(最省事)**:`git clone` 后,在克隆目录里开 Claude Code —— `.claude/skills/qtrade-redroid-resume/` 会作为**项目级 skill 自动被发现**,`/qtrade-redroid-resume` 直接可用,无需复制。
   2. **装成全局 skill**:把克隆目录里的 `.claude/skills/qtrade-redroid-resume/` 整个复制到新机的 `~/.claude/skills/`(Windows 原生 Claude Code 是 `%USERPROFILE%\.claude\skills\`),任意目录都能 `/qtrade-redroid-resume`。
-  3. **只要内容不要 skill 机制**:直接读克隆目录里的 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文 + `reference/` 两份,再读 `docs/`。
-- **记忆**:随仓库带过去的是 `reference/design-doc-consistency-lessons.md`(多 agent 写文档的一致性教训)与 `reference/qidian-read-via-db.md`(企点读库正线/延迟/消息类型的实测结论)两份**快照**;新机上它们不是「活记忆」,是随本 skill 的参考件。原机的活记忆仍在 ibquote memory 目录、随本项目继续更新。
+  3. **只要内容不要 skill 机制**:直接读克隆目录里的 `.claude/skills/qtrade-redroid-resume/SKILL.md` 全文 + `reference/` 五份,再读 `docs/`。
+- **记忆**:随仓库带过去的是 `reference/` 下**五份快照** —— `zh-only-rule.md`(中文头等规范)、`design-doc-consistency-lessons.md`(多 agent 写文档的一致性教训)、`qidian-read-via-db.md`(企点读库正线/延迟/消息类型的实测结论)、**`e2e-lessons-2026-09-21.md`(端到端教训)**、**`orchestration-discipline.md`(多 agent 编排纪律)**;新机上它们不是「活记忆」,是随本 skill 的参考件。原机的活记忆仍在两个 memory 目录里、随本项目继续更新(见 §6)。
 
 ## 0. 项目一句话
 
-给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**目前是详细设计阶段(R6-38~R6-42 已收第七轮 cursor 评审 7.8/10,五轮只读终审末轮 ACCEPT;此前:六轮回改 + 第七轮 cursor 复评已闭环:R6-36「读取正线改主库」的邻表半改由 §15g R6-37 收口、独立只读终审两轮判 ACCEPT/可开工基线、评审提的边缘风险已补),尚未进入编码;企点收发已真机验证。**
+给交易/资金团队做的**多通道 IM 自动化控制台**:一个 Windows 单 EXE 离线安装 → WSL2 + 自编 binder 内核 + redroid(Docker 里的 Android 11)跑**企点/QQ**、Windows 侧跑**微信 PC**,统一 RPA 收发消息、邮件摆渡驱动、多账号管理。**2026-09-21 现状:全部部件已编码。** 仓库里 `src/qtrade_agent/`(Agent,五批:store / 企点读库 / 总线 + 安全闸 / scheduler / api / runtime / pool / 账号生命周期 / 健康循环 / WinAgent 客户端 / mail / QQ / 微信 / 横切基础设施)、`winagent/`(服务 + 会话代理两进程)、`console/`(Electron 控制台)、`installer/`(Inno 引擎 + 自编 SFX 存根 + rootfs 构建 + 签名工程 + 载荷总装)、`fieldtest/`(真机验收手册 + 测试虚拟机脚本)、`tests/e2e/`(控制台↔真 Agent 联调)全部在位,五套测试实跑全绿(条数见 §5)。**但**:正式包出过一版后被端到端测试证明「装上必定起不来」,缺陷已修、包未重出、真装验证尚未开始(见 §5「🔴 最新状态」)。真机接入(redroid / RPA 执行层 / 真 docker·adb 后端)仍只在安琳原机,开发容器里一律假后端;企点收发已真机验证。此前脉络:R6-47~R6-50 收第八轮 cursor 评审 8.4/10,R6-38~R6-46 收第七轮评审与企点专项,R6-1~R6-37 六轮回改与终审。**
 
 - 🔴 **设计文档唯一的源(2026-09-19 夜安琳定;改这里、读这里)**:`/mnt/c/Users/anlin/Desktop/work/docs/`(= `C:\Users\anlin\Desktop\work\docs\`)。它所在的 `Desktop\work\` 是 git 仓库,远端 = **`git@github.com:dantsinghua/windows-IM-channel-intergration.git`(私有,分支 `main`)**;**每轮改完:跑对账脚本 → `git add -A && git commit` → `git push`**。提交身份只在该仓库本地配置(`dantsinghua` + GitHub noreply 邮箱),没动全局 git 配置。
 - ⛔ **已停止维护、不要再改也不要再同步**:WSL 的 `~/work/qtrade-redroid-installer/docs/design/`(内容停在 R6-46、与 GitHub 首个提交 `a2e93ee` 逐文件一致,放了一份「⛔已迁移」说明;文件未删,只作历史留底)。原桌面知识库 `Desktop\QTrade详细设计-20260918\` **已被安琳挪进 `Desktop\work\docs\`、原路径不存在了**——本文件下面凡写「桌面知识库 / 桌面副本 / cp 回桌面」的旧句,一律理解为 `Desktop\work\docs\`。
@@ -35,15 +41,16 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 | 序 | 文件 | 读它解决什么 |
 |---|---|---|
-| **先读** | `00-共享基线与口径.md` (v1.3 + §15g 增补) | 术语/拓扑/端口/目录/配置/ID/数据模型/状态机/枚举/表名/页面ID/**红线§11**/**§14 拍板**/**§15~§15g 六轮回改+第七轮复评裁决表(R-*~R6-37)** |
-| 1 | `02-后端与本地数据库设计.md` (v0.4.5) | Agent/WinAgent 模块、SQLite 两库全部 DDL、`/api/v1`+`/wa/v1` 端点、并发规约、IPC 契约 |
-| 2 | `01-控制台前端设计.md` (v0.4.5) | Electron 三进程、页面/元素 ID 唯一出处、testid、事件→UI |
-| 3 | `03-安装引导与自动化配置.md` (v0.4.5) | 单 EXE 离线打包、环境矩阵、内核切换与回滚、微信版本匹配/重装、退出码 |
-| 4 | `04-系统监控与本地网络.md` (v0.4.5) | 健康项、连通性探测、WSL⇄Windows 网络、`.wslconfig` 十一键、防火墙 |
-| 5 | `05-账号配置与多账号管理.md` (v0.4.6) | 三通道首登、DPAPI Vault、多账号切换、微信单在线、**企点读取=旁路读库(§非frida)**;§2.1.1 ⑪a **企点 `self_uid` = 登录 uin(纯数字)**(R6-39) |
-| 6 | `06-邮件摆渡与消息存取.md` (v0.4.6) | 邮件收发/模板/去重、消息本地存取、**企点旁路读库 §2.9.5(主库;🔴 R6-38~R6-42 重写:`poll_maindb` 伪代码=表发现+bootstrap+历史闸+水位自检+掉线续读、`check_group_gaps` 群缺口、发送确认阻塞语义)**、30天保留 |
-| 附 | `07-配置项总表.md` (v0.2) | 约130键跨册对账基准(owner/默认/消费方) |
-| 附 | `check-truth-tables.py` | **真值表对账器,改完必跑**(FORBIDDEN/PAIRED/ENUM/STATUS/KEYNAME/COPYABLE/MIRROR/**⑨DYNAMIC=值集合从owner册现读**/**⑩VALUE=企点确认窗≥15000 且 02↔07 同值**/版本;**73 条规则**(R6-37 `qdidx:`/`c4ext1`;R6-38~R6-41 新增索引库列名、L2 二选一、`.backup`、6 字节密钥、`poll` 无参签名、`ingest` 两元组、新码/新键登记等;**每条新规则都在改前备份上反向验证过能红**);`python3 check-truth-tables.py`,退出0=全绿 |
+| **先读** | `00-共享基线与口径.md` (v1.3 + §15g 增补) | 术语/拓扑/端口/目录/配置/ID/数据模型/状态机/枚举/表名/页面ID/**红线§11**/**§14 拍板**/**§15~§15g 裁决表(R-*~**R6-62**;R6-47~R6-50 = 第八轮评审收口,R6-52/54/56 = 代码二~四批的编码口径,R6-51/53/55/57 = 四批独立验收收口,R6-58 = 第五批接线的 116 条口径一次回写、R6-59 = 第五批独立验收收口,**R6-60/61/62 = 2026-09-21 端到端阶段新增**——R6-60 首启先 `--init-db` 后启用服务 / 机型档案字段 `profile_key` / 体积按实测,R6-61 `--init-db` 退出码 0/2/3/4/5,R6-62 WS 鉴权失败先 accept 再 close(4401) / 成功响应带 `trace_id`(#72 免鉴权摘要例外)/ API 版本 1.0 / 幂等键在 body / 业务结果码 = 200 + `ok:false` + 完整 `CommandResult` / `agent_probe_enabled` 缺省 false)** |
+| 1 | `02-后端与本地数据库设计.md` (v0.4.14) | Agent/WinAgent 模块、SQLite 两库全部 DDL、`/api/v1`+`/wa/v1` 端点、并发规约、IPC 契约;**代码直接对着写的段**:§2.2.2 bus 七段流水/登录门/安全闸、§2.2.4 runtime、§2.2.5 pool + 内存水位、§2.2.7 events、§2.5 WinAgent 契约、§2.6 恢复 + `error_since_ms` 两个动作、§2.8 入库/去重/合并、§3.1 DDL(逐字抽成 `schema_agent.sql`)、§3.4 端点(#1~#23 已带 R6-54/56/57 口径)、§3.7 告警码、§7.1 配置 |
+| 2 | `01-控制台前端设计.md` (v0.4.11) | Electron 三进程、页面/元素 ID 唯一出处、testid、事件→UI(**`console/` 已按本册全量实现**) |
+| 3 | `03-安装引导与自动化配置.md` (v0.4.9) | 单 EXE 离线打包、环境矩阵、内核切换与回滚、微信版本匹配/重装、退出码 |
+| 4 | `04-系统监控与本地网络.md` (v0.4.8) | 健康项(H02/H03/H04/H05/H06/H13 已编码,`[health]`/`[monitor]` 键是 owner)、连通性探测、WSL⇄Windows 网络、`.wslconfig` 十一键、防火墙 |
+| 5 | `05-账号配置与多账号管理.md` (v0.4.10) | 三通道首登(§2.1.1 冷启动全序已编码到 ⑤b,⑥~⑪ 以 `login_fn` 回调代替)、DPAPI Vault、多账号切换、微信单在线、§2.5.4 掉线(已编码)、§2.5.5 账号级设置(#22 已编码)、§7 `[accounts]` 是 owner;**企点读取=旁路读库(§非frida)**;§2.1.1 ⑪a **企点 `self_uid` = 登录 uin(纯数字)**(R6-39) |
+| 6 | `06-邮件摆渡与消息存取.md` (v0.4.8) | 邮件收发/模板/去重(未编码)、消息本地存取、**企点旁路读库 §2.9.5(主库;`poll_maindb` 伪代码=表发现+bootstrap+历史闸+水位自检+掉线续读、`check_group_gaps` 群缺口、`ensure_root` 三步、发送确认阻塞语义——全部已编码)**、§2.9.2 `norm`/`fingerprint`、§2.12 出向合并、30天保留 |
+| 附 | `07-配置项总表.md` (v0.3.1) | 约130键跨册对账基准(owner/默认/消费方) |
+| 附 | `check-truth-tables.py` | **真值表对账器,改完必跑**(FORBIDDEN/PAIRED/ENUM/STATUS/KEYNAME/COPYABLE/MIRROR/**⑨DYNAMIC=值集合从owner册现读**/**⑩VALUE=企点确认窗≥15000 且 02↔07 同值**/版本;规则数以实跑为准(2026-09-20:FORBIDDEN 38 / PAIRED 30 / COPYABLE 3 / MIRROR 6 / DYNAMIC 3 + KEYNAME/ENUM/⑩ VALUE/⑪ NORM/⑫ LITERAL;PAIRED 17→30 的每条都在改前备份或「抹掉登记行」副本上反向验证过能红;⚠️ 含否定词的规则会被行级 NEGATION 整行吞掉——⑫ LITERAL 因此单列);`python3 check-truth-tables.py`,退出0=全绿 |
+| 代码 | `src/qtrade_agent/` + `tests/`;`winagent/`;`console/`;`installer/`;`fieldtest/`;`tests/e2e/` | **全部部件已在位**(2026-09-19~21)。模块 ↔ 规格段落见 §5「🔴 代码现状总表」;根仓 `tests/test_*.py` = 开发者测试,`tests/acceptance/test_spec_*.py` = 独立验收(每份由只读规格、不看开发者测试的子 agent 撰写),`tests/e2e/` = 控制台↔真 Agent 联调与形状对账;`tests/test_docs_consistency.py` 把代码与文档对账(含 `schema_agent.sql` 与 02 §3.1 sql 块**逐字**相等)。**跑法与条数见 §5「跑哪五套」——数字一律以你跑那一刻为准,别拿本文的当断言** |
 
 ⚠️ **没有「同步副本」了**:唯一的源是 `Desktop\work\docs\`(见 §0),改完跑对账脚本、提交、推送。该目录在 Windows 盘上(`/mnt/c`),**不是 git 之外还有一份备份**——每轮改前仍先 `cp` 一份到 scratchpad 供只读终审 diff,但真正的还原点现在是 git 历史(`git diff` / `git checkout -- <file>`)。
 
@@ -67,19 +74,192 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 | **企点读消息(实时)** | **主库** `{uin}.db`:参考实现 `~/work/xunjia-agent/relay/side_a/echo_loop_maindb.py` 的 `query()`;规格 06 §2.9.5(**R6-36 已改主库**) | 会话分表 `mr_friend_{MD5(对端uin)大写}_New`/`mr_troop_{MD5(群号)大写}_New`;`msgData/senderuin/frienduin` 逐字节 **XOR,密钥 = ASCII 字符串 `b"02:00:00:00:00:00"` 的 17 字节循环(`in[i]^KEY[i%17]`;🔴 不是 6 个原始字节——R6-39 勘误,按 6 字节解出来全是乱码)**;游标=各表 `_id`;延迟 **2~12 s**(见 §5);**前置=先 `ensure_root`**;零attach零崩溃、`.backup` 只读副本 |
 | **企点读消息(历史/全文兜底)** | 索引库 `{uin}-IndexQQMsg.db`:`db_reader.py`(Base64、单表 `IndexContent_content`、单 `docid` 水位) | **滞后 13~36 s、只索文本**,不做实时正线(R6-36);只作历史回填/全文检索 |
 | **微信取钥** | `/mnt/c/Users/anlin/Desktop/盈米/蜂鸟项目/南银理财/weChatlog/` (chatlog + wx_key DLL) | 三段固定序:起hook→点图片(img_key)→退出重登(data_key),两钥同轮才落盘;详见 [[wechat-pc-install-facts-2026-09-18]] |
-| **改设计文档** | 改 `/mnt/c/Users/anlin/Desktop/work/docs/` → 跑 `check-truth-tables.py`(在该目录里跑)→ `git commit` → `git push` | 新裁决追加到基线 §11 末尾、引用写"§11.N [锚名]";别插中间(会导致编号漂移) |
+| **改设计文档** | 改 `<克隆目录>/docs/`(原机 = `/mnt/c/Users/anlin/Desktop/work/docs/`)→ 在 `docs/` 里跑 `python3 check-truth-tables.py`(exit 0)→ 仓库根 `python3 -m pytest -q`(代码↔文档对账也在里面)→ `git commit` → `git push` | **新裁决追加到基线 §15g 末尾、编号续 R6-N**(红线条款才追加到 §11 末尾、引用写"§11.N [锚名]");都别插中间(会导致编号漂移);新增脚本规则须在改前备份上反向验证能红;编码口径裁决(R6-52/54/56 这类)写前**先 grep 同册通用段与 owner 册**(R6-53/R6-57 各抓过一次自己与 owner 打架) |
+| **改代码 / 跑单测** | 仓库根 `python3 -m pytest -q`(需 `pytest`、`pytest-asyncio`,`requirements-dev.txt`;`pythonpath=src` 与 `asyncio_mode=auto` 在 pyproject.toml;远程容器由 `.claude/hooks/session-start.sh` 自动装);`tests/test_docs_consistency.py` 把代码与文档对账(配置默认值 = 02 §7.1 / 04 §7 / 05 §7、schema 文件 = 02 §3.1 sql 块、`norm` 函数体 = 06 §2.9.2、端口表、`used` SQL、`error_since_ms` SQL) | 代码以文档为准;改表先改 02 再重新抽 `schema_agent.sql`(抽取方式写在文件头);**开发容器里一律假后端**:`tests/conftest.py::make_rig(tmp_path, cfg=, clock=, login_fn=, aligner=, wsl_total_mb=)` 装配 `FakeContainers`/`FakeAdb`/`FakeVault`/`FakeWinAgent`/`FakeFs`,`Clock(auto_step_ms)` 可拨时钟;真机执行层(点发送键 / 装企点 / 填登录)以 `sender`、`login_fn` 回调注入,缺省未接 |
+| **每批交付后的独立验收** | 起一个后台子 agent:只给规格段落行号 + 夹具接口(不许读 `tests/test_*.py` 与实现函数体),写 `tests/acceptance/test_spec_<批次>.py`,失败不改 `src`、原样报回;总控逐条分诊「实现缺陷 / 用例误读 / 规格问题(两册不一致 / 未钉 / 自引用)」,措辞收口进 §15g 新裁决、改行为的修复同一提交 | 五轮验收的产出比例:实现缺陷少、用例误读多、规格张力每轮 7~20 条;**验收撰写者的报告里「疑似规格自相矛盾」一栏最值钱**,逐条落裁决 |
+| **起服务(真机)** | `python3 -m qtrade_agent.main --config /etc/qtrade/agent.toml --db /var/lib/qtrade/agent.db`(uvicorn `ws="websockets"`);先 `Store.upsert_api_client(app_id="console", level="admin", token=…)` 建控制台令牌 | 不注入假后端时用 `DockerCliBackend`/`AdbCliBackend`(只包命令行,**没在真机跑过**)、`WinAgentVault` + urllib;`/etc/qtrade/winagent.token` 缺失只会让 WinAgent 探测记离线、不阻塞;`resource_pools(wsl).total_mb` 首建取 `/proc/meminfo MemTotal` |
+| **出包(单 EXE)** | `installer/build/README.md`(载荷 13 项、四道门 G1/G1b/G2~G5、M0 真机验证清单)+ 原机 `.omc/handoffs/packager-2.md`(精确命令、校验判据、产物指纹)与 `payload.md`(载荷来源与 sha256) | 产物根 `C:\Users\anlin\qtrade-payload\`(原机);**出包前先 `rm -rf build/`**(setuptools 增量缓存);正式包判据 = manifest `lightweight=false` + `missing` 空 + `7z t` `Everything is Ok`;🔴 **绝不运行**产出的 EXE |
+| **发行版 rootfs 构建** | `installer/rootfs/README.md` + `build-rootfs.sh` / `Dockerfile` / `files/`(firstboot、systemd 单元、机型档案库) | 🔴 docker 纪律:只 `build/create/export/save/pull`、`qtrade-build/` 前缀、**绝不碰现有 12 个容器**;当前有 6 项待修,见 §5「下一步」 |
+| **代码签名** | `installer/signing/`(`New-QtSelfSignedCert.ps1` / `Invoke-QtSign.ps1` / `Import-QtCodeSigningCert.ps1`)+ 原机 `.omc/handoffs/signing.md` 末尾的命令清单 | 现阶段 = **自签名**(将来换公司 CA 或 OV);`build.ps1 -Sign -CertThumbprint …`;**尚未真执行过**,生成证书要先经安琳点头 |
+| **真机验收(物理机)** | `fieldtest/真机验收手册.md`(目标机要求、17 项改动清单、A~I 九组 51 条用例、排障与回滚)+ `fieldtest/collect-evidence.ps1`(只读取证) | 主方案 = **另一台 Windows 物理机**(待安琳提供);§1.4「先导入证书」待签名版出包后补 |
+| **本机测试虚拟机(备选)** | `fieldtest/vm-lab/README.md`(只读体检 / DISM 逐包启用与对称撤销 / 建 Gen2 虚拟机 / 无人值守 ISO / 快照回滚 / PowerShell Direct 送包) | 启用 Hyper-V 须**重启主机一次**,会中断 WSL 内 12 个容器 ⇒ **必须先由安琳决定何时重启**,脚本一律打印命令等确认、绝不自动重启 |
+| **端到端联调(控制台 ↔ 真 Agent)** | `tests/e2e/`(`serve_fake_agent.py` 起全假后端真 Agent、`shape_audit.py`/`shape_diff.py` 逐端点形状对账、`console-real/` 验收用例、`test_admin_line.py`)+ 原机 `.omc/handoffs/e2e-console-agent.md`、`e2e-recheck.md` §7「复跑方式」 | 🔴 **前端不许只对着自己的 mock 验**(教训见 `reference/e2e-lessons-2026-09-21.md`);判定一律按 `docs/` 规格,不按 mock |
+| **看端到端踩过的坑** | `reference/e2e-lessons-2026-09-21.md`(11 条:现象 / 为什么单测看不见 / 怎么防) | 开工前读一遍,能省一轮返工 |
 
 ## 4. 🔴 禁区(违反会出大事)
 
 - ❌ **绝不自行** `wsl --shutdown` / 重启 WSL / 重启 docker 容器 —— 会中断安琳的登录态和其它工作负载(Dify/MySQL/GaussDB 等 12 个容器都在同一 WSL)。要重启先明示、等确认。
 - ❌ **绝不动** `~/.config/frp` frpc、不改 FlClash 配置(飞连/OpenVPN 可调)。
-- ❌ 企点/微信是**真实工作账号**:任何**会离开本机**的动作(发消息/加好友/进退群/改资料)—— **有指令且对象内容逐字给定→复述即发;需要推断→复述后等回话;碰红线(价格/成交)→无论如何等回话**。判据=出不出这台机器。
+- 企点/微信是安琳自己的账号。询价回复由 Dify 生成后，经公网信箱交采集端发出，不再逐条等安琳确认。加好友、进退群、改资料仍只在安琳明确指令时做。成交词仍由红线闸拦截，不自动成交。
 - ❌ 企点主进程**在翻译层下对 frida 重负载极脆弱**(广谱hook/全量堆扫崩过两次)—— 读消息一律走**旁路读库**(主库 `echo_loop_maindb.py` 的 `query()`;frida 不在读取链),别 attach 进程。
 - ⚠️ 内核崩溃转储:v2 关机根因=`CONFIG_VIRTIO_VSOCKETS=y` 抢 vsock;改内核配置前必查 vsock 三项与现役 v3 一致。
 
-## 5. 当前进度与下一步(2026-09-19 更新至 R6-37 收口 + 边缘风险已补)
+**2026-09-21 端到端/出包阶段新增(同样是硬禁区)**:
 
-### 🔴 最新状态(2026-09-19 晚,接手先读这一段;下面「已完成/挂着的」是更早的记录)
+- ❌ **真机 `C:\ProgramData\QTrade` 在非真装期间必须不存在**。跑 WinAgent 测试、构建、出包前后都要验 `Test-Path` 为 `False`;
+  **一旦出现就说明有东西在往生产目录写**(踩过:`--dev` 靠平台巧合"自包含",真 Windows 上把 `FakeCrypto` 假熵写进了生产熵文件位置、ACL 全开)。发现即停下查落点,别顺手删了当没事。
+- ❌ **未经安琳同意,绝不运行**产出的安装 EXE(`installer/out/QTrade-Setup-*.exe`)、引擎 EXE、WinAgent exe。
+  校验只做 `7z t` / `7z l` / sha256 / manifest 判据这类**不执行**的检查。
+- ❌ **`qtrade-redroid` 容器里跑的是真实工作账号(企点)**:任何 agent **不得对它发 adb 命令**(含 `adb shell`、`input`、`uiautomator dump`、截图)。
+  真机 profile 采集、UI 验证用例 R-1~R-12 仍按安琳指定的时机做。询价回复由 Dify 经公网信箱发到已接入的企点会话，不再逐条等确认。
+- ❌ docker 只允许 `build/create/export/save/pull`,镜像与容器一律 `qtrade-build/` 前缀;**绝不碰现有 12 个容器**、绝不 `docker system prune`。
+- ❌ 启用 Hyper-V / 任何需要重启主机的动作:**打印命令、说明影响面、等安琳确认**,绝不自己执行(重启会中断 WSL 内全部容器)。
+
+## 5. 当前进度与下一步(2026-09-21:端到端验证与出包阶段)
+
+### 🔴 最新状态(2026-09-21 清晨;接手**先读这一段**)
+
+**安琳要的终点** = 一个**能装、装完各功能能用**的单 EXE 安装包,且**须经端到端验证**。
+
+- **分支** `claude/lucid-dijkstra-uu5max`,**未合 `main`**。GitHub 远端停在 `c3e657b`,本地有一批提交未推 —— 2026-09-21 07:25 实查为 **ahead 6**(`d374f00` 文档第五轮收口、`85b02e1` 后端第三批、`dea4ae5` 控制台第二批、`c6da639` 注释订正、`c9e6f34` `[probe] agent_probe_enabled`、`2d65b48` 文档终审第六轮收口),**当时仍有 agent 在陆续提交,接手时以 `git status -sb` + `git log --oneline` 实查为准**;待文档第七轮终审 ACCEPT、全套复跑全绿后一起 push。
+- **出过一版正式包**:`installer/out/QTrade-Setup-1.0.0.exe`,**2,258,242,349 B**,sha256 `11060a07…64ecd5a8`,13 项载荷齐全、**未签名**、**从未在任何机器上运行过**。
+- 🔴 **但那一版装上必定起不来**:随后的三轮端到端测试揪出首装 P0(首启脚本调的 `--init-db` 参数当时不存在)与「控制台连真后端一条请求都发不出」。**这两类问题已修,修复后的包还没重出**;**真装验证尚未开始**。
+- **文档**:裁决表到 **R6-62**,只读独立终审已跑**六轮**(每轮 REVISE 的新问题都出自上一轮新写的句子),第六轮只剩两句在收口,改完再起第七轮。对账脚本 exit 0。
+
+**跑哪五套(实跑数字,2026-09-21 07:20~07:23 CST;🔴 以你跑那一刻为准——此刻仍有 agent 在改 `docs/`、`console/`、`src/`)**:
+
+| 命令 | 本次实跑 |
+|---|---|
+| `~/.venvs/qtrade/bin/python -m pytest -q`(仓库根) | **2136 passed**(5 分 05 秒) |
+| `cd winagent && ~/.venvs/qtrade/bin/python -m pytest -q` | **329 passed**(真 Windows 上同样 329) |
+| `~/.venvs/qtrade/bin/python -m pytest -q installer/tests` | **122 passed**(另有 Windows 侧 Pester 633,须在 Windows 跑 `installer/tests/run-pester.ps1`) |
+| `cd docs && python3 check-truth-tables.py` | **exit 0**(「真值表全部一致」) |
+| console:先 `rsync -a --exclude node_modules --exclude dist console/ ~/work/qtrade-build/console/`,在那边 `npm test` | **151 passed** |
+
+**各部件现状(✅ 已验证 / 🟡 有代码未真机验 / 🔴 已知不可用)**
+
+| 部件 | 现状 |
+|---|---|
+| Agent `src/qtrade_agent/` | ✅ 全量 pytest 全绿。`docs/02` §3.4 的端点已全部注册(三批共补 25+ 个);**无执行体的(画面流 #34/#35、ASR #53、企点登出、企点截图)如实回 503/409 + reason,不伪造数据**;`--init-db` 已实现(退出码 0/2/3/4/5);H02/H03 告警已接。 |
+| 企点通道 | 🟡 读库正线 + UI 执行层 `adapters/qidian/ui.py` 已接线,**只在全假后端测过**。🔴 默认 profile 里 **13 个控件 id 与全部文案锚点是推测**,须真机 `uiautomator dump` 后另存专用 profile 才能用(禁区:不得擅自对真实工作账号发 adb)。 |
+| QQ 通道 | 🟡 OneBot WS、推型入库、`get_msg` 读回、H08 已有;二维码转发与 WebUI 开关未做(NapCat 接口名须实机核对)。 |
+| 微信通道 | 🟡 Agent 半(适配器、槽位状态机、登录流)已有;WinAgent 半的 Win* 真实现(chatlog 托管、取钥、pyweixin 写)**从未碰过真微信**。 |
+| WinAgent `winagent/` | ✅ Linux 与**真 Windows 均 329 全绿**(`--dev` 自包含缺陷已修,跑测期间 `C:\ProgramData\QTrade` 零写入)。`winagent/README.md` §4 的 38 条真机项未验。 |
+| 控制台 `console/` | ✅ typecheck / lint / 151 单测 / build 全过;**用控制台客户端源码直连真后端(全假件)**自测通过。独立复测 `tests/e2e/console-real` 73 条里 71 绿(2 红:一条已由控制台第二批修待复测、一条按裁决应改用例断言)。Playwright e2e 未写。 |
+| 安装器 `installer/` | ✅ Pester 633 + 对账 122 全绿;Inno 引擎真编译 0 error;自编存根 `QTradeSD.sfx` 真编译并经哑 EXE 实测(InstallPath 留存、退出码 26/3010 透传、`requireAdministrator` 清单)。签名工程已入库(自签名阶段)但**尚未真执行**。🔴 `installer/rootfs/` 有 6 项待修(见「下一步」)。 |
+| 真机验收 `fieldtest/` | 🟡 手册(A~I 九组 51 条)+ 只读取证脚本 + 本机 Hyper-V 虚拟机脚本齐备,**一条都还没在真机跑过**。 |
+| 设计文档 `docs/` | ✅ 裁决表 R6-62,对账脚本 exit 0;终审第七轮待起。 |
+
+### 🔴 端到端测试揪出的缺陷 —— 本会话最大的教训
+
+**「四套单测全绿」只说明各部件内部自洽。** 下面这些在单测里一条都看不见,全靠端到端跑真东西才暴露(**全部已修**,除标注外):
+
+1. **跨部件接缝没人对账**:首启脚本调 `python -m qtrade_agent.main --init-db`,而 Agent 根本不认这个参数 ⇒ **首装必断**(`864db87`)。同类:企点 UI 执行层写完了但生产入口是 `sender=_sender_not_wired`,**根本没接线**(`2accdcb`)。
+2. **前端对着自己的 mock 开发 = 自证**:控制台写死 `X-QT-Api-Min: 1.3`(现行 1.0)⇒ 每个请求 426;幂等键放请求头(应在 body);HTTP 200 + `ok:false` 的业务结果被当异常吞;`CommandResult` 被拆;WS 4401 客户端只见 1006。**mock 是前端「以为」的后端**,151 条前端单测全对着它跑。
+3. **构建不报错,但产物是坏的**:①归档 >2 GB 时 PowerShell `ReadAllBytes` 抛错,而存根与配置已写入 ⇒ 留下「能双击、解压必炸」的 209 KB 残次品;②`manifest.rootfs_contents` 恒为空 ⇒ 镜像完整性复核**静默失效**,两轮出包都「成功」过;③`setuptools` 的 `build/lib/` 增量缓存让打包自检**假绿**(反向验证删掉声明照样全绿);④`| Out-Null` 吞掉 PS 5.1 原生命令的失败,装依赖失败表现成后一步莫名其妙的 `No module named pytest`。
+4. **写了但不生效 / 不可见**:`StartLimitIntervalSec` 写在 `[Service]` 段被 systemd 忽略(**尚未修**);H02/H03 只改内存不发告警 ⇒ `checks=firing` 而 `alerts` 空,控制台/事件/webhook 三处都收不到。
+5. **只在一个平台跑过**:WinAgent `--dev` 的「自包含」靠「Linux 上 `%ProgramData%` 展不开」的巧合成立,真 Windows 上往 `C:\ProgramData\QTrade` 写假熵(`17dcb35`)。
+
+> 逐条的「现象 / 为什么单测看不见 / 怎么防」见 **`reference/e2e-lessons-2026-09-21.md`**(11 条 + 三条通用判据)。原始证据在原机 `.omc/handoffs/e2e-*.md`、`payload.md`、`packager-2.md`、`winagent-impl.md`。
+
+### 🔴 下一步(按先后;做之前先读对应的 README / 交接文件)
+
+1. **重建发行版 rootfs**(⚠️ 2026-09-21 07:25 实查:已有 agent 在改 `installer/rootfs/{Dockerfile,build-rootfs.sh,files/opt/qtrade/bin/qtrade-firstboot.sh,files/systemd/qtrade-agent.service}`,**接手前先看这批改完没、有没有对应交接**,别重复开工)。六项待修:
+   ①删 `installer/rootfs/files/qtrade-firstboot.sh` 里「`[ -f agent.db ]` 就跳过 `--init-db`」的闸门(R6-61/62:**调用方不得自加前置闸门**,否则升级/修复路径不跑迁移);
+   ②`qtrade-agent.service` 的 `StartLimitIntervalSec/Burst` 从 `[Service]` 挪到 `[Unit]`(现被 systemd 忽略 ⇒ 失败无限重启);
+   ③Python 由 jammy 自带的 **3.11.0rc1** 换正式版;
+   ④机型档案库落点改到 `docs/05` §7 的 `/opt/qtrade/agent/data/device_profiles.json`(现落 `/opt/qtrade/profiles/`,不改则生产机型池只有内置 10 条);
+   ⑤`installer/rootfs/README.md` 里已裁决却仍标「待裁决」的陈述订正;
+   ⑥**先 `rm -rf build/` 再重打 wheel**,用新 wheel 重建,`contents.json` 随之更新。
+2. **独立复测**(新起测试方,与实现方分离):rootfs 冒烟复测(沿原机 `.omc/handoffs/e2e-rootfs.md` 的六条 + 本轮修复点);控制台↔真后端复测(含按裁决翻面的验收断言,清单在 `console-fix-2.md` §9 / `backend-api-3.md` / 终审第六轮 W5)。
+3. **生成自签名证书 → 带 `-Sign` 重出正式包 → 校验**:命令清单在原机 `.omc/handoffs/signing.md` 末尾(生成证书要先经安琳点头;出包会覆盖旧 EXE);出包步骤与校验判据见 `packager-2.md`;载荷产物根 `C:\Users\anlin\qtrade-payload\`(3.3 GB,13 项齐,`SOURCES.md` 有来源与 sha256)。
+4. **真装验证**(安琳已选:另一台 Windows 物理机为主、本机 Hyper-V 虚拟机为辅):`fieldtest/真机验收手册.md` + `collect-evidence.ps1`;虚拟机路线见 `fieldtest/vm-lab/README.md`(**启用 Hyper-V 须重启主机一次,会中断 WSL 内 12 个容器 ⇒ 由安琳决定时机**)。
+5. **文档第七轮终审 → ACCEPT 后 push**。
+
+### 🔴 要问安琳的事(未决,别自行假设)
+
+- 生成自签名证书的两条命令是否现在跑。
+- **发送失败是否计入限速**(倾向计入,护号)——开放项 R6-60 (f)。
+- `#88` 各 settings 组保存后 `GET` 读回的是「当前生效值」而非「已保存待重启值」⇒ 表单回填旧值;正式设计待定(前端暂用「本次提交值回填 + 标注重启后生效」)。
+- 磁盘门槛是否按实测体积重算(现偏保守 = 安全侧)。
+- 另一台 Windows 物理机(Win10 22H2/Win11、x64、BIOS 开虚拟化、≥8 GB 内存、≥40 GB 空闲盘)。
+- 将来正式分发用公司内部 CA 还是 OV 证书(现阶段自签名 + 目标机导入)。
+- 分支 `claude/lucid-dijkstra-uu5max` 何时合 `main`;要不要把这一版回给 cursor 做第九轮评审。
+
+### 🔴 代码现状总表(接手先读这一段;分支 `claude/lucid-dijkstra-uu5max`,尚未合 `main`)
+
+| 模块(`src/qtrade_agent/`) | 规格段落 | 批次 / 裁决 | 一句话 |
+|---|---|---|---|
+| `text.py` `ids.py` `models.py` `config.py` | 06 §2.9.2 / 00 §6 / 00 §7 / 02 §7.1 + 04 §7 + 05 §7 | 一~四批 | `norm`/`clean_text` 逐字;ULID;`agent.toml` 全部段的默认值都与 owner 册对账 |
+| `store/` | 02 §3.1 DDL、§2.2.8、§2.8、§2.6 | 一、三批 | 唯一读写 `agent.db`;`ingest` 三元组;`transition` 同事务 `error_since_ms` 两动作;`settings.seq.*` 分配 id;资源池行 |
+| `adapters/qidian/` | 06 §2.9.5 | 一批 R6-51 | XOR 解码、msgtype 路由、`poll_maindb`/`check_group_gaps`、`send` 点完即返回;`maindb.py` 本地/adb 两后端 |
+| `bus/` + `gate.py` | 02 §2.2.2、§3.10、§6;00 §11.3 | 一、四批 | 登录门 → 参数校验 → 幂等三态 → 安全闸(白名单/出口词表热更/自定义闸)→ 串行队列 → 队列外等确认 |
+| `events.py` `alerts.py` | 02 §2.2.7、§3.7;00 §7.5 | 一~四批 | outbox + 事件专属 `lag_s/late/origin`;告警去重键 `(code, subject)`、级别翻转再发 firing |
+| `scheduler.py` `health.py` `api/` `app.py` `main.py` | 02 §2.2.11、§2.2.12、§2.2.1、§3.4、§3.4.7、§2.1 | 二批 R6-52/53 | 计时与执行分离;进程内健康态;FastAPI + WS 事件流;装配与启动恢复 |
+| `runtime/` | 02 §2.2.4;06 §2.9.5 `ensure_root`;05 §2.5.7 | 三批 R6-54/55 | docker/adb 后端协议 + CLI 实现 + 假实现;端口推导;`_purge_ephemeral`;`ensure_root` 三步逐字;启动全局串行 |
+| `pool.py` `pressure.py` | 02 §2.2.5;00 §7.6;04 H24 | 三、四批 | `can_add`(start 排除自身)/行级 claim/snapshot;内存水位三级、LRU 建议、critical 阻断、只停显式开关的账号 |
+| `accounts.py` | 02 §3.4.1 #2~#23、§2.6;05 §2.1.1/§2.2.7/§2.5.2/§2.5.4/§2.5.5;00 §8.1 | 三、四批 | 生命周期状态机(不跳段)、登录阶段端点、掉线登记与提醒、能力矩阵、账号级设置、批量、启动恢复 |
+| `healthloop.py` `timesync.py` | 04 §2.3 H04/H05/H06/H13、§2.9、§2.10 | 三、四批 | 容器退避重拉、adb 三振 + root 态、boot 稳态、H13 校时、唤醒后复提权 |
+| `vault_client.py` `winagent_client.py` | 02 §2.5、§3.6 #1/#2/#4/#7~#12;00 §11.1 | 三批 | 单向调用、令牌文件、超时/重试表、Vault 读走 POST + `X-Trace-Id`;假实现 |
+| `capabilities/*.json` | 02 §3.10、#21 | 一、四、五批 | **16 个目录文件**:通道类 5 个(`send_text`/`read_messages`/`get_state`/`screenshot`(QQ = `not_applicable`,R6-58 (ax))/`list_sessions`)+ **danger 十项**(`account_switch`/`account_stop`/`account_delete`/`account_purge`/`messages_purge`/`settings_write`/`vault_write`/`workflow_run`/`mail_cleanup_run`/`system_wsl_restart`)+ `system_cleanup_run`;系统类 op 的 `channels` 三格恒 `not_applicable`(R6-58 (ay))。**缺目录 = `expand_allow_ops(["*"])` 与 HMAC 入站的 `op_allowed` 把高危 op 全放行** |
+| `adapters/qq/` | 02 §2.8.1 QQ 行、§7.1 `[adapters.qq]`;04 H08;06 §2.9.1/§2.9.3/§2.9.4/§2.12 | 五批 R6-58 | OneBot 正向 WS(心跳 40 s 传输层重连、退避 `3×min(2^(n−1),10)`)、`get_msg` 读回走 `store.bind_out_by_trace_id`(确定绑定)、`message_sent` 扩展事件、`#n` 复用族与撤回取族内 `ts` 最大、start 序列不跳段(`login_required`/`logging_in` 两个 0 秒态照发) |
+| `adapters/wechat/` + `login.py` | 05 §2.4.*;02 §2.2.5 槽位、§3.6 #28~#42 | 五批 R6-58 | 槽位 claim/续期/reaper、`WechatLoginFlow`(取钥三段、`bind`、合并老档案)、`read_guard`/`write_guard`(`KEY_FAIL` 读写都拒)、`#38` 回的 `ext_msg_id` 只作证据、终态由 `store.ingest` 合并产生 |
+| `mail/` | 06 全册 | 五批 R6-58 | IMAP/POP3 取信(v1 轮询降级、IDLE 列 M6+)、验签三闸、danger 二次确认(只走控制台)、回执、SMTP 队列、归档与清理(五道 `NEVER_DELETE` 门)、模板渲染(`compat_profile` 三值) |
+| `maintenance.py` `media.py` `monitor.py` `workflow` | 02 §2.2.6/§2.2.7/§2.8.2/§2.8.4/§2.8.8;04 §2.4.5 | 五批 R6-58 | webhook 投递与死信(行值优先 + 两处并记)、保留期与磁盘三级水位(写闸包在 `store` 一层)、media 子系统(建行/下载/去重/上限)、`monitor.Sampler`(`health_samples` 的**唯一写方**,四类 scope)、`JobsReclaimer`、`PublicEndpointProbe`、直线工作流引擎 |
+| `api/app.py`(HMAC middleware) | 02 §3.4/§3.5/§3.4.7 | 五批 R6-58 (ba) | **签验提到 middleware**:`/api/v1` 全部端点 + WS 握手都能用 HMAC,级别判定仍留在端点 |
+
+**另有五个顶层目录(非 `src/qtrade_agent/`)**:
+
+| 目录 | 规格 / 说明 | 一句话 |
+|---|---|---|
+| `winagent/` | 02 §2.4/§3.2/§3.6/§7.2;04 §2.5~§2.9;05 §2.4 | WinAgent **服务 + 会话代理**两进程、`/wa/v1` 全量(含 #48 `PUT /wa/v1/probes/adopt`、`#15 ?kind=observed`)、Vault(DPAPI)、monitor/netprobe/power、命名管道 IPC、wslctl(`WSLCONFIG_KEYS` 11 项)、installer_ops、wechat;`winagent.db` DDL **逐字抽自 02 §3.2**;PyInstaller 打包(`winagent/build/build.ps1`,原生命令经 `Invoke-Native` 判退出码)。**Linux 与真 Windows 同一套用例都跑**——路径展开类缺陷只有真 Windows 上才红 |
+| `console/` | 01 全册 | Electron + Vue3 控制台;`src/i18n/zh-CN/codes.ts` 与 00 §8.1/§8.3、02 §3.7 逐码对账,`tests/unit/{codes,testids}-coverage.spec.ts` 守这两张表;`mock/` 已逐端点改到与真后端同形并有 `mock-shape` 自检 53 条。**仓库里不装 `node_modules`**,须 `rsync` 到 `~/work/qtrade-build/console` 再 `npm test` |
+| `installer/` | 03 全册 | `engine/` Inno Setup 6 引擎(`.iss` 真编译 0 error/0 warning)+ 17 个 PowerShell 模块 + 派发器;`sfx-stub/` **自编 SFX 存根 `QTradeSD.sfx`**(官方 `7zSD.sfx` 只认 7 键、解到 `%TEMP%` 即删、`return 0` 不透传退出码,故必须自编;官方存根 + `precheck-disk.cmd` 为回退路径);`rootfs/` 发行版构建工程(Dockerfile / `build-rootfs.sh` / firstboot / systemd 单元 / 机型档案库);`signing/` 代码签名工程(自签名阶段,**未真执行**);`build/` 载荷收集与总装(`collect-payload.ps1` 13 项一个都不能少、`build.ps1` 流式拼接三段);`out/` 产物 |
+| `fieldtest/` | 03 §8b / M0~M3 | `真机验收手册.md`(目标机要求、17 项改动清单、A~I 九组 51 条、排障与回滚)、`collect-evidence.ps1`(**只读**取证,排除清单对齐 `QTrade.Diag`)、`vm-lab/`(本机 Hyper-V 测试虚拟机:只读体检 / DISM 逐包启用与**对称撤销** / Gen2 虚拟机 16G 静态 + vTPM + 嵌套虚拟化 / 无人值守 ISO / 基线快照回滚 / PowerShell Direct 送包;**打印命令、等确认、绝不自动重启**) |
+| `tests/e2e/` | 01 + 02 | 控制台 ↔ 真 Agent(全假件)联调:`serve_fake_agent.py` 起真 Agent、`shape_audit.py`/`shape_diff.py` 逐端点形状对账(66 个端点)、`console-real/` 独立验收用例 73 条、`test_admin_line.py`(wsl-restart 无 confirm 时零请求发往 WinAgent 且写审计) |
+
+**仍未做 / 仍无执行体**(2026-09-21 订正;此前那份清单里的 `#51~#54`、`#75~#87`、`#90~#93` 等端点已由后端二、三批补齐):
+**端点已注册但无执行体、如实回 503/409 + reason** 的有——画面流与输入回注 `#34/#35`(连带画面流 H07)、语音转文字 `#53`、企点登出、企点截图;
+**未做**:企点 UI 执行层的**真机 profile**(现默认 profile 的控件 id 与文案锚点是推测)、`runtime.set_napcat_webui`(C-35)、QQ 二维码转发与 WebUI 开关、IMAP IDLE 真实现(v1 走轮询降级)、微信 WinAgent 半的真实现从未碰过真微信、控制台 Playwright e2e、能力目录仍缺的几个 `danger=false` 项的 `args_schema`。
+
+**五批的通用做法(接手照做)**:①先读规格段落再写,代码注释引用条款;②规格没写死的口径先登记成 §15g「编码口径」裁决(R6-52/54/56 式)再编码,**写前 grep 同册通用段与 owner 册**;③交付后起只读规格的子 agent 独立验收,分诊「实现缺陷 / 用例误读 / 规格问题」,收口成下一条裁决(R6-53/55/57 式);④每条新脚本规则在改前备份上反向验证;⑤按精确路径 `git add`,不夹带子 agent 半成品;⑥开发容器里绝不碰真 docker/adb/WinAgent/WSL;⑦**并行写代码会重演「并行写文档」的老毛病** —— 第五批的做法是**各路代码按保守口径落、一行 docs/ 都不改,把全部规格张力逐条登记进一张表(`.omc/handoffs/integrator-rulings.md`,116 条,每条含「位置 + 原句→新句」),由总控一次裁完再回写六册**(R6-58);比各路边写边改文档少造无数新分叉。
+
+---
+
+### 📜 更早的记录(2026-09-19~20 的五批代码细节与六~八轮评审脉络;**接手不必先读**,查某一批当时为什么那么定时再回来翻)
+
+> 下面这一大段是**历史**:第一~五批 Agent 侧代码的逐批口径、独立验收结论、企点真机实测与更早几轮评审的收口。
+> 它们仍然有效(裁决都已回写进 `docs/`),但**当前状态一律以上面「🔴 最新状态」为准**;两处冲突时信上面那段。
+
+**第八轮 cursor 评审(8.4/10;R7 五条 CLOSED、R6-38~R6-46 零回归;1 P0 + 3 P1)已由 R6-47~R6-50 收口(2026-09-19,在 GitHub 仓库分支上改、脚本 exit 0)**:
+- **R6-47(P0)`norm()` 三册无可抄定义** → 06 §2.9.2 落函数体(评审原句照收):`not s → ""`;NFKC;`re.sub(r"\s+"," ",s).strip()`;**不剥 `U+0014`**。分工逐字定死:`clean_text` = 读库解码侧、只在 `to_message()` 调一次;`norm()` = 比较侧、两侧各算一次、不改 `[表情]`/`[图片]`;**出向 `SENDING` 行 = 发送原文、入库前不过 `clean_text`**;00 §7.4 / 02 §2.8.1 改指针。脚本 ⑪ NORM 查唯一 `def norm(` + 函数体三件事、且不含 `\u0014`/`.replace(`。
+- **R6-48 开放项 (r) 拍板 = A(总控定,安琳可改)**:`send_text.text` 须 `clean_text(text)==text`,违例 `400 INVALID_ARGS`/`error.reason='text_has_control_chars'`/`pointer='/text'`,校验点 02 §3.10 `bus` 参数校验段、三通道同一条、不写 `SENDING` 行不占幂等键。不选 B 的理由:`U+0014` 是客户端内部转义、不可输入;B 会让库里「我方发出的内容」与实际发出的不一致。**真机待验一格**:企点会不会把 Unicode emoji 改写成 `U+0014` 落库(06 §8b M2「含表情/控制字符的发送」④,超时且读回含 `[表情]` 即记实测结论另裁,不预设)。
+- **R6-49(P1)** 01 §2.7.7 `P-MSG` 渲染事件专属三字段:`late` 琥珀「迟到 {lag_s} s」`qt-msg-row-{id}-late`、`origin="external"`「外部来源」`qt-msg-row-{id}-origin-external`;只进本次会话 store,`GET /messages` 不带、重拉后消失 = 预期;§8b M2-1/M2-2。
+- **R6-50(P1)** 02 §3.1 `audit_log` 登记 `action='qidian.rebootstrap'`(`kind/transport='system'`、`actor='system:qidian_adapter'`、`detail_json{old_uin,new_uin,deleted_cursors}`),05 ⑪a 同名引用;01 §2.10 写明 `QIDIAN_TABLE_DECODE_STUCK`/`QIDIAN_MSG_GAP` **只进铃与角标**、不上 `qt-acct-detail-read-degraded` 横幅。
+- 脚本新增 PAIRED ×10(norm 定义 ×2、`text_has_control_chars` ×2、三字段 testid ×2、`qidian.rebootstrap` ×2、两码 01 承接 ×2)+ ⑪ NORM;**每条都在改前备份与「抹掉登记行」副本上反向验证能红**(harness 留在 session scratchpad,不入库)。评审「开工门」:M1、内核 D、WinAgent、Electron 路由与 testid、微信向导、邮件取信、企点 poll 骨架可开;`norm()`/`send_*` 确认匹配已补 ⇒ **无阻塞项,进入编码**(见下「代码现状」)。
+
+**🔴 代码现状(2026-09-19 夜,首批;GitHub 分支 `claude/lucid-dijkstra-uu5max`,尚未合入 `main`)**:
+- 范围 = 02 §8 里 **M2** 行中能在无 redroid 环境下编码与单测的部分:`store` + `agent.db` 基线 DDL(逐字抽自 02 §3.1,SQLite 3.45 实跑;`schema_version` 记 sha256)、`bus` 单账号队列(出向先落库经 `store.ingest`、幂等三态、R6-48 入口校验、登录门、队列外等确认 + 加速轮投递)、`adapters.qidian` 读库正线(`poll_maindb`/`check_group_gaps` 按 06 §2.9.5 伪代码逐分支,含历史闸/水位自检/换号审计/H13 守卫/加速轮不动计数)、`events`(outbox + 事件专属 `lag_s`/`late`/`origin`)、`alerts`(去重键 `(code,subject)`)。**首批时点没做**(其中 `api`/`runtime`/`pool`/`vault_client`/`scheduler`/`health` 已在二~四批补齐;`workflow`/`mail` 仍未做):UI 执行层(搜索/打开会话/ADBKeyboard/点发送)以 `QidianAdapter(sender=…)` 回调注入,真机接入时把 `qidian_cold_start.sh` 的动作包成同签名回调。
+- 单测 49 条全绿(`tests/`):`norm`/`clean_text` 全部边界(纯表情不为空、串尾孤零、后继 `\t`)、XOR 17 字节自反、路由表五行、`-1035` 顺序、`ingest` 重扫 `(False,False)`、撤回 `changed`、出向合并定序/窗口/空文本守卫、QQ `#n`、空批推游标、单事务回滚、首登历史闸、新会话不丢第一条、重扫不重放、被踢重登 `late`/`external`、加速轮不动计数、首登 12 轮宽限、H13 换号只审计一次、个别表 STUCK 独立码、整库解不出一条告警、群缺口、bus 端到端「send_text → 假 RPA 落库 → poll 合并 → DELIVERED」、控制字符 400 且不进 commands、UNCONFIRMED 留 SENDING、登录门、send 让出队列。
+- **代码 ↔ 文档对账**(`tests/test_docs_consistency.py`):配置默认值 = 02 §7.1、`schema_agent.sql` = 02 §3.1 sql 块、`norm` 函数体逐行 = 06 §2.9.2、能力目录会话参数只叫 `session`。改文档后跑单测也会红。
+- **接手下一步(2026-09-20 第五批接线 + R6-58/R6-59 收口之后;五批代码全部在位、全套实跑全绿,剩下的基本都是「只能在安琳原机做」的事)**:
+  **① 🔴 真机验证清单(最高优先级——下面每一条判错都会静默丢消息或让验收判据整体失效)**:
+  (a) **微信 chatlog 的 `seq` 是账号级全局单调,还是每会话各一条?**(R6-58 (ci) / 验收 T-1)—— 在两个会话里各发一条新消息,看 `seq` 是否交错递增。当前实现按「全量轮取 `max(per-talker)` 作账号级 `since_seq`、加速轮逐 talker」;**若 `seq` 其实每会话独立,账号级 `max` 会把 seq 较小的那个会话的新消息整段跳过**,06 §2.9.3 与 05 §2.4.4 ⑦ 届时必须同时改。
+  (b) **自编 SFX 存根 `QTradeSD.sfx` 首次真跑**(R6-58 (cm))—— 三处补丁各验一次:`InstallPath` 解压产物**留在** `%ProgramData%\QTrade` 没被删、磁盘 <6 GB 时**解压前**就退 26(一个字节都没写)、引擎的退出码**原样**透传成 EXE 退出码(拿 §3.4 表里的 10/26/29/76/123/3010 各验一个)。走回退路径(官方存根)时 EXE 退出码恒 0,判据改读 `%ProgramData%\QTrade\logs\last-exit-code.txt`。
+  (c) **WinAgent 的 38 条真机项**(`winagent/README.md` §4)—— DPAPI Vault、命名管道 IPC、`powercfg` 备份还原、防火墙 ensure/delete、`.wslconfig` 十一键读写与备份、内核 apply/verify/rollback,全部要在真 Windows 上跑一遍。
+  (d) **企点 emoji 那格**((r) 拍板 A)—— 我方发出含 Unicode emoji 的文本,读库拉回来时是不是被转成了 `U+0014`;转了则 `norm()` 两侧永不相等、出向行恒 `UNCONFIRMED`。
+  (e) `uniseq` **跨库重建**是否稳定(R6-42 留的开放项,正反两向都要看)、被踢期间别的端发出的样本、群缺口自动补拉、`DockerCliBackend`/`AdbCliBackend`/`AdbMainDb` 首跑、05 §2.1.1 ④⑤⑤b(起容器 → boot → 提权)、06 §8b M2「含表情/控制字符的发送」五例。
+  起服务 = `python3 -m qtrade_agent.main --db /var/lib/qtrade/agent.db`(先 `store.upsert_api_client` 建控制台令牌;`/etc/qtrade/winagent.token` 缺失时 WinAgent 探测只记离线、不阻塞)。
+  **② 载荷收集(安装包做出来之前绕不过去)**:`pkg/` 下的真文件与 `manifest` 的真 sha256 —— rootfs.tar(3.3 GB)、redroid/napcat 镜像 tar、自编内核 `bzImage`(现役 v4 = 方案 D)、`wsl.msi`、adb、随包微信 `weixin_4.1.12.26.exe`(🔴 **另一候选包外层 VersionInfo 完全相同,只能靠 sha256 分辨**,装错版本校验不出来)、chatlog 与 `wx_key1/2.dll`。**占位 sha256 有 CI 硬门挡着**(03 §2.2.1),收齐前 `build.ps1` 出不了正式包。
+  **③ 代码签名**:外层 EXE(SFX 存根 + 归档)与内层引擎各自 Authenticode,证书 **OV 起步**(P-22);自编存根改了二进制,**改一次必重签**。EDR/AppLocker 若拦 SFX 存根,回退到官方存根 + 搬运法(此时退出码判据改读落盘文件,见 ①(b))。
+  **④ Playwright e2e(控制台)**:`console/tests/unit/testids-coverage.spec.ts` 现在对 01 §4 的合写**两种写法都放行**;R6-58 (cv) 已把 `整名`/`-续写` 的展开**定死成一种**并逐字给出四处取值 ⇒ **真跑 e2e 之前先把该测试收紧成单解**,否则选择器按哪种写都「有据可依」、一半用例选不中元素而症状是「页面渲染异常」。
+  **⑤ 剩余编码项**(都不阻塞真机):企点 UI 执行层接 `accounts.login_fn`(05 §2.1.1 ⑥~⑪)、#34/#35 画面注入 + H07 画面流 + `#101` 的 `stream_restarted` 接真、`runtime.set_napcat_webui`(C-35)、IMAP IDLE 真实现、入站附件落 `media/` 与出站信息邮件的 `day_seq`/`seq_total`、`#90~#93`/`#51~#54`/`#75~#87` 一批端点、`mail`/`media` 两条写闸、能力目录仍缺的七个 `danger=false` 项的 `args_schema`、`jobs_reclaimer` 之外的作业类清理。
+  **⑥ 合 `main`(或开 PR)由安琳定。**
+- ⚠️ 已知取舍:`Store` 是同步 sqlite3 核心 + `AsyncStore` 分片锁包装(文档要求 aiosqlite;容器无网络装包,且 aiosqlite 本质也是线程 + sqlite3);bus 的 GATE 安全闸第四批已接(`gate.py`,R6-56);`Bus.submit` 对 `SENDING` 幂等行的等待用进程内 future,跨进程重启走 `ABANDONED → confirm_probe`;#15 prompt / `h06_fail_streak` / `rooting_until_ms` / 退避重拉计数都是进程内内存态,Agent 重启即丢(规格如此)。
+
+**🔴 第二批代码(2026-09-19 夜)= 基线 §15g R6-52,独立验收 = R6-53**:`scheduler.py`(计时循环与执行分离:到点/trigger 只启动一轮、正在跑则 `skipped+1`)、`health.py`(H13 firing / `mark_rooting` 宽限窗 / 免鉴权摘要,均进程内内存态)、`api/`(FastAPI:Bearer 鉴权按 `api_clients` 表、级别 R/W/A、`allow_accounts` 收窄;00 §10 错误信封;`X-QT-Api-Version`/`X-QT-Agent-Version`/`X-QT-Capabilities-Version` 头与 `X-QT-Api-Min` → 426;端点 `system/version|health`、`capabilities`、`accounts`(00 §7.1 视图、端口按序号推导)、`accounts/{id}/commands|send`(#28/#29/#30/#31:HTTP 层错误按 00 §10 映射、业务结果一律 200 + CommandResult、REPLAY 409 带完整信封、`async`/同步超时 202)、`sessions`、`messages`(#48:FTS/LIKE 混合、G-16 JSON cursor、ISO 时间;#49)、`audit`、WS `/events`(订阅/`since_seq` 重放/`truncated`/过滤/`allow_accounts` 二次收窄/ping/重发订阅帧);每次调用记 `audit_log`,health 免鉴权摘要除外)、`app.py`(装配:开库→崩溃恢复→模块→scheduler 注册 `qidian_poll_all`/`qidian_gaps_all`/outbox 保留期)、`main.py`(uvicorn `ws="websockets"`)。**没做**:`runtime`(docker/redroid)、`pool`、账号生命周期端点(`POST /accounts`/start/stop/login…)、`mail`、`vault_client`、WinAgent 探测、HMAC 公网入站、webhook 投递器。第三位独立验收者(`tests/acceptance/test_spec_api.py` 77 条)首跑 3 失败——全是规格明写实现漏了(`disk_free_mb`、`X-QT-Capabilities-Version` 头、WS 帧 `ts` 未 ISO);另揪出 **R6-52 自己与 02 §3.4 通用约定打架**(#48 写 `items` 而通用是 `data`;cursor 写 `"ts_ms:id"` 而 G-16 是 JSON)——按通用约定改回,教训:**新写专条前先 grep 同册通用段**。终态 277 条全绿(开发者 65 + 验收 212)。
+
+**🔴 第三批代码(2026-09-20)= 基线 §15g R6-54,独立验收 = R6-55**:`runtime/`(`ContainerBackend`/`AdbBackend` 协议 + `DockerCliBackend`/`AdbCliBackend` 命令行实现 + `FakeContainers`/`FakeAdb` 可编程假实现;`port_plan` 按 00 §3 段基址 + NN;`docker run` 必带 `--ulimit core=0`、端口只绑 127.0.0.1、`--restart no`;`_purge_ephemeral` 五项清单 + 审计 `runtime.purge_ephemeral`,容器不在时跳容器步;**`ensure_root` 三步逐字**(`mark_rooting` → `adb root` → `stop adbd; start adbd` → 只对本账号 `disconnect/connect` → `whoami==root`),失败只发 warn `QIDIAN_NOT_ROOT`(evidence `{whoami, ensure_root_attempts, db_visible}`)、state 不动、`AdbBackend` 协议里**根本没有 kill_server**;启动全局串行 `start_lock`;inspect 缓存 ≤5 s)、`pool.py`(02 §2.2.5 伪代码逐字:`used` 只算 host=wsl ∧ enabled ∧ state ∉ {stopped,disabled,error};`can_add` 三通道;`reserve` 行级 claim;`snapshot` = 00 §7.6 形态含 R6-6 空值口径;wsl 池 `total_mb` 首建 = `/proc/meminfo MemTotal`,WinAgent 快照到手后覆盖)、`accounts.py`(状态迁移唯一写点 `transition` = `store.transition`(同事务 `error_since_ms` 两个动作规范 SQL)+ `account_state` 事件;#2/#4/#5/#6/#7/#9/#10/#11/#19;start 序列 `provisioning → starting → boot → ensure_root → login_required(WAIT_PASSWORD) → [有凭据] logging_in → running`,UI 执行层以可注入 `login_fn` 代替;stop 序列 `stopping → stopped` **之后**清临时**再**释放额度;02 §2.6 启动恢复 `recover()`)、`vault_client.py`(协议 + `FakeVault` + `WinAgentVault`:读走 `POST …/read` 带 `X-Trace-Id`)、`winagent_client.py`(02 §2.5 契约:地址发现 `url → host.json → resolv.conf`、令牌文件、ping/health 2 s、time/vault 3 s、只读 1 次重试、写不重试、`X-WA-Version`;`FakeWinAgent` 传输层假实现)、`timesync.py`(H13:每 60 s `|Δ|>2 s` → `hwclock -s`/`date -s` 对齐 → 再测仍漂才 warn `H13_CLOCK_DRIFT`;`last_resume_ms` 变化 → `app.on_host_resume` 对 running 企点重连 + 复跑 `ensure_root`)、`api` 补账号端点与 `GET /resources`、`app` 注册 `winagent_probe`(H02,三振去抖)/`dockerd_probe`(H03)/`h13_clock_sync`、`config` 加 `[runtime]/[pool]/[winagent]/[wechat]`。**R6-54 编码口径**:#2 幂等 = `settings` 键 `idem.accounts.<key>`、409 不消耗 seq;`error.alternatives[].kind ∈ {add_other_channel, stop_one, wechat_switch}`;start/stop 不适用态 `409 NOT_APPLICABLE`、已在目标态 `200 {already:true}`;软删一律 `state=stopped`、容器 stop 不 remove;Vault 写失败账号照建 `remember=0`。**R6-55 验收(第四位撰写者,83 条,首跑 11 红全是用例侧、实现缺陷 0)**揪出 7 条规格张力,其中 1 条改了行为:`start`/`restart` 的 `can_add` **排除自身**(`created` 已计入 `used`,预算恰好只够一个时按字面写它自己起不来);其余只收措辞(05 删除前置、单对象端点信封规则、`remember` 注释、#2 微信 503、`port_plan` 键名/`media/tmp` 前缀)。终态 **420 条全绿(开发者 125 + 验收 295)**,文档对账 exit 0(PAIRED 27→29,改前备份验红)。**没做**见「接手下一步」⑤。
+
+**🔴 第四批代码(2026-09-20)= 基线 §15g R6-56,独立验收 = R6-57**:`gate.py`(00 §11.3 [GATE] / 02 §6 四件套之三道:账号级 `sessions.allowlist` 白名单、`settings` 表 `gate.blocklist` 出口词表**每次校验现读(热更)**、`gates.custom` 自定义闸(未注册按拒绝);接进 `bus` 幂等之后、路由之前;`GATE_BLOCKED` 留痕同登录门、**幂等行删掉**、正文只留 sha8)、`healthloop.py`(04 §2.3 H04 容器退出 → `error(CONTAINER_EXIT)` + `H04_CONTAINER_EXITED` crit + OOM 时同发 `CONTAINER_OOM_KILLED` warn,退避重拉 `[60,120,300,600]`、`restart_count<5`/小时、超限推 `AUTO_RESTART_EXHAUSTED` crit 并停自愈;H06 (a) 连接态 `disconnect/connect` + `ensure_root`、`h06_fail_streak` 三振 crit(**「成功」= 下一轮看到 `device`**,R6-57)、宽限窗内不判;(b) root 态独立永不 crit;H05 稳态;**绝不 kill-server**)、`pressure.py`(E-19:`mem_warn_mb/mem_critical_mb` 三级、`MEM_PRESSURE` warn→crit 翻转、LRU 建议名单 `[{account_id, last_active_at, rss_mb}]`、critical 阻断 #2/`recover()` 回 `409 mem_pressure`、只停 `auto_stop_on_pressure=true` 的且**每次 stop 前先读余量**;warn 只告警不阻断)、`accounts.py` 扩(#12 人发起登录:`login_required` 前置、`secret` 来源规则、Vault 无条目 ⇒ `WAIT_PASSWORD` 202 等人(R6-57 按 05 改);#13/#14 凭据;#15 prompt 内存态;#16b 取消 `stale` 幂等 no-op;`mark_offline` = 05 §2.5.4 三件事 + `ACCOUNT_OFFLINE`(1 小时第 3 次升 crit);`login_remind` 同 `trace_id`;#20 矩阵(与 Account `capabilities` 同源于目录,目录补 `screenshot`/`list_sessions`);#22 settings;#23 batch)、`alerts` 同键级别翻转再发 firing、`config` 加 `[health]` 全键 / `[pool] mem_*` / `[accounts]`。**R6-56 编码口径**见 00 §15g;**R6-57 验收(第五位撰写者,119 条,首跑 20 红中 16 条用例侧、终跑 4 失败 + 9 条张力)**:2 条实现缺陷(漏推 `AUTO_RESTART_EXHAUSTED`;`wait_idle` 吞不掉被取消任务的 `CancelledError`)、1 条 **R6-56 自己与 05 打架**(`login {}` 无 Vault 应转 `WAIT_PASSWORD` 而非 400——教训:编码口径裁决也要过一遍 owner 册)、1 条「停前还是停后读余量」未钉(取停前读);张力回写 04 F-33/`[monitor]`「warn 只告警不阻断」、04 H04 `CONTAINER_OOM_KILLED` warn、H06「成功」定义、#16b 三通道同、#20 键集同源。终态 **579 条全绿(开发者 165 + 验收 414)**,文档对账 exit 0(PAIRED 29→30)。**没做**见「接手下一步」⑤。
+
+**🔴 第五批代码(2026-09-20)= 「Agent 侧统一接线」,口径裁决 = 基线 §15g **R6-58**(116 条),独立验收收口 = **R6-59****:把四路并行写出来的新模块(`mail/`、`adapters/qq/`、`adapters/wechat/` + `login.py`、横切基础设施 `maintenance.py`/`media.py`/`monitor.py`/webhook 投递/HMAC 入站/工作流引擎)并进共享文件(`app.py`/`api/app.py`/`accounts.py`/`store/`/`bus/`/`config.py`),并补齐第二轮的端点与执行体(#57/#66/#88/#89/#94/#95/#96~#103/#107/#108/#25、`monitor.Sampler`/`JobsReclaimer`/`PublicEndpointProbe`/`media` 子系统)。
+**本批最重要的做法**:🔴 **代码一律按「以 docs/02 DDL 与 §7.1 为准」的保守口径落,一行 `docs/` 都不改**,把全部规格张力逐条登记进 `.omc/handoffs/integrator-rulings.md`(**116 条,每条含「位置 + 原句→新句 + 处置(采纳实现/改文档/留开放项)」**),由总控一次裁完再回写六册 —— 这是从「多 agent 并行写文档」那一轮学来的:各路边写边改文档必然各改各的、造出新分叉。
+**会改行为的几条**(全部已实现):QQ `get_msg` 读回改走 `store.bind_out_by_trace_id`(确定绑定,不再降级成模糊合并);微信登录流**在世期间续期** `slot_pending_expires_ms`(不做则扫码超 10 分钟必被 reaper 误杀);`Alerts` 按 02 §3.7「事件类型」列发 `mail`/`resource`/`net` 事件族(不再一律 `alert`);`bus` 的 `write_guard` **提前到落 `SENDING` 行之前**、且**不把 `NOT_READY/GATE_BLOCKED/LOGIN_REQUIRED` 抹成 `SEND_FAILED`**;`store.PRAGMAS` 加 `auto_vacuum=INCREMENTAL`(不加则 `incremental_vacuum` **静默无效**);HMAC **签验提到 middleware**(原来只有 #28/#29 认 HMAC);`models.json_safe()` 把 `CommandResult.data` 里的裸 `bytes` 换成 `{__binary__, len}`(不做则微信截图经总线恒 `INTERNAL`);能力目录**补齐 danger 十项**(缺目录 = 两道闸形同虚设);`monitor.Sampler` 给 `health_samples` 补上**唯一写入方**。
+**R6-59 验收(三位撰写者,实跑 666 条)**抓到的实现缺陷/缺口:QQ start 序列**跳掉 `login_required`/`logging_in` 两个 0 秒态**、HMAC 只在两个端点生效、`#108`/`#25` 路由 404、微信截图经总线恒 `INTERNAL`、`bind_retry_max` 写死在代码里、`health_samples` 无写入方、能力目录缺 danger 十项、`login_cancel` 微信分支判据恒假、`bus` 先落行再问适配器、`auto_vacuum` 没设 —— 全部已修。**被 R6-58 打红、转交验收撰写者的用例 3 条**(`test_spec_infra.py` 的 RT46 / AP22 / RT04),写作时已由撰写者改齐。
+**终态(实跑)**:根 `pytest -q` **1934**、`winagent` **307**、`installer/tests` **95**、console `npm test` **71**、`docs/check-truth-tables.py` **exit 0**(本轮新增 DEAD_KEYNAMES ×5 + FORBIDDEN ×3 + PAIRED ×6,另删掉 1 条**首跑不红的空规则**(行级 NEGATION 把整行吞了,R6-51 ⑫ 同一个坑的第二次),每条都在改前备份或「抹掉消费方那一行的副本」上反向验证能红)。
+
+**🔴 首批独立验收(2026-09-19,安琳要求「子 agent 按需求文档独立写用例」)= 基线 §15g R6-51**:两位只读规格、**不看开发者测试**的撰写者各写一份 `tests/acceptance/test_spec_qidian_read.py`(94 项)与 `test_spec_store_bus.py`(41 项),首跑 2 失败:①**B-30 登录门留不留 `commands` 行**三处措辞互斥,实现选了「不留」——按 B-30 改为留 `failed` 行(`started_ms IS NULL`)、不写 idempotency;②**B-08 `confirmed_by` 由 probe 回填**实现漏做——回填到首次 trace、`code` 不改。另 20 条规格张力(`fingerprint` 序列化未定、QQ ext 两册不一致、`#n` 比对基准、合并窗字面 60s、`external` 窗口基准、孤零 `U+0014` 空串、Java 魔数隐式例外、事件时间键名 `ts`/`received_at`、`get_state` 返回…)全部按「只收措辞、不加设计」落进 02/06,代码同步(events payload 改 ISO 8601、`get_state` 返回 OK、QQ `#n` 与族内 `ts` 最大行比、gated WARNING 带表名/time 范围、`app_version` 取 `account_runtime`)。脚本加 ⑫ LITERAL(字面 60s;**不能放 FORBIDDEN**——那两句含否定词会被行级 NEGATION 整行跳过,首跑实测是空规则,改成独立检查后在 R8 改前备份上验能红)。终态:**184 条全绿(原 49 + 验收 135)**,文档对账 exit 0。**验收撰写者报告里值得记住的两条方法论**:①「用例失败先问是不是自己夹具违反了规格」(读库组首轮 2 条误报就是直接落 `UNCONFIRMED` 行、绕过了 SENDING→UPDATE 的规格路径);②规格里「示意公式」(`fingerprint`)、「省略号」(`msg_count+…`)、「同一量两种写法」(`60s` vs 配置项)这三类,独立实现者一定会各算各的——发现一处就逐字定死一处。环境:`.claude/hooks/session-start.sh`(仅远程容器装 pytest/pytest-asyncio)+ `requirements-dev.txt`。
 
 **第七轮 cursor 评审(7.8/10,5 条 P0)已收口:基线 §15g R6-38 → R6-42,五轮只读独立终审 REVISE×4 → ACCEPT**(会改行为的问题数 8 → 13 → 7 → 2 → 0;末轮 0 阻塞、置信度高)。桌面副本已同步、脚本全绿(规则数以脚本实跑为准:FORBIDDEN 38 / PAIRED 17 / COPYABLE 3 / MIRROR 6 / DYNAMIC 3 + KEYNAME/ENUM/⑩值检查)。
 - **R6-38(评审 5 条 P0,均核实属实)**:06 §2.9.1 `type/ts/self` 改主库 `msgtype/time/issend`(唯一出处 §2.9.5);`[bus] confirm_timeout_qidian_ms` 8000→**15000** + 新键 `[adapters.qidian] confirm_poll_interval_ms=1000`(真机实测我方回复落库可见 9.3~11.4 s,8 s 必然 `UNCONFIRMED`);§2.12 企点确认 = **ingest 合并**(`confirmed_by=ingest_merge`、`ext=qd:{uniseq}`;`history` 仅控件树降级路线;回执「确认方式」取的是 `CommandResult.source`=`qidian_db`,别和 `confirmed_by` 混);表发现算法;L2 **只认方案 D**(manifest 恒 `"D"` + CI 硬门)。总控另查出:方案 A 残留多 3 处、`.backup` 与实测读取器相反(主库 64 MB,正线 = `mode=ro` 只读直查增量)。
@@ -99,7 +279,7 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 **开工时必须带着的开放项(不阻塞编码;全文见基线 §15g R6-42 行 (a)~(i))**:`uniseq` 跨库重建稳定性(正反两向真机验)/「恰在被踢期间由别的端发出」无样本 / `on_late` 无承载 / 群缺口自动补拉未验证 / `mark_rooting` 重启即丢 / 历史闸 120 s 余量 / **对账脚本不读伪代码控制流(伪代码只能靠逐分支人读)** / `origin=external` 策略留 S4 / 脚本待补两条规则。
 
-**下个 session 第一件事**:①问安琳要不要把这一版回给 cursor 做第八轮评审(R6-38~R6-46 改动面大,06 §2.9.5 基本重写);②S1 读循环仍须安琳亲自 gate(开工时解码直接用参考解码器的口径);③企点专项第一批(延迟/消息类型/被踢/体检)**已收完**,开放项见基线 §15g R6-42 (a)~(i) + R6-43~R6-46 (j)~(s),其中要真机验的:`uniseq` 跨库重建稳定性、被踢期间别的端发出的样本、**我方发出含表情的文本能否读回确认**((r):出向行存原文、读回是 `[表情]`,`norm(text)` 不等)、群缺口自动补拉;`norm()` 三册无定义((s))。**子 agent 的结论该进规格的由总控落,别让它改 `docs/design/`。**
+**⛔ 已作废(2026-09-21)——下面这段「下个 session 第一件事」写于 2026-09-20,条数与待办都已过时,一律以 §5「🔴 最新状态」为准;保留仅为追溯**:①`git pull` 后跑四套确认基线 —— 根 `~/.venvs/qtrade/bin/python -m pytest -q`(**1934**)、`cd winagent && pytest -q`(**314**)、`pytest -q installer/tests`(**95**)、console 先 `rsync` 到 `~/work/qtrade-build/console` 再 `npm test`(**71**),外加 `cd docs && python3 check-truth-tables.py`(**exit 0**);②问安琳:分支 `claude/lucid-dijkstra-uu5max` 合不合 `main`、要不要把 R6-58/R6-59 这一版回给 cursor 做第九轮评审(**六册全改了一遍、改动面是历轮最大的一次**);③按「接手下一步」① 真机验证清单开工(那是现在唯一的硬瓶颈),开工前先读该项规格段落。真机项(只能在原机做):`uniseq` 跨库重建稳定性、被踢期间别的端发出的样本、**我方发出含表情的文本能否读回确认**((r) 拍板 A 那格)、群缺口自动补拉、`DockerCliBackend`/`AdbCliBackend` 首跑。**子 agent 的结论该进规格的由总控落,别让它改 `docs/`。**
 
 **🔴 方法论(本轮新增,已写入 [[design-doc-consistency-lessons]])**:①**每一轮的新问题都出自上一轮新写的东西**——收敛期「只动点名处、不扩面」,宁可撤回一条未验证前提的补偿规则、留成开放项,也不要再加设计;②**伪代码要当真代码逐分支跑**(变量在每个分支有没有值、每个 `return` 出口处计数/告警状态是否一致),脚本看不见这一层;③换数据源时旧源**整张表的全部列名**都要进 FORBIDDEN;④同册写下一个实测量就要 grep 所有依赖它的阈值,并做成脚本的**值检查**;⑤新规则必须在改前备份上**反向验证能红**(本轮抓到 3 条自己写的空规则:否定词自吞、正则竖线多转义一层);⑥评审给的替换句也要核后果(`value_int=0` 会回灌全部历史)、终审给的建议也要核(「把 fail 挪到 stuck 之后」会一因两告警);⑦**新语义要沿事件流往下游走一遍**(R6-43 让非文本行也产出 `Message`,没接到出站信息邮件〔无类型过滤、只认 text|image〕、图片恒 MISSING、还引用了不存在的 `Message.origin_json`——解法是**收窄**回「只产出文本」,不是往下游接);⑧**数据清洗规则要问「清完会不会变空」**(删表情 → 17 条空正文 → 空邮件或被静默过滤;改成 `[表情]` 占位);⑨子 agent 的结论采信前到源头抽查(`-1049`/`-1035` 两条我都独立核过),它的推测要让它用全库数据证实或证伪(「@ 属性控制字节」后来被它自己的全库统计否定)。
 
@@ -121,15 +301,47 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 **方法论教训(第六轮,已写入 [[design-doc-consistency-lessons]])**:①返工自己会造新接缝(各路自洽、合起来打架)——跨册的名字/判据原句必须在裁决里**逐字定死**再分派;②总控自己的裁决也会错(⑤/⑥ 锚点、§2.7.5/§2.7.4、提权序列里的 kill-server、「九项已闭合」)——子 agent 与终审的异议要认真看;③「脚本全绿」≠ 通过,存在性检查会给假阳性的安全感,必须有只读的独立终审;④收敛期(只剩「owner 写对、消费方没跟」的单点)由总控**直接改**比再分派更稳(第五次零新引入);⑤值集合类检查要「从 owner 册现读」,写死清单管不了 owner 新增。
 
-**挂着的**:
-1. **企点接进 RPA 五步节奏**(⚠️ 安琳 2026-09-19:**读循环先不开工,等再一轮 cursor 评审良性后才开**):S1 读循环(**读主库**,游标 = 各表 `_id`;启动先 `ensure_root`)→ S2 统一入库 → S3 发送闭环(异步读回确认、会话校验)→ S4 喂谈判核心(先 mock)→ S5 守护/降级。红线:真实发送只发测试号。
-2. ✅ **设计文档企点读取节已改主库**(2026-09-19,基线 §15g **R6-36**):06 §2.9.5 + §2.9.1 + 02 §2.8.1/§2.8.3 + 00 §6 全部换成主库 `{uin}.db`(会话分表、XOR 密钥 `02:00:00:00:00:00`、游标 `cursors.kind='qidian_rowid:<native_id>'`、`ext_msg_id='qd:{uniseq}'`、延迟 2~12 s、异步读回)。索引库降为兜底(`db_reader.py`);主库参考实现 = `echo_loop_maindb.py` 的 `query()`。✅ **那轮 cursor 评审已回**(R6-36 半改已由 R6-37 收口、邻表全跟上、独立终审判 ACCEPT/可开工)——安琳设的「读循环等一轮 cursor 评审良性后才开 S1」这个前置**现已满足**。🔴 **下个 session 第一件事 = 跟安琳确认是否开 S1 读循环**(条件已满足,但安琳要亲自 gate、别自作主张开工;S1 = 读主库、游标各表 `_id`、启动先 `ensure_root`、只回测试号)。
+**挂着的**(2026-09-20 加注:1/2 的代码部分已在四批里落地,真机 gate 仍归安琳):
+1. **企点接进 RPA 五步节奏**(⚠️ 安琳 2026-09-19:**读循环先不开工,等再一轮 cursor 评审良性后才开**——该前置已满足;✅ S1 读循环 = `adapters/qidian/poll.py`、S2 统一入库 = `store.ingest`、S3 发送闭环 = `bus` + 队列外等确认、S5 守护 = `healthloop`/`pressure`/`alerts`,均已编码并独立验收;**真机接线 = 「接手下一步」①**):S1 读循环(**读主库**,游标 = 各表 `_id`;启动先 `ensure_root`)→ S2 统一入库 → S3 发送闭环(异步读回确认、会话校验)→ S4 喂谈判核心(先 mock)→ S5 守护/降级。询价回复发到已接入会话，不再逐条等确认。
+2. ✅ **设计文档企点读取节已改主库**(2026-09-19,基线 §15g **R6-36**):06 §2.9.5 + §2.9.1 + 02 §2.8.1/§2.8.3 + 00 §6 全部换成主库 `{uin}.db`(会话分表、XOR 密钥 `02:00:00:00:00:00`、游标 `cursors.kind='qidian_rowid:<native_id>'`、`ext_msg_id='qd:{uniseq}'`、延迟 2~12 s、异步读回)。索引库降为兜底(`db_reader.py`);主库参考实现 = `echo_loop_maindb.py` 的 `query()`。✅ **那轮 cursor 评审已回**(R6-36 半改已由 R6-37 收口、邻表全跟上、独立终审判 ACCEPT/可开工)——安琳设的「读循环等一轮 cursor 评审良性后才开 S1」这个前置**现已满足**。(2026-09-20:S1 读循环代码已在首批落地并经独立验收,**真机接线**仍须安琳亲自 gate、别自作主张;S1 = 读主库、游标各表 `_id`、启动先 `ensure_root`、只回测试号。)
 3. 待安琳定:要不要做「logcat 触发」(≈2 s 知道有新消息,只读日志、低风险);要不要探索让内容也秒级(提前落库/读界面,都要碰企点,有风险)。
 4. 里程碑收尾清单(不阻塞):`mark_rooting` 进程重启即丢的处理;脚本补「全套行号锚扫描」「跨册同义量命名唯一性」;**脚本 FORBIDDEN 的 NEGATION 由「整行含否定词即跳」收紧到「命中点近邻窗口」**(现整行判会漏「活写坏 token + 同行无关否定词」,qdidx/c4ext1 两规则都受此限,终审已点名——但按「误报比漏报更伤」没把握前别动共享 NEGATION 逻辑)。
    ✅ **边缘风险已补(2026-09-19,安琳定"先补边缘风险再说")**:①`fp:` 前缀分叉——02 §2.8.1(529)去重键 + 02 DDL(925)注释都对齐 owner 06 §2.9.2 = `ext_msg_id=fingerprint`(full sha256、无前缀;原 `"fp:"+[:32]` 按 99c C-03 作废);②01 §2.5 白名单③ 补 `GET /wa/v1/wechat/login/status`、`ui-visible`(05 §3.2 R6-5 判控制台只读可直调、01 §3 已列,是 01 内部漏列);③01 §4 P-ACCT-DETAIL 新增 `qt-acct-detail-read-degraded`(warn 横幅、**无按钮**,守住 R6-35 已删的"重试提权";兑现 01:873 悬空声明)+ §2.7.3.4 概览承接;④README 行数/版本刷新到实际。脚本全绿、桌面同步。
 5. 企点当前**已退回消息列表页**(2026-09-19 已做);redroid 容器 `qtrade-redroid` 在跑、已登录态、adb root 在位。
 
-## 6. 记忆索引(项目相关,`~/.claude/projects/-home-anlin-work-qtrade-ibquote/memory/`)
+## 5b. 🔴 多 agent 编排纪律(安琳 2026-09-21 定;派工前必读)
+
+> 规范原件 = 仓库 **`CLAUDE.md`**「🔴 多 agent 编排纪律」段(冲突以它为准);随仓库的详版快照 = **`reference/orchestration-discipline.md`**;
+> 原机活记忆 `/home/anlin/.claude/projects/-mnt-c-Users-anlin-Desktop-work/memory/agent-role-independence.md` 里有每条的踩坑经过。
+
+- **角色独立**:实现 / 开发者测试 / 独立验收 / 文档回写 / 只读终审各由**不同 agent** 承担。开发者不改自己的测试;
+  🔴 **被某道质量门挡住的人不修那道门**,更不得绕过;验收用例只由「只读规格、不看实现方测试」的独立验收方撰写与改写,**总控也不代改**。
+- **agent 关了就新起**:某条线的 agent 已关、又来了新活 → 新起职责对口的 agent(靠 `.omc/handoffs/*.md` 传上下文),不让别的存活 agent 或总控顺手代办。
+- **保住上下文窗口**:一个 agent 只给**一批**边界清楚的活,做完写交接、关闭;下一批新起,不对同一个 agent 连发多批。
+- **换人前先查在途任务**:看它的后台进程与输出目录时间戳;它拒绝关闭且理由正当(中断会留半成品)就让它跑完,把接替者改成**独立核查者**。
+- **重活不用 sonnet**:构建 / 打包 / 跨 WSL↔Windows 长任务 / 多步编排一律 opus 或更高。
+- **边做边落盘**:跨会话要用的报告、交接、备份一律写 `.omc/handoffs/`(git 忽略、在仓库盘上、断线不丢),分段追加、不攒到最后。
+  ⚠️ 由此:`.omc/` **不随 git 走**,所以接手**必需**的信息(现状、待办、禁区、纪律、跑法)必须写进受 git 管理的 `SKILL.md` / `HANDOFF.md` / `README.md` / `CLAUDE.md`。
+- **一律中文**、每次回复称呼「安琳」,**没有例外**(过渡句、派工提示、子 agent 汇报、交接文件、提交说明);派子 agent 时在提示里写明「全部用中文」。
+- **开工顺序**:先 `git fetch --all` / `git pull` 到最新分支,**再**读**仓库内**这份 skill(全局 `~/.claude/skills/` 那份会落后好几批)。
+
+**测试环境(派工时要交代给子 agent)**:主仓 `~/.venvs/qtrade/bin/python -m pytest -q`(系统 python 没装 pytest;这个 venv 是 uv 建的、**没有 pip 模块**);
+打 wheel 用 `/usr/bin/python3 -m pip wheel`;控制台先 `rsync` 到 `~/work/qtrade-build/console` 再 `npm test`(`/mnt/c` 上跑 node 太慢);
+Pester 经 `installer/tests/run-pester.ps1`;真 Windows 的 Python 在 `C:\Python312`,WinAgent 测试 venv = `C:\Users\anlin\qtrade-payload\.venv-winagent-test`。
+**本机已装(安琳同意)**:Inno Setup 6、VS2019 Build Tools(MSVC 14.29 + Win SDK 10.0.19041)、Python 3.12;`7zSD.sfx` 取自官方 LZMA SDK 2301。
+
+## 6. 记忆索引(项目相关;**两个原机目录**)
+
+> ⚠️ 这些是**原机的活记忆**,**不随 git 走**。别的机器 / 远程容器上一律以本 skill `reference/` 的**五份快照**为准:
+> `zh-only-rule.md`(头等规范)、`design-doc-consistency-lessons.md`(多 agent 写文档的一致性教训,末尾已追加「代码阶段」)、`qidian-read-via-db.md`(企点读库实测)、
+> **`e2e-lessons-2026-09-21.md`(端到端教训:单测全绿 ≠ 装得上)**、**`orchestration-discipline.md`(多 agent 编排纪律)**。新的项目记忆先写进本 skill,回原机再落活记忆。
+>
+> **2026-09-21 新增的三条(在 `/home/anlin/.claude/projects/-mnt-c-Users-anlin-Desktop-work/memory/`,即本仓库对应的记忆目录)**:
+> - [[always-chinese]] — 一律中文 + 每次称呼「安琳」,过渡句 / 子 agent 派工与汇报 / 交接文件 / 提交说明**无例外**(快照 = `reference/orchestration-discipline.md` §7、规范原件 = 仓库 `CLAUDE.md`)
+> - [[agent-role-independence]] — 角色独立、agent 关了就新起、一个 agent 只给一批活、换人前查在途任务、重活不用 sonnet、重要产出落 `.omc/handoffs/`(快照 = `reference/orchestration-discipline.md`)
+> - [[pull-before-resume-skill]] — 开工顺序:先 `git pull` 再读**仓库内**的 skill;主仓测试用 `~/.venvs/qtrade/bin/python -m pytest -q`
+>
+> 下面这一组在更早的原机目录 `~/.claude/projects/-home-anlin-work-qtrade-ibquote/memory/`:
 
 - [[qtrade-design-docs-2026-09-18]] — 设计文档唯一真值口径、六册分工、开工边界、Cursor 15条P0
 - [[design-doc-consistency-lessons]] — 🔴多agent并行写文档的7类缺陷+我犯的错;对账脚本八类检查的由来
@@ -142,7 +354,8 @@ description: 断点续接交接 —— QTrade「redroid 多实例 IM 控制台 +
 
 ## 7. 环境约束(本机)
 - 内网访问需飞连VPN在线;回复与思考一律中文。
-- Bash 每条命令后 cwd 重置到 `/home/anlin/work/yingmi`,跨命令用绝对路径。
+- Bash 每条命令后 cwd 会被重置(本仓库会话里重置到 `/mnt/c/Users/anlin/Desktop/work`),**跨命令一律用绝对路径**或在同一条命令里 `cd`。
 - 防自杀 hook:`pgrep/pkill -f` 明文被拦(exit 144),用单字符方括号规避(如 `[f]rida`);`pkill -f xxx` 会把自己这条命令也算进去而误杀,慎用。
 - ⚠️ **改文档的 python 脚本别写 `open(p,'w').write(open(p).read())` 这种"读回自己"的收尾行**——`'w'` 先截断,读到空、写回空,会把整册清零(2026-09-19 踩过,靠桌面副本恢复)。每轮改完 `cp` 回桌面 = 唯一可靠还原点,务必保留这个习惯。
 - 对账脚本 `check-truth-tables.py` 新增规则首跑**必看命中**:误报比漏报更伤(会让人不再看它);历史裁决表 §15x 会引述旧句,规则要用否定词近邻/范围收窄排除。
+- **远程容器(Claude Code on the web)接手时**:没有 `gh`,GitHub 操作走 MCP;`pip` 只装 `requirements-dev.txt`(SessionStart 钩子自动);**没有 docker/adb/WinAgent/WSL,一切经 `tests/conftest.py::make_rig` 的假后端**;临时文件放 session scratchpad(`/tmp/claude-0/…/scratchpad/`),对账脚本的「改前备份验红」也在那里做(拷 `docs/*.md` + 脚本,把目标册换成 `git show HEAD:<path>` 的版本再跑);Stop hook 会催「未提交请提交推送」——按精确路径 `git add`,别把子 agent 正在写的验收文件一起带上。

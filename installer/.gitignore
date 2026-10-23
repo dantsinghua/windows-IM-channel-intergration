@@ -1,0 +1,21 @@
+# 🔴 仓库根 .gitignore 里的 `build/` 会把本目录的 `installer/build/` 一并忽略,
+#    但那里放的是**打包脚本与 SFX 配置(源文件,必须入库)**,不是构建产物。
+#    深层 .gitignore 的规则覆盖上层,故在这里显式取消忽略,再单独忽略里面真正的产物/第三方件。
+#    (与 winagent/.gitignore 同一套做法;git 的规则是「父目录被排除就无法再包含其中的文件」,
+#     所以必须先 `!build/` 把目录本身放回来,后面的规则才有机会生效。)
+!build/
+
+# 打包产物(build.ps1 的输出;单个 EXE 约 3 GB,绝不进仓库)
+out/
+
+# 载荷暂存与归档中间件
+payload/
+*.7z
+
+# SFX 存根:第三方二进制(官方 LZMA SDK / 7-Zip Extra 里的件),由 CI 或本地按 build/README.md 放置
+build/7zSD.sfx
+build/7zS2.sfx
+*.sfx
+
+# OMC 运行期状态(钩子生成)
+.omc/

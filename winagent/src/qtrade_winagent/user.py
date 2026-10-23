@@ -1,0 +1,325 @@
+"""``user`` —— 用户会话代理 ``qtrade-winagent-user.exe`` 的装配(02 §2.4,C-02)。
+
+计划任务「用户登录时」以**登录用户身份**拉起,**不提权**;需要交互桌面(微信 UI 自动化)与用户自己的 WSL 登记。
+它**不监听任何端口**(04 §2.6.3 R-14:防火墙规则里绝不出现会话代理 exe),只作为命名管道的**客户端**被服务调度。
+
+方法名与 ``/wa/v1`` 一一映射(``/wa/v1/wsl/start`` ⇒ ``wsl.start``,02 §2.4.1);混合端点由服务拆好后
+只把**管道半**下发过来(如 ``wsl.kernel.apply`` 只带 ``kernel_path`` + ``confirm_shutdown``)。
+
+上线动作(02 §2.1 步 2′):按 ``winagent.toml [wsl] autostart=true`` 拉起发行版 ``qtrade``
+(**随用户登录,不随开机**,C-02);失败记日志并由本会话后台每 60s 重试,不阻塞管道心跳。
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import time
+from typing import Any, Callable, Optional
+
+from .backends import PipeBackend, PowerBackend, WeChatBackend, WslBackend
+from .config import WinAgentConfig
+from .errors import NOT_READY, WaError
+from .logfmt import get_logger
+from .pipe import UserAgentLink, _pipe_disconnected
+from .wechat import WeChatSession
+from .wslctl import WslCtl
+
+log = get_logger("user")
+WSL_RETRY_S = 60.0
+
+
+class UserAgent:
+    """会话代理主体:把管道方法路由到 ``WslCtl`` / ``WeChatSession`` / ``PowerBackend``。"""
+
+    def __init__(self, cfg: WinAgentConfig, *, pipe: PipeBackend, wsl: WslBackend,
+                 wechat: Optional[WeChatBackend] = None, power: Optional[PowerBackend] = None,
+                 session_id: str = "1", user_sid: str = "", version: str = "0.1.0", pid: Optional[int] = None,
+                 backup_dir: Optional[str] = None, clock: Callable[[], int] = lambda: int(time.time() * 1000)):
+        self.cfg = cfg
+        self._clock = clock
+        self.wslctl = WslCtl(wsl, cfg.wsl, backup_dir=backup_dir, clock=clock)
+        self.wechat = WeChatSession(wechat, cfg.wechat, clock=clock) if wechat is not None else None
+        self._power = power
+        self._wsl_task: asyncio.Task | None = None
+        modules = ("wslctl",) + (("wechat",) if (wechat is not None and cfg.wechat.enabled) else ())
+        self.link = UserAgentLink(pipe, cfg.ipc, pipe_name=cfg.api.pipe_user, session_id=session_id,
+                                  user_sid=user_sid, version=version, pid=pid or os.getpid(), modules=modules,
+                                  clock=clock)
+        self._register()
+
+    # ---------------------------------------------------------------- 方法路由
+    def _register(self) -> None:
+        w = self.wslctl
+        self.link.on("wsl.status", lambda p: w.status())
+        self.link.on("wsl.network", self._wsl_network)
+        self.link.on("wsl.host.update", self._wsl_host_update)
+        self.link.on("wsl.start", lambda p: w.start())
+        self.link.on("wsl.stop", lambda p: w.stop())
+        self.link.on("wsl.restart", lambda p: w.restart(mode=p.get("mode") or "terminate", confirm=bool(p.get("confirm"))))
+        self.link.on("wsl.version", self._wsl_version)
+        self.link.on("wsl.config.get", self._config_get)
+        self.link.on("wsl.config.put", self._config_put)
+        self.link.on("wsl.kernel.verify", self._kernel_verify)
+        self.link.on("wsl.kernel.apply", self._kernel_apply)
+        self.link.on("wsl.kernel.rollback", self._kernel_rollback)
+        self.link.on("wsl.distro.repair", self._distro_repair)
+        self.link.on("power.display", self._power_display)
+        self.link.on("metrics.deployment-volumes", self._deployment_volumes)
+        self.link.on("wechat.module", self._wechat_module)
+        for method, fn in (("wechat.status", self._wechat_status), ("wechat.locate", self._wechat_locate),
+                           ("wechat.login.start", self._wechat_login_start),
+                           ("wechat.login.cancel", self._wechat_login_cancel),
+                           ("wechat.login.status", self._wechat_login_status), ("wechat.bind", self._wechat_bind),
+                           ("wechat.logout", self._wechat_logout), ("wechat.key.retry", self._wechat_key_retry),
+                           ("wechat.ui-visible", self._wechat_ui_visible), ("wechat.send", self._wechat_send),
+                           ("wechat.read", self._wechat_read), ("wechat.media", self._wechat_media),
+                           ("wechat.sessions", self._wechat_sessions), ("wechat.screenshot", self._wechat_screenshot),
+                           ("wechat.reinstall", self._wechat_reinstall)):
+            self.link.on(method, fn)
+
+    # ---------------------------------------------------------------- 生命周期
+    async def start(self) -> dict[str, Any]:
+        welcome = await self.link.connect()
+        # R6-88:微信模块开关以服务侧(C-43 真值 toml 的持有者)为准 —— 本进程启动时读到的 toml 可能已过时
+        # (用户登录桌面前控制台已启用过模块 / 服务与会话代理任一方重启过);握手即对齐,后续 `wechat.module` 推送再变更。
+        if isinstance(welcome, dict) and "wechat_enabled" in welcome:
+            await self._wechat_module({"enabled": bool(welcome["wechat_enabled"])})
+        if self._wsl_task is None:
+            self._wsl_task = asyncio.create_task(self._maintain_wsl(), name="ua-wsl-lifecycle")
+        if self.cfg.wechat.enabled:
+            self._warm_wechat()
+        return welcome
+
+    async def _maintain_wsl(self) -> None:
+        while True:
+            try:
+                await self.wslctl.ensure_running()
+            except Exception as e:
+                detail = str(e)
+                if len(detail) > 4096:
+                    marker = "...[truncated]..."
+                    detail = detail[:512] + marker + detail[-(4096 - 512 - len(marker)):]
+                log.warning("发行版启动或持有失败,60s 后重试", extra={"op": "wsl.start", "code": "FAILED",
+                                                            "kv": {"err": type(e).__name__,
+                                                                   "detail": detail}})
+            await asyncio.sleep(WSL_RETRY_S)
+
+    def _warm_wechat(self) -> None:
+        """微信后端预热放线程、不等待(全新机器首次导入 pywinauto/comtypes 可达十几秒,别让第一次 #28 撞超时)。"""
+        if self.wechat is None:
+            return
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, self.wechat.warmup)
+
+    async def run(self) -> None:
+        try:
+            await self.link.run()
+        except Exception as e:
+            if not _pipe_disconnected(e):
+                raise
+            log.warning("服务管道断开,等待重连", extra={"op": "pipe.run", "code": "DISCONNECTED",
+                                                      "kv": {"err": type(e).__name__}})
+        finally:
+            try:
+                # 暂时断线只收口旧管道请求,不释放发行版持有者或覆盖运行意图。
+                await self.link.stop()
+            except Exception as e:
+                if not _pipe_disconnected(e):
+                    raise
+
+    async def stop(self) -> None:
+        try:
+            await self.link.stop()
+        finally:
+            try:
+                if self.wechat is not None:
+                    await self.wechat.close()
+            finally:
+                if self._wsl_task is not None:
+                    self._wsl_task.cancel()
+                    await asyncio.gather(self._wsl_task, return_exceptions=True)
+                    self._wsl_task = None
+                await self.wslctl.close()
+
+    async def _deployment_volumes(self, p: dict[str, Any]) -> dict[str, Any]:
+        from .win.storage import probe_deployment_volumes
+        try:
+            rows = await asyncio.to_thread(probe_deployment_volumes, p, distro=self.cfg.wsl.distro)
+        except ValueError as exc:
+            raise WaError(NOT_READY, "Deployment volume query unavailable", reason=str(exc), retryable=True) from None
+        return {"rows": rows}
+
+    # ---------------------------------------------------------------- wsl
+    async def _managed_distro_running(self) -> bool:
+        rows = await self.wslctl._wsl.list_distros()
+        return any(r.get("name") == self.cfg.wsl.distro and r.get("running") is True for r in rows)
+
+    async def _wsl_network(self, p: dict[str, Any]) -> dict[str, Any]:
+        from .netprobe import private_ipv4
+        if not await self._managed_distro_running():
+            return {"guest_ip": None}
+        backend, distro = self.wslctl._wsl, self.cfg.wsl.distro
+        rc, text = await backend.exec(distro, ["ip", "-j", "-4", "route", "show", "default"])
+        if rc:
+            return {"guest_ip": None}
+        try:
+            routes = json.loads(text)
+            devices = {r.get("dev") for r in routes if isinstance(r.get("dev"), str)}
+            if len(devices) != 1:
+                return {"guest_ip": None}
+            device = devices.pop()
+            rc, text = await backend.exec(distro, ["ip", "-j", "-4", "address", "show", "dev", device,
+                                                 "scope", "global"])
+            addresses = json.loads(text) if rc == 0 else []
+            ips = {private_ipv4(info.get("local")) for row in addresses
+                   for info in row.get("addr_info", []) if info.get("family") == "inet"}
+            ips.discard(None)
+            return {"guest_ip": ips.pop() if len(ips) == 1 else None}
+        except (ValueError, TypeError, AttributeError):
+            return {"guest_ip": None}
+
+    async def _wsl_host_update(self, p: dict[str, Any]) -> dict[str, Any]:
+        from .netprobe import private_ipv4
+        if not await self._managed_distro_running():
+            return {"written": False}
+        host = private_ipv4(p.get("host_ip"))
+        if not host:
+            return {"written": False}
+        # Only the fixed public discovery data is accepted; never execute a
+        # caller-supplied path or shell fragment. This file contains no secret.
+        data = json.dumps({"host_ip": host, "winagent_base_url": f"http://{host}:17610",
+                           "wsl_subnet": p.get("wsl_subnet"), "seq": p.get("seq", 0),
+                           "written_ms": self._clock()}, separators=(",", ":")).encode()
+        script = ("import os,sys,tempfile; p='/run/qtrade'; os.makedirs(p,mode=0o755,exist_ok=True); "
+                  "fd,n=tempfile.mkstemp(prefix='.host-',dir=p); os.fchmod(fd,0o644); "
+                  "f=os.fdopen(fd,'wb'); f.write(sys.stdin.buffer.read(4096)); f.flush(); "
+                  "os.fsync(f.fileno()); f.close(); os.replace(n,p+'/host.json')")
+        rc, _ = await self.wslctl._wsl.exec_stdin(
+            self.cfg.wsl.distro, ["/opt/qtrade/agent/venv/bin/python", "-c", script], data)
+        return {"written": rc == 0}
+
+    async def _wsl_version(self, p: dict[str, Any]) -> Any:
+        return await self.wslctl._wsl.version()        # noqa: SLF001 —— WslCtl 拥有后端,这里只读一个版本串
+
+    async def _config_get(self, p: dict[str, Any]) -> Any:
+        return self.wslctl.config_get()
+
+    async def _config_put(self, p: dict[str, Any]) -> Any:
+        # #25 白名单四键(C-32);安装器/内核流程走 kernel.* 那几个方法,不经本入口
+        return self.wslctl.config_put(dict(p.get("desired") or {}),
+                                      allow_keys=("memory", "processors", "autoMemoryReclaim", "swap"))
+
+    async def _kernel_verify(self, p: dict[str, Any]) -> Any:
+        return (await self.wslctl.kernel_verify()).view()
+
+    async def _kernel_apply(self, p: dict[str, Any]) -> Any:
+        return await self.wslctl.kernel_write_and_restart(kernel_path=p.get("kernel_path"),
+                                                          confirm_shutdown=bool(p.get("confirm_shutdown")))
+
+    async def _kernel_rollback(self, p: dict[str, Any]) -> Any:
+        """回滚 = 把 ``kernel=`` 改回备份值(这里以「清空 ``kernel=`` 回默认内核」为基线实现,03 §2.6.5)。"""
+        return await self.wslctl.kernel_write_and_restart(kernel_path=p.get("kernel_path"),
+                                                          confirm_shutdown=bool(p.get("confirm_shutdown")))
+
+    async def _distro_repair(self, p: dict[str, Any]) -> Any:
+        return await self.wslctl.distro_repair(confirm=bool(p.get("confirm")),
+                                               rootfs=str(p.get("rootfs") or ""),
+                                               backup_tar=str(p.get("backup_tar") or ""))
+
+    # ---------------------------------------------------------------- power(会话代理只负责 ES_DISPLAY_REQUIRED)
+    async def _power_display(self, p: dict[str, Any]) -> Any:
+        if self._power is None:
+            raise WaError(NOT_READY, "会话代理未接电源后端", reason="no_power_backend")
+        cur = self._power.current_requests()
+        self._power.set_execution_state(system_required=bool(cur.get("system_required")), display_required=bool(p.get("on")))
+        return {"applied": True, "display_required": bool(p.get("on"))}
+
+    # ---------------------------------------------------------------- wechat
+    def _wx(self) -> WeChatSession:
+        if self.wechat is None:
+            raise WaError(NOT_READY, "会话代理未加载微信模块", reason="wechat_module_absent")
+        return self.wechat
+
+    async def _wechat_module(self, p: dict[str, Any]) -> Any:
+        """#43:``enabled`` 改动后服务通知会话代理起/停模块(握手 WELCOME 附带值也走这里)。幂等:同值不动作。"""
+        want = bool(p.get("enabled"))
+        changed = want != self.cfg.wechat.enabled
+        self.cfg = self.cfg.with_wechat(enabled=want)
+        if self.wechat is not None:
+            self.wechat._cfg = self.cfg.wechat          # noqa: SLF001 —— 配置热更新,唯一写点
+            if changed and not want:
+                await self.wechat.logout()
+            elif want:
+                self._warm_wechat()
+        return {"enabled": self.cfg.wechat.enabled}
+
+    async def _wechat_status(self, p: dict[str, Any]) -> Any:
+        # 2026-10-10 真机:status() 里 psutil 扫进程 / pywinauto 探窗都是阻塞调用,直接跑在事件循环上会把心跳一起卡住;
+        # 放到线程里,管道读循环与心跳不受影响(deadline 仍由服务侧 via_pipe 掌握)。
+        wx = self._wx()
+        if p.get("advance") is True:
+            await wx.ensure_server()
+        return await wx.read_status(screen_locked=bool(p.get("screen_locked")))
+
+    async def _wechat_locate(self, p: dict[str, Any]) -> Any:
+        """服务侧 #29 version-match 的事实来源(R6-86 承接):``wechat_install`` 没行时按本机实际安装算,不再假定「未安装」。"""
+        wx = self._wx()
+        return await asyncio.to_thread(wx.locate)
+
+    async def _wechat_login_start(self, p: dict[str, Any]) -> Any:
+        # main_wnd_class:R6-58 (at) ②——服务侧按 account_id 算好的「该 wxid 行值 / 配置默认」,这里只应用
+        return await self._wx().login_start(account_id=p.get("account_id"), login_session_id=p.get("login_session_id"),
+                                            main_wnd_class=p.get("main_wnd_class"),
+                                            supported_versions=tuple(p.get("supported_versions") or ()))
+
+    async def _wechat_login_cancel(self, p: dict[str, Any]) -> Any:
+        return await self._wx().login_cancel(login_session_id=p.get("login_session_id"))
+
+    async def _wechat_login_status(self, p: dict[str, Any]) -> Any:
+        wx = self._wx()
+        return await wx.poll() if p.get("advance") is True else wx.login_status()
+
+    async def _wechat_bind(self, p: dict[str, Any]) -> Any:
+        wx = self._wx()
+        s = wx.session
+        if s is not None:
+            s.wxid = p.get("wxid") or s.wxid
+            s.account_id = p.get("account_id") or s.account_id
+        # main_wnd_class:R6-58 (at) ①——把这次探测到的主窗口类名随响应带回,服务侧据此 record_main_wnd_class
+        # (方向仍是「服务发请求、结果随响应带回」,本类自己不碰 DB)
+        return {"ok": True, "wxid": p.get("wxid"), "account_id": p.get("account_id"),
+                "main_wnd_class": wx.detected_main_wnd_class()}
+
+    async def _wechat_logout(self, p: dict[str, Any]) -> Any:
+        return await self._wx().logout()
+
+    async def _wechat_key_retry(self, p: dict[str, Any]) -> Any:
+        return await self._wx().key_retry()
+
+    async def _wechat_ui_visible(self, p: dict[str, Any]) -> Any:
+        return self._wx().ui_visible()
+
+    async def _wechat_send(self, p: dict[str, Any]) -> Any:
+        return await self._wx().send(session_name=str(p.get("session_name") or ""), text=p.get("text"),
+                                     image_path=p.get("image_path"), idempotency_key=p.get("idempotency_key"),
+                                     confirm_timeout_ms=p.get("confirm_timeout_ms"))
+
+    async def _wechat_read(self, p: dict[str, Any]) -> Any:
+        return await self._wx().read(talker=p.get("talker"), since_seq=p.get("since_seq"), limit=p.get("limit"))
+
+    async def _wechat_media(self, p: dict[str, Any]) -> Any:
+        """截图/媒体走 base64 装进一帧;单帧 ≤ ``[ipc] max_frame_kb``(02 §2.4.1),超限由 ``FakePipeConn``/真管道拒。"""
+        raw = await self._wx().media(str(p.get("key") or ""))
+        return {"b64": base64.b64encode(raw).decode("ascii"), "content_type": "image/jpeg"}
+
+    async def _wechat_sessions(self, p: dict[str, Any]) -> Any:
+        return {"sessions": await self._wx().sessions(keyword=p.get("keyword"), limit=int(p.get("limit") or 100))}
+
+    async def _wechat_screenshot(self, p: dict[str, Any]) -> Any:
+        raw = await self._wx().screenshot(screen_locked=bool(p.get("screen_locked")))
+        return {"b64": base64.b64encode(raw).decode("ascii"), "content_type": "image/png"}
+
+    async def _wechat_reinstall(self, p: dict[str, Any]) -> Any:
+        return await self._wx().reinstall(installer=p.get("installer"))

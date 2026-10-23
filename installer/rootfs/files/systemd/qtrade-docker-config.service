@@ -1,0 +1,28 @@
+[Unit]
+Description=QTrade：在 dockerd 首启前写 /etc/docker/daemon.json（选定地址池）
+Documentation=file:///opt/qtrade/bin/qtrade-docker-config.sh
+# Run before docker.socket without the implicit After=basic.target cycle.
+# Preserve the remaining normal service startup and shutdown dependencies.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+# 🔴 docs/03 §2.7.3 R5-9：这一条 Before= 是整个选段机制的成败所在。
+# 旧写法把「写 daemon.json」挂在 After=docker.service 的 oneshot 里 ⇒ dockerd 已用
+# 默认段起过、docker0(172.17)已建，事后 restart 也改不回来，选段白做。
+Before=docker.service
+Before=docker.socket
+After=local-fs.target
+ConditionPathExists=!/etc/qtrade/.docker-configured
+ConditionPathExists=/etc/qtrade/install.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/qtrade/bin/qtrade-docker-config.sh
+# Target configuration must exist before Docker may start.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

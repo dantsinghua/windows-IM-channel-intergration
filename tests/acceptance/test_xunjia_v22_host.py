@@ -1,0 +1,334 @@
+"""Independent collector-host contracts with injected protocol/network edges.
+
+The host, its SQLite state, event normalization scheduling and lifecycle are
+real. No external protocol package, service, account or network is required.
+"""
+import asyncio
+from copy import deepcopy
+import json
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from qtrade_agent.events import Events, message_payload
+from qtrade_agent.models import Message, Session
+from qtrade_agent.store import Store
+from qtrade_agent.ossbox.xunjia_v22 import XunjiaV22Host
+from qtrade_agent.ossbox.institution import InstitutionCollectorHost, InstitutionAccountHost
+
+
+class Ledger:
+    def __init__(self, order):
+        self.order, self.pending = order, set()
+        self.clock = time.time
+    def begin_inbound(self, event_id, peer_id):
+        self.order.append(("begin", event_id))
+        self.pending.add(event_id)
+    def stage_out(self, data, seconds):
+        self.order.append(("stage_out", data["event_id"]))
+        return "waiting"
+    def permission(self, command):
+        return not self.pending
+
+
+class Port:
+    channel = "qidian"
+    def __init__(self, binding):
+        self.binding = binding
+        self.adapters = {}
+        self.execution_permission = None
+        self.calls = []
+    def _account(self):
+        return {"id": "qd90", "self_uid": self.binding.account_uid, "state": "running"}
+    def normalize_native_message(self, row, live=False):
+        return {"event_id": "native-" + row["ext_msg_id"], "peer_id": row["session_id"].split(":", 1)[1],
+                "direction": row["dir"], "text": row["text"], "kind": "message", "ext_msg_id": row["ext_msg_id"],
+                "occurred_at": row["ts_ms"] / 1000, "historical": not live,
+                "native_account_uid": row["native_account_uid"], "identity_epoch": row["identity_epoch"],
+                "channel": self.channel}
+    def native_send(self, command):
+        if not self.execution_permission(command):
+            return {"status": "failed", "evidence": "synthetic permission blocked"}
+        self.calls.append(command)
+        return {"status": "unknown", "evidence": "synthetic unknown"}
+    def native_reconcile(self, command):
+        return {"status": "unknown", "evidence": "synthetic read only reconciliation"}
+
+
+class Bridge:
+    echo_wait_seconds = 1
+    def __init__(self, binding):
+        self.binding = binding
+        self.order, self.published = [], []
+        self.ledger = Ledger(self.order)
+        self.fail_publication = False
+        self.runs = 0
+        self.catalogs = 0
+        self.contacts = []
+        self.adapters = {"oss": SimpleNamespace(publish_contacts=self.publish_contacts)}
+    def publish_native(self, data, historical=False):
+        self.order.append(("publish", data["event_id"]))
+        if self.fail_publication:
+            raise OSError("synthetic network unavailable")
+        self.published.append(deepcopy(data))
+        self.ledger.pending.discard(data["event_id"])
+    def run_once(self):
+        self.runs += 1
+        return {"processed": 0, "errors": []}
+    def publish_capabilities(self):
+        self.catalogs += 1
+    def publish_contacts(self, payload):
+        self.contacts.append(deepcopy(payload))
+
+
+def build(tmp_path, loop, *, legacy_disabled=lambda: True, bus_guard=True):
+    binding = SimpleNamespace(owner_user_id="synthetic-owner", account_uid="synthetic-account", workbench_id="synthetic-workbench")
+    bridge, port = Bridge(binding), Port(binding)
+    host = XunjiaV22Host(store=SimpleNamespace(outbox_seq_bounds=lambda: (0, 0)),
+        bus=SimpleNamespace(supports_xunjia_v22_guard=bus_guard), loop=loop, binding=binding,
+        bridge=bridge, port=port, state_path=tmp_path / "host.sqlite3",
+        legacy_inbox_disabled=legacy_disabled)
+    return host, bridge, port
+
+
+def observe(host, *, text="first quotation", revoked=False, direction="in", event_id="event-1", account="qd90"):
+    host.observe(event="message", channel="qidian", account_id=account, event_id=event_id,
+        payload={"account_id": account, "session": {"id": "qd90:synthetic-peer", "kind": "private"},
+                 "ext_msg_id": "synthetic-native-id", "dir": direction, "text": text,
+                 "ts_ms": 1_792_202_400_000, "revoked": revoked})
+
+
+def test_host_rejects_legacy_overlap_and_missing_bus_guard(tmp_path):
+    async def run():
+        with pytest.raises(RuntimeError, match="legacy"):
+            build(tmp_path, asyncio.get_running_loop(), legacy_disabled=lambda: False)
+        with pytest.raises(RuntimeError, match="guard"):
+            build(tmp_path, asyncio.get_running_loop(), bus_guard=False)
+    asyncio.run(run())
+
+
+def test_host_defaults_to_guarded_native_send_and_start_is_single_worker(tmp_path):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        command = {"business_version": "2.2"}
+        assert not host.permission(command)
+        assert bridge.native_send(command)["status"] == "failed"
+        assert port.calls == []
+        await host.start()
+        worker = host._worker
+        await host.start()
+        assert host._worker is worker
+        try:
+            assert host.permission(command)
+            assert bridge.native_send(command)["status"] == "unknown"
+            assert port.calls == [command]
+        finally:
+            await host.stop()
+        assert not host.permission(command)
+        assert bridge.native_send(command)["status"] == "failed"
+        assert port.calls == [command]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("barrier", ["intake", "legacy", "ledger"])
+def test_default_native_send_still_rechecks_execution_barriers(tmp_path, barrier):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        host._active = True  # Exercise guards without starting a background worker.
+        if barrier == "intake":
+            host._intake_ok = False
+        elif barrier == "legacy":
+            host.legacy_inbox_disabled = lambda: False
+        else:
+            host.ledger.pending.add("synthetic-unpublished-inbound")
+        assert not host.permission({"business_version": "2.2"})
+        assert bridge.native_send({"business_version": "2.2"})["status"] == "failed"
+        assert port.calls == []
+    asyncio.run(run())
+
+
+def test_intake_registers_local_barrier_before_any_network_and_deduplicates(tmp_path):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        observe(host)
+        assert bridge.order == [("begin", "native-synthetic-native-id")]
+        assert bridge.published == [] and bridge.runs == 0
+        observe(host)
+        await host.run_once()
+        assert len(bridge.published) == 1
+        assert bridge.order.index(("begin", "native-synthetic-native-id")) < bridge.order.index(("publish", "native-synthetic-native-id"))
+        assert port.calls == []
+    asyncio.run(run())
+
+
+def test_native_edit_and_retract_keep_one_original_reference(tmp_path):
+    async def run():
+        host, bridge, _ = build(tmp_path, asyncio.get_running_loop())
+        observe(host)
+        observe(host, text="corrected quotation", event_id="event-2")
+        observe(host, text="corrected quotation", revoked=True, event_id="event-3")
+        assert bridge.published == [], "Native observations must never perform network I/O inline"
+        await host.run_once()
+        assert [data["kind"] for data in bridge.published] == ["message", "edit", "retract"]
+        first, edit, retract = bridge.published
+        assert edit["target_event_id"] == retract["target_event_id"] == first["event_id"]
+        assert len({data["event_id"] for data in bridge.published}) == 3
+        assert all(not data["historical"] for data in bridge.published)
+    asyncio.run(run())
+
+
+def test_outbound_echo_is_held_locally_before_publication(tmp_path):
+    async def run():
+        host, bridge, _ = build(tmp_path, asyncio.get_running_loop())
+        observe(host, direction="out")
+        assert bridge.order == [("stage_out", "native-synthetic-native-id")]
+        assert bridge.published == []
+        await host.run_once()
+        assert bridge.order[0][0] == "stage_out"
+    asyncio.run(run())
+
+
+def test_restart_replays_unpublished_native_events_without_resending(tmp_path):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        bridge.fail_publication = True
+        observe(host)
+        with pytest.raises(OSError):
+            await host.run_once()
+        restarted, second, next_port = build(tmp_path, asyncio.get_running_loop())
+        await restarted.run_once()
+        await restarted.run_once()
+        assert len(second.published) == 1 and second.published[0]["text"] == "first quotation"
+        assert port.calls == next_port.calls == []
+    asyncio.run(run())
+
+
+def test_host_never_accepts_old_business_commands_or_another_account_event(tmp_path):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        host._active = True
+        assert bridge.native_send({"business_version": "1"})["status"] == "failed"
+        observe(host, account="qd91")
+        await host.run_once()
+        assert not bridge.published and not port.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("version", ["1", "2.2", "future-version"])
+def test_current_institution_start_owns_real_native_core_for_any_retired_version(tmp_path, monkeypatch, version):
+    from relay.gateway_paths import InstitutionKeys, CONTRACT
+    from relay.file_gateway import GatewayAuth
+    monkeypatch.setenv("XUNJIA_COLLECTOR_VERSION", version)
+    async def run():
+        store = Store(str(tmp_path / "current-store.sqlite3")).open()
+        store.ensure_account("qd90", "qidian", state="running", self_uid="10001")
+        uploaded = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        class Client:
+            def __init__(self, path): self.queue_identity=("synthetic-relay",path)
+            def upload(self, name, blob):
+                loop.call_soon_threadsafe(uploaded.set)
+            def pending(self): return 0
+        settings = SimpleNamespace(workbench_id="synthetic-workbench", view=lambda: {"workbench_name":"desk"}, saved=lambda:None)
+        host = InstitutionCollectorHost(store=store, bus=SimpleNamespace(supports_xunjia_v22_guard=True),
+            loop=loop, keys=InstitutionKeys.from_auth(GatewayAuth("synthetic", b"0123456789abcdef")),
+            config={"workbench_name":"desk", "contract":CONTRACT}, settings=settings, data_dir=tmp_path,
+            legacy_inbox_disabled=lambda:True, friends_provider=lambda _:[],
+            organization_provider=lambda _:{"org_state":"empty", "org":{"departments":[],"members":[]}},
+            client_factory=Client)
+        try:
+            await host.start()
+            await asyncio.wait_for(uploaded.wait(), timeout=3)
+            assert len(host.hosts)==1, host.errors
+            core=host.hosts[("qd90","10001")]
+            assert isinstance(core,InstitutionAccountHost) and isinstance(core,XunjiaV22Host)
+            worker=core._worker
+            await host.start()
+            assert host.hosts[("qd90","10001")] is core and core._worker is worker
+            assert core.port._account()["self_uid"]=="10001"
+        finally:
+            await host.stop()
+            store.close()
+        assert not core._active and core._worker is None
+    asyncio.run(run())
+
+
+def test_live_edit_then_durable_outbox_replay_never_republishes_older_text(tmp_path):
+    async def run():
+        loop = asyncio.get_running_loop()
+        store = Store(str(tmp_path / "qtrade-outbox.sqlite3")).open()
+        store.ensure_account("qd90","qidian",state="running",self_uid="synthetic-account")
+        binding = SimpleNamespace(owner_user_id="synthetic-owner", account_uid="synthetic-account", workbench_id="synthetic-workbench")
+        bridge, port = Bridge(binding), Port(binding)
+        host = XunjiaV22Host(store=store, bus=SimpleNamespace(supports_xunjia_v22_guard=True), loop=loop,
+            binding=binding, bridge=bridge, port=port, state_path=tmp_path / "host.sqlite3", legacy_inbox_disabled=lambda: True)
+        events = Events(store, on_emit=host.observe)
+        original=Message(account_id="qd90",channel="qidian",session=Session("qd90","synthetic-peer","private"),
+            ext_msg_id="synthetic-native-id",dir="in",type="text",text="first quotation",
+            ts_ms=1_792_202_400_000,source="qidian_db",sender_id="synthetic-peer")
+        store.ingest(original)
+        body=message_payload(original,late_after_s=60)
+        try:
+            events.emit("message", payload=body, account_id="qd90", channel="qidian", now_ms=1_792_202_400_000)
+            corrected=Message(account_id="qd90",channel="qidian",session=original.session,
+                ext_msg_id=original.ext_msg_id,dir="in",type="text",text="corrected quotation",
+                ts_ms=original.ts_ms,source="qidian_db",sender_id="synthetic-peer")
+            store.ingest(corrected)
+            events.emit("message", payload={**body, "text": "corrected quotation"}, account_id="qd90", channel="qidian", now_ms=1_792_202_401_000)
+            await host.run_once()
+            assert [row["text"] for row in bridge.published] == ["first quotation", "corrected quotation"], (
+                "Replaying an already observed outbox event cannot create a new edit that restores an older body"
+            )
+            await host.run_once()
+            assert len(bridge.published) == 2
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+def test_active_native_core_runs_guarded_worker_without_owning_directory_publication(tmp_path):
+    async def run():
+        host, bridge, port = build(tmp_path, asyncio.get_running_loop())
+        processed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        original = bridge.run_once
+        def tick():
+            result=original()
+            loop.call_soon_threadsafe(processed.set)
+            return result
+        bridge.run_once = tick
+        await host.run_once()
+        assert bridge.catalogs == 0
+        assert callable(port.execution_permission)
+        processed.clear()
+        await host.start()
+        try:
+            await asyncio.wait_for(processed.wait(), timeout=2)
+            assert bridge.catalogs == 0 and bridge.runs >= 2
+            assert host.permission({"business_version": "2.2"})
+            host.ledger.pending.add("synthetic-unpublished-inbound")
+            assert not host.permission({"business_version": "2.2"})
+            assert port.calls == []
+        finally:
+            await host.stop()
+        await host.run_once()
+        assert bridge.catalogs == 0
+    asyncio.run(run())
+
+
+def test_reusable_receiver_core_has_no_retired_environment_factory():
+    assert not hasattr(XunjiaV22Host, "from_env")
+
+
+@pytest.mark.parametrize("field", ["owner_user_id", "account_uid", "workbench_id"])
+def test_receiver_state_cannot_be_rebound_to_another_identity(tmp_path, field):
+    async def run():
+        host, _, _ = build(tmp_path, asyncio.get_running_loop())
+        binding = SimpleNamespace(**vars(host.binding))
+        setattr(binding, field, "another-synthetic-identity")
+        with pytest.raises(ValueError, match="collector_state_belongs_to_another_binding"):
+            XunjiaV22Host(store=host.store, bus=host.bus, loop=host.loop, binding=binding,
+                bridge=Bridge(binding), port=Port(binding), state_path=host.state_path,
+                legacy_inbox_disabled=lambda: True)
+    asyncio.run(run())

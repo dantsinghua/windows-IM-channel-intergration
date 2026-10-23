@@ -1,0 +1,41 @@
+{
+  "op": "system_wsl_restart",
+  "kind": "admin",
+  "danger": true,
+  "confirmable": false,
+  "channels": {
+    "qidian": "not_applicable",
+    "qq": "not_applicable",
+    "wechat": "not_applicable"
+  },
+  "args_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "terminate",
+          "shutdown"
+        ]
+      },
+      "confirm": {
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "required": [
+      "mode"
+    ]
+  },
+  "result_schema": {
+    "type": "object",
+    "properties": {
+      "accepted": {
+        "type": "boolean"
+      }
+    }
+  },
+  "since": "0.1.0"
+}

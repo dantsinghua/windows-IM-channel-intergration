@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtrade-agent"
+version = "0.1.0"
+description = "QTrade 多实例 IM 控制台 —— Agent(WSL 侧 systemd 服务)。规格 = docs/00 基线 + docs/01~06 六册。"
+requires-python = ">=3.11"
+# 02 §2.2 技术选型:FastAPI + uvicorn(显式 ws="websockets")+ aiosqlite + websockets。
+# `docker` SDK 已从依赖删除(backend-fix-7):src/ 从未 import 它(对 dockerd 走子进程/假实现),只白给发行版带进
+# docker/requests/urllib3/charset-normalizer 四个包;02 §2.2 选型句里的「docker SDK」待文档方同步。
+# 🔴 uvicorn 必须带 [standard] 之外的显式 websockets(ws="auto" 选中 sansio 实现会让 101 响应带两个 Date 头,
+# ibquote 2026-08-12 麒麟现场 502 事故);docker/adb/WinAgent/邮箱在开发容器里一律注假实现,装了依赖也不会去连。
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "websockets>=12",
+  "aiosqlite>=0.20",
+  "cryptography>=50.0.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# 🔴 运行期要读的数据文件必须逐条声明,否则装进 wheel 后目录根本不存在(`tests/test_packaging.py` 真打一个
+# wheel 开包断言,专拦这类漏)。`profiles/`、`migrations/` 不是包(没有 `__init__.py`),故挂在父包名下按子路径通配。
+[tool.setuptools.package-data]
+"qtrade_agent.store" = ["*.sql", "migrations/*.sql"]
+"qtrade_agent.capabilities" = ["*.json"]
+"qtrade_agent.adapters.qidian" = ["profiles/*.yaml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "version": "0.1.0",
+  "api_version": "1.0",
+  "uptime_s": 0,
+  "user_agent": false,
+  "user_session": null,
+  "modules": {
+    "vault": "ok",
+    "monitor": "ok",
+    "netprobe": "ok",
+    "power": "ok",
+    "wslctl": "offline",
+    "wechat": "offline"
+  },
+  "checks": {
+    "H01": null,
+    "H09": null,
+    "H10": null,
+    "H11": null,
+    "H14": null,
+    "H15": null,
+    "H16": null,
+    "H20": null
+  },
+  "host": {
+    "total_mb": 16384.0,
+    "available_mb": 6100.0,
+    "wsl_vm_mb": 0.0,
+    "wechat_mb": 0,
+    "chatlog_mb": 0.0
+  }
+}
