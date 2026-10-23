@@ -351,12 +351,12 @@ def test_final_send_stale_rechecks_session_after_full_read_retry(monkeypatch):
         return rig.send.enabled
 
     def session_name():
-        if rig.composer.name != TARGET:
+        if rig.title.name != TARGET:
             invalid_session_reads.append(True)
-        return rig.composer.name
+        return rig.title.name
 
     monkeypatch.setattr(rig.send, "is_enabled", enabled)
-    monkeypatch.setattr(rig.composer, "window_text", session_name)
+    monkeypatch.setattr(rig.title, "window_text", session_name)
     with pytest.raises(WaError):
         send(rig, monkeypatch)
     assert stale and invalid_session_reads, "按钮重读必须重过会话门，不能沿用此前目标结果"
@@ -373,9 +373,9 @@ def test_composer_name_stale_reacquires_and_rechecks_target(monkeypatch):
         if len(reads) == 1:
             rig.invalidate("composer", "wrong-session")
             raise FakeComError()
-        return rig.composer.name
+        return rig.title.name
 
-    monkeypatch.setattr(rig.composer, "window_text", name)
+    monkeypatch.setattr(rig.title, "window_text", name)
     with pytest.raises(WaError):
         send(rig, monkeypatch)
     assert len(reads) == 2

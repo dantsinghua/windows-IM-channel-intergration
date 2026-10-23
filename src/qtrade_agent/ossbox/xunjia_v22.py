@@ -1,4 +1,4 @@
-"""Opt-in V2.2 collector host. It never starts an IM account or a native sender.
+"""Current V2.2 collector core. It never starts an IM account or a native sender.
 
 The existing Agent owns this worker and its event hook. The institution collector
 supplies the transport; this core owns guarded receiver execution and durable state.
@@ -11,8 +11,6 @@ from datetime import datetime
 import hashlib
 import json
 import logging
-import math
-import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -21,16 +19,9 @@ import time
 log = logging.getLogger('qtrade.ossbox.xunjia_v22')
 
 
-def collector_version(env=None):
-    value = (os.environ if env is None else env).get('XUNJIA_COLLECTOR_VERSION', '1')
-    if value not in ('1', '2.2'):
-        raise ValueError('xunjia_collector_version_invalid')
-    return value
-
-
 class XunjiaV22Host:
     def __init__(self, *, store, bus, loop, binding, bridge, port, state_path,
-                 legacy_inbox_disabled, contacts_provider=None):
+                 legacy_inbox_disabled, media_provider=None):
         if not callable(legacy_inbox_disabled):
             raise ValueError('invalid_collector_execution_policy')
         if not legacy_inbox_disabled():
@@ -43,7 +34,7 @@ class XunjiaV22Host:
         self.binding, self.bridge, self.port = binding, bridge, port
         self.ledger = bridge.ledger
         self.legacy_inbox_disabled = legacy_inbox_disabled
-        self.contacts_provider = contacts_provider
+        self.media_provider = media_provider
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -52,18 +43,21 @@ class XunjiaV22Host:
         self._worker = None
         self._wake = asyncio.Event()
         self._tick_lock = asyncio.Lock()
-        self._last_catalog = 0.0
         self.port.execution_permission = self.permission
         quiescent = getattr(self.port, 'quiescent', None)
         self.bridge.native_quiescent = quiescent if callable(quiescent) else None
         self.bridge.native_send = self._send
         self.bridge.native_reconcile = self.port.native_reconcile
-        identity = json.dumps([binding.owner_user_id, binding.account_uid, binding.workbench_id])
+        identity = json.dumps([binding.owner_user_id, binding.account_uid, binding.workbench_id] + ([self.port.channel] if self.port.channel != 'qidian' else []))
         with self._db() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS host_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS host_event (event_id TEXT PRIMARY KEY, body TEXT NOT NULL,
                     published INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS host_media (event_id TEXT PRIMARY KEY, body TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL DEFAULT '', checked_at REAL NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS host_media_chunk (sha256 TEXT NOT NULL, route TEXT NOT NULL,
+                    position INTEGER NOT NULL, PRIMARY KEY(sha256,route,position));
                 CREATE TABLE IF NOT EXISTS host_native (native_key TEXT PRIMARY KEY, original_id TEXT NOT NULL,
                     text_hash TEXT NOT NULL, revoked INTEGER NOT NULL, outbox_seq INTEGER NOT NULL DEFAULT 0);
             ''')
@@ -102,7 +96,7 @@ class XunjiaV22Host:
         """Read the shared ledger only for this port's unique bound account."""
         account = self.port._account()
         if (not account or account.get('id') != account_id
-                or account.get('channel') != 'qidian'
+                or account.get('channel') != self.port.channel
                 or str(account.get('self_uid')) != self.binding.account_uid):
             return None
         current = self.ledger.reset_status()
@@ -135,7 +129,7 @@ class XunjiaV22Host:
 
     def observe(self, *, event, payload, account_id=None, event_id='', channel=None,
                 trace_id=None, now_ms=None, historical=False, source_seq=0):
-        if event != 'message' or channel != 'qidian':
+        if event != 'message' or channel != self.port.channel:
             return
         try:
             # Event payload is already the committed QTrade message snapshot.
@@ -147,6 +141,22 @@ class XunjiaV22Host:
             bound = self.port._account()
             if not bound or row['account_id'] != bound['id']:
                 return
+            if not source_seq and event_id and hasattr(self.store, 'con'):
+                position = self.store.con.execute("SELECT seq FROM events_outbox WHERE target='ws' AND event_id=?", (event_id,)).fetchone()
+                source_seq = position['seq'] if position else 0
+            identity = getattr(self.store, 'native_identity', lambda _: {})(bound['id'])
+            if identity and (not source_seq or source_seq <= identity.get('outbox_seq', 0)):
+                return
+            row['source_seq'] = source_seq
+            row['native_account_uid'] = payload.get('native_account_uid', str(bound['self_uid']))
+            row['identity_epoch'] = payload.get('identity_epoch', identity.get('epoch', 0))
+            lookup = getattr(self.store, 'get_message', None)
+            if callable(lookup):
+                message = lookup(row.get('id')) if row.get('id') else None
+                if (message is None or message.get('identity_epoch', 0) != identity.get('epoch', 0)
+                        or message.get('ext_msg_id') != row.get('ext_msg_id')
+                        or message.get('dir') != row.get('dir') or message.get('session_id') != row.get('session_id')):
+                    return
             data = self.port.normalize_native_message(row, live=not historical)
             native_key = json.dumps([data['peer_id'], data['direction'], data['ext_msg_id']])
             text_hash = hashlib.sha256(data['text'].encode()).hexdigest()
@@ -202,109 +212,129 @@ class XunjiaV22Host:
             rows = db.execute('SELECT event_id,body FROM host_event WHERE published=0 ORDER BY rowid LIMIT 200').fetchall()
         for row in rows:
             data = json.loads(row['body'])
+            account = self.port._account()
+            identity = getattr(self.store, 'native_identity', lambda _: {})(account['id']) if account else {}
+            if (data.get('native_account_uid') != self.binding.account_uid
+                    or data.get('identity_epoch') != identity.get('epoch', 0)
+                    or data.get('channel') != self.port.channel):
+                # Preserve unverifiable pre-upgrade work without replaying it as a new login.
+                self._intake_ok = False
+                log.error('Native pending identity is unverified; automatic sending blocked')
+                continue
+            if data.get('media') and callable(self.media_provider):
+                from relay.protocol import digest
+                data.update(self._prepare_media(data))
+                data['media_manifest_id'] = 'native-media-' + digest([self.binding.account_uid, self.port.channel, data['event_id']])
+                with self._db() as db:
+                    db.execute('INSERT OR IGNORE INTO host_media(event_id,body) VALUES(?,?)',
+                               (data['event_id'], json.dumps(data, ensure_ascii=False)))
+                    db.execute('UPDATE host_event SET body=? WHERE event_id=?',
+                               (json.dumps(data, ensure_ascii=False), data['event_id']))
+                self._publish_media_chunks(data)
             self.bridge.publish_native(data, historical=data.get('historical', False))
             with self._db() as db:
                 db.execute('UPDATE host_event SET published=1 WHERE event_id=?', (row['event_id'],))
+        self._flush_media()
 
-    def _previous_org(self):
-        with self._db() as db:
-            row = db.execute("SELECT value FROM host_meta WHERE key='org_publication_id'").fetchone()
-        if row:
-            for adapter in self.bridge.adapters.values():
-                if not hasattr(adapter, 'store'):
+    def _prepare_media(self, event):
+        facts = self.media_provider(event)
+        blobs = facts.pop('_media_blobs', {})
+        root = self.state_path.parent / 'native-media'
+        for sha, raw in blobs.items():
+            if not isinstance(raw, bytes) or hashlib.sha256(raw).hexdigest() != sha:
+                raise ValueError('NATIVE_MEDIA_HASH_MISMATCH')
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = root / sha
+            if path.exists():
+                if hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+                    raise ValueError('NATIVE_MEDIA_SPOOL_CORRUPT')
+            else:
+                temporary = root / (sha + '.pending')
+                with temporary.open('wb') as out:
+                    out.write(raw); out.flush()
+                    import os
+                    os.fsync(out.fileno())
+                temporary.replace(path)
+                path.chmod(0o600)
+                directory_fd = os.open(root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        # A restart or MediaStore expiration cannot erase already spooled bytes.
+        previous = event.get('attachments', [])
+        if facts.get('media_state') == 'pending' and previous and len(previous) == len(event.get('media', [])):
+            valid = True
+            for item in previous:
+                if item.get('content_base64'):
                     continue
-                with adapter.store.db() as db:
-                    saved = db.execute('SELECT data FROM tx_publication WHERE scope=? AND id=? AND route=? AND uploaded=1',
-                        (adapter.store.scope, row['value'], adapter.route)).fetchone()
-                if saved:
-                    book = json.loads(saved['data'])['payload']
-                    if (book.get('account_uid') == self.binding.account_uid
-                            and book.get('org_state') in ('ready', 'empty') and isinstance(book.get('org'), dict)):
-                        return {key: book.get(key) for key in ('org', 'org_updated_at')}
-        return {'org': {}, 'org_updated_at': None}
+                sha = item.get('sha256', '')
+                path = root / sha if len(sha) == 64 and not set(sha) - set('0123456789abcdef') else None
+                if path is None or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+                    valid = False; break
+            if valid:
+                facts = {'attachments': previous, 'media': event['media'],
+                         'media_state': 'chunked' if any('content_base64' not in a for a in previous) else 'ready'}
+        return facts
 
-    def _previous_contacts(self):
-        with self._db() as db:
-            pointer = db.execute("SELECT value FROM host_meta WHERE key='contacts_publication_id'").fetchone()
-        for adapter in self.bridge.adapters.values():
-            if not hasattr(adapter, 'store'):
+    def _publish_media_chunks(self, event):
+        import base64
+        from relay.gateway_paths import CONTRACT, CHUNK_BYTES, MAX_FILE_BYTES
+        for item in event.get('attachments', []):
+            if 'content_base64' in item:
                 continue
-            with adapter.store.db() as db:
-                if pointer:
-                    row = db.execute('SELECT data FROM tx_publication WHERE scope=? AND id=? AND route=? AND uploaded=1',
-                        (adapter.store.scope, pointer['value'], adapter.route)).fetchone()
-                else:
-                    row = db.execute("SELECT data FROM tx_publication WHERE scope=? AND route=? AND uploaded=1 "
-                        "AND json_extract(data,'$.kind')='contacts' ORDER BY rowid DESC LIMIT 1",
-                        (adapter.store.scope, adapter.route)).fetchone()
-            if row:
-                book = json.loads(row['data'])['payload']
-                if book.get('account_uid') == self.binding.account_uid and isinstance(book.get('contacts'), list):
-                    return book['contacts']
-        return []
+            sha, size = item.get('sha256'), item.get('size')
+            if (not isinstance(sha, str) or len(sha) != 64 or set(sha) - set('0123456789abcdef')
+                    or type(size) is not int or not 0 < size <= MAX_FILE_BYTES):
+                raise ValueError('NATIVE_MEDIA_SOURCE_INVALID')
+            path = self.state_path.parent / 'native-media' / sha
+            if not path.is_file() or path.stat().st_size != size or hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+                raise ValueError('NATIVE_MEDIA_SOURCE_LOST')
+            count = (size + CHUNK_BYTES - 1) // CHUNK_BYTES
+            for route, adapter in self.bridge.adapters.items():
+                with path.open('rb') as source:
+                    for position in range(count):
+                        raw = source.read(CHUNK_BYTES)
+                        with self._db() as db:
+                            sent = db.execute('SELECT 1 FROM host_media_chunk WHERE sha256=? AND route=? AND position=?',
+                                              (sha, route, position)).fetchone()
+                        if sent:
+                            continue
+                        adapter.publish_manifest({'contract': CONTRACT, 'op': 'media_chunk', 'sha256': sha,
+                            'size': size, 'position': position, 'chunks': count, 'data': base64.b64encode(raw).decode('ascii')},
+                            message_id='media-' + sha + '-' + str(position))
+                        with self._db() as db:
+                            db.execute('INSERT OR IGNORE INTO host_media_chunk VALUES(?,?,?)', (sha, route, position))
 
-    def _remember_org(self, payload):
-        from relay.protocol import digest
-        identity = 'contacts-' + digest(payload)[:32]
-        with self._db() as db:
-            db.execute("INSERT INTO host_meta(key,value) VALUES('contacts_publication_id',?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (identity,))
-            if payload.get('org_state') in ('ready', 'empty'):
-                db.execute("INSERT INTO host_meta(key,value) VALUES('org_publication_id',?) "
-                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (identity,))
-
-    def _publish_directory(self):
-        account = self.port._account()
-        if account is None:
+    def _flush_media(self):
+        if not callable(self.media_provider):
             return
-        self.bridge.publish_capabilities()
-        previous = self._previous_org()
-        payload = {'account_uid': self.binding.account_uid, 'contacts': account.get('contacts', []),
-                   **previous, 'org_state': 'unreported', 'org_error': None, 'updated_at': self.ledger.clock()}
-        if self.contacts_provider is not None:
-            try:
-                book = self.contacts_provider(account)
-                if not isinstance(book, dict) or not isinstance(book.get('contacts'), list):
-                    raise ValueError('collector_contacts_unavailable')
-                payload['contacts'] = book['contacts']
-                state = book.get('org_state', 'ready' if isinstance(book.get('org'), dict) and
-                                 isinstance(book['org'].get('departments'), list) and
-                                 isinstance(book['org'].get('members'), list) else 'unreported')
-                if state in ('ready', 'empty') and 'org_updated_at' not in book:
-                    book = {**book, 'org_updated_at': self.ledger.clock()}
-                if state in ('ready', 'empty'):
-                    org = book.get('org')
-                    if (not isinstance(org, dict) or not isinstance(org.get('departments'), list)
-                            or not isinstance(org.get('members'), list)
-                            or type(book.get('org_updated_at')) not in (int, float)
-                            or not math.isfinite(book['org_updated_at'])
-                            or book['org_updated_at'] > self.ledger.clock() + 60
-                            or state != ('ready' if org['departments'] or org['members'] else 'empty')):
-                        raise ValueError('collector_org_schema_invalid')
-                    payload.update(org=org, org_state=state, org_updated_at=book['org_updated_at'])
+        from relay.protocol import digest
+        from relay.gateway_paths import CONTRACT
+        with self._db() as db:
+            pending = db.execute('SELECT * FROM host_media ORDER BY checked_at,rowid LIMIT 20').fetchall()
+        for row in pending:
+            event = json.loads(row['body'])
+            facts = self._prepare_media(event)
+            self._publish_media_chunks({**event, **facts})
+            payload = {"contract": CONTRACT, "op": "native_media", "event_id": event['event_id'],
+                       "ext_msg_id": event['ext_msg_id'], "peer_id": event['peer_id'],
+                       "channel": self.port.channel, "media_manifest_id": event['media_manifest_id'], **facts}
+            fingerprint = digest(payload)
+            if fingerprint != row['fingerprint']:
+                for adapter in self.bridge.adapters.values():
+                    adapter.publish_manifest(payload, message_id=event['media_manifest_id'] + '-' + fingerprint)
+            with self._db() as db:
+                if facts.get('media_state') in ('ready', 'chunked'):
+                    db.execute('DELETE FROM host_media WHERE event_id=?', (row['event_id'],))
                 else:
-                    payload.update(org_state=state if state in ('error', 'unreported') else 'error',
-                                   org_error=book.get('org_error') or 'ORG_NOT_REPORTED')
-            except Exception:
-                payload.update(contacts=self._previous_contacts(), org_state='error', org_error='ORG_PROVIDER_UNAVAILABLE')
-                log.warning('V2.2 contacts unavailable; preserving previous published organization')
-        from relay.protocol import canonical
-        limit = min(getattr(getattr(adapter, 'codec', None), 'max_bytes', 4 * 1024 * 1024)
-                    for adapter in self.bridge.adapters.values()) - 4096
-        if len(canonical(payload)) > limit:
-            payload.update(previous, org_state='error', org_error='ORG_DOCUMENT_TOO_LARGE')
-        if payload['contacts'] or payload['org'] or payload['org_state'] in ('empty', 'error'):
-            for adapter in self.bridge.adapters.values():
-                adapter.publish_contacts(payload)
-                self._remember_org(payload)
+                    db.execute('UPDATE host_media SET fingerprint=?,checked_at=?,body=? WHERE event_id=?',
+                               (fingerprint, time.time(), json.dumps({**event, **facts}, ensure_ascii=False), row['event_id']))
 
     async def run_once(self):
         async with self._tick_lock:
             await asyncio.to_thread(self._flush_native)
             result = await asyncio.to_thread(self.bridge.run_once)
-            if self._active and self._intake_ok and self.legacy_inbox_disabled() and time.monotonic() - self._last_catalog >= 60:
-                self._last_catalog = time.monotonic()
-                await asyncio.to_thread(self._publish_directory)
             return result
 
     async def _run(self):

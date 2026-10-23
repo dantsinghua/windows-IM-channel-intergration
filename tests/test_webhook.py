@@ -95,7 +95,10 @@ async def test_body_is_the_same_frame_as_ws(store, clock):
     await d.deliver_due()
     frame = json.loads(http.requests[0]["body"])
     assert frame["event"] == "message" and frame["account_id"] == "qd01" and frame["channel"] == "qidian"
-    assert frame["trace_id"] == "t1" and frame["payload"] == {"id": "msg_1"}
+    assert frame["trace_id"] == "t1" and frame["payload"] == {
+        "id":"msg_1","identity_epoch":0,"native_account_uid":"3007373675"}
+    assert store.get_account('qd01')['self_uid']==frame['payload']['native_account_uid']
+    assert store.native_identity('qd01').get('epoch',0)==frame['payload']['identity_epoch']
     assert frame["ts"] == iso8601(clock()) and isinstance(frame["seq"], int)
 
 

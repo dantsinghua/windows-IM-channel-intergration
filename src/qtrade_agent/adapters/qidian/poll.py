@@ -175,7 +175,7 @@ class QidianPoller:
                         self._fail(acct, st, "clock_unsynced")   # 判定在 DELETE 之前;不静默停摆
                         return
                     now_ms = self.clock()
-                    self.store.qidian_bootstrap_rebase(acct.id, acct.self_uid, old_uin=(boot.value if boot is not None else None), now_ms=now_ms)
+                    self.store.qidian_bootstrap_rebase(acct.id, acct.self_uid, old_uin=(boot.value if boot is not None else None), now_ms=now_ms, native_account_uid=acct.self_uid)
                     boot = self.store.cursor_get(acct.id, "qidian_bootstrap")
                 for t, nid in st.table_map.items():
                     if self.store.cursor_get(acct.id, "qidian_rowid:" + nid) is not None:
@@ -184,9 +184,9 @@ class QidianPoller:
                         m = db.last_id_uniseq(t)   # 非空(见 ②)
                         if m is None:
                             continue
-                        self.store.cursor_set(acct.id, "qidian_rowid:" + nid, m[0], json.dumps({"last_uniseq": m[1]}))
+                        self.store.cursor_set(acct.id, "qidian_rowid:" + nid, m[0], json.dumps({"last_uniseq": m[1]}), native_account_uid=acct.self_uid)
                     else:
-                        self.store.cursor_set(acct.id, "qidian_rowid:" + nid, 0, None)   # bootstrap 之后才出现的表 = 新会话,从 0 起
+                        self.store.cursor_set(acct.id, "qidian_rowid:" + nid, 0, None, native_account_uid=acct.self_uid)   # bootstrap 之后才出现的表 = 新会话,从 0 起
                 todo = list(st.table_map)
 
             assert boot is not None and boot.value_int is not None
@@ -220,10 +220,11 @@ class QidianPoller:
                     if unknown:
                         n_unknown += 1
                     if m is not None:
+                        m._native_account_uid = acct.self_uid
                         msgs.append(m)
                 now_ms = self.clock()
                 results = self.store.ingest_batch(
-                    msgs, CursorUpdate(acct.id, "qidian_rowid:" + nid, rows[-1].id, json.dumps({"last_uniseq": rows[-1].uniseq})), now_ms=now_ms)
+                    msgs, CursorUpdate(acct.id, "qidian_rowid:" + nid, rows[-1].id, json.dumps({"last_uniseq": rows[-1].uniseq}), native_account_uid=acct.self_uid), now_ms=now_ms)
                 for inserted, changed, msg in results:
                     if (inserted or changed) and msg.dir == "in":
                         log.info(

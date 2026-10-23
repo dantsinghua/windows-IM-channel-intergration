@@ -74,17 +74,28 @@ def test_current_factory_failure_does_not_start_any_fallback(tmp_path, monkeypat
     asyncio.run(run())
 
 
-def test_disabled_current_host_never_falls_back_to_retired_env_factory(tmp_path, monkeypatch):
+def test_retired_disable_flag_cannot_override_current_institution_host(tmp_path, monkeypatch):
     monkeypatch.setenv("XUNJIA_COLLECTOR_VERSION", "2.2")
     monkeypatch.setenv("XUNJIA_INSTITUTION_COLLECTOR", "0")
-    async def forbidden(*args, **kwargs): pytest.fail("disabled host must not be assembled")
-    monkeypatch.setattr(InstitutionCollectorHost, "from_settings", forbidden)
+    calls=[]
+    class Host(InstitutionCollectorHost):
+        def __init__(self):pass
+        async def start(self):calls.append("start-current")
+        async def stop(self):calls.append("stop-current")
+    host=Host()
+    async def current(cls,settings,**kwargs):
+        assert kwargs['legacy_inbox_disabled']() is True
+        calls.append("configure-current")
+        return host
+    monkeypatch.setattr(InstitutionCollectorHost, "from_settings", classmethod(current))
     async def run():
         rig = make_rig(tmp_path)
         try:
             await rig.agent._configure_xunjia_v22()
-            assert rig.agent.xunjia_v22_host is None
+            assert rig.agent.xunjia_v22_host is host
+            assert calls==["configure-current","start-current"]
             assert not rig.agent._started and not rig.agent.scheduler._started
         finally:
             await rig.agent.stop()
+        assert calls[-1]=="stop-current"
     asyncio.run(run())

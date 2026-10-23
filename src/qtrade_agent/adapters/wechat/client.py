@@ -21,7 +21,8 @@ from ...winagent_client import WinAgentClient, WinAgentUnavailable
 
 # 02 §2.5 超时表:微信端点走「通用」一档;send 另按 confirm_timeout_ms 放宽(它要等 WinAgent 侧读回)
 WECHAT_TIMEOUT_S = 5.0
-WECHAT_SEND_EXTRA_S = 5.0          # send 的 HTTP 超时 = confirm_timeout_ms/1000 + 本值(留 WinAgent 收尾余量)
+WECHAT_SEND_EXTRA_S = 5.0          # Grace after the requested confirmation deadline.
+WECHAT_SEND_TIMEOUT_S = 50.0       # svc TIMEOUT_S["wechat_send"] = 45 seconds + 5 seconds grace.
 # R6-91(2026-10-10 真机):慢动作的 HTTP 超时必须 ≥ WinAgent 服务侧给会话代理的时限(svc.TIMEOUT_S)再留余量,
 # 否则 Agent 5 s 就判「登录会话未起来」把号打 stopped,而 WinAgent 那边照样把讲述人 / chatlog 拉起来 —— 两边状态分叉。
 # 全新机器首次 import pywinauto/comtypes 就要十几秒。值 = 服务侧时限 + 5 s(让服务侧先超时、回干净的错误信封)。
@@ -192,7 +193,8 @@ class WeChatWinAgent:
             body["text"] = text
         if image_path is not None:
             body["image_path"] = image_path
-        return await self._call("POST", "/wa/v1/wechat/send", body=body, timeout_s=confirm_timeout_ms / 1000 + WECHAT_SEND_EXTRA_S)
+        timeout_s = max(confirm_timeout_ms / 1000 + WECHAT_SEND_EXTRA_S, WECHAT_SEND_TIMEOUT_S)
+        return await self._call("POST", "/wa/v1/wechat/send", body=body, timeout_s=timeout_s)
 
 
 def _q(s: str) -> str:

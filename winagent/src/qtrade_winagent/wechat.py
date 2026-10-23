@@ -909,7 +909,7 @@ class WeChatSession:
         if not text and not image_path:
             raise WaError(INVALID_ARGS, "text 与 image_path 至少给一个", reason="empty_payload")
         self._require_key()
-        await self._ensure_main_window()
+        await asyncio.to_thread(self._wx.prepare_send)
         # 图片仍要控件树。文字走前台切换后的点击发送。当前窗口不是微信时，先把唯一微信主窗口调到前台。
         if image_path and not await asyncio.to_thread(self._wx.ui_tree_visible):
             raise WaError(NOT_READY,

@@ -201,12 +201,14 @@ class WechatPoller:
         for talker, group in by_talker.items():
             group.sort(key=lambda r: int(r["seq"]))
             msgs = [to_message(acct.id, r, self_uid=acct.self_uid, self_nick=acct.self_nick) for r in group]
+            for message in msgs:
+                message._native_account_uid = acct.self_uid
             last_seq = int(group[-1]["seq"])
             last_ts = msgs[-1].ts_ms
             prev = self.cursor_seq(acct.id, talker)
             now_ms = self.clock()
             cursor = CursorUpdate(acct.id, CURSOR_PREFIX + talker, max(prev, last_seq),
-                                  _cursor_value(last_ts, max(prev, last_seq)))
+                                  _cursor_value(last_ts, max(prev, last_seq)), native_account_uid=acct.self_uid)
             results = self.store.ingest_batch(msgs, cursor, now_ms=now_ms)
             self.st(acct.id).seen_talkers.add(talker)
             for inserted, changed, msg in results:

@@ -18,7 +18,7 @@
 **微信通道(Agent 半)**
 - 02 §2.2.5 `pool` 微信槽位 C-01(`wechat_slots` 六字段与空值口径、行级 claim、三条释放路径、`pending → holder`、R4-8/R5-4 接管)、
   §2.2.3 的 wechat 行(全部经 `/wa/v1/wechat/*`、`degraded(KEY_FAIL)` 读写都拒)、§2.8.1 微信行(ext = `"{talker}:{seq}"`、
-  `source='chatlog'`、10 s 未读回 `FAILED`)、§3.4.1 #16b/#17/#18/#19、#69 `GET /resources`、§3.6 #28~#43 调用契约、§7.1 `[wechat]`/`[adapters.wechat]`。
+  `source='chatlog'`、未读回对外 `SEND_FAILED` 且内部 `UNCONFIRMED`)、§3.4.1 #16b/#17/#18/#19、#69 `GET /resources`、§3.6 #28~#43 调用契约、§7.1 `[wechat]`/`[adapters.wechat]`。
 - 05 §2.4 全节:§2.4.2 槽位与 `account_id`(字段表 / 空值口径 / R-04 三条释放 / R4-8+R5-4 接管)、§2.4.2.1 分配顺序 0)~5) 与
   **五条失败回滚**、§2.4.3 讲述人仪式、§2.4.4 完整流程 ①~⑧、§2.4.4a 取钥三段与两钥同轮、§2.4.5 切换 1)~6)、§2.4.7 `KEY_FAIL` 读写门;
   §2.5.4 微信三行(掉线 / chatlog 挂 / 锁屏)。
@@ -2102,7 +2102,7 @@ async def test_wx_发送确认期把周期加密到一秒(tmp_path):
 
 
 async def test_wx_确认窗是十秒(tmp_path):
-    """02 §7.1 `[bus] confirm_timeout_wechat_ms = 10000`;06 §2.12 微信行:10 s 内没有 → `state=FAILED`。"""
+    """02 §7.1 `[bus] confirm_timeout_wechat_ms = 10000`;未读回对外 SEND_FAILED，内部 UNCONFIRMED 保留未知事实。"""
     async with wx_rig(tmp_path) as r:
         assert r.agent.cfg.bus.confirm_timeout_wechat_ms == CONFIRM_TIMEOUT_WECHAT_MS
 
@@ -2133,29 +2133,47 @@ async def test_wx_发送前先落SENDING行且source是chatlog(tmp_path):
         assert row["source"] == "chatlog" and row["is_self"] == 1 and row["trace_id"]
 
 
-async def test_wx_十秒未读回判FAILED(tmp_path):
-    """06 §2.12 微信行(C.4.2 微信口径):10 s 内没读到 → `state=FAILED`;00 §8.3:`SEND_FAILED` = 「微信 10s 未读回」,R6-108:发送动作已调用而确认超时，保留兼容码但禁止自动重试，必须人工核对。"""
+async def test_wx_未读回保留SEND_FAILED结果与UNCONFIRMED事实(tmp_path):
+    """对外 SEND_FAILED 不等于明确未发送；已调用未读回保持 UNCONFIRMED，等待真实原生读回且禁止补发。"""
     async with wx_rig(tmp_path, clock=Clock(auto_step_ms=4000)) as r:
         make_wx(r, state="running", self_uid=WXID)
         r.wa.send_result = {"ok": True, "code": "SENT", "ext_msg_id": None, "confirm_ms": None}   # WinAgent 只回「点完了」
-        res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
+        command = wx_send_cmd()
+        res = await asyncio.wait_for(r.agent.bus.submit(command), ASYNC_TIMEOUT)
         assert res.code == "SEND_FAILED", res
         assert res.error.retryable is False
         assert res.error.needs_human is True
         assert res.error.reason == "send_outcome_unknown"
         row = [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]
-        assert row["state"] == "FAILED"
+        assert row["state"] == "UNCONFIRMED"
 
+        assert res.ok is False
+        assert r.store.idem_get(WX, command.idempotency_key)["status"] == "DONE"
+        assert len(r.wa.sent) == 1
+        replay = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd(key=command.idempotency_key)), ASYNC_TIMEOUT)
+        assert replay.code == "IDEMPOTENT_REPLAY" and replay.ok is False
+        assert len(r.wa.sent) == 1
 
-async def test_wx_没有待核这个态(tmp_path):
-    """00 §8.3:`SEND_CALLED_BUT_UNCONFIRMED`「企点/QQ 才有;**微信无此态**」——微信超时一律 `SEND_FAILED`。"""
+async def test_wx_禁用待核结果码但保留UNCONFIRMED消息事实(tmp_path):
+    """微信不返回 SEND_CALLED_BUT_UNCONFIRMED 结果码；内部 UNCONFIRMED 保留已调用未知事实供迟到读回核实。"""
     async with wx_rig(tmp_path, clock=Clock(auto_step_ms=4000)) as r:
         make_wx(r, state="running", self_uid=WXID)
         r.wa.send_result = {"ok": True, "code": "SENT", "ext_msg_id": None, "confirm_ms": None}
-        res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
+        command = wx_send_cmd()
+        res = await asyncio.wait_for(r.agent.bus.submit(command), ASYNC_TIMEOUT)
         assert res.code != "SEND_CALLED_BUT_UNCONFIRMED"
-        assert [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]["state"] != "UNCONFIRMED"
+        assert [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]["state"] == "UNCONFIRMED"
 
+        assert res.code == "SEND_FAILED"
+        assert res.error.retryable is False
+        assert res.error.needs_human is True
+        assert res.error.reason == "send_outcome_unknown"
+        assert res.ok is False
+        assert r.store.idem_get(WX, command.idempotency_key)["status"] == "DONE"
+        assert len(r.wa.sent) == 1
+        replay = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd(key=command.idempotency_key)), ASYNC_TIMEOUT)
+        assert replay.code == "IDEMPOTENT_REPLAY" and replay.ok is False
+        assert len(r.wa.sent) == 1
 
 async def test_wx_WinAgent报SEND_FAILED直接判失败(tmp_path):
     """02 §3.6 #38:`{ok, code:'DELIVERED|SEND_FAILED', ext_msg_id, confirm_ms}`;**不重试**。"""

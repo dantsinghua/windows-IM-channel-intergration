@@ -508,8 +508,8 @@ def create_api(agent) -> FastAPI:
         p = _principal(request, "read")
         require_account(p, account_id)
         row = agent.store.get_account_full(account_id)
-        if row is None or row.get("deleted_ms") or row["channel"] != "qidian":
-            raise ApiError(404, "TARGET_NOT_FOUND", "当前企点账号不存在")
+        if row is None or row.get("deleted_ms") or row["channel"] not in ("qidian", "wechat"):
+            raise ApiError(404, "TARGET_NOT_FOUND", "当前采集账号不存在")
         request.state.account_id = account_id
         host = getattr(agent, "xunjia_v22_host", None)
         if host is None:

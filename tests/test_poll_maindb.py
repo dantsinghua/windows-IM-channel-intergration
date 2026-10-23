@@ -157,24 +157,37 @@ def test_h13_blocks_bootstrap_and_relogin_switch_uin_audits_once(env):
     st, clk, db, p, alerts, h13 = env["store"], env["clock"], env["maindb"], env["poller"], env["alerts"], env["h13"]
     p.poll_maindb(acct())
     st.cursor_set("qd01", f"qidian_rowid:{PEER}", 3, json.dumps({"last_uniseq": 1}))
-    # 换号 + H13 firing:不删水位、不建基准、不审计;12 轮后 clock_unsynced 告警
+    # Real identity CAS retains the old epoch; H13 blocks a baseline in the new epoch.
     h13["firing"] = True
-    st.ensure_account("qd01", "qidian", state="running", self_uid="3007373675")
+    old_cursors=[dict(r) for r in st.con.execute("SELECT * FROM cursors WHERE owner='qd01' ORDER BY kind")]
+    changed=st.observe_qidian_identity("qd01", "3007373675", "77777")
+    assert changed["self_uid"]=="77777"
+    identity_audit=st.list_audit("account.native_identity_changed")
+    assert len(identity_audit)==1
+    assert identity_audit[0]["account_id"]=="qd01" and identity_audit[0]["result_code"]=="OK"
+    assert json.loads(identity_audit[0]["detail_json"])=={
+        "old_uid":"3007373675","new_uid":"77777","identity_epoch":1,"account_id":"qd01"}
     # 让「新 uin」的库存在:把同一文件当新号的库
     p.maindb_factory = lambda uid: LocalSqliteMainDb(db.path)
     for _ in range(12):
-        p.poll_maindb(acct(uid="777"))
-    assert st.cursor_get("qd01", "qidian_bootstrap").value == "3007373675"
-    assert st.cursor_get("qd01", f"qidian_rowid:{PEER}") is not None and st.list_audit("qidian.rebootstrap") == []
+        p.poll_maindb(acct(uid="77777"))
+    assert st.cursor_get("qd01", "qidian_bootstrap") is None
+    assert st.cursor_get("qd01", f"qidian_rowid:{PEER}") is None and st.list_audit("qidian.rebootstrap") == []
+    assert [dict(r) for r in st.con.execute("SELECT * FROM cursors WHERE owner='qd01' ORDER BY kind")]==old_cursors
+    assert st.list_audit("account.native_identity_changed")==identity_audit
     assert alerts.is_firing(QIDIAN_DB_UNAVAILABLE, "account:qd01")
     assert st.list_events("alert")[-1]["payload"]["evidence"]["reason"] == "clock_unsynced"
-    # 撤掉开关:下一轮建基准、旧水位此时才删且只 audit 一次、告警 resolved
+    # H13 recovery creates the new baseline once; old epoch facts remain untouched.
     h13["firing"] = False
-    p.poll_maindb(acct(uid="777"))
-    assert st.cursor_get("qd01", "qidian_bootstrap").value == "777"
-    assert len(st.list_audit("qidian.rebootstrap")) == 1 and not alerts.is_firing(QIDIAN_DB_UNAVAILABLE, "account:qd01")
-    p.poll_maindb(acct(uid="777"))
-    assert len(st.list_audit("qidian.rebootstrap")) == 1
+    p.poll_maindb(acct(uid="77777"))
+    assert st.cursor_get("qd01", "qidian_bootstrap").value == "77777"
+    assert st.list_audit("qidian.rebootstrap")==[] and not alerts.is_firing(QIDIAN_DB_UNAVAILABLE, "account:qd01")
+    p.poll_maindb(acct(uid="77777"))
+    assert st.observe_qidian_identity("qd01","3007373675","77777") is None
+    assert st.observe_qidian_identity("qd01","77777","77777") is None
+    assert st.list_audit("account.native_identity_changed")==identity_audit
+    assert st.list_audit("qidian.rebootstrap")==[]
+    assert [dict(r) for r in st.con.execute("SELECT * FROM cursors WHERE owner='qd01' ORDER BY kind")]==old_cursors
 
 
 def test_single_table_stuck_uses_independent_code(env, maindb):

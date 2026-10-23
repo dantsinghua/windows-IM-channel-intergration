@@ -1073,6 +1073,10 @@ class WinWeChat:
                           "请在微信里给目标改一个唯一备注后重试", reason="display_name_ambiguous")
         return name
 
+    def prepare_send(self) -> None:
+        """Prepare only the verified existing main window, without starting WeChat."""
+        self._require_foreground()
+
     async def send(self, *, session_name: str, text: Optional[str], image_path: Optional[str],
                    confirm_timeout_ms: int) -> dict[str, Any]:
         """pyweixin 写 + chatlog 读回确认;微信没有 ``confirm=false``,期限内读不到即 ``SEND_FAILED``。
@@ -1270,8 +1274,8 @@ def _ensure_wechat_foreground(hwnd: int) -> bool:
     import win32gui
 
     active = win32gui.GetForegroundWindow()
-    hwnds = wechat_main_hwnds(_visible_window_rows())
     try:
+        hwnds = wechat_main_hwnds(_visible_window_rows())
         _action, current = plan_wechat_foreground(active, hwnds)
         if current != hwnd:
             raise WeChatWindowError("wechat_window_changed", "微信主窗口已变化，已停止发送")
@@ -1294,6 +1298,95 @@ def _search_popup_entries(win) -> list[tuple[object, str]]:
                 entries.append((ctrl, text))
         return entries
     return _wechat_ui_call("search_snapshot", read, retry_read=True)
+
+
+def _verify_wechat_chat_header(win, composer, target_control, expected_name: str) -> None:
+    """Verify the recipient in the composer's own message page, never in its draft."""
+    def unverified():
+        raise WaError(NOT_READY, "WeChat conversation identity could not be verified",
+                      reason="wechat_session_unverified")
+
+    def identity(ctrl):
+        info = ctrl.element_info
+        runtime_id = tuple(info.runtime_id or ())
+        if (not runtime_id or any(not isinstance(part, int) for part in runtime_id)
+                or not isinstance(info.process_id, int) or info.process_id <= 0):
+            unverified()
+        return runtime_id, info
+
+    root_id, root_info = identity(win)
+    if (root_info.class_name != "mmui::MainWindow"
+            or not isinstance(root_info.handle, int) or root_info.handle <= 0
+            or not expected_name):
+        unverified()
+    root_pid, root_handle = root_info.process_id, root_info.handle
+
+    def chain(ctrl):
+        result, seen = [], set()
+        for _ in range(64):
+            key, info = identity(ctrl)
+            if key in seen or info.process_id != root_pid:
+                unverified()
+            seen.add(key)
+            result.append(ctrl)
+            if key == root_id:
+                if info.handle != root_handle:
+                    unverified()
+                return result
+            ctrl = ctrl.parent()
+            if ctrl is None:
+                unverified()
+        unverified()
+
+    def inside(ctrl, parent):
+        box, outer = ctrl.rectangle(), parent.rectangle()
+        if (box.right <= box.left or box.bottom <= box.top
+                or outer.right <= outer.left or outer.bottom <= outer.top
+                or box.left < outer.left or box.top < outer.top
+                or box.right > outer.right or box.bottom > outer.bottom):
+            unverified()
+
+    def page_for(ctrl):
+        ancestors = chain(ctrl)
+        pages = [node for node in ancestors
+                 if node.element_info.class_name == "mmui::ChatMessagePage"]
+        if len(pages) != 1 or not pages[0].is_visible():
+            unverified()
+        page = pages[0]
+        inside(page, win)
+        inside(ctrl, page)
+        return page, ancestors
+
+    page, _ = page_for(composer)
+    page_id = identity(page)[0]
+    masters = [ctrl for ctrl in page.descendants()
+               if ctrl.element_info.class_name == "mmui::ChatTitleBarMasterView"
+               and ctrl.is_visible()]
+    if len(masters) != 1:
+        unverified()
+    master = masters[0]
+    if identity(page_for(master)[0])[0] != page_id:
+        unverified()
+    master_id = identity(master)[0]
+    titles = [ctrl for ctrl in master.descendants()
+              if ctrl.element_info.control_type == "Text"
+              and ctrl.element_info.class_name == "mmui::XTextView"
+              and ctrl.is_visible() and not ctrl.children()]
+    if len(titles) != 1:
+        unverified()
+    title = titles[0]
+    title_page, title_chain = page_for(title)
+    if (identity(title_page)[0] != page_id
+            or sum(identity(node)[0] == master_id for node in title_chain) != 1):
+        unverified()
+    inside(title, master)
+    if identity(page_for(target_control)[0])[0] != page_id:
+        unverified()
+    if identity(win)[0] != root_id or win.element_info.process_id != root_pid:
+        unverified()
+    if title.window_text() != expected_name:
+        raise WaError(NOT_READY, "Current WeChat conversation does not match the recipient",
+                      reason="wechat_session_mismatch")
 
 
 def _unique_wechat_control(win, role: str, *, require_enabled: bool = True,
@@ -1329,12 +1422,11 @@ def _unique_wechat_control(win, role: str, *, require_enabled: bool = True,
                 raise WaError(NOT_READY, "微信发送控件不可用", reason=f"wechat_{wanted}_control_disabled")
             return ctrl
 
-        composer = None
+        composer = unique("composer", True) if expected_name is not None else None
+        ctrl = composer if role == "composer" and composer is not None else unique(role, require_enabled)
         if expected_name is not None:
-            composer = unique("composer", True)
-            if composer.window_text() != expected_name:
-                raise WaError(NOT_READY, "当前微信会话与发送目标不一致", reason="wechat_session_mismatch")
-        return composer if role == "composer" and composer is not None else unique(role, require_enabled)
+            _verify_wechat_chat_header(win, composer, ctrl, expected_name)
+        return ctrl
     return _wechat_ui_call(f"{role}_control", read, retry_read=True)
 
 
@@ -1474,6 +1566,25 @@ def _claim_foreground(hwnd: int) -> bool:
     return win32gui.GetForegroundWindow() == hwnd
 
 
+def _verified_wechat_window_class(hwnd: int, pid: int, native_class: str) -> str:
+    """Read only: generic Qt classes are not evidence of a logged-in main window."""
+    try:
+        from pywinauto import Desktop
+
+        info = Desktop(backend="uia").window(handle=hwnd).element_info
+        if int(info.handle) != hwnd or int(info.process_id) != pid:
+            raise ValueError("UIA window identity mismatch")
+        kind = info.class_name
+        if kind not in {"mmui::MainWindow", "mmui::LoginWindow", "mmui::XHBoxView"}:
+            raise ValueError("UIA window class is unknown")
+        if native_class != "Qt51514QWindowIcon" and native_class != kind:
+            raise ValueError("Win32 and UIA window classes conflict")
+        return kind
+    except Exception as exc:
+        # Never ignore an unverified candidate and call the remaining window unique.
+        raise WeChatWindowError("wechat_window_unverified", "WeChat window could not be safely identified") from exc
+
+
 def _visible_window_rows() -> list[tuple[int, str, str]]:
     import ctypes
     from ctypes import wintypes
@@ -1496,14 +1607,43 @@ def _visible_window_rows() -> list[tuple[int, str, str]]:
             kernel32.CloseHandle(handle)
         return ""
 
+    # Classify hidden WeChat candidates as well, so restore never launches a process.
+    main_pids: set[int] = set()
+    hidden_auxiliary_pids: set[int] = set()
+
     def visit(hwnd: int, _: object) -> bool:
-        if not win32gui.IsWindowVisible(hwnd):
+        visible = bool(win32gui.IsWindowVisible(hwnd))
+        kind = win32gui.GetClassName(hwnd) or ""
+        candidates = {"mmui::MainWindow", "mmui::LoginWindow", "Qt51514QWindowIcon"}
+        if not visible and kind not in candidates:
             return True
         _thread, pid = win32process.GetWindowThreadProcessId(hwnd)
-        rows.append((int(hwnd), win32gui.GetClassName(hwnd) or "", exe_of(pid)))
+        exe = exe_of(pid)
+        wechat = exe.lower() in {"weixin.exe", "wechat.exe"}
+        if not visible and not wechat:
+            return True
+        if wechat and kind in candidates:
+            verified_kind = _verified_wechat_window_class(int(hwnd), pid, kind)
+            if verified_kind == "mmui::XHBoxView" and visible:
+                raise WeChatWindowError("wechat_window_unverified", "Visible WeChat auxiliary window is not verified")
+            # A recycled or changed candidate invalidates the entire uniqueness proof.
+            if (bool(win32gui.IsWindowVisible(hwnd)) != visible
+                    or win32process.GetWindowThreadProcessId(hwnd)[1] != pid
+                    or win32gui.GetClassName(hwnd) != kind
+                    or exe_of(pid).lower() != exe.lower()):
+                raise WeChatWindowError("wechat_window_unverified", "WeChat window identity changed during verification")
+            kind = verified_kind
+            if kind == "mmui::MainWindow":
+                main_pids.add(pid)
+            elif kind == "mmui::XHBoxView":
+                hidden_auxiliary_pids.add(pid)
+        rows.append((int(hwnd), kind, exe))
         return True
 
     win32gui.EnumWindows(visit, None)
+    # The one observed auxiliary class is safe only beside a proven main of that PID.
+    if hidden_auxiliary_pids - main_pids:
+        raise WeChatWindowError("wechat_window_unverified", "Hidden WeChat auxiliary window has no verified main")
     return rows
 
 

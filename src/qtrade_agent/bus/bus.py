@@ -320,7 +320,12 @@ class Bus:
                 return
             if not res.ok:
                 if job.msg_id:
-                    self.store.mark_out_state(job.msg_id, "FAILED")
+                    # Only a trusted readback timeout after adapter.send remains mergeable.
+                    uncertain_readback = (acct.channel == "wechat" and res.code == "SEND_FAILED"
+                                          and res.source == "chatlog" and res.error is not None
+                                          and res.error.reason == "send_outcome_unknown"
+                                          and res.error.retryable is False and res.error.needs_human is True)
+                    self.store.mark_out_state(job.msg_id, "UNCONFIRMED" if uncertain_readback else "FAILED")
                 # 适配器给出的明确不可重试码(NOT_READY / GATE_BLOCKED / LOGIN_REQUIRED)不得抹成 SEND_FAILED:
                 # 抹掉后上层按「可重试」处理,而规格要的是明确告诉人「现在不能发」(05 §2.4.7 / §2.5.4)。
                 code = res.code if res.code in ("NOT_READY", "GATE_BLOCKED", "LOGIN_REQUIRED") else "SEND_FAILED"
@@ -391,7 +396,7 @@ class Bus:
             await asyncio.sleep(interval)
         if acct.channel == "wechat":
             if job.msg_id:
-                self.store.mark_out_state(job.msg_id, "FAILED")
+                self.store.mark_out_state(job.msg_id, "UNCONFIRMED")
             self._finalize(job, CommandResult(ok=False, code="SEND_FAILED", trace_id=cmd.trace_id, source=source,
                                               error=CommandError("发送动作已调用，但未在确认窗口读回；请核对会话，禁止自动补发", reason="send_outcome_unknown", retryable=False, needs_human=True), cost_ms=self.clock() - started))
         else:

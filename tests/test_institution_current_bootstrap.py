@@ -28,8 +28,10 @@ def test_current_bootstrap_uses_institution_network_without_legacy_loader(tmp_pa
         app = rig.agent
         for name in ("relay_settings", "xunjia_inbox", "_xunjia_oss_box", "catalog_publisher", "oss_settings"):
             assert not hasattr(app, name)
-        assert app.collector_reporting_settings._seed["hostname"] == "relay.synthetic.invalid"
-        assert app.collector_reporting_settings._seed["addresses"] == ["192.0.2.5"]
+        assert app.collector_reporting_settings.view()["base_url"]=="https://its-relay.yingmi.cn"
+        assert 'hostname' not in app.collector_reporting_settings._seed
+        assert 'addresses' not in app.collector_reporting_settings._seed
+        assert app.collector_reporting_settings.saved() is None
         assert not app._started and not app.scheduler._started
     finally:
         rig.close()

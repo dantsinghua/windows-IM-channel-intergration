@@ -1155,37 +1155,48 @@ class TestK_ClockUnsynced:
         assert rowid_cursors(store) == wm_before
 
     def test_K2_uin_switch_under_h13_deletes_nothing_until_clear(self, store, clock, tmp_path):
-        """§8b M2 1612 ②:已 bootstrap 的 qd02 换 uin 登录、H13 firing ⇒ 旧 qidian_rowid:* 一行没被删、无 audit、无新 bootstrap;≥12 轮 clock_unsynced;
-        撤开关后下一轮旧水位此时才删且只 audit 一次、bootstrap.value=新 uin、告警 resolved。"""
+        """真实身份 CAS 保留旧 epoch;H13 阻断新基准,解除后只建新基准,身份事实恰审计一次。"""
         from conftest import FakeMainDb  # noqa: WPS433  夹具类,只用它造第二个库
-        store.ensure_account("qd02", "qidian", state="running", self_uid="4001")
-        db_old = FakeMainDb(str(tmp_path / "4001.db"), self_uin="4001")
-        db_new = FakeMainDb(str(tmp_path / "4002.db"), self_uin="4002")
+        store.ensure_account("qd02", "qidian", state="running", self_uid="40001")
+        db_old = FakeMainDb(str(tmp_path / "40001.db"), self_uin="40001")
+        db_new = FakeMainDb(str(tmp_path / "40002.db"), self_uin="40002")
         p, alerts, h13 = new_poller(store, clock, lambda uid: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
         db_old.insert_text(PEER_A, "旧库", time_s=clock.now_s - 3600)
         db_new.insert_text(PEER_B, "新库历史", time_s=clock.now_s - 3600)
-        p.poll_maindb(acct_view(id="qd02", self_uid="4001"))
+        p.poll_maindb(acct_view(id="qd02", self_uid="40001"))
+        db_old.insert_text(PEER_A,"旧身份事实",time_s=clock.now_s)
+        p.poll_maindb(acct_view(id="qd02",self_uid="40001"))
+        old_messages=all_messages(store,"qd02");assert len(old_messages)==1
         old_wm = rowid_cursors(store, "qd02")
         assert set(old_wm) == {"qidian_rowid:" + PEER_A}
+        old_cursors=[dict(r) for r in store.con.execute("SELECT * FROM cursors WHERE owner='qd02' ORDER BY kind")]
         h13["on"] = True
+        changed=store.observe_qidian_identity("qd02","40001","40002")
+        assert changed["self_uid"]=="40002"
+        audits=store.list_audit("account.native_identity_changed");assert len(audits)==1
+        assert json.loads(audits[0]["detail_json"])=={"account_id":"qd02","old_uid":"40001","new_uid":"40002","identity_epoch":1}
         for i in range(11):
-            clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="4002"))
-            assert rowid_cursors(store, "qd02") == old_wm
+            clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="40002"))
+            assert rowid_cursors(store, "qd02") == {}
+            assert [dict(r) for r in store.con.execute("SELECT * FROM cursors WHERE owner='qd02' ORDER BY kind")]==old_cursors
             assert store.list_audit("qidian.rebootstrap") == []
-            assert store.cursor_get("qd02", "qidian_bootstrap").value == "4001"
+            assert store.list_audit("account.native_identity_changed")==audits
+            assert store.cursor_get("qd02", "qidian_bootstrap") is None
             assert alert_events(store, QIDIAN_DB_UNAVAILABLE) == []
-        clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="4002"))
+        clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="40002"))
         fired = alert_events(store, QIDIAN_DB_UNAVAILABLE, "firing")
         assert len(fired) == 1 and fired[0]["evidence"]["reason"] == "clock_unsynced" and fired[0]["subject"] == "account:qd02"
-        assert rowid_cursors(store, "qd02") == old_wm
+        assert rowid_cursors(store, "qd02") == {}
         h13["on"] = False
-        clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="4002"))
+        clock.advance(5_000); p.poll_maindb(acct_view(id="qd02", self_uid="40002"))
         assert set(rowid_cursors(store, "qd02")) == {"qidian_rowid:" + PEER_B}
         boot = store.cursor_get("qd02", "qidian_bootstrap")
-        assert boot.value == "4002" and boot.value_int == clock()
-        audits = store.list_audit("qidian.rebootstrap")
-        assert len(audits) == 1 and audits[0]["account_id"] == "qd02"
-        assert json.loads(audits[0]["detail_json"])["old_uin"] == "4001" and json.loads(audits[0]["detail_json"])["new_uin"] == "4002"
+        assert boot.value == "40002" and boot.value_int == clock()
+        assert store.list_audit("qidian.rebootstrap")==[]
+        assert store.observe_qidian_identity("qd02","40001","40002") is None
+        assert store.list_audit("account.native_identity_changed")==audits
+        assert [dict(r) for r in store.con.execute("SELECT * FROM cursors WHERE owner='qd02' ORDER BY kind")]==old_cursors
+        assert all_messages(store,"qd02")==old_messages
         assert len(alert_events(store, QIDIAN_DB_UNAVAILABLE, "resolved")) == 1
         assert store.count_messages("qd02") == 0
 
@@ -1394,36 +1405,46 @@ class TestN_GroupGaps:
 
 class TestO_Rebootstrap:
     def test_O1_uin_switch_rebuilds_cursors_and_audits_once(self, store, clock, maindb, tmp_path):
-        """§8b M2 1616:qd01 退出后用另一个 uin 登录 ⇒ 原 qidian_rowid:* 全部删除后按新库重建;qidian_bootstrap.value=新 uin、value_int 刷新;
-        新库历史 0 入库;audit_log 恰一行 action='qidian.rebootstrap'(kind='system'、account_id='qd01'、detail_json.old_uin/new_uin 为两个 uin;
-        02 §3.1:transport='system'、actor='system:qidian_adapter'、trace_id NULL、result_code='OK'、detail_json.deleted_cursors=被删行数)。"""
+        """新 UID 按真实 CAS 建独立基准/水位,历史零导入,旧 epoch 原样保留,身份审计恰一次。"""
         from conftest import FakeMainDb
-        db_new = FakeMainDb(str(tmp_path / "4009.db"), self_uin="4009")
+        db_new = FakeMainDb(str(tmp_path / "40009.db"), self_uin="40009")
         p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
         maindb.insert_text(PEER_A, "旧库 A", time_s=clock.now_s - 3600)
         maindb.insert_text(GROUP_G, "旧库 G", time_s=clock.now_s - 3600, group=True, sender="777001")
         p.poll_maindb(acct_view())
         assert set(rowid_cursors(store)) == {"qidian_rowid:" + PEER_A, "qidian_rowid:g_" + GROUP_G}
+        maindb.insert_text(PEER_A,"保留旧身份事实",time_s=clock.now_s)
+        p.poll_maindb(acct_view())
+        old_messages=all_messages(store);assert len(old_messages)==1
+        old_events=msg_events(store);assert len(old_events)==1
+        old_cursors=[dict(r) for r in store.con.execute("SELECT * FROM cursors WHERE owner='qd01' ORDER BY kind")]
         boot_old = store.cursor_get("qd01", "qidian_bootstrap")
         p.poll_maindb(acct_view(state="login_required"))       # 退出
         clock.advance(60_000)
         new_last = db_new.insert_text(PEER_B, "新库历史", time_s=clock.now_s - 7200)
-        p.poll_maindb(acct_view(self_uid="4009"))
+        changed=store.observe_qidian_identity("qd01",SELF_UID,"40009")
+        assert changed["self_uid"]=="40009" and store.count_messages("qd01")==0
+        p.poll_maindb(acct_view(self_uid="40009"))
         wm = rowid_cursors(store)
         assert set(wm) == {"qidian_rowid:" + PEER_B}
         assert wm["qidian_rowid:" + PEER_B][0] == new_last
         boot = store.cursor_get("qd01", "qidian_bootstrap")
-        assert boot.value == "4009" and boot.value_int == clock() and boot.value_int != boot_old.value_int
-        assert store.count_messages("qd01") == 0 and msg_events(store) == []
-        audits = store.list_audit("qidian.rebootstrap")
+        assert boot.value == "40009" and boot.value_int == clock() and boot.value_int != boot_old.value_int
+        assert store.count_messages("qd01") == 0 and msg_events(store) == old_events
+        assert all_messages(store)==old_messages
+        assert [e for e in store.replay_outbox(0) if e["event"]=="message"]==[]
+        assert [dict(r) for r in store.con.execute("SELECT * FROM cursors WHERE owner='qd01' ORDER BY kind")]==old_cursors
+        audits = store.list_audit("account.native_identity_changed")
         assert len(audits) == 1
         a = audits[0]
         assert a["kind"] == "system" and a["account_id"] == "qd01" and a["transport"] == "system"
-        assert a["actor"] == "system:qidian_adapter" and a["trace_id"] is None and a["result_code"] == "OK"
+        assert a["actor"] == "system:institution_collector" and a["trace_id"] is None and a["result_code"] == "OK"
         d = json.loads(a["detail_json"])
-        assert d["old_uin"] == SELF_UID and d["new_uin"] == "4009" and d["deleted_cursors"] == 2
-        clock.advance(5_000); p.poll_maindb(acct_view(self_uid="4009"))
-        assert len(store.list_audit("qidian.rebootstrap")) == 1  # 只 audit 一次
+        assert d=={"account_id":"qd01","old_uid":SELF_UID,"new_uid":"40009","identity_epoch":1}
+        clock.advance(5_000); p.poll_maindb(acct_view(self_uid="40009"))
+        assert store.observe_qidian_identity("qd01",SELF_UID,"40009") is None
+        assert store.list_audit("account.native_identity_changed")==audits
+        assert store.list_audit("qidian.rebootstrap")==[]
 
     def test_O2_same_uin_relogin_no_rebootstrap(self, store, clock, maindb, poller):
         """§2.9.5 ③:同一 uin 重登 ⇒ 不是「首次」,不删水位、不写 audit、bootstrap 行不变。"""

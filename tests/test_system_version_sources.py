@@ -69,7 +69,7 @@ def test_api_reader_failure_keeps_metadata_available_without_500(rig):
     body = response.json()
     assert body["ok"] is True
     assert body["agent"]["version"]
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == rig.agent.store.schema_version() == 2
     for key in ("kernel", "docker", "distro", "kernel_state", "wsl_state"):
         assert body.get(key) is None
     reader.versions.assert_awaited_once_with()

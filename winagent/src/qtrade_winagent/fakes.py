@@ -501,6 +501,7 @@ class FakeWeChat:
     sessions: list[dict[str, Any]] = field(default_factory=list)
     media_blobs: dict[str, bytes] = field(default_factory=dict)
     send_ok: bool = True
+    prepare_send_error: Optional[Exception] = None
     calls: list[str] = field(default_factory=list)
 
     def locate(self) -> dict[str, Any]:
@@ -587,6 +588,13 @@ class FakeWeChat:
         out = [m for m in self.messages if (talker is None or m.get("talker") == talker)
                and (since_seq is None or int(m.get("seq", 0)) > since_seq)]
         return out[:limit]
+
+    def prepare_send(self) -> None:
+        self.calls.append("prepare_send")
+        if self.prepare_send_error is not None:
+            raise self.prepare_send_error
+        self.window_visible = True
+        self.window_minimized = False
 
     async def send(self, *, session_name: str, text: Optional[str], image_path: Optional[str],
                    confirm_timeout_ms: int) -> dict[str, Any]:

@@ -35,6 +35,7 @@ from qtrade_agent.adapters.qidian.maindb import LocalSqliteMainDb
 from qtrade_agent.app import AgentApp
 from qtrade_agent.config import AgentConfig, ApiConfig, BusConfig, QidianAdapterConfig
 from qtrade_agent.models import Message, Session
+from qtrade_agent.events import message_payload
 from qtrade_agent.scheduler import Scheduler
 
 # ────────────────────────────────────────────────────────────────────── 常量(规格自抄)
@@ -1062,9 +1063,18 @@ def test_L05_rejected_calls_still_audited(rig, client):
 # ══════════════════════════════════════════════════════════════════════ 十、WS /api/v1/events(02 §3.4.7;00 §7.5;01 §2.8;R6-52 ③)
 
 
+def _emit_stored_message(client, rig, native_id, *, account_id=QD, channel="qidian", text="hi"):
+    """Emit a committed synthetic message, as the native ingestion path does."""
+    peer=QQ_GROUP if channel=="qq" else PEER
+    message=Message(account_id,channel,Session(account_id,peer,"group" if channel=="qq" else "private"),
+        "in","text",text,rig.clock.now_ms,"onebot" if channel=="qq" else "qidian_db",ext_msg_id=native_id,sender_id=PEER)
+    rig.store.ingest(message)
+    return emit(client,rig.agent,"message",payload=message_payload(message,late_after_s=60),account_id=account_id,channel=channel,trace_id=None)
+
+
 def _emit_three(client, rig) -> list[int]:
     """依次 emit:qd01 message、qq03 alert、qd01 account_state;返回三条 seq。"""
-    s1 = emit(client, rig.agent, "message", payload={"id": "msg_x", "text": "hi"}, account_id=QD, channel="qidian", trace_id=None)
+    s1 = _emit_stored_message(client,rig,"msg_x")
     s2 = emit(client, rig.agent, "alert", payload={"code": "H06_ADB_OFFLINE", "severity": "warn", "state": "firing", "subject": f"account:{QQ}"},
               account_id=QQ, channel="qq")
     s3 = emit(client, rig.agent, "account_state", payload={"state": "running", "error_since_ms": None}, account_id=QD, channel="qidian")
@@ -1165,7 +1175,9 @@ def test_W03_since_seq_replays_all_in_order(rig, client):
     assert [f["event"] for f in frames] == ["message", "alert", "account_state"]
     for f in frames:
         assert EVENT_FRAME_KEYS <= set(f), EVENT_FRAME_KEYS - set(f)
-    assert frames[0]["account_id"] == QD and frames[0]["channel"] == "qidian" and frames[0]["payload"]["id"] == "msg_x"
+    assert frames[0]["account_id"] == QD and frames[0]["channel"] == "qidian"
+    assert frames[0]["payload"]["ext_msg_id"]=="msg_x"
+    assert frames[0]["payload"]["id"]==rig.store.list_messages(QD)[0]["id"]
     assert frames[1]["account_id"] == QQ and frames[1]["payload"]["code"] == "H06_ADB_OFFLINE"
 
 
@@ -1198,7 +1210,7 @@ def test_W06_accounts_filter(rig, client):
         ws.send_json({"subscribe": {"accounts": [QQ], "since_seq": 0}})
         f = ws_recv(ws)
         assert f["account_id"] == QQ and f["seq"] == seqs[1]
-        s4 = emit(client, rig.agent, "message", payload={"id": "m2"}, account_id=QQ, channel="qq")
+        s4 = _emit_stored_message(client,rig,"m2",account_id=QQ,channel="qq")
         f2 = ws_recv(ws)
         assert f2["seq"] == s4 and f2["account_id"] == QQ
 
@@ -1222,8 +1234,8 @@ def test_W08_allow_accounts_second_narrowing(rig, client):
         f1, f2 = ws_recv(ws), ws_recv(ws)
         assert [f1["seq"], f2["seq"]] == [seqs[0], seqs[2]]
         assert f1["account_id"] == QD and f2["account_id"] == QD
-        s4 = emit(client, rig.agent, "message", payload={"id": "m-qq"}, account_id=QQ, channel="qq")
-        s5 = emit(client, rig.agent, "message", payload={"id": "m-qd"}, account_id=QD, channel="qidian")
+        s4 = _emit_stored_message(client,rig,"m-qq",account_id=QQ,channel="qq")
+        s5 = _emit_stored_message(client,rig,"m-qd")
         f3 = ws_recv(ws)
         assert f3["seq"] == s5 and f3["account_id"] == QD and s4 < s5
 
@@ -1242,11 +1254,11 @@ def test_W10_resubscribe_frame_narrows_filter(rig, client):
     """01 §2.8 首段 / 02 §3.4.7(R6-52 ③):客户端随时可重发订阅帧收窄过滤(P-MSG 不在前台时收窄 message)。"""
     with client.websocket_connect(f"{P}/events?token={TOK_R}") as ws:
         ws.send_json({"subscribe": {"events": [], "accounts": ["*"]}})
-        s1 = emit(client, rig.agent, "message", payload={"id": "m1"}, account_id=QD, channel="qidian")
+        s1 = _emit_stored_message(client,rig,"m1")
         assert ws_recv(ws)["seq"] == s1
         ws.send_json({"subscribe": {"events": ["alert"], "accounts": ["*"]}})
         time.sleep(0.6)                      # 让服务端处理完重订阅帧再产生新事件
-        emit(client, rig.agent, "message", payload={"id": "m2"}, account_id=QD, channel="qidian")
+        _emit_stored_message(client,rig,"m2")
         s3 = emit(client, rig.agent, "alert", payload={"code": "A1"}, account_id=QD, channel="qidian")
         f = ws_recv(ws)
         assert f["event"] == "alert" and f["seq"] == s3

@@ -71,7 +71,7 @@ def test_version_headers_and_426(rig):
     r = c.get("/api/v1/system/version", headers=H())
     assert r.status_code == 200 and r.headers["X-QT-Api-Version"] == "1.0" and r.headers["X-QT-Agent-Version"]
     body = r.json()
-    assert body["api_version"] == "1.0" and body["schema_version"] == 1 and body["capabilities_version"]
+    assert body["api_version"] == "1.0" and body["schema_version"] == rig['store'].schema_version() == 2 and body["capabilities_version"]
     r = c.get("/api/v1/system/version", headers=H(**{"X-QT-Api-Min": "2.0"}))
     assert r.status_code == 426 and r.json()["code"] == "UPGRADE_REQUIRED" and r.headers["X-QT-Api-Version"] == "1.0"
     r = c.get("/api/v1/system/version", headers=H(**{"X-QT-Api-Min": "1.0"}))
@@ -166,6 +166,8 @@ def _seed_messages(st, t0: int):
 def test_messages_query_fts_like_cursor_and_view(rig):
     c, st, clock = rig["client"], rig["store"], rig["clock"]
     t0 = clock.now_ms
+    # Keep subsecond truncation explicit instead of relying on setup clock reads.
+    t0=t0//1000*1000+200
     _seed_messages(st, t0)
     j = c.get("/api/v1/messages?account_id=qd01&limit=3", headers=H()).json()
     assert len(j["data"]) == 3 and j["next_cursor"] and "slow_match" not in j
@@ -224,9 +226,12 @@ def test_ws_subscribe_replay_filter_and_truncated(rig):
         assert [f["event"] for f in frames] == ["message", "message"] and frames[0]["seq"] < frames[1]["seq"]
         assert frames[0]["payload"]["lag_s"] >= 0 and "late" in frames[0]["payload"]
         # 新事件实时推送
-        agent.events.emit("message", payload={"id": "x", "dir": "in"}, account_id="qd01", channel="qidian")
+        live=Message(account_id="qd01",channel="qidian",session=Session("qd01",PEER,"private",PEER),
+            dir="in",type="text",text="new live fact",ts_ms=clock.now_ms,source="qidian_db",ext_msg_id="x",sender_id=PEER)
+        st.ingest(live)
+        agent.events.emit("message", payload=message_payload(live,late_after_s=120), account_id="qd01", channel="qidian")
         f = ws.receive_json()
-        assert f["event"] == "message" and f["payload"]["id"] == "x" and f["seq"] == mx + 1
+        assert f["event"] == "message" and f["payload"]["id"] == live.id and f['payload']['ext_msg_id']=='x' and f["seq"] == mx + 1
     # allow_accounts 二次收窄:limited 令牌订阅 * 也只收 qd02
     with c.websocket_connect(f"/api/v1/events?token={TOKEN_LIMITED}") as ws:
         ws.send_json({"subscribe": {"accounts": ["*"], "since_seq": 0}})

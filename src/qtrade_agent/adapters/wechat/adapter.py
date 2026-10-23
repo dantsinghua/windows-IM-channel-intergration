@@ -255,7 +255,8 @@ class WechatAdapter:
                                  data={"ext_msg_id": res["ext_msg_id"], "confirm_ms": res.get("confirm_ms")})
         if res.get("code") == "SEND_FAILED":
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog",
-                                 error=CommandError("微信 10 秒内未在聊天记录读到(C.4.2)", retryable=True))
+                                 error=CommandError("微信 10 秒内未在聊天记录读到(C.4.2)",
+                                                    reason="send_outcome_unknown", retryable=False, needs_human=True))
         # WinAgent 只回了「点完了」:读回确认交给 poll 的 ingest 合并,bus 在队列外等那一行翻 DELIVERED
         return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native})
 

@@ -5,7 +5,7 @@ export interface InstitutionReportingStatus {
   last_directory_at: number
   errors: Record<string, string>
   history: Record<string, { scanned: number; published: number; media_bytes: number; error: string | null }>
-  native_presence: Record<string, { state: 'online' | 'offline' | 'unknown'; code: string; confirmed_at: number }>
+  native_presence: Record<string, { state: 'online' | 'offline' | 'unknown'; code: string; confirmed_at: number; channel?: 'qidian' | 'wechat'; account_uid?: string }>
 }
 const record = (v: unknown): Record<string, unknown> | null => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null
 const number = (v: unknown): number => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0
@@ -23,7 +23,7 @@ export function normalizeInstitutionReporting(value: unknown): InstitutionReport
   }
   for (const [uid, raw] of Object.entries(record(v.native_presence) || {}).slice(0, 30)) {
     const p = record(raw)
-    if (p && /^[0-9]{1,30}$/.test(uid)) out.native_presence[uid] = { state: p.state === 'online' || p.state === 'offline' ? p.state : 'unknown', code: code(p.code), confirmed_at: number(p.confirmed_at) }
+    if (p && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(uid)) out.native_presence[uid] = { state: p.state === 'online' || p.state === 'offline' ? p.state : 'unknown', code: code(p.code), confirmed_at: number(p.confirmed_at), channel: p.channel === 'wechat' ? 'wechat' : 'qidian', account_uid: typeof p.account_uid === 'string' ? p.account_uid : uid }
   }
   return out
 }

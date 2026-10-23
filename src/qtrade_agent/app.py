@@ -370,27 +370,16 @@ class AgentApp:
         # Only the institution collector owns Xunjia transport and configuration.
         from .ossbox.collector_settings import CollectorReportingSettings
         self.oss_start_error = ""
-        from .ossbox.xunjia_v22 import collector_version
-        try:
-            self._xunjia_version = collector_version()
-        except ValueError:
-            self._xunjia_version = "disabled"
-            self.oss_start_error = "xunjia_collector_version_invalid"
-        seed = {"base_url": os.environ.get("XUNJIA_FILE_GATEWAY_URL", "")}
+        seed = {"base_url": "https://its-relay.yingmi.cn"}
         try:
             from pathlib import Path
-            source = Path(os.environ.get("XUNJIA_COLLECTOR_CONFIG_FILE", ""))
-            if source.is_file() and source.stat().st_size <= 16384:
-                document = json.loads(source.read_text())
-                if isinstance(document, dict):
-                    seed["workbench_id"] = document.get("workbench_id", "")
             network = Path(os.environ.get("XUNJIA_INSTITUTION_CONFIG", ""))
             if network.is_file() and network.stat().st_size <= 65536:
                 metadata = json.loads(network.read_text())
                 if isinstance(metadata, dict):
                     from relay.file_gateway_connection import resolve_tls_files
                     metadata = resolve_tls_files(metadata, network.parent)
-                    seed.update({key: metadata[key] for key in ("hostname", "addresses", "client_cert_file", "client_key_file", "ca_file") if key in metadata})
+                    seed.update({key: metadata[key] for key in ("client_cert_file", "client_key_file", "ca_file") if key in metadata})
         except (OSError, ValueError, TypeError):
             log.warning("Collector seed metadata unavailable; local configuration remains editable")
         self.collector_reporting_settings = CollectorReportingSettings(self.store, self.vault, seed=seed)
@@ -921,6 +910,8 @@ class AgentApp:
         return str(Path(self.data_dir) / "organization" / (uid + ".json"))
 
     def _xunjia_v22_contacts(self, row):
+        if row.get("channel") == "wechat":
+            return {"contacts": self._xunjia_institution_friends(row), "org_state": "unreported"}
         from .adapters.qidian.contacts import list_private_contacts
         if row.get("state") != "running" or not row.get("self_uid"):
             raise RuntimeError("collector_contacts_account_not_running")
@@ -941,6 +932,22 @@ class AgentApp:
         return {"contacts": contacts, **organization}
 
     async def _xunjia_institution_presence(self, row):
+        if row.get("channel") == "wechat":
+            if self.accounts.busy(row["id"]):
+                return {"state": "unknown", "code": "NATIVE_ACCOUNT_OPERATION_IN_PROGRESS"}
+            report = await self.wechat_client.status()
+            native = report.get("wechat", {})
+            chatlog = report.get("chatlog", {})
+            uid = native.get("wxid")
+            if uid and uid != str(row["self_uid"]):
+                return {"state": "offline", "code": "NATIVE_ACCOUNT_CHANGED", "self_uid": uid}
+            if native.get("running") is False or native.get("logged_in") is False:
+                return {"state": "offline", "code": "NATIVE_ACCOUNT_OFFLINE"}
+            ready = (report.get("enabled") is True and native.get("running") is True
+                     and native.get("logged_in") is True and uid == str(row["self_uid"])
+                     and chatlog.get("running") is True and chatlog.get("key_ok") is True)
+            return {"state": "online" if ready else "unknown", "self_uid": uid,
+                    "code": "NATIVE_PRESENCE_CONFIRMED" if ready else "NATIVE_PRESENCE_UNVERIFIED"}
         from .adapters.qidian.presence import NativePresenceProbe
         if self.accounts.busy(row["id"]):return {"state":"unknown","code":"NATIVE_ACCOUNT_OPERATION_IN_PROGRESS"}
         return await NativePresenceProbe(self.qidian_ui,clock=lambda:self.clock()/1000)(row)
@@ -952,7 +959,39 @@ class AgentApp:
             extra={"adb_serial":row.get("adb_serial") or f"127.0.0.1:{16000+int(row['seq'])}"})
         return self._maindb_for_uid(str(row["self_uid"]),account)
 
+    async def _xunjia_wechat_directory(self, row):
+        # The session endpoint belongs to the native login, so fence both reads.
+        session_limit = 5000
+        for before in (True, False):
+            presence = await self._xunjia_institution_presence(row)
+            current = self.store.get_account(row["id"])
+            if (presence.get("state") != "online" or not current
+                    or current.get("self_uid") != row.get("self_uid")):
+                raise RuntimeError("collector_directory_native_identity_unverified")
+            if before:
+                sessions = await self.wechat_client.sessions(limit=session_limit)
+        if len(sessions) >= session_limit:
+            error = RuntimeError("WECHAT_DIRECTORY_TRUNCATED")
+            error.code = "WECHAT_DIRECTORY_TRUNCATED"
+            raise error
+        return sessions
+
     def _xunjia_institution_friends(self, row):
+        if row.get("channel") == "wechat":
+            # Existing WinAgent read endpoint; never starts or logs in an account.
+            future = asyncio.run_coroutine_threadsafe(self._xunjia_wechat_directory(row), self.xunjia_v22_host.loop)
+            sessions = future.result(timeout=30)
+            contacts = []
+            for item in sessions:
+                native = item.get("userName") or item.get("talker") or item.get("native_id") or item.get("id")
+                if not isinstance(native, str) or not native:
+                    continue
+                import base64
+                peer = "wxpeer-" + base64.urlsafe_b64encode(native.encode()).decode("ascii").rstrip("=")
+                contacts.append({"peer_id": peer, "native_id": native,
+                                 "name": str(item.get("nickName") or item.get("remark") or item.get("name") or ("文件传输助手" if native == "filehelper" else native)),
+                                 "kind": "group" if native.endswith("@chatroom") else "private"})
+            return contacts
         from .adapters.qidian.contacts import list_private_contacts
         if row.get("state") not in ("running","degraded") or not row.get("self_uid"):
             raise RuntimeError("collector_contacts_account_not_running")
@@ -963,14 +1002,36 @@ class AgentApp:
         return list_private_contacts(source.list_contact_source_rows())
 
 
+    def _xunjia_institution_media(self, event):
+        import base64
+        import hashlib
+        row = self.store.get_message(event.get("native_message_id"))
+        items = json.loads(row["media_json"]) if row else event.get("media", [])
+        from relay.gateway_paths import MAX_FILE_BYTES
+        attachments, media, blobs = [], [], {}
+        for item in items:
+            descriptor = dict(item)
+            mid = descriptor.get("media_id")
+            stored = self.media.get(mid) if type(mid) is int else None
+            raw = self.media.read_file(mid) if stored and type(stored.get("size")) is int and 0 < stored["size"] <= MAX_FILE_BYTES else None
+            if raw:
+                sha = hashlib.sha256(raw).hexdigest()
+                import mimetypes
+                extension = mimetypes.guess_extension(stored.get("mime") or "") or ".bin"
+                attachment = {"name": descriptor.get("name") or sha + extension, "sha256": sha, "size": len(raw)}
+                if len(raw) <= 2 * 1024 * 1024:
+                    attachment["content_base64"] = base64.b64encode(raw).decode("ascii")
+                else:
+                    blobs[sha] = raw
+                attachments.append(attachment)
+                descriptor.update(state="ready", sha256=sha, size=len(raw))
+            else:
+                descriptor["state"] = stored.get("status", "pending") if stored else "pending"
+            media.append(descriptor)
+        state = "pending" if len(attachments) != len(media) else ("chunked" if blobs else "ready")
+        return {"attachments": attachments, "media": media, "media_state": state, "_media_blobs": blobs}
+
     async def _configure_xunjia_v22(self) -> None:
-        if getattr(self, "_xunjia_version", "1") != "2.2":
-            return
-        institution_mode=os.environ.get("XUNJIA_INSTITUTION_COLLECTOR","0")
-        if institution_mode not in ("0","1"):
-            raise ValueError("institution_collector_flag_must_be_zero_or_one")
-        if institution_mode != "1":
-            return
         from .ossbox.institution import InstitutionCollectorHost
         try:
             if self.xunjia_v22_host is not None and not isinstance(self.xunjia_v22_host,InstitutionCollectorHost):
@@ -981,6 +1042,7 @@ class AgentApp:
                     data_dir=self.data_dir,legacy_inbox_disabled=lambda:True,
                     friends_provider=self._xunjia_institution_friends,organization_provider=self._xunjia_v22_contacts,
                     history_provider=self._xunjia_institution_history_source,presence_provider=self._xunjia_institution_presence,
+                    media_provider=self._xunjia_institution_media,
                     clock=lambda:self.clock()/1000)
             await self.xunjia_v22_host.start()
             self.oss_start_error=""

@@ -13,7 +13,6 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..vault_client import VaultUnavailable
-from .keys import book_object_name, index_object_name
 from .object_io import ObjectIO
 from .errors import OssboxSettingsError
 
@@ -170,7 +169,7 @@ class CollectorReportingSettings:
         async with self._lock:
             public, secret = await self._prepare(body)
             previous = self.saved()
-            if previous and public == {key: previous[key] for key in public}:
+            if previous and public == {key: previous.get(key) for key in public}:
                 try:
                     unchanged = secret == await self._credentials()
                 except OssboxSettingsError as exc:
@@ -205,8 +204,6 @@ class CollectorReportingSettings:
             from relay.file_gateway_connection import connection_client
             from relay.gateway_paths import DIRECTORY_PATH
             config = dict(public)
-            if urlsplit(public["base_url"]).hostname == self._seed.get("hostname"):
-                config.update({k:self._seed[k] for k in ("hostname", "addresses") if k in self._seed})
             client = connection_client(config, auth, path=DIRECTORY_PATH)
             pending = await asyncio.wait_for(self._io.run(client.pending), timeout=15)
         except TimeoutError:
@@ -217,15 +214,19 @@ class CollectorReportingSettings:
         return {"authenticated": True, "carrier": "its-relay", "pending": pending, "token_generated": True}
 
     def catalog(self):
+        from relay.gateway_paths import account_paths, DIRECTORY_PATH
         accounts = []
-        for row in self.store.list_accounts(channel="qidian"):
+        for row in self.store.list_accounts():
+            channel = row.get("channel")
+            if channel not in ("qidian", "wechat"):
+                continue
             uid, slot = str(row.get("self_uid") or ""), str(row["id"])
             if row.get("state") == "deleted" or not _IDENT.fullmatch(uid) or not _IDENT.fullmatch(slot):
                 continue
-            accounts.append({"account_id": slot, "account_uid": uid, "channel": "qidian",
+            accounts.append({"account_id": slot, "account_uid": uid, "channel": channel,
                 "account_nick": row.get("self_nick") or row.get("label") or "",
-                "collector_id": slot, "book_path": book_object_name(self.workbench_id, "qidian", uid, slot)})
+                "collector_id": slot, "paths": account_paths(self.workbench_id, uid, channel=channel)})
         return {"workbench_id": self.workbench_id, "workbench_name": self.view()["workbench_name"],
-                "index_path": index_object_name(self.workbench_id),
-                "accounts": sorted(accounts, key=lambda row: (row["account_uid"], row["account_id"])),
+                "index_path": DIRECTORY_PATH,
+                "accounts": sorted(accounts, key=lambda row: (row["channel"], row["account_uid"], row["account_id"])),
                 "published": False, "alignment_required": True}

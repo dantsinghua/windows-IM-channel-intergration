@@ -138,7 +138,10 @@ async def test_send_failed_is_reported_as_send_failed(tmp_path):
     rig = make_wechat_rig(tmp_path)
     rig.fake.send_result = {"ok": False, "code": "SEND_FAILED", "ext_msg_id": None, "confirm_ms": None}
     res = await rig.adapter.send(rig.account(), cmd("send_text", session="wx01:p", text="x"))
-    assert res.ok is False and res.code == "SEND_FAILED" and res.error.retryable is True
+    assert res.ok is False and res.code == "SEND_FAILED" and res.error.retryable is False
+    assert res.error.reason == "send_outcome_unknown"
+    assert res.error.needs_human is True
+    assert len(rig.fake.sent) == 1
     rig.store.close()
 
 

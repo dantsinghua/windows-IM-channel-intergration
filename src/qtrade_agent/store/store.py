@@ -107,6 +107,7 @@ class CursorUpdate:
     kind: str
     value_int: Optional[int]
     value: Optional[str] = None
+    native_account_uid: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -253,7 +254,8 @@ class Store:
         if cur > code_v:
             con.close()
             raise self._too_new(cur, code_v)
-        if cur == code_v == BASELINE_VERSION:
+        # Additive migrations retain the baseline mail-column requirements.
+        if cur >= BASELINE_VERSION:
             for table, columns in {"mail_inbox": {"effective_protocol", "idempotency_key"}, "mail_outbox": {"render_notes"}}.items():
                 found = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
                 if found and not columns.issubset(found):
@@ -499,17 +501,34 @@ class Store:
             if (row is None or row['channel'] != 'qidian' or row['self_uid'] != expected_uid
                     or row['deleted_ms'] or not row['enabled'] or row['state'] not in ('running','degraded')):
                 return None
-            # Slot-local caches must never become the new native user's history.
-            db.execute("DELETE FROM messages WHERE account_id=?", (account_id,))
-            db.execute("DELETE FROM sessions WHERE account_id=?", (account_id,))
-            db.execute("DELETE FROM cursors WHERE owner=?", (account_id,))
-            db.execute("DELETE FROM idempotency WHERE account_id=?", (account_id,))
-            db.execute("DELETE FROM commands WHERE account_id=?", (account_id,))
+            identity = self.native_identity(account_id)
+            boundary = db.execute("SELECT COALESCE(MAX(seq),0) FROM events_outbox WHERE target='ws'").fetchone()[0]
+            current = {"epoch": identity.get("epoch", 0) + 1, "uid": observed_uid,
+                       "previous_uid": expected_uid, "outbox_seq": boundary, "changed_ms": now}
+            db.execute("INSERT INTO settings(key,value_json,updated_ms,updated_by) VALUES(?,?,?,'native-identity') "
+                       "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_ms=excluded.updated_ms,updated_by=excluded.updated_by",
+                       ("relay.identity." + account_id, json.dumps(current), now))
             db.execute("UPDATE accounts SET self_uid=?,self_nick=NULL,identity_json=?,"
                        "login_mode='manual',remember=0,credential_ref=NULL,settings_json='{}',"
                        "updated_ms=?,last_seen_ms=? WHERE id=?",
                        (observed_uid,json.dumps({'login_account':observed_uid}),now,now,account_id))
+            self._insert_audit(db, kind="system", transport="system", actor="system:institution_collector",
+                               action="account.native_identity_changed", account_id=account_id,
+                               trace_id=None, result_code="OK",
+                               detail={"old_uid": expected_uid, "new_uid": observed_uid,
+                                       "identity_epoch": current["epoch"], "account_id": account_id}, now=now)
         return self.get_account_full(account_id)
+
+    def native_identity(self, account_id: str) -> dict[str, Any]:
+        return self.settings_get("relay.identity." + account_id) or {}
+
+    def _identity_epoch(self, account_id: str) -> int:
+        return self.native_identity(account_id).get("epoch", 0)
+
+    @staticmethod
+    def _current_identity_sql(table="messages") -> str:
+        return (table + ".identity_epoch=COALESCE((SELECT json_extract(value_json,'$.epoch') "
+                "FROM settings WHERE key='relay.identity.'||" + table + ".account_id),0)")
 
     ACCOUNT_PATCHABLE = ("label", "quota_mb", "capture_text", "retention_days", "media_policy_json", "remember", "credential_ref", "auto_recover", "settings_json")
 
@@ -744,6 +763,8 @@ class Store:
         now = now_ms or self._clock()
         out: list[tuple[bool, bool, Message]] = []
         with self.write_guard("store.ingest_batch"), self._tx() as c:
+            if cursor_update is not None:
+                self._verify_native_uid(c, cursor_update.owner, cursor_update.native_account_uid)
             for m in msgs:
                 r = self._ingest_one(c, m, now)
                 m.id = r.id
@@ -757,12 +778,14 @@ class Store:
         s = msg.session
         name = s.name or s.native_id
         c.execute(
-            "INSERT INTO sessions(id, account_id, channel, native_id, name, kind, last_msg_ms, msg_count, first_seen_ms, created_ms, updated_ms) "
-            "VALUES (?,?,?,?,?,?,?,0,?,?,?) "
+            "INSERT INTO sessions(id, account_id, channel, native_id, name, kind, last_msg_ms, msg_count, first_seen_ms, created_ms, updated_ms, identity_epoch) "
+            "VALUES (?,?,?,?,?,?,?,0,?,?,?,?) "
             "ON CONFLICT(account_id, native_id) DO UPDATE SET "
-            "  name = CASE WHEN excluded.name <> excluded.native_id THEN excluded.name ELSE sessions.name END, "
-            "  last_msg_ms = MAX(COALESCE(sessions.last_msg_ms, 0), excluded.last_msg_ms), updated_ms = excluded.updated_ms",
-            (s.id, msg.account_id, msg.channel, s.native_id, name, s.kind, msg.ts_ms, msg.ts_ms, now, now))
+            "  identity_epoch=excluded.identity_epoch, name = CASE WHEN excluded.identity_epoch<>sessions.identity_epoch OR excluded.name <> excluded.native_id THEN excluded.name ELSE sessions.name END, "
+            "  first_seen_ms=CASE WHEN excluded.identity_epoch<>sessions.identity_epoch THEN excluded.first_seen_ms ELSE sessions.first_seen_ms END, "
+            "  msg_count=CASE WHEN excluded.identity_epoch<>sessions.identity_epoch THEN 0 ELSE sessions.msg_count END, "
+            "  last_msg_ms=CASE WHEN excluded.identity_epoch<>sessions.identity_epoch THEN excluded.last_msg_ms ELSE MAX(COALESCE(sessions.last_msg_ms,0),excluded.last_msg_ms) END, updated_ms=excluded.updated_ms",
+            (s.id, msg.account_id, msg.channel, s.native_id, name, s.kind, msg.ts_ms, msg.ts_ms, now, now, self._identity_epoch(msg.account_id)))
 
     def _row_values(self, msg: Message, now: int) -> dict[str, Any]:
         text = msg.text
@@ -772,7 +795,7 @@ class Store:
         msg.received_ms = now
         stored_text = text if self.capture_text else None
         return {
-            "id": msg.id or message_id(now), "ext_msg_id": msg.ext_msg_id, "dedup_kind": msg.dedup_kind, "fingerprint": fp,
+            "identity_epoch": self._identity_epoch(msg.account_id), "id": msg.id or message_id(now), "ext_msg_id": msg.ext_msg_id, "dedup_kind": msg.dedup_kind, "fingerprint": fp,
             "account_id": msg.account_id, "channel": msg.channel, "session_id": msg.session_id,
             "dir": msg.dir, "type": msg.type, "state": msg.state if msg.dir == "out" else "DELIVERED",
             "text": stored_text, "text_len": len(text) if text is not None else None,
@@ -798,7 +821,7 @@ class Store:
         """06 §2.12「入向轮询撞到自己发的」:只对 self=True 的出向读回行;返回定序后的那一行或 None。"""
         rows = c.execute(
             "SELECT id, rowid AS rid, session_id, ts_ms, text, fingerprint FROM messages "
-            "WHERE account_id=? AND dir='out' AND state IN ('SENDING','UNCONFIRMED') AND ext_msg_id IS NULL",
+            "WHERE account_id=? AND dir='out' AND state IN ('SENDING','UNCONFIRMED') AND ext_msg_id IS NULL AND " + self._current_identity_sql(),
             (msg.account_id,)).fetchall()
         media_shas = [m["sha256"] for m in msg.media if m.get("sha256")]
         my_fp = compute_fingerprint(msg.account_id, msg.session_id, msg.sender_id or msg.sender_name, msg.text, media_shas, msg.ts_ms)
@@ -824,13 +847,21 @@ class Store:
     def _confirmed_by_for(source: str) -> str:
         return {"qidian_db": "ingest_merge", "chatlog": "chatlog", "onebot": "get_msg"}.get(source, "ingest_merge")
 
+    def _verify_native_uid(self, db, account_id, expected_uid):
+        if expected_uid is None:
+            return
+        row = db.execute("SELECT self_uid FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if row is None or row[0] != expected_uid:
+            raise ValueError("native_identity_changed_before_ingest")
+
     def _ingest_one(self, c: sqlite3.Connection, msg: Message, now: int) -> IngestResult:
+        self._verify_native_uid(c, msg.account_id, getattr(msg, '_native_account_uid', None))
         self._upsert_session(c, msg, now)
 
         # ① bus 出向先落库(C-21/R6-16):幂等重试命中同 idempotency_key 直接复用这一行
         if msg.dir == "out" and msg.state == "SENDING" and msg.ext_msg_id is None:
             if msg.idempotency_key:
-                r = c.execute("SELECT id FROM messages WHERE account_id=? AND idempotency_key=? AND dir='out'",
+                r = c.execute("SELECT id FROM messages WHERE account_id=? AND idempotency_key=? AND dir='out' AND " + self._current_identity_sql(),
                               (msg.account_id, msg.idempotency_key)).fetchone()
                 if r:
                     msg.id = r["id"]
@@ -845,7 +876,7 @@ class Store:
             existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND (ext_msg_id=? OR ext_msg_id LIKE ?) "
                                  "ORDER BY ts_ms DESC, rowid DESC LIMIT 1", (msg.account_id, msg.ext_msg_id, msg.ext_msg_id + "#%")).fetchone()
         else:
-            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=?",
+            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=? AND " + self._current_identity_sql(),
                                  (msg.account_id, msg.ext_msg_id)).fetchone()
         if existing is not None:
             if msg.channel == "qq" and abs(msg.ts_ms - existing["ts_ms"]) > QQ_ID_REUSE_MS:
@@ -888,7 +919,7 @@ class Store:
     def find_out_by_text(self, account_id: str, session_id: str, text: str, window_ms: int, ts_ms: int) -> Optional[dict[str, Any]]:
         """confirm_probe 用:同会话、同 norm(text)、窗内的已确认出向行。"""
         rows = self.con.execute(
-            "SELECT id, text, ts_ms, ext_msg_id, state FROM messages WHERE account_id=? AND session_id=? AND dir='out' AND ext_msg_id IS NOT NULL AND ABS(ts_ms-?) <= ?",
+            "SELECT id, text, ts_ms, ext_msg_id, state FROM messages WHERE account_id=? AND session_id=? AND dir='out' AND ext_msg_id IS NOT NULL AND ABS(ts_ms-?) <= ? AND " + self._current_identity_sql(),
             (account_id, session_id, ts_ms, window_ms)).fetchall()
         n = norm(text)
         for r in rows:
@@ -897,11 +928,11 @@ class Store:
         return None
 
     def get_message(self, id: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT * FROM messages WHERE id=?", (id,)).fetchone()
+        r = self.con.execute("SELECT * FROM messages WHERE id=? AND " + self._current_identity_sql(), (id,)).fetchone()
         return dict(r) if r else None
 
     def list_messages(self, account_id: str, *, session_id: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM messages WHERE account_id=?"
+        sql = "SELECT * FROM messages WHERE account_id=? AND " + self._current_identity_sql()
         params: list[Any] = [account_id]
         if session_id:
             sql += " AND session_id=?"
@@ -911,37 +942,43 @@ class Store:
         return [dict(r) for r in self.con.execute(sql, params).fetchall()]
 
     def count_messages(self, account_id: str) -> int:
-        return self.con.execute("SELECT COUNT(*) FROM messages WHERE account_id=?", (account_id,)).fetchone()[0]
+        return self.con.execute("SELECT COUNT(*) FROM messages WHERE account_id=? AND " + self._current_identity_sql(), (account_id,)).fetchone()[0]
 
     # ------------------------------------------------------------------ 游标
     def cursor_get(self, owner: str, kind: str) -> Optional[Cursor]:
-        r = self.con.execute("SELECT owner, kind, value, value_int, updated_ms FROM cursors WHERE owner=? AND kind=?", (owner, kind)).fetchone()
+        r = self.con.execute("SELECT owner, kind, value, value_int, updated_ms FROM cursors WHERE owner=? AND kind=?", (self._cursor_owner(owner), kind)).fetchone()
         return Cursor(*r) if r else None
 
     def cursors_list(self, owner: str, kind_prefix: str) -> list[Cursor]:
         rows = self.con.execute("SELECT owner, kind, value, value_int, updated_ms FROM cursors WHERE owner=? AND kind LIKE ? ORDER BY kind",
-                                (owner, kind_prefix + "%")).fetchall()
+                                (self._cursor_owner(owner), kind_prefix + "%")).fetchall()
         return [Cursor(*r) for r in rows]
+
+    def _cursor_owner(self, owner: str) -> str:
+        epoch = self._identity_epoch(owner)
+        return owner + ":identity:" + str(epoch) if epoch else owner
 
     def _cursor_set(self, c: sqlite3.Connection, owner: str, kind: str, value_int: Optional[int], value: Optional[str], now: int) -> None:
         c.execute("INSERT INTO cursors(owner, kind, value, value_int, updated_ms) VALUES (?,?,?,?,?) "
                   "ON CONFLICT(owner, kind) DO UPDATE SET value=excluded.value, value_int=excluded.value_int, updated_ms=excluded.updated_ms",
-                  (owner, kind, value, value_int, now))
+                  (self._cursor_owner(owner), kind, value, value_int, now))
 
-    def cursor_set(self, owner: str, kind: str, value_int: Optional[int], value: Optional[str] = None) -> None:
+    def cursor_set(self, owner: str, kind: str, value_int: Optional[int], value: Optional[str] = None, *, native_account_uid: Optional[str] = None) -> None:
         with self._tx() as c:
+            self._verify_native_uid(c, owner, native_account_uid)
             self._cursor_set(c, owner, kind, value_int, value, self._clock())
 
-    def qidian_bootstrap_rebase(self, account_id: str, new_uin: str, *, old_uin: Optional[str], now_ms: int) -> int:
+    def qidian_bootstrap_rebase(self, account_id: str, new_uin: str, *, old_uin: Optional[str], now_ms: int, native_account_uid: Optional[str] = None) -> int:
         """06 §2.9.5 ③:删旧水位 + 写新基准 **同一事务**;换号(old_uin 非空)时先记审计 ``qidian.rebootstrap``(R6-50)。返回删掉的水位行数。"""
         with self._tx() as c:
+            self._verify_native_uid(c, account_id, native_account_uid)
             deleted = 0
             if old_uin is not None:
-                deleted = c.execute("SELECT COUNT(*) FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (account_id,)).fetchone()[0]
+                deleted = c.execute("SELECT COUNT(*) FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (self._cursor_owner(account_id),)).fetchone()[0]
                 self._insert_audit(c, kind="system", transport="system", actor="system:qidian_adapter", action="qidian.rebootstrap",
                                    account_id=account_id, trace_id=None, result_code="OK",
                                    detail={"old_uin": old_uin, "new_uin": new_uin, "deleted_cursors": deleted}, now=now_ms)
-                c.execute("DELETE FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (account_id,))
+                c.execute("DELETE FROM cursors WHERE owner=? AND kind LIKE 'qidian_rowid:%'", (self._cursor_owner(account_id),))
             self._cursor_set(c, account_id, "qidian_bootstrap", now_ms, new_uin, now_ms)
             return deleted
 
@@ -972,6 +1009,15 @@ class Store:
         """target='ws' 的行是规范事件记录(供 WS 按 seq 重放),写入即 delivered;webhook 行留 pending 给投递器(02 §2.2.7)。"""
         now = now_ms or self._clock()
         with self._tx() as c:
+            if event == "message" and account_id:
+                payload = json.loads(payload_json)
+                native = c.execute("SELECT identity_epoch FROM messages WHERE id=? AND account_id=?",
+                                   (payload.get("id"), account_id)).fetchone()
+                identity = self.native_identity(account_id)
+                payload["identity_epoch"] = native[0] if native else identity.get("epoch", 0)
+                row = c.execute("SELECT self_uid FROM accounts WHERE id=?", (account_id,)).fetchone()
+                payload["native_account_uid"] = str(row[0]) if row else None
+                payload_json = json.dumps(payload, ensure_ascii=False)
             if target == "ws":
                 cur = c.execute(
                     "INSERT INTO events_outbox(event_id, target, event, ts_ms, trace_id, account_id, channel, payload_json, status, delivered_ms) "
@@ -993,7 +1039,10 @@ class Store:
 
     def replay_outbox(self, since_seq: int, limit: int = 1000) -> list[dict[str, Any]]:
         rows = self.con.execute("SELECT seq, event, ts_ms, trace_id, account_id, channel, payload_json FROM events_outbox "
-                                "WHERE target='ws' AND seq > ? ORDER BY seq LIMIT ?", (since_seq, limit)).fetchall()
+                                "WHERE target='ws' AND seq > ? AND (event<>'message' OR COALESCE(json_extract(payload_json,'$.identity_epoch'),0)="
+                                "COALESCE((SELECT json_extract(value_json,'$.epoch') FROM settings WHERE key='relay.identity.'||events_outbox.account_id),0)) "
+                                "AND (event<>'message' OR EXISTS(SELECT 1 FROM messages m WHERE m.id=json_extract(events_outbox.payload_json,'$.id') "
+                                "AND m.account_id=events_outbox.account_id AND " + self._current_identity_sql("m") + ")) ORDER BY seq LIMIT ?", (since_seq, limit)).fetchall()
         return [dict(r) | {"payload": json.loads(r["payload_json"])} for r in rows]
 
     def list_events(self, event: Optional[str] = None, account_id: Optional[str] = None) -> list[dict[str, Any]]:
@@ -1008,9 +1057,9 @@ class Store:
     def insert_command(self, *, trace_id: str, account_id: str, op: str, args_json: str, idempotency_key: Optional[str], confirm: bool,
                        timeout_ms: int, transport: str, actor: str, ip: Optional[str], now_ms: int) -> None:
         with self._tx() as c:
-            c.execute("INSERT INTO commands(trace_id, account_id, op, args_json, idempotency_key, confirm, timeout_ms, origin_transport, origin_actor, origin_ip, status, submitted_ms) "
-                      "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?)",
-                      (trace_id, account_id, op, args_json, idempotency_key, 1 if confirm else 0, timeout_ms, transport, actor, ip, now_ms))
+            c.execute("INSERT INTO commands(trace_id, account_id, op, args_json, idempotency_key, confirm, timeout_ms, origin_transport, origin_actor, origin_ip, status, submitted_ms, identity_epoch) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
+                      (trace_id, account_id, op, args_json, idempotency_key, 1 if confirm else 0, timeout_ms, transport, actor, ip, now_ms, self._identity_epoch(account_id)))
 
     def command_started(self, trace_id: str, now_ms: int) -> None:
         with self._tx() as c:
@@ -1029,7 +1078,7 @@ class Store:
     def backfill_confirm_from_message(self, trace_id: str) -> Optional[dict[str, Any]]:
         """B-08:probe 命中后把 command_results.confirmed_by/confirm_ms 从该 trace 的出向行派生回填(只补空、code 不改)。返回那条出向行。"""
         with self._tx() as c:
-            m = c.execute("SELECT id, ext_msg_id, confirmed_by, confirmed_ms, source FROM messages WHERE trace_id=? AND dir='out'", (trace_id,)).fetchone()
+            m = c.execute("SELECT id, ext_msg_id, confirmed_by, confirmed_ms, source FROM messages WHERE trace_id=? AND dir='out' AND " + self._current_identity_sql(), (trace_id,)).fetchone()
             if m is None or m["confirmed_by"] is None:
                 return dict(m) if m else None
             c.execute("UPDATE command_results SET confirmed_by=COALESCE(confirmed_by, ?), confirm_ms=COALESCE(confirm_ms, ?) WHERE trace_id=?",
@@ -1040,34 +1089,37 @@ class Store:
         """Exact immutable trace correlation only; never writes or matches text/time."""
         rows = self.con.execute(
             "SELECT * FROM messages WHERE trace_id=? AND dir='out' AND state='DELIVERED' "
-            "AND ext_msg_id IS NOT NULL AND confirmed_by IS NOT NULL LIMIT 2", (trace_id,)
+            "AND ext_msg_id IS NOT NULL AND confirmed_by IS NOT NULL AND " + self._current_identity_sql() + " LIMIT 2", (trace_id,)
         ).fetchall()
         return dict(rows[0]) if len(rows) == 1 else None
 
     def get_command_result(self, trace_id: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT * FROM command_results WHERE trace_id=?", (trace_id,)).fetchone()
+        r = self.con.execute("SELECT command_results.* FROM command_results JOIN commands USING(trace_id) WHERE trace_id=? AND " + self._current_identity_sql("commands"), (trace_id,)).fetchone()
         return dict(r) | {"data": json.loads(r["data_json"])} if r else None
 
     def idem_get(self, account_id: str, key: str) -> Optional[dict[str, Any]]:
         r = self.con.execute("SELECT * FROM idempotency WHERE account_id=? AND idem_key=?", (account_id, key)).fetchone()
+        if r and r["identity_epoch"] != self._identity_epoch(account_id):
+            # The former identity's unresolved native action remains fenced.
+            return {**dict(r), "status": "IDENTITY_FENCED", "result_code": None}
         return dict(r) if r else None
 
     def idem_claim(self, *, account_id: str, key: str, op: str, args_hash: str, trace_id: str, now_ms: int, ttl_days: int) -> bool:
         """行级 claim:不存在才写 SENDING(§2.3.1 ③);返回 True = 本次抢到。"""
         with self._tx() as c:
-            cur = c.execute("INSERT INTO idempotency(account_id, idem_key, op, args_hash, status, trace_id, created_ms, updated_ms, expires_ms) "
-                            "VALUES (?,?,?,?,'SENDING',?,?,?,?) ON CONFLICT(account_id, idem_key) DO NOTHING",
-                            (account_id, key, op, args_hash, trace_id, now_ms, now_ms, now_ms + ttl_days * 86400 * 1000))
+            cur = c.execute("INSERT INTO idempotency(account_id, idem_key, op, args_hash, status, trace_id, created_ms, updated_ms, expires_ms, identity_epoch) "
+                            "VALUES (?,?,?,?,'SENDING',?,?,?,?,?) ON CONFLICT(account_id, idem_key) DO NOTHING",
+                            (account_id, key, op, args_hash, trace_id, now_ms, now_ms, now_ms + ttl_days * 86400 * 1000, self._identity_epoch(account_id)))
             return cur.rowcount == 1
 
     def idem_finish(self, *, account_id: str, key: str, status: str, result_code: Optional[str], now_ms: int) -> None:
         with self._tx() as c:
-            c.execute("UPDATE idempotency SET status=?, result_code=?, updated_ms=? WHERE account_id=? AND idem_key=?",
+            c.execute("UPDATE idempotency SET status=?, result_code=?, updated_ms=? WHERE account_id=? AND idem_key=? AND " + self._current_identity_sql("idempotency"),
                       (status, result_code, now_ms, account_id, key))
 
     def idem_delete(self, account_id: str, key: str) -> None:
         with self._tx() as c:
-            c.execute("DELETE FROM idempotency WHERE account_id=? AND idem_key=?", (account_id, key))
+            c.execute("DELETE FROM idempotency WHERE account_id=? AND idem_key=? AND " + self._current_identity_sql("idempotency"), (account_id, key))
 
     # ------------------------------------------------------------------ api 用的查询(账号 / 会话 / 消息 / 指令 / 调用方)
     def list_accounts(self, *, channel: Optional[str] = None, state: Optional[str] = None, enabled: Optional[bool] = None,
@@ -1105,7 +1157,7 @@ class Store:
 
     def list_sessions(self, *, account_id: Optional[str] = None, keyword: Optional[str] = None, kind: Optional[str] = None,
                       limit: Optional[int] = 100) -> list[dict[str, Any]]:
-        sql, params = "SELECT * FROM sessions WHERE 1=1", []
+        sql, params = "SELECT * FROM sessions WHERE " + self._current_identity_sql("sessions"), []
         if account_id:
             sql += " AND account_id=?"; params.append(account_id)
         if kind:
@@ -1130,7 +1182,7 @@ class Store:
             "LEFT JOIN accounts a ON a.id = m.account_id"
         )
         params: list[Any] = []
-        where: list[str] = []
+        where: list[str] = [self._current_identity_sql("m")]
         if allowed_accounts is not None:
             if not allowed_accounts:
                 return [], False
@@ -1175,18 +1227,19 @@ class Store:
             "SELECT m.*, s.name AS session_name, s.kind AS session_kind, s.native_id AS session_native_id, "
             "a.self_nick AS account_self_nick, a.label AS account_label "
             "FROM messages m JOIN sessions s ON s.id = m.session_id "
-            "LEFT JOIN accounts a ON a.id = m.account_id WHERE m.id=?",
+            "LEFT JOIN accounts a ON a.id = m.account_id WHERE m.id=? AND " + self._current_identity_sql("m"),
             (id,),
         ).fetchone()
         return dict(r) if r else None
 
     def get_command(self, trace_id: str) -> Optional[dict[str, Any]]:
-        r = self.con.execute("SELECT * FROM commands WHERE trace_id=?", (trace_id,)).fetchone()
+        r = self.con.execute("SELECT * FROM commands WHERE trace_id=? AND " + self._current_identity_sql("commands"), (trace_id,)).fetchone()
         return dict(r) if r else None
 
     def list_commands(self, account_id: str, *, status: Optional[str] = None, op: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
         sql, params = "SELECT c.*, r.ok, r.code, r.data_json, r.cost_ms, r.source, r.confirmed_by, r.finished_ms AS result_finished_ms FROM commands c " \
                       "LEFT JOIN command_results r ON r.trace_id = c.trace_id WHERE c.account_id=?", [account_id]
+        sql += " AND " + self._current_identity_sql("c")
         if status:
             sql += " AND c.status=?"; params.append(status)
         if op:
@@ -1310,7 +1363,7 @@ class Store:
                            since_ms: Optional[int] = None, until_ms: Optional[int] = None,
                            limit: int = 100, before: Optional[tuple[int, str]] = None, allowed_accounts: Optional[list[str]] = None) -> list[dict[str, Any]]:
         """#26 的分页视图:按 ``(COALESCE(last_msg_ms,0), id)`` 降序(与 ``ix_sessions_account_last`` 同向),``before`` = 上一页末行。"""
-        sql, params = "SELECT * FROM sessions WHERE 1=1", []
+        sql, params = "SELECT * FROM sessions WHERE " + self._current_identity_sql("sessions"), []
         if allowed_accounts is not None:
             if not allowed_accounts:
                 return []

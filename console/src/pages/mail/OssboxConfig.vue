@@ -274,11 +274,11 @@ onUnmounted(() => {
     <template v-if="saved && institution">
       <p data-testid="ossbox-save-status">{{ saved.applied ? '配置已由采集服务装载。' : '配置尚未由采集服务应用。' }}{{ saved.restart_required ? '保存版本与运行版本不同；需完成受控切换。' : '' }}</p>
       <section data-testid="institution-reporting-status">
-        <p>机构文件通道：{{ institution.active ? '已运行' : '已停止' }} · 企点账号工作进程 {{ institution.account_workers }}</p>
+        <p>机构文件通道：{{ institution.active ? '已运行' : '已停止' }} · 采集账号工作进程 {{ institution.account_workers }}</p>
         <p>最近目录上传：{{ institution.last_directory_at ? new Date(institution.last_directory_at * 1000).toLocaleString() : '尚无成功记录' }}。上传完成不代表内网已接收。</p>
         <p v-if="statusError" role="alert">{{ statusError }}</p>
         <p v-for="(code, component) in institution.errors" :key="component" role="alert">{{ component }}：{{ code }}</p>
-        <p v-for="(presence, uid) in institution.native_presence" :key="uid">企点 {{ uid }}：{{ presence.state === 'online' && now - presence.confirmed_at < 60 ? '原生在线已核验' : presence.state === 'offline' ? '原生已离线' : '原生状态尚未确认' }} · {{ presence.code }}</p>
+        <p v-for="(presence, uid) in institution.native_presence" :key="uid">{{ presence.channel === 'wechat' ? '微信' : '企点' }} {{ presence.account_uid || uid }}：{{ presence.state === 'online' && now - presence.confirmed_at < 60 ? '原生在线已核验' : presence.state === 'offline' ? '原生已离线' : '原生状态尚未确认' }} · {{ presence.code }}</p>
         <p v-for="(history, uid) in institution.history" :key="uid">企点 {{ uid }} 主库历史：读取 {{ history.scanned }}，提交 {{ history.published }}，附件 {{ history.media_bytes }} 字节{{ history.error ? '；'+history.error : '' }}。提交数量不等于内网入库数量。</p>
         <a-button data-testid="institution-refresh-status" :disabled="!!busy || session.gateVisible" @click="refreshRuntime">刷新运行状态</a-button>
       </section>

@@ -33,7 +33,11 @@ class Rect:
 class Control:
     def __init__(self, rig, role, kind, cls, name, rect, *, visible=True, enabled=True):
         self.rig, self.role = rig, role
-        self.element_info = SimpleNamespace(control_type=kind, class_name=cls, name=name)
+        self.element_info = SimpleNamespace(control_type=kind, class_name=cls, name=name,
+                                            runtime_id=[42, 7, id(self)], process_id=71, handle=0)
+        parent_roles = {"composer": "input_view", "send": "input_view", "title": "title_single",
+                        "title_single": "title_master", "title_master": "page", "input_view": "page"}
+        self.parent_control = getattr(rig, parent_roles.get(role, ""), rig)
         self.name, self.rect = name, rect
         self.visible, self.enabled = visible, enabled
         self.value = ""
@@ -41,6 +45,20 @@ class Control:
 
     def window_text(self):
         return self.name
+
+    def parent(self):
+        return self.parent_control
+
+    def children(self):
+        return [ctrl for ctrl in self.rig.controls + getattr(self.rig, "initial_controls", [])
+                if ctrl.parent_control is self]
+
+    def descendants(self, **kwargs):
+        found = []
+        for child in self.children():
+            found.append(child)
+            found.extend(child.descendants(**kwargs))
+        return found
 
     def class_name(self):
         return self.element_info.class_name
@@ -63,7 +81,7 @@ class Control:
         if self.role == "result":
             self.rig.opened = True
         if self.role == "send":
-            self.rig.sent.append((self.rig.composer.name, self.rig.composer.value))
+            self.rig.sent.append((self.rig.title.name, self.rig.composer.value))
 
 
 class DesktopRig:
@@ -76,12 +94,47 @@ class DesktopRig:
         self.ctrl = False
         self.on_body = None
         self.send_stays_disabled = False
+        self.element_info = SimpleNamespace(control_type="Window", class_name="mmui::MainWindow",
+                                            runtime_id=[42, 7], handle=7, process_id=71)
+        self.page = self.make("page", "Pane", "mmui::ChatMessagePage", "", 420, 0, width, height)
+        self.input_view = self.make("input_view", "Pane", "mmui::ChatInputView", "",
+                                    420, height - 270, width, height)
+        self.title_master = self.make("title_master", "Pane", "mmui::ChatTitleBarMasterView", "",
+                                      430, 0, width - 15, 110)
+        self.title_single = self.make("title_single", "Pane", "mmui::ChatTitleBarChatSingleView", "",
+                                      430, 0, width - 15, 110)
+        self.title = self.make("title", "Text", "mmui::XTextView", TARGET,
+                               450, 15, width - 50, 50)
         self.search = self.make("search", "Edit", "mmui::XValidatorTextEdit", "", 147, 69, 342, 99)
         self.composer = self.make("composer", "Edit", "mmui::ChatInputField", TARGET,
                                   450, height - 250, width - 30, height - 80)
         self.send = self.make("send", "Button", "mmui::XOutlineButton", "发送",
                               width - 130, height - 70, width - 30, height - 30, enabled=False)
-        self.controls = [self.search, self.composer, self.send]
+        self.controls = [self.search, self.composer, self.send, self.page, self.input_view,
+                         self.title_master, self.title_single, self.title]
+        self.initial_page = self.make("initial_page", "Pane", "mmui::ChatMessagePage", "",
+                                      420, 0, width, height)
+        self.initial_input_view = self.make("initial_input_view", "Pane", "mmui::ChatInputView", "",
+                                            420, height - 270, width, height)
+        self.initial_title_master = self.make("initial_title_master", "Pane", "mmui::ChatTitleBarMasterView", "",
+                                              430, 0, width - 15, 110)
+        self.initial_title_single = self.make("initial_title_single", "Pane", "mmui::ChatTitleBarChatSingleView", "",
+                                              430, 0, width - 15, 110)
+        self.initial_title = self.make("initial_title", "Text", "mmui::XTextView", "Previous conversation",
+                                       450, 15, width - 50, 50)
+        self.initial_composer = self.make("initial_composer", "Edit", "mmui::ChatInputField", "",
+                                          450, height - 250, width - 30, height - 80)
+        self.initial_send = self.make("initial_send", "Button", "mmui::XOutlineButton", "Send",
+                                      width - 130, height - 70, width - 30, height - 30, enabled=False)
+        self.initial_input_view.parent_control = self.initial_page
+        self.initial_title_master.parent_control = self.initial_page
+        self.initial_title_single.parent_control = self.initial_title_master
+        self.initial_title.parent_control = self.initial_title_single
+        self.initial_composer.parent_control = self.initial_input_view
+        self.initial_send.parent_control = self.initial_input_view
+        self.initial_controls = [self.initial_page, self.initial_input_view, self.initial_title_master,
+                                 self.initial_title_single, self.initial_title, self.initial_composer,
+                                 self.initial_send]
         self.heading = self.make("section", "Text", "Text", section, 150, 120, 300, 150)
         self.result = self.make("result", "ListItem", "ListItem", TARGET, 150, 150, 350, 200)
         self.focused = self.make("unrelated", "Edit", "OtherEdit", "", 0, 0, 10, 10)
@@ -111,8 +164,15 @@ class DesktopRig:
     def rectangle(self):
         return self.box
 
+    def parent(self):
+        return None
+
+    def children(self):
+        return [ctrl for ctrl in self.controls if ctrl.parent_control is self]
+
     def descendants(self, **kwargs):
-        rows = list(self.controls)
+        rows = (list(self.controls) if self.opened else
+                [ctrl for ctrl in self.controls if ctrl.role == "search"] + list(self.initial_controls))
         if self.search.value == TARGET and not self.opened:
             rows.extend([self.heading, self.result])
         return rows
@@ -156,6 +216,8 @@ class DesktopRig:
         elif failure == "wrong-session":
             ctrl.name = "Different synthetic contact"
             ctrl.element_info.name = ctrl.name
+            self.title.name = ctrl.name
+            self.title.element_info.name = ctrl.name
         else:
             raise AssertionError(failure)
 
