@@ -2112,25 +2112,95 @@ def wx_send_cmd(text: str = "微信一条", *, key: Optional[str] = None) -> Com
                    idempotency_key=key or f"k-{uuid.uuid4().hex[:10]}", origin=CommandOrigin())
 
 
-async def test_wx_发送读回确认绑定ext并置DELIVERED(tmp_path):
-    """06 §2.12 微信行:chatlog 读到 `isSelf=true` 且 `norm(content) == norm(text)` 的行 ⇒
-    绑定 `ext_msg_id`、`state=DELIVERED`、`confirmed_by=chatlog`。"""
-    async with wx_rig(tmp_path) as r:
+def install_wx_native_readback(r: Rig, monkeypatch, *, evidence: str = "new") -> list[dict[str, Any]]:
+    """批准的 P0 T03/T07/T08：独立编排 #39 原生行，不从 #38 请求正文拼确认。
+
+    发送前已有目标会话 seq=10；只有 #38 开始后才出现预置的 seq=11。
+    #28 当前身份、#39 原生行与请求三者独立，产品 Fake 的默认行为保持不变。
+    """
+    r.wa.wechat["wxid"] = WXID
+    r.wa.add_row(talker=TALKER, content="微信一条", seq=10, ts_ms=T0_MS - 1000, is_self=True)
+    native = {"talker": TALKER, "content": "微信一条", "seq": 11,
+              "ts_ms": T0_MS, "is_self": True}
+    if evidence == "wrong_talker":
+        native["talker"] = ROOM
+    before_send: list[dict[str, Any]] = []
+    route = r.wa._route
+
+    def scripted_route(method, bare, query, data, rh):
+        if method == "POST" and bare == "/wa/v1/wechat/send":
+            before_send.extend(dict(row) for row in rows_of(r, WX, limit=10) if row["trace_id"])
+            if evidence in ("new", "wrong_talker"):
+                r.wa.add_row(**native)
+            seq = 10 if evidence == "old" else 11
+            r.wa.send_result = {"ok": True, "code": "DELIVERED",
+                                "ext_msg_id": f"{TALKER}:{seq}", "confirm_ms": 1200}
+            if evidence != "new":
+                # 无证据分支让业务时钟走完原确认预算；不延长/缩短产品配置、不盲睡。
+                r.clock.auto_step_ms = 2000
+        return route(method, bare, query, data, rh)
+
+    monkeypatch.setattr(r.wa, "_route", scripted_route)
+    return before_send
+
+
+async def test_wx_发送读回确认绑定ext并置DELIVERED(tmp_path, monkeypatch):
+    """06 §2.12 / 批准 P0 T03：同账号同会话的新原生行确认，绑定原占位且不重复入库。"""
+    async with wx_rig(tmp_path, clock=Clock(auto_step_ms=0)) as r:
         make_wx(r, state="running", self_uid=WXID)
+        before_send = install_wx_native_readback(r, monkeypatch)
         res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
         assert res.code == "DELIVERED", res
-        row = [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]
+        row = [x for x in rows_of(r, WX, limit=10) if x["trace_id"] == res.trace_id][0]
         assert row["state"] == "DELIVERED" and row["confirmed_by"] == "chatlog"
-        assert row["ext_msg_id"].startswith(f"{TALKER}:")
+        assert row["ext_msg_id"] == f"{TALKER}:11"
+        assert row["id"] == before_send[0]["id"], "原生读回必须绑定发送前的同一占位"
+        await wx_poll(r, only=[TALKER])
+        matches = [x for x in rows_of(r, WX, limit=10) if x["ext_msg_id"] == f"{TALKER}:11"]
+        assert len(matches) == 1 and matches[0]["id"] == row["id"]
 
 
-async def test_wx_发送前先落SENDING行且source是chatlog(tmp_path):
-    """06 §2.12 / 02 §2.8.1 出向行 R6-25:本系统发出的微信出向行 `source='chatlog'`,发送前先写 `SENDING`。"""
-    async with wx_rig(tmp_path) as r:
+async def test_wx_发送前先落SENDING行且source是chatlog(tmp_path, monkeypatch):
+    """06 §2.12 / 02 §2.8.1 R6-25：在 #38 调用边界观察 SENDING；source 本身不是成功证据。"""
+    async with wx_rig(tmp_path, clock=Clock(auto_step_ms=0)) as r:
         make_wx(r, state="running", self_uid=WXID)
-        await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
-        row = [x for x in rows_of(r, WX, limit=10) if x["dir"] == "out"][0]
+        before_send = install_wx_native_readback(r, monkeypatch)
+        res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
+        assert len(before_send) == 1
+        row = before_send[0]
+        assert row["state"] == "SENDING" and row["ext_msg_id"] is None and row["confirmed_by"] is None
         assert row["source"] == "chatlog" and row["is_self"] == 1 and row["trace_id"]
+        assert res.code == "DELIVERED", res
+
+
+@pytest.mark.parametrize("evidence", ["missing", "old", "wrong_talker"])
+async def test_wx_返回DELIVERED但缺有效原生行仍不可确认(tmp_path, monkeypatch, evidence):
+    """批准 P0 T02/T07/T08：#38 的成功标签不替代 #39 新原生行，不能借旧同文/别群确认。"""
+    async with wx_rig(tmp_path, clock=Clock(auto_step_ms=0)) as r:
+        make_wx(r, state="running", self_uid=WXID)
+        install_wx_native_readback(r, monkeypatch, evidence=evidence)
+        command = wx_send_cmd()
+        res = await asyncio.wait_for(r.agent.bus.submit(command), ASYNC_TIMEOUT)
+        assert res.code == "SEND_FAILED" and res.ok is False
+        row = [x for x in rows_of(r, WX, limit=10) if x["trace_id"] == res.trace_id][0]
+        assert row["state"] == "UNCONFIRMED" and row["ext_msg_id"] is None and row["confirmed_by"] is None
+        assert len(r.wa.sent) == 1
+        replay = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd(key=command.idempotency_key)), ASYNC_TIMEOUT)
+        assert replay.code == "IDEMPOTENT_REPLAY" and replay.ok is False
+        assert len(r.wa.sent) == 1
+
+
+async def test_wx_当前账号UID不符不能用该账号原生行确认(tmp_path, monkeypatch):
+    """批准 P0 水位绑定当前账号：不同 UID 的 #28 不能授权向该账户发送或确认。"""
+    async with wx_rig(tmp_path, clock=Clock(auto_step_ms=2000)) as r:
+        make_wx(r, state="running", self_uid=WXID)
+        install_wx_native_readback(r, monkeypatch)
+        r.wa.wechat["wxid"] = "wxid_other_account"
+        res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd()), ASYNC_TIMEOUT)
+        assert res.code != "DELIVERED" and res.ok is False
+        assert r.wa.sent == []
+        assert all(row["state"] != "DELIVERED" and row["ext_msg_id"] is None
+                   for row in rows_of(r, WX, limit=10) if row["trace_id"])
 
 
 async def test_wx_未读回保留SEND_FAILED结果与UNCONFIRMED事实(tmp_path):
@@ -2197,11 +2267,13 @@ async def test_wx_取钥失败下发送不写SENDING行(tmp_path):
         assert r.wa.sent == [], "闸拦下就不该真发"
 
 
-async def test_wx_发送经38且带幂等键与确认窗(tmp_path):
+async def test_wx_发送经38且带幂等键与确认窗(tmp_path, monkeypatch):
     """02 §3.6 #38:`{session_name, text?, image_path?, idempotency_key, confirm_timeout_ms:10000}`。"""
-    async with wx_rig(tmp_path) as r:
+    async with wx_rig(tmp_path, clock=Clock(auto_step_ms=0)) as r:
         make_wx(r, state="running", self_uid=WXID)
-        await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd(key="k-wx-1")), ASYNC_TIMEOUT)
+        install_wx_native_readback(r, monkeypatch)
+        res = await asyncio.wait_for(r.agent.bus.submit(wx_send_cmd(key="k-wx-1")), ASYNC_TIMEOUT)
+        assert res.code == "DELIVERED", res
         sent = r.wa.sent[-1]
         assert sent["session_name"] == TALKER and sent["idempotency_key"] == "k-wx-1"
         assert sent["confirm_timeout_ms"] == CONFIRM_TIMEOUT_WECHAT_MS

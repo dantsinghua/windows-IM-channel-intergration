@@ -388,9 +388,29 @@ class AgentApp:
 
     async def _wa_media_raw(self, path: str) -> bytes:
         """真下载器取微信 chatlog 图片的出口(#40 ``GET /wa/v1/wechat/media/<md5>``,二进制)。"""
-        status, _headers, raw = await self.winagent.request("GET", path, timeout_s=30.0, raw=True)
+        from .media import MediaFetchError
+        from .winagent_client import WinAgentUnavailable
+        import re
+        try:
+            status, _headers, raw = await self.winagent.request("GET", path, timeout_s=30.0, raw=True)
+        except (WinAgentUnavailable, OSError, TimeoutError):
+            raise MediaFetchError("winagent_unreachable", retryable=True) from None
         if status != 200:
-            raise RuntimeError(f"winagent media http_{status}")
+            error = {}
+            try:
+                body = json.loads(raw) if isinstance(raw, bytes) and len(raw) <= 4096 else {}
+                error = body.get("error", {}) if isinstance(body, dict) else {}
+                error = error if isinstance(error, dict) else {}
+            except (ValueError, UnicodeError):
+                pass
+            reason = error.get("reason") or error.get("code")
+            if not isinstance(reason, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", reason) is None:
+                reason = "winagent_media_http_" + str(status)
+            permanent = ("invalid_image", "identity", "account_mismatch", "invalid_ref", "path_escape", "key_invalid")
+            retryable = not any(word in reason.lower() for word in permanent) and (
+                reason.lower() == "wechat_media_not_found" or error.get("retryable") is True
+                or status in (408, 429) or 500 <= status <= 599)
+            raise MediaFetchError(reason, retryable=retryable)
         return raw
 
     def _wechat_screenshot_media(self, acct: Account, png: bytes) -> dict[str, Any]:
@@ -493,16 +513,18 @@ class AgentApp:
             self.alerts.resolve("ACCOUNT_OFFLINE", subject="account:" + account_id, account_id=account_id)
 
 
-    def _maindb_for_uid(self, self_uid: str, acct: Optional[Account] = None) -> MainDb:
-        acct = acct or self._current_qidian_account
+    def _maindb_for_uid(self, self_uid: str, acct: Account) -> MainDb:
+        row = self.store.get_account_full(acct.id)
+        if (acct.channel != "qidian" or not self_uid
+                or acct.self_uid and acct.self_uid != self_uid
+                or row and row.get("self_uid") and row["self_uid"] != self_uid):
+            raise ValueError("Capture UID conflicts with the explicit account")
         if self._maindb_factory is not None:
             return self._maindb_factory(self_uid, acct)
-        serial = acct.extra.get("adb_serial") if acct else None
+        serial = acct.extra.get("adb_serial")
         if serial:
             return AdbMainDb(serial, self_uid)
         return LocalSqliteMainDb(f"/data/data/com.tencent.qidian/databases/{self_uid}.db")
-
-    _current_qidian_account: Optional[Account] = None
 
     def running_qidian_accounts(self) -> list[Account]:
         out = []
@@ -520,19 +542,11 @@ class AgentApp:
     # ------------------------------------------------------------------ 周期任务
     async def qidian_poll_all(self) -> None:
         for acct in self.running_qidian_accounts():
-            self._current_qidian_account = acct
-            try:
-                await self.adapters["qidian"].poll(acct)
-            finally:
-                self._current_qidian_account = None
+            await self.adapters["qidian"].poll(acct)
 
     async def qidian_gaps_all(self) -> None:
         for acct in self.running_qidian_accounts():
-            self._current_qidian_account = acct
-            try:
-                await self.adapters["qidian"].check_group_gaps(acct)
-            finally:
-                self._current_qidian_account = None
+            await self.adapters["qidian"].check_group_gaps(acct)
 
     async def wechat_poll_all(self) -> None:
         """05 §2.4.4 ⑦:**每账号周期是动态的** —— 平时 ``[adapters.wechat] poll_interval_s``(5 s),
@@ -909,15 +923,56 @@ class AgentApp:
         from pathlib import Path
         return str(Path(self.data_dir) / "organization" / (uid + ".json"))
 
+    def _xunjia_org_source_identity(self, row):
+        from .adapters.qidian.org import OrgReadError
+        if not hasattr(self, "store"):
+            return None  # A supplied local-file source has no native account registry.
+        uid = str(row.get("self_uid") or "")
+        active = [item for item in self.store.list_accounts(channel="qidian")
+                  if item.get("enabled", True) and not item.get("deleted_ms")
+                  and item.get("state") in ("running", "degraded") and item.get("self_uid")]
+        matches = [item for item in active if str(item["self_uid"]) == uid]
+        if len(matches) > 1:
+            raise OrgReadError("ORG_ACCOUNT_SOURCE_CONFLICT")
+        if not matches or matches[0]["id"] != row.get("id"):
+            raise OrgReadError("ORG_ACCOUNT_SOURCE_CHANGED")
+        current = matches[0]
+        def serial(item):
+            return item.get("adb_serial") or f"127.0.0.1:{16000 + int(item['seq'])}"
+        target_serial = serial(current)
+        for item in active:
+            if item["id"] == current["id"]:
+                continue
+            same_container_id = bool(current.get("container_id")) and current["container_id"] == item.get("container_id")
+            same_container_name = bool(current.get("container_name")) and current["container_name"] == item.get("container_name")
+            if serial(item) == target_serial or same_container_id or same_container_name:
+                raise OrgReadError("ORG_NATIVE_SOURCE_ACCOUNT_CONFLICT")
+        return (current["id"], uid, target_serial, current.get("container_id"), current.get("container_name"),
+                current.get("created_ms"), current.get("last_started_ms"))
+
     def _xunjia_v22_contacts(self, row):
         if row.get("channel") == "wechat":
             return {"contacts": self._xunjia_institution_friends(row), "org_state": "unreported"}
         from .adapters.qidian.contacts import list_private_contacts
         if row.get("state") != "running" or not row.get("self_uid"):
             raise RuntimeError("collector_contacts_account_not_running")
+        identity = self._xunjia_org_source_identity(row)
         account = Account(id=row["id"], channel="qidian", state=row["state"], self_uid=row["self_uid"],
-            extra={"adb_serial": row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"})
+            extra={"adb_serial": identity[2] if identity else row.get("adb_serial") or f"127.0.0.1:{16000 + int(row['seq'])}"})
         source = self._maindb_for_uid(str(row["self_uid"]), account)
+        if all(hasattr(source, key) for key in ("adb", "serial", "server_port", "_shell")):
+            from .adapters.qidian.org import OrgReadError
+            if identity is None:
+                raise OrgReadError("ORG_NATIVE_IDENTITY_UNVERIFIED")
+            if source.serial != identity[2] or str(source.path) != f"/data/data/com.tencent.qidian/databases/{identity[1]}.db":
+                raise OrgReadError("ORG_ACCOUNT_SOURCE_CHANGED")
+            def current_identity():
+                current = self._xunjia_org_source_identity(row)
+                if current != identity:
+                    raise OrgReadError("ORG_ACCOUNT_SOURCE_CHANGED")
+                return current
+            source.org_source_identity = identity
+            source.org_identity_check = current_identity
         if not source.exists():
             raise RuntimeError("collector_contacts_source_unavailable")
         contacts = list_private_contacts(source.list_contact_source_rows())
@@ -988,8 +1043,13 @@ class AgentApp:
                     continue
                 import base64
                 peer = "wxpeer-" + base64.urlsafe_b64encode(native.encode()).decode("ascii").rstrip("=")
-                contacts.append({"peer_id": peer, "native_id": native,
-                                 "name": str(item.get("nickName") or item.get("remark") or item.get("name") or ("文件传输助手" if native == "filehelper" else native)),
+                name = item.get("display_name")
+                if not isinstance(name, str) or not name.strip():
+                    name = native if native.endswith("@chatroom") else str(
+                        item.get("remark") or item.get("nickName") or item.get("name") or native)
+                if native == "filehelper" and name == native:
+                    name = "文件传输助手"
+                contacts.append({"peer_id": peer, "native_id": native, "name": name,
                                  "kind": "group" if native.endswith("@chatroom") else "private"})
             return contacts
         from .adapters.qidian.contacts import list_private_contacts
@@ -1031,6 +1091,73 @@ class AgentApp:
         state = "pending" if len(attachments) != len(media) else ("chunked" if blobs else "ready")
         return {"attachments": attachments, "media": media, "media_state": state, "_media_blobs": blobs}
 
+    async def _capture_wechat_media_refresh(self, grant, native_id, ext_msg_id):
+        """Refresh one explicitly granted historical media reference without moving a cursor."""
+        from .adapters.wechat.normalize import to_message
+        from relay.protocol import ProtocolError
+        capture = getattr(self.xunjia_v22_host, "capture", None)
+        if capture is None or not capture.authorized(grant) or native_id not in grant.selected_native_ids:
+            raise ProtocolError("CAPTURE_BACKFILL_NOT_AUTHORIZED")
+        prefix = native_id + ":"
+        if not isinstance(ext_msg_id, str) or not ext_msg_id.startswith(prefix) or not ext_msg_id[len(prefix):].isdigit():
+            raise ProtocolError("CAPTURE_BACKFILL_NATIVE_ID_INVALID")
+        seq = int(ext_msg_id[len(prefix):])
+        if not 0 < seq < 2**63:
+            raise ProtocolError("CAPTURE_BACKFILL_NATIVE_ID_INVALID")
+        rows = [row for row in self.store.list_accounts(channel="wechat")
+                if row.get("self_uid") == grant.account_uid and row.get("enabled", True)
+                and not row.get("deleted_ms") and row.get("state") in ("running", "degraded")]
+        if len(rows) != 1:
+            raise ProtocolError("CAPTURE_NATIVE_ACCOUNT_AMBIGUOUS")
+        account = rows[0]
+        identity = self.store.native_identity(account["id"])
+        stored = self.store.con.execute("SELECT id FROM messages WHERE account_id=? AND session_id=? AND ext_msg_id=?",
+                    (account["id"], account["id"]+":"+native_id, ext_msg_id)).fetchall()
+        if len(stored) != 1:
+            raise ProtocolError("CAPTURE_BACKFILL_NATIVE_AMBIGUOUS")
+        existing = self.store.get_message(stored[0]["id"])
+        if not existing or existing["type"] != "image" or existing.get("source") != "chatlog":
+            raise ProtocolError("CAPTURE_BACKFILL_IMAGE_REQUIRED")
+        for before in (True, False):
+            presence = await self._xunjia_institution_presence(account)
+            current = self.store.get_account(account["id"])
+            if (presence.get("state") != "online" or presence.get("self_uid") != grant.account_uid
+                    or not current or not current.get("enabled", True) or current.get("self_uid") != grant.account_uid
+                    or current.get("state") not in ("running", "degraded")
+                    or self.store.native_identity(account["id"]) != identity or not capture.authorized(grant)):
+                raise ProtocolError("CAPTURE_BACKFILL_IDENTITY_CHANGED")
+            if before:
+                native_rows = await self.wechat_client.read(talker=native_id, since_seq=seq-1, limit=2)
+        matching = [row for row in native_rows if row.get("talker") == native_id and row.get("seq") == seq]
+        if len(matching) != 1:
+            raise ProtocolError("CAPTURE_BACKFILL_NATIVE_AMBIGUOUS")
+        message = to_message(account["id"], matching[0], self_uid=grant.account_uid,
+                             self_nick=account.get("self_nick"))
+        if (message.ext_msg_id != ext_msg_id or message.type != existing["type"]
+                or message.dir != existing["dir"] or message.ts_ms != existing["ts_ms"] or not message.media):
+            raise ProtocolError("CAPTURE_BACKFILL_NATIVE_MISMATCH")
+        # A completed media reference is retained; this narrow operation repairs
+        # only the formerly empty field and never overwrites an active task.
+        if json.loads(existing["media_json"]):
+            self.store.register_capture_source(existing["id"], account_id=account["id"], expected_uid=grant.account_uid,
+                expected_epoch=identity.get("epoch", 0), expected_ext=ext_msg_id)
+            return False
+        changed = self.store.complete_native_media(existing["id"], account_id=account["id"],
+            expected_uid=grant.account_uid, expected_epoch=identity.get("epoch", 0),
+            expected_ext=ext_msg_id, media=message.media, expected_media_json=existing["media_json"])
+        self.store.register_capture_source(existing["id"], account_id=account["id"], expected_uid=grant.account_uid,
+            expected_epoch=identity.get("epoch", 0), expected_ext=ext_msg_id)
+        return changed
+
+    def _capture_wechat_media_refresher(self, grant, native_id, ext_msg_id):
+        future = asyncio.run_coroutine_threadsafe(
+            self._capture_wechat_media_refresh(grant, native_id, ext_msg_id), self.xunjia_v22_host.loop)
+        try:
+            return future.result(timeout=30)
+        except TimeoutError:
+            future.cancel()
+            raise
+
     async def _configure_xunjia_v22(self) -> None:
         from .ossbox.institution import InstitutionCollectorHost
         try:
@@ -1043,6 +1170,7 @@ class AgentApp:
                     friends_provider=self._xunjia_institution_friends,organization_provider=self._xunjia_v22_contacts,
                     history_provider=self._xunjia_institution_history_source,presence_provider=self._xunjia_institution_presence,
                     media_provider=self._xunjia_institution_media,
+                    capture_refresher=self._capture_wechat_media_refresher,
                     clock=lambda:self.clock()/1000)
             await self.xunjia_v22_host.start()
             self.oss_start_error=""

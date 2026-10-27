@@ -118,19 +118,21 @@ async def test_screen_locked_blocks_write_but_not_read(tmp_path):
 
 
 async def test_send_delivered_merges_readback_into_sending_row(tmp_path):
-    """#38 回 ``DELIVERED`` 时,适配器把读回行喂 ``store.ingest`` ⇒ 合并进 ``SENDING`` 行(06 §2.12,``confirmed_by='chatlog'``)。"""
+    """P0: exact native ID and actual read row bind to the original Bus placeholder."""
     rig = make_wechat_rig(tmp_path)
-    out = Message(account_id="wx01", channel="wechat", session=Session("wx01", "p", "private"), dir="out", type="text",
-                  text="你好", ts_ms=rig.clock(), source="chatlog", self=True, state="SENDING", trace_id="TR1", idempotency_key="k1",
-                  sender_id="wxid_demo01")
-    sending_id = rig.store.ingest(out, now_ms=rig.clock()).id
-    res = await rig.adapter.send(rig.account(), cmd("send_text", session="wx01:p", text="你好"))
-    assert res.ok and res.data["ext_msg_id"] == "p:1"
-    st = rig.store.message_state(sending_id)
-    assert st["state"] == "DELIVERED" and st["confirmed_by"] == "chatlog" and st["ext_msg_id"] == "p:1"
-    assert rig.store.count_messages("wx01") == 1                 # 不插第二行
-    assert rig.fake.sent[0]["session_name"] == "p"               # session_id 前缀已剥成原生 talker
-    rig.store.close()
+    rig.fake.send_result = {"ok": True, "code": "DELIVERED", "ext_msg_id": "p:1", "confirm_ms": 1}
+    rig.fake.add_row(talker="p", content="你好", seq=1, ts_ms=rig.clock(), is_self=True)
+    bus = rig.make_bus()
+    try:
+        res = await bus.submit(cmd("send_text", session="wx01:p", text="你好"))
+        assert res.ok and res.data["ext_msg_id"] == "p:1"
+        st = rig.store.confirmed_outbound_for_trace(res.trace_id)
+        assert st["state"] == "DELIVERED" and st["confirmed_by"] == "chatlog" and st["ext_msg_id"] == "p:1"
+        assert rig.store.count_messages("wx01") == 1
+        assert rig.fake.sent[0]["session_name"] == "p"
+    finally:
+        await bus.close()
+        rig.store.close()
 
 
 async def test_send_failed_is_reported_as_send_failed(tmp_path):
@@ -154,23 +156,23 @@ async def test_send_opens_confirm_window(tmp_path):
     rig.store.close()
 
 
-async def test_confirm_probe_hits_local_store_first(tmp_path):
-    """B-08 幂等复核:本库里那条出向行已被合并成已确认 ⇒ 直接 True,不再问 chatlog。"""
+async def test_confirm_probe_rejects_local_same_text_owned_by_another_trace(tmp_path):
+    """P0: an existing native row from another trace cannot confirm this command."""
     rig = make_wechat_rig(tmp_path)
     done = Message(account_id="wx01", channel="wechat", session=Session("wx01", "p", "private"), dir="out", type="text",
                    text="上次发过的", ts_ms=T0, source="chatlog", self=True, state="DELIVERED", ext_msg_id="p:9", trace_id="TR0")
     rig.store.ingest(done, now_ms=T0)
     rig.fake.calls.clear()
-    assert await rig.adapter.confirm_probe(rig.account(), cmd("send_text", session="wx01:p", text="上次发过的")) is True
+    assert await rig.adapter.confirm_probe(rig.account(), cmd("send_text", session="wx01:p", text="上次发过的")) is False
     assert rig.fake.calls == []
     rig.store.close()
 
 
-async def test_confirm_probe_falls_back_to_chatlog_same_text(tmp_path):
-    """02 §2.2.3:微信查 chatlog 同分钟同文本(P-14);两侧比较过 ``norm()``(全角/空白差异不影响)。"""
+async def test_confirm_probe_rejects_uncorrelated_same_text_in_chatlog(tmp_path):
+    """P0: normalized same text without exact original-trace evidence is not confirmation."""
     rig = make_wechat_rig(tmp_path)
     rig.fake.add_row(talker="p", content="报价  3.05", seq=4, ts_ms=T0 + 1000, is_self=True)
-    assert await rig.adapter.confirm_probe(rig.account(), cmd("send_text", session="wx01:p", text="报价 3.05")) is True
+    assert await rig.adapter.confirm_probe(rig.account(), cmd("send_text", session="wx01:p", text="报价 3.05")) is False
     assert await rig.adapter.confirm_probe(rig.account(), cmd("send_text", session="wx01:p", text="另一句")) is False
     rig.store.close()
 

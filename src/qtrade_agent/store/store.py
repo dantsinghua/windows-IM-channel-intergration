@@ -173,8 +173,74 @@ class Store:
                 pass    # :memory: 下 WAL 不适用
         self._con = con
         self._migrate()
+        self._ensure_native_capture_source()
         self._seed()
         return self
+
+    def _ensure_native_capture_source(self) -> None:
+        """Add a local recovery outbox without changing the legacy schema version."""
+        with self._tx() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS native_capture_source(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL,account_id TEXT NOT NULL,
+                native_uid TEXT NOT NULL,identity_epoch INTEGER NOT NULL,ext_msg_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,fingerprint TEXT NOT NULL,historical INTEGER NOT NULL DEFAULT 0,
+                created_ms INTEGER NOT NULL)""")
+            connection.execute("CREATE INDEX IF NOT EXISTS ix_native_capture_identity ON native_capture_source(account_id,native_uid,identity_epoch,ext_msg_id,seq)")
+
+    def capture_source_bounds(self) -> tuple[Optional[int], Optional[int]]:
+        row = self.con.execute("SELECT MIN(seq),MAX(seq) FROM native_capture_source").fetchone()
+        return row[0], row[1]
+
+    def capture_sources(self, after_seq: int, limit: int = 200) -> list[dict[str, Any]]:
+        if type(after_seq) is not int or after_seq < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("native_capture_source_query_invalid")
+        return [dict(row) for row in self.con.execute(
+            "SELECT seq,message_id,account_id,native_uid,identity_epoch,ext_msg_id,payload_json,historical "
+            "FROM native_capture_source WHERE seq>? ORDER BY seq LIMIT ?", (after_seq, limit)).fetchall()]
+
+    def _append_capture_source(self, connection, message_id: str, now: int, *, historical=False) -> Optional[int]:
+        row = connection.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+        if row is None or row["channel"] != "wechat" or row["source"] != "chatlog" or not row["ext_msg_id"]:
+            return None
+        account = connection.execute("SELECT self_uid,enabled,deleted_ms,state FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
+        if (account is None or not account["self_uid"] or not account["enabled"] or account["deleted_ms"] is not None
+                or account["state"] not in ("running", "degraded")
+                or row["identity_epoch"] != self._identity_epoch(row["account_id"])):
+            return None
+        session = connection.execute("SELECT id,native_id,kind,name FROM sessions WHERE id=?", (row["session_id"],)).fetchone()
+        if session is None:
+            raise ValueError("native_capture_session_missing")
+        payload = {key: value for key, value in dict(row).items() if key != "raw_ref"}
+        payload.update(native_account_uid=account["self_uid"], session=dict(session))
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        fingerprint = hashlib.sha256(encoded.encode("utf8")).hexdigest()
+        scope = (row["account_id"], account["self_uid"], row["identity_epoch"], row["ext_msg_id"])
+        previous = connection.execute(
+            "SELECT seq,fingerprint FROM native_capture_source WHERE account_id=? AND native_uid=? AND identity_epoch=? AND ext_msg_id=? ORDER BY seq DESC LIMIT 1",
+            scope).fetchone()
+        if previous and previous["fingerprint"] == fingerprint:
+            return int(previous["seq"])
+        inserted = connection.execute("""INSERT INTO native_capture_source(
+            message_id,account_id,native_uid,identity_epoch,ext_msg_id,payload_json,fingerprint,historical,created_ms)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (message_id, *scope, encoded, fingerprint, int(historical), now))
+        return int(inserted.lastrowid)
+
+    def register_capture_source(self, message_id: str, *, account_id: str, expected_uid: str,
+                                expected_epoch: int, expected_ext: str) -> int:
+        """Register one externally authorized, verified historical native fact."""
+        if (not isinstance(expected_uid, str) or not expected_uid or type(expected_epoch) is not int
+                or expected_epoch < 0 or not isinstance(expected_ext, str) or not expected_ext):
+            raise ValueError("native_capture_registration_invalid")
+        with self._tx() as connection:
+            self._verify_native_uid(connection, account_id, expected_uid)
+            row = connection.execute("SELECT account_id,identity_epoch,ext_msg_id FROM messages WHERE id=?", (message_id,)).fetchone()
+            if (row is None or row["account_id"] != account_id or row["identity_epoch"] != expected_epoch
+                    or row["ext_msg_id"] != expected_ext or self._identity_epoch(account_id) != expected_epoch):
+                raise ValueError("native_capture_registration_changed")
+            seq = self._append_capture_source(connection, message_id, self._clock(), historical=True)
+            if seq is None:
+                raise ValueError("native_capture_registration_not_native")
+            return seq
 
     def close(self) -> None:
         if self._con is not None:
@@ -676,6 +742,101 @@ class Store:
                       (ext_msg_id, confirmed_by, now, r["id"]))
             return str(r["id"])
 
+    def bind_wechat_readback(self, trace_id: str, msg: Message, *, now_ms: int,
+                             readback_record: Optional[dict[str, Any]] = None) -> Optional[str]:
+        """Bind verified native readback to exactly one current-identity send, never by text/time proximity."""
+        if (not trace_id or msg.channel != "wechat" or msg.source != "chatlog" or msg.dir != "out"
+                or msg.self is not True or msg.state != "DELIVERED" or msg.dedup_kind != "native"
+                or msg.type != "text" or not isinstance(msg.text, str) or not msg.text
+                or not isinstance(msg.ext_msg_id, str) or not msg.ext_msg_id
+                or msg.trace_id not in (None, trace_id) or msg.session.account_id != msg.account_id
+                or type(msg.ts_ms) is not int or msg.ts_ms <= 0):
+            return None
+        native_id, separator, native_seq = msg.ext_msg_id.rpartition(":")
+        if (not separator or native_id != msg.session.native_id or not native_seq.isascii()
+                or not native_seq.isdecimal() or int(native_seq) <= 0):
+            return None
+        text_hash = hashlib.sha256(msg.text.encode("utf-8")).hexdigest()
+
+        def same_body(row: sqlite3.Row) -> bool:
+            return row["type"] == msg.type and row["text_hash"] == text_hash and (row["text"] is None or row["text"] == msg.text)
+
+        with self.write_guard("store.bind_wechat_readback"), self._tx() as c:
+            record_key = "wechat.readback." + trace_id
+            if readback_record is not None:
+                if not isinstance(readback_record, dict):
+                    return None
+                try:
+                    expected_json = json.dumps(readback_record, ensure_ascii=False)
+                    snapshot = json.loads(expected_json)
+                except (TypeError, ValueError):
+                    return None
+                if snapshot.get("status") != "pending":
+                    return None
+                persisted = c.execute("SELECT value_json FROM settings WHERE key=?", (record_key,)).fetchone()
+                if persisted is None or persisted["value_json"] != expected_json:
+                    return None
+                confirmed_json = json.dumps({**snapshot, "status": "confirmed"}, ensure_ascii=False)
+            expected_uid = getattr(msg, "_native_account_uid", None)
+            account = c.execute("SELECT self_uid, channel FROM accounts WHERE id=?", (msg.account_id,)).fetchone()
+            if (not isinstance(expected_uid, str) or not expected_uid or account is None
+                    or account["channel"] != "wechat" or account["self_uid"] != expected_uid):
+                return None
+            targets = c.execute("SELECT * FROM messages WHERE trace_id=? AND channel='wechat' AND dir='out' AND "
+                                + self._current_identity_sql() + " LIMIT 2", (trace_id,)).fetchall()
+            if len(targets) != 1:
+                return None
+            target = targets[0]
+            if (target["account_id"] != msg.account_id or target["session_id"] != msg.session_id
+                    or not target["is_self"] or not same_body(target)):
+                return None
+            if target["ext_msg_id"] is not None:
+                if (target["ext_msg_id"] == msg.ext_msg_id and target["state"] == "DELIVERED"
+                        and target["confirmed_by"] == "chatlog"):
+                    if readback_record is not None:
+                        c.execute("UPDATE settings SET value_json=?, updated_ms=?, updated_by=? WHERE key=?",
+                                  (confirmed_json, now_ms, "system:wechat_adapter", record_key))
+                    msg.id = target["id"]
+                    return str(target["id"])
+                return None
+            if target["state"] not in ("SENDING", "UNCONFIRMED"):
+                return None
+            native = c.execute("SELECT * FROM messages WHERE account_id=? AND ext_msg_id=? AND "
+                               + self._current_identity_sql(), (msg.account_id, msg.ext_msg_id)).fetchone()
+            if native is not None and (native["trace_id"] is not None or native["idempotency_key"] is not None
+                    or native["session_id"] != msg.session_id or native["channel"] != "wechat"
+                    or native["dir"] != "out" or native["is_self"] != 1 or native["source"] != "chatlog"
+                    or native["state"] != "DELIVERED" or native["dedup_kind"] != "native" or not same_body(native)):
+                return None
+
+            # Copy every persisted native field, including media/revocation/ASR facts, before removing its duplicate.
+            values = dict(native) if native is not None else self._row_values(msg, now_ms)
+            for key in ("id", "trace_id", "idempotency_key"):
+                values.pop(key, None)
+            values.update(state="DELIVERED", confirmed_by="chatlog", confirmed_ms=now_ms)
+            if native is not None:
+                c.execute("DELETE FROM messages WHERE id=?", (native["id"],))
+            c.execute("UPDATE messages SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?",
+                      (*values.values(), target["id"]))
+            self._upsert_session(c, msg, now_ms)
+            c.execute("UPDATE sessions SET msg_count=msg_count-?, last_msg_ms=(SELECT MAX(ts_ms) FROM messages "
+                      "WHERE session_id=? AND " + self._current_identity_sql() + ") WHERE id=?",
+                      (1 if native is not None else 0, msg.session_id, msg.session_id))
+            if native is not None:
+                self._insert_audit(c, kind="system", transport="system", actor="system:wechat_adapter",
+                                   action="wechat.readback.merge", account_id=msg.account_id, trace_id=trace_id,
+                                   result_code="DELIVERED", detail={"message_id": target["id"], "merged_message_id": native["id"],
+                                                                    "ext_msg_id": msg.ext_msg_id}, now=now_ms)
+            if readback_record is not None:
+                c.execute("UPDATE settings SET value_json=?, updated_ms=?, updated_by=? WHERE key=?",
+                          (confirmed_json, now_ms, "system:wechat_adapter", record_key))
+            msg.id = target["id"]
+            msg.trace_id = trace_id
+            msg.idempotency_key = target["idempotency_key"]
+            msg.received_ms = values["received_ms"]
+            self._append_capture_source(c, str(target["id"]), now_ms)
+            return str(target["id"])
+
     # ------------------------------------------------------------------ jobs(02 §3.1;§3.4.9 R-21:凡 202 {job_id} 的端点统一走这张表)
     def job_create(self, *, kind: str, actor: str, params: Optional[dict[str, Any]] = None,
                    account_id: Optional[str] = None, now_ms: Optional[int] = None) -> str:
@@ -814,6 +975,7 @@ class Store:
         qs = ",".join("?" for _ in v)
         c.execute(f"INSERT INTO messages({cols}) VALUES ({qs})", tuple(v.values()))
         c.execute("UPDATE sessions SET msg_count = msg_count + 1 WHERE id = ?", (msg.session_id,))
+        self._append_capture_source(c, v["id"], now)
         msg.id = v["id"]
         return v["id"]
 
@@ -884,17 +1046,22 @@ class Store:
                               (msg.account_id, msg.ext_msg_id, msg.ext_msg_id + "#%")).fetchone()[0]
                 return IngestResult(True, False, self._insert_message(c, msg, now, ext_override=f"{msg.ext_msg_id}#{n + 1}"))
             changed = False
+            capture_changed = False
             if msg.revoked and not existing["revoked"]:
                 c.execute("UPDATE messages SET revoked=1, revoked_ms=COALESCE(?, revoked_ms, ?), revoked_by=COALESCE(?, revoked_by) WHERE id=?",
                           (msg.revoked_ms, now, msg.revoked_by, existing["id"]))
                 changed = True
+                capture_changed = True
             if existing["text"] is None and msg.text is not None and self.capture_text:
                 c.execute("UPDATE messages SET text=?, text_len=? WHERE id=?", (msg.text, len(msg.text), existing["id"]))
+                capture_changed = True
+            if capture_changed:
+                self._append_capture_source(c, existing["id"], now)
             msg.id = existing["id"]
             return IngestResult(False, changed, existing["id"])
 
         # ③ 入向轮询撞到自己发的(06 §2.12):只对我方出向的读回行
-        if msg.self and msg.dir == "out":
+        if msg.self and msg.dir == "out" and msg.channel != "wechat":
             cand = self._find_merge_candidate(c, msg)
             if cand is not None:
                 c.execute("UPDATE messages SET ext_msg_id=?, state='DELIVERED', confirmed_by=?, confirmed_ms=? WHERE id=?",
@@ -930,6 +1097,54 @@ class Store:
     def get_message(self, id: str) -> Optional[dict[str, Any]]:
         r = self.con.execute("SELECT * FROM messages WHERE id=? AND " + self._current_identity_sql(), (id,)).fetchone()
         return dict(r) if r else None
+
+    def complete_native_media(self, message_id: str, *, account_id: str, expected_uid: str,
+                              expected_epoch: int, expected_ext: str, media: list[dict[str, Any]],
+                              expected_media_json: str = "[]") -> bool:
+        """Fill one verified native image's empty attachment list without changing its history."""
+        if (not isinstance(expected_uid, str) or not expected_uid
+                or type(expected_epoch) is not int or expected_epoch < 0
+                or not isinstance(expected_ext, str) or not expected_ext
+                or not isinstance(expected_media_json, str)
+                or not isinstance(media, list) or not 1 <= len(media) <= 20
+                or any(not isinstance(item, dict) or item.get("kind") != "image"
+                       or not isinstance(item.get("wa_path"), str)
+                       or not item["wa_path"].startswith("/wa/v1/wechat/media/")
+                       or "media_id" in item for item in media)):
+            raise ValueError("native_media_completion_invalid")
+        encoded = json.dumps(media, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 65536:
+            raise ValueError("native_media_completion_invalid")
+        with self._tx() as connection:
+            account = connection.execute(
+                "SELECT channel,self_uid,enabled,deleted_ms,state FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if (account is None or account["channel"] != "wechat" or account["self_uid"] != expected_uid
+                    or not account["enabled"] or account["deleted_ms"] is not None
+                    or account["state"] not in ("running", "degraded")
+                    or self._identity_epoch(account_id) != expected_epoch):
+                raise ValueError("native_media_identity_changed")
+            row = connection.execute(
+                "SELECT account_id,channel,type,source,ext_msg_id,identity_epoch,media_json FROM messages WHERE id=?",
+                (message_id,)).fetchone()
+            if (row is None or row["account_id"] != account_id or row["channel"] != "wechat"
+                    or row["type"] != "image" or row["source"] != "chatlog"
+                    or row["ext_msg_id"] != expected_ext or row["identity_epoch"] != expected_epoch):
+                raise ValueError("native_media_message_changed")
+            try:
+                existing = json.loads(row["media_json"])
+                expected = json.loads(expected_media_json)
+            except (TypeError, ValueError) as error:
+                raise ValueError("native_media_revision_invalid") from error
+            if existing == media:
+                return False
+            if existing != [] or expected != [] or row["media_json"] != expected_media_json:
+                raise ValueError("native_media_revision_conflict")
+            changed = connection.execute("UPDATE messages SET media_json=? WHERE id=? AND media_json=?",
+                                         (encoded, message_id, expected_media_json))
+            if changed.rowcount != 1:
+                raise ValueError("native_media_revision_conflict")
+            self._append_capture_source(connection, message_id, self._clock(), historical=True)
+            return True
 
     def list_messages(self, account_id: str, *, session_id: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT * FROM messages WHERE account_id=? AND " + self._current_identity_sql()
@@ -1237,7 +1452,7 @@ class Store:
         return dict(r) if r else None
 
     def list_commands(self, account_id: str, *, status: Optional[str] = None, op: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
-        sql, params = "SELECT c.*, r.ok, r.code, r.data_json, r.cost_ms, r.source, r.confirmed_by, r.finished_ms AS result_finished_ms FROM commands c " \
+        sql, params = "SELECT c.*, r.ok, r.code, r.data_json, r.cost_ms, r.source, r.confirmed_by, r.error_message, r.error_retryable, r.error_needs_human, r.finished_ms AS result_finished_ms FROM commands c " \
                       "LEFT JOIN command_results r ON r.trace_id = c.trace_id WHERE c.account_id=?", [account_id]
         sql += " AND " + self._current_identity_sql("c")
         if status:

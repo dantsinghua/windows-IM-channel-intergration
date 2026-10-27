@@ -95,7 +95,7 @@ class QidianAdapter:
         return row is not None
 
     async def poll(self, acct: Account, *, only_sessions: Optional[list[str]] = None) -> None:
-        await asyncio.to_thread(self._poller.poll_maindb, self._view(acct), only_sessions)
+        await asyncio.to_thread(self._poller.poll_maindb, acct, only_sessions)
 
     async def check_group_gaps(self, acct: Account) -> None:
-        await asyncio.to_thread(self._poller.check_group_gaps, self._view(acct))
+        await asyncio.to_thread(self._poller.check_group_gaps, acct)

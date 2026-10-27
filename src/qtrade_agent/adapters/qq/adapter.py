@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -54,6 +55,8 @@ class QQSession:
     ingested: int = 0
     backfilled: int = 0
     events_seen: dict[str, int] = field(default_factory=dict)
+    native_identity: Optional[tuple[str, int]] = None
+    generation: object = field(default_factory=object, repr=False)
 
 
 def default_transport_factory(acct: Account) -> OneBotTransport:
@@ -77,6 +80,7 @@ class QQAdapter:
         self._access_token_for = access_token_for or (lambda acct: None)
         self.clock = clock
         self._sessions: dict[str, QQSession] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ 生命周期
     def session_of(self, account_id: str) -> Optional[QQSession]:
@@ -88,30 +92,74 @@ class QQAdapter:
         return ws_url(port_plan("qq", seq_of(acct.id))["ws"])
 
     async def start(self, acct: Account) -> None:
-        """建连 + 挂 hook,**不阻塞到登录**(02 §2.2.3)。已建连则幂等返回。"""
-        if acct.id in self._sessions:
+        """建连 + 挂 hook,**不阻塞到登录**(02 §2.2.3)。同一身份的已建连会话幂等返回。"""
+        async with self._session_locks.setdefault(acct.id, asyncio.Lock()):
+            await self._start_session(acct)
+
+    async def _start_session(self, acct: Account) -> None:
+        row = self.store.get_account_full(acct.id)
+        if (not row or row.get("channel") != "qq" or row.get("deleted_ms") or not row.get("enabled", True)
+                or row.get("self_uid") != acct.self_uid):
+            log.info("QQ ignored stale start account=%s", acct.id)
             return
+        previous = self._sessions.get(acct.id)
+        if previous is not None:
+            epoch = self.store.native_identity(acct.id).get("epoch", 0)
+            if (previous.acct.self_uid == acct.self_uid
+                    and (previous.native_identity is None or previous.native_identity == (acct.self_uid, epoch))):
+                return
+            self._sessions.pop(acct.id)
+            await previous.client.close()
         client = OneBotClient(self.ws_url_for(acct), transport=self._transport_factory(acct), cfg=self.qq,
                               access_token=self._access_token_for(acct), clock=self.clock,
-                              on_event=lambda frame, aid=acct.id: self._on_event_by_id(aid, frame),
-                              on_reconnect=lambda a=acct: self.backfill(a))
-        self._sessions[acct.id] = QQSession(acct=acct, client=client)
+                              on_event=lambda frame: self._on_event(session, frame),
+                              on_reconnect=lambda: self._backfill_session(session))
+        session = QQSession(acct=acct, client=client)
+        self._sessions[acct.id] = session
+        acct.extra["_qq_session_generation"] = session.generation
+        self._session_identity(session)
         await client.start()
         if not acct.extra.get("login_pending"):
             try:
-                await self.backfill(acct)
+                await self._backfill_session(session)
             except Exception:
                 log.exception("QQ 连接后补历史失败 account=%s", acct.id)
 
     async def stop(self, acct: Account, *, graceful: bool) -> None:
-        sess = self._sessions.pop(acct.id, None)
-        if sess is not None:
-            await sess.client.close()
+        requested_generation = acct.extra.get("_qq_session_generation")
+        async with self._session_locks.setdefault(acct.id, asyncio.Lock()):
+            sess = self._sessions.get(acct.id)
+            if (sess is not None and (requested_generation is None or requested_generation is sess.generation)
+                    and (acct.self_uid is None or acct.self_uid == sess.acct.self_uid)):
+                self._sessions.pop(acct.id)
+                await sess.client.close()
 
     async def close(self) -> None:
         for aid in list(self._sessions):
             sess = self._sessions.pop(aid)
             await sess.client.close()
+
+    def _session_identity(self, sess: QQSession, acct: Optional[Account] = None) -> Optional[tuple[str, int]]:
+        """Only the current connection for the unique active native identity may read or write."""
+        if self._sessions.get(sess.acct.id) is not sess or sess.acct.extra.get("login_pending"):
+            return None
+        uid = sess.acct.self_uid
+        if not uid or (acct is not None and (acct.id != sess.acct.id or acct.self_uid != uid)):
+            return None
+        matches = [row for row in self.store.list_accounts(channel="qq")
+                   if row.get("enabled", True) and not row.get("deleted_ms")
+                   and row.get("state") in ("running", "degraded") and row.get("self_uid") == uid]
+        if len(matches) != 1 or matches[0]["id"] != sess.acct.id:
+            return None
+        identity = uid, self.store.native_identity(sess.acct.id).get("epoch", 0)
+        if sess.native_identity is None:
+            sess.native_identity = identity
+        return identity if sess.native_identity == identity else None
+
+    @staticmethod
+    def _event_identity_matches(event: dict[str, Any], uid: str) -> bool:
+        value = event.get("self_id")
+        return not isinstance(value, bool) and isinstance(value, (str, int)) and str(value) == uid
 
     # ------------------------------------------------------------------ get_state
     async def get_state(self, acct: Account) -> str:
@@ -119,6 +167,10 @@ class QQAdapter:
         sess = self._sessions.get(acct.id)
         if sess is None:
             return acct.state
+        identity = self._session_identity(sess, acct)
+        if identity is None:
+            row = self.store.get_account_full(acct.id)
+            return row["state"] if row and row["state"] not in ("running", "degraded") else "login_required"
         now = self.clock()
         if sess.state_cache is not None and now - sess.state_cache[0] < GET_STATE_CACHE_MS:
             return sess.state_cache[1]
@@ -129,9 +181,12 @@ class QQAdapter:
                 state = "login_required"
             elif isinstance(status, dict) and status.get("online") is True:
                 info = await sess.client.call_action("get_login_info")
-                state = "running" if isinstance(info, dict) and info.get("user_id") else "login_required"
+                state = ("running" if isinstance(info, dict) and not isinstance(info.get("user_id"), bool)
+                         and str(info.get("user_id")) == identity[0] else "login_required")
         except (OneBotClosed, OneBotError) as e:
             log.info("QQ get_state 未取到(沿用 %s)account=%s: %s", acct.state, acct.id, e)
+        if self._session_identity(sess, acct) != identity:
+            return "login_required"
         sess.state_cache = (now, state)
         return state
 
@@ -167,8 +222,21 @@ class QQAdapter:
         if sess is None or not sess.client.connected:
             return CommandResult(ok=False, code="NOT_READY", trace_id=tid, source="onebot",
                                  error=CommandError("OneBot 连接未建立", reason="onebot_unreachable", retryable=True))
+        identity = self._session_identity(sess, acct)
+        if identity is None:
+            return CommandResult(ok=False, code="NOT_READY", trace_id=tid, source="onebot",
+                                 error=CommandError("QQ 当前账号来源不唯一或已变化", reason="qq_identity_changed"))
         native, kind = split_session(acct.id, cmd.args["session"])
         action, params = action_for(native, kind, cmd.args["text"])
+        try:
+            info = await sess.client.call_action("get_login_info")
+        except (OneBotClosed, OneBotError):
+            return CommandResult(ok=False, code="NOT_READY", trace_id=tid, source="onebot",
+                                 error=CommandError("QQ 原生身份暂不可核验", reason="qq_identity_unavailable", retryable=True))
+        if (self._session_identity(sess, acct) != identity or not isinstance(info, dict)
+                or isinstance(info.get("user_id"), bool) or str(info.get("user_id")) != identity[0]):
+            return CommandResult(ok=False, code="NOT_READY", trace_id=tid, source="onebot",
+                                 error=CommandError("QQ 原生账号身份已变化", reason="qq_identity_changed"))
         try:
             data = await sess.client.call_action(action, params)
         except (OneBotClosed, OneBotError) as e:
@@ -178,7 +246,8 @@ class QQAdapter:
         if message_id is None:
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=tid, source="onebot",
                                  error=CommandError(f"{action} 未返回 message_id", retryable=True))
-        confirmed = await self._readback(sess, native, kind, int(message_id), trace_id=cmd.trace_id)
+        confirmed = (self._session_identity(sess, acct) == identity
+                     and await self._readback(sess, native, kind, int(message_id), trace_id=cmd.trace_id))
         # 不论读回成没成都返回 ok —— 确认由 bus 在 [bus] confirm_timeout_qq_ms 内看出向行状态(读不到 ⇒ UNCONFIRMED)
         return CommandResult(ok=True, code="OK", trace_id=tid, source="onebot",
                              data={"native_id": native, "message_id": message_id, "confirmed": confirmed})
@@ -193,14 +262,23 @@ class QQAdapter:
         ``get_msg.time`` 跨秒时两支判据都不成立 ⇒ 该行恒 ``UNCONFIRMED``。
         拿不到 ``trace_id``(不经总线的直调)才退回 ``ingest`` 合并支。
         """
+        identity = self._session_identity(sess)
+        if identity is None:
+            return False
         try:
             data = await sess.client.call_action("get_msg", {"message_id": message_id})
         except (OneBotClosed, OneBotError) as e:
             log.info("QQ get_msg 读回未成(留给 bus 判 UNCONFIRMED)account=%s message_id=%s: %s", sess.acct.id, message_id, e)
             return False
-        if not isinstance(data, dict) or not data:
+        if (not isinstance(data, dict) or not data or self._session_identity(sess) != identity
+                or ("self_id" in data and not self._event_identity_matches(data, identity[0]))):
             return False
         if trace_id:
+            target = self.store.con.execute(
+                "SELECT account_id, identity_epoch FROM messages WHERE trace_id=? AND dir='out' LIMIT 1",
+                (trace_id,)).fetchone()
+            if target is not None and (target["account_id"] != sess.acct.id or target["identity_epoch"] != identity[1]):
+                return False
             bound = self.store.bind_out_by_trace_id(trace_id, ext_msg_id(native_id, message_id), "get_msg")
             if bound is not None:
                 row = self.store.message_state(bound)
@@ -232,11 +310,14 @@ class QQAdapter:
         sess = self._sessions.get(acct.id)
         if sess is None or not sess.client.connected:
             return True                             # 本库已有绑定好的出向行 = 上次确实发出去了;连不上 napcat 不改这个事实
+        identity = self._session_identity(sess, acct)
+        if identity is None:
+            return False
         try:
             data = await sess.client.call_action("get_msg", {"message_id": int(str(row["ext_msg_id"]).rsplit(":", 1)[1].split("#")[0])})
         except (OneBotClosed, OneBotError, ValueError):
             return True
-        return bool(data)
+        return bool(data) and self._session_identity(sess, acct) == identity
 
     async def poll(self, acct: Account, *, only_sessions: Optional[list[str]] = None) -> None:
         """推型通道为空实现(02 §2.2.3 协议注释)。QQ 的入库靠 ``on_message`` 推,不靠轮询。"""
@@ -249,10 +330,19 @@ class QQAdapter:
             await self._on_event(sess, frame)
 
     async def _on_event(self, sess: QQSession, frame: dict[str, Any]) -> None:
+        if self._sessions.get(sess.acct.id) is not sess:
+            return
+        row = self.store.get_account_full(sess.acct.id)
+        if not row or row.get("deleted_ms") or not row.get("enabled", True):
+            return
         post = frame.get("post_type")
         sess.events_seen[str(post)] = sess.events_seen.get(str(post), 0) + 1
         if sess.acct.extra.get("login_pending") and post != "meta_event":
             return                  # 身份确认完成前，不能把扫码者的消息写进指定账号。
+        identity = self._session_identity(sess)
+        if not sess.acct.extra.get("login_pending") and (identity is None or
+                ("self_id" in frame and not self._event_identity_matches(frame, identity[0]))):
+            return
         if post in ("message", "message_sent"):
             self._ingest_event(sess, frame)
             return
@@ -264,6 +354,9 @@ class QQAdapter:
             self.store.cursor_set(sess.acct.id, "ws_last_event", self.clock())
 
     def _ingest_event(self, sess: QQSession, event: dict[str, Any]) -> None:
+        identity = self._session_identity(sess)
+        if identity is None or not self._event_identity_matches(event, identity[0]):
+            return
         raw_ref = None
         if self.cfg.messages.raw_payload:
             raw_ref = json.dumps(event, ensure_ascii=False)      # 02 §2.8 raw 落盘本期未接,先原样带在行上
@@ -277,9 +370,14 @@ class QQAdapter:
         if seq is not None:
             cur = self.store.cursor_get(sess.acct.id, f"onebot_seq:{msg.session.native_id}")
             if cur is None or (cur.value_int or 0) < seq:
-                self.store.cursor_set(sess.acct.id, f"onebot_seq:{msg.session.native_id}", seq)
+                self.store.cursor_set(sess.acct.id, f"onebot_seq:{msg.session.native_id}", seq,
+                                      native_account_uid=identity[0])
 
     def _ingest(self, sess: QQSession, msg: Message) -> tuple[bool, bool]:
+        identity = self._session_identity(sess)
+        if identity is None:
+            return False, False
+        msg._native_account_uid = identity[0]
         now = self.clock()
         r = self.store.ingest(msg, now_ms=now)
         if r.inserted or r.changed:                              # 三通道统一的发出条件:重扫撞键、内容无变化的已存在行不发
@@ -341,9 +439,16 @@ class QQAdapter:
         补拉行的 ``received_ms`` 自然晚于 ``ts_ms``(02 §2.8.1 原话);撤回由后续 ``revoked`` 更新覆盖。
         """
         sess = self._sessions.get(acct.id)
-        n = self.qq.history_backfill_on_reconnect
-        if sess is None or n <= 0 or sess.acct.extra.get("login_pending"):
+        if sess is None or self._session_identity(sess, acct) is None:
             return 0
+        return await self._backfill_session(sess)
+
+    async def _backfill_session(self, sess: QQSession) -> int:
+        identity = self._session_identity(sess)
+        n = self.qq.history_backfill_on_reconnect
+        if identity is None or n <= 0:
+            return 0
+        acct = sess.acct
         total = 0
         targets: dict[str, tuple[str, str]] = {}
         for row in self.store.list_sessions(account_id=acct.id, limit=1000):
@@ -355,6 +460,8 @@ class QQAdapter:
             elif name and not prev[1]:
                 targets[native] = (prev[0], name)
         for native, (kind, name) in targets.items():
+            if self._session_identity(sess) != identity:
+                return total
             cur = self.store.cursor_get(acct.id, f"onebot_seq:{native}")
             since = cur.value_int if cur else None
             action, params = history_action_for(native, kind, n)
@@ -363,12 +470,16 @@ class QQAdapter:
             except (OneBotClosed, OneBotError) as e:
                 log.info("QQ 补历史未成 account=%s session=%s: %s", acct.id, native, e)
                 continue
+            if self._session_identity(sess) != identity:
+                return total
             rows = data.get("messages") if isinstance(data, dict) else data
             top = since
             for ev in (rows or []):
                 if not isinstance(ev, dict):
                     continue
-                ev.setdefault("self_id", acct.self_uid)
+                ev.setdefault("self_id", identity[0])
+                if not self._event_identity_matches(ev, identity[0]):
+                    continue
                 self._fill_session_fields(ev, native, kind)
                 seq = message_seq_of(ev)
                 if since is not None and seq is not None and seq <= since:
@@ -383,7 +494,7 @@ class QQAdapter:
                 if seq is not None and (top is None or seq > top):
                     top = seq
             if top is not None and top != since:
-                self.store.cursor_set(acct.id, f"onebot_seq:{native}", top)
+                self.store.cursor_set(acct.id, f"onebot_seq:{native}", top, native_account_uid=identity[0])
             if name:
                 self.store.con.execute(
                     "UPDATE sessions SET name=? WHERE account_id=? AND native_id=? AND (name IS NULL OR name='')",

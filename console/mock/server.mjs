@@ -512,6 +512,14 @@ const server = createServer(async (req, res) => {
     if (m === 'PATCH') { Object.assign(a, body); pushAccountState(a); return ok(res, a) }
     if (m === 'DELETE') { a.deleted_ms = Date.now(); a.state = 'stopped'; return flat(res, { deleted: true, data_kept: true }) }
   }
+  if ((mm = /^\/accounts\/([^/]+)\/session-reset$/.exec(p)) && m === 'GET') {
+    const a = acct(mm[1])
+    if (!a || a.deleted_ms || !['qidian', 'wechat'].includes(a.channel)) {
+      return fail(res, 404, 'TARGET_NOT_FOUND', '当前采集账号不存在')
+    }
+    // The isolated mock has no connected institution host or reset ledger.
+    return ok(res, { available: false, account_id: a.id, connection_state: 'not_connected', reset: null })
+  }
   if ((mm = /^\/accounts\/([^/]+)\/(start|stop|restart|enable|disable)$/.exec(p)) && m === 'POST') {
     const a = acct(mm[1]); if (!a) return fail(res, 404, 'TARGET_NOT_FOUND', '账号不存在')
     const next = { start: 'starting', stop: 'stopping', restart: 'starting', enable: 'stopped', disable: 'disabled' }[mm[2]]

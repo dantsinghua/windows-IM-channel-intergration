@@ -184,7 +184,7 @@ def out_sending(store, clock, text: str, *, peer: str = PEER_A, trace_id: str = 
 
 @pytest.fixture
 def local_factory(maindb):
-    return lambda uid: LocalSqliteMainDb(maindb.path)
+    return lambda uid, acct: LocalSqliteMainDb(maindb.path)
 
 
 @pytest.fixture
@@ -966,7 +966,7 @@ class TestI_FastPoll:
     def test_I1_fast_rounds_do_not_reset_fail_counter(self, store, clock, maindb):
         """§8b M2 1611 ②:读库指向不存在的库文件名,同时持续加速轮 ⇒ 3 个读取周期(全量轮)后照常发 QIDIAN_DB_UNAVAILABLE(加速轮不把失败计数清零)。"""
         paths = {"p": maindb.path}
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(paths["p"]))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(paths["p"]))
         maindb.insert_text(PEER_A, "老", time_s=clock.now_s - 3600)
         p.poll_maindb(acct_view())
         paths["p"] = maindb.path + ".moved"
@@ -984,7 +984,7 @@ class TestI_FastPoll:
     def test_I2_fast_rounds_do_not_resolve(self, store, clock, maindb):
         """§2.9.5 R6-40:加速轮既不 fail() 也不 resolve()——库恢复后加速轮不销告警,全量轮整轮成功才 resolved。"""
         paths = {"p": maindb.path}
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(paths["p"]))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(paths["p"]))
         p.poll_maindb(acct_view())
         paths["p"] = maindb.path + ".moved"
         for _ in range(3):
@@ -1032,7 +1032,7 @@ class TestJ_DbUnavailable:
         """§2.9.5 fail() + 02 §3.7:maindb_seen 之后库文件不存在 ⇒ 连续 3 轮失败才发 warn QIDIAN_DB_UNAVAILABLE(subject=account:qd01,
         evidence{db_path, reason='not_found', app_version}, hint_actions=['open_env']);前 2 轮不发;重复 firing 不重复发事件。"""
         paths = {"p": maindb.path}
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(paths["p"]))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(paths["p"]))
         p.poll_maindb(acct_view())
         paths["p"] = maindb.path + ".moved"
         for i in range(2):
@@ -1052,7 +1052,7 @@ class TestJ_DbUnavailable:
 
     def test_J2_first_login_grace_12_rounds(self, store, clock, maindb):
         """§2.9.5 fail() 唯一例外:reason=not_found 且本次 running 期内从未见过主库 ⇒ 阈值放宽到 12 轮;第 12 轮才发。"""
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(maindb.path + ".notyet"))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(maindb.path + ".notyet"))
         for i in range(11):
             clock.advance(5_000); p.poll_maindb(acct_view())
             assert alert_events(store, QIDIAN_DB_UNAVAILABLE) == [], f"第 {i + 1} 轮在首登宽限内不该告警"
@@ -1063,7 +1063,7 @@ class TestJ_DbUnavailable:
     def test_J3_recovery_resolves_and_resumes_from_watermark(self, store, clock, maindb):
         """§8b M2 1606 ④:恢复后告警 resolved、水位 qidian_rowid:<native_id> 从断点续读不丢不重。"""
         paths = {"p": maindb.path}
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(paths["p"]))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(paths["p"]))
         p.poll_maindb(acct_view())
         clock.advance(5_000)
         maindb.insert_text(PEER_A, "断前", time_s=clock.now_s, uniseq=100_001)
@@ -1082,7 +1082,7 @@ class TestJ_DbUnavailable:
 
     def test_J4_schema_mismatch_reason(self, store, clock, maindb):
         """§8b M2 1606:换成缺列的库副本(模拟 schema 变更)⇒ 3 轮后 warn QIDIAN_DB_UNAVAILABLE、evidence.reason='schema_mismatch'。"""
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(maindb.path))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(maindb.path))
         create_raw_table(maindb.path, table_name(PEER_A), with_msgdata=False, time_s=clock.now_s)
         for i in range(2):
             clock.advance(5_000); p.poll_maindb(acct_view())
@@ -1094,7 +1094,7 @@ class TestJ_DbUnavailable:
     def test_J5_leaving_running_resets_and_resolves(self, store, clock, maindb):
         """§2.9.5 ⓪:离开 running 即全部重置并 resolve;下次登录重新享受建库宽限(被踢重登时不得误告复发)。"""
         paths = {"p": maindb.path}
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(paths["p"]))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(paths["p"]))
         p.poll_maindb(acct_view())
         paths["p"] = maindb.path + ".moved"
         for _ in range(3):
@@ -1111,7 +1111,7 @@ class TestJ_DbUnavailable:
 
     def test_J6_not_running_never_alerts_and_account_state_untouched(self, store, clock, maindb):
         """02 §3.7:未登录(state != running 或 self_uid 为空)读循环只空转、不发本码;R6-32:告警期间 accounts.state 仍 running(poll 不改账号态)。"""
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(maindb.path + ".none"))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(maindb.path + ".none"))
         for _ in range(15):
             clock.advance(5_000)
             p.poll_maindb(acct_view(state="login_required"))
@@ -1160,7 +1160,7 @@ class TestK_ClockUnsynced:
         store.ensure_account("qd02", "qidian", state="running", self_uid="40001")
         db_old = FakeMainDb(str(tmp_path / "40001.db"), self_uin="40001")
         db_new = FakeMainDb(str(tmp_path / "40002.db"), self_uin="40002")
-        p, alerts, h13 = new_poller(store, clock, lambda uid: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
+        p, alerts, h13 = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
         db_old.insert_text(PEER_A, "旧库", time_s=clock.now_s - 3600)
         db_new.insert_text(PEER_B, "新库历史", time_s=clock.now_s - 3600)
         p.poll_maindb(acct_view(id="qd02", self_uid="40001"))
@@ -1376,7 +1376,7 @@ class TestN_GroupGaps:
         poller.check_group_gaps(acct_view())
         assert poller.alerts_.is_firing(QIDIAN_MSG_GAP, "account:qd01")
         p2 = QidianPoller(store=store, events=poller.events, alerts=poller.alerts_, cfg=AgentConfig(), h13_firing=lambda: False,
-                          clock=clock, maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path))   # 进程重启:同一告警态、空映射
+                          clock=clock, maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path))   # 进程重启:同一告警态、空映射
         n_before = len(store.list_events(event="alert"))
         p2.check_group_gaps(acct_view())
         assert len(store.list_events(event="alert")) == n_before
@@ -1408,7 +1408,7 @@ class TestO_Rebootstrap:
         """新 UID 按真实 CAS 建独立基准/水位,历史零导入,旧 epoch 原样保留,身份审计恰一次。"""
         from conftest import FakeMainDb
         db_new = FakeMainDb(str(tmp_path / "40009.db"), self_uin="40009")
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
         maindb.insert_text(PEER_A, "旧库 A", time_s=clock.now_s - 3600)
         maindb.insert_text(GROUP_G, "旧库 G", time_s=clock.now_s - 3600, group=True, sender="777001")
         p.poll_maindb(acct_view())
@@ -1469,7 +1469,7 @@ class TestP_MultiAccount:
         from conftest import FakeMainDb
         store.ensure_account("qd02", "qidian", state="running", self_uid="4002")
         db2 = FakeMainDb(str(tmp_path / "4002.db"), self_uin="4002")
-        p, alerts, _ = new_poller(store, clock, lambda uid: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
+        p, alerts, _ = new_poller(store, clock, lambda uid, acct: LocalSqliteMainDb(str(tmp_path / f"{uid}.db")))
         a1, a2 = acct_view(), acct_view(id="qd02", self_uid="4002")
         p.poll_maindb(a1); p.poll_maindb(a2)
         clock.advance(5_000)

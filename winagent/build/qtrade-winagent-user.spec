@@ -43,7 +43,8 @@ a = Analysis(
     hiddenimports=[
         "win32api", "win32con", "win32file", "win32gui", "win32pipe", "win32process",
         "win32security", "win32ts", "pywintypes", "psutil", "winreg",
-        "pywinauto", "pywinauto.application", "PIL", "PIL.ImageGrab",
+        "pywinauto", "pywinauto.application", "PIL", "PIL.Image", "PIL.ImageGrab", "PIL._imaging",
+        "PIL.JpegImagePlugin", "PIL.PngImagePlugin", "PIL.GifImagePlugin", "PIL.WebPImagePlugin",
         "qtrade_winagent.win.pipes", "qtrade_winagent.win.power", "qtrade_winagent.win.proc",
         "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat", "qtrade_winagent.win.sysinfo",
         "qtrade_winagent.main_user", "qtrade_winagent.fakes",

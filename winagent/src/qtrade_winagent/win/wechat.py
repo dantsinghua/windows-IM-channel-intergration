@@ -10,17 +10,22 @@ M3.5 骨架:本类把每个动作落到具体的外部程序与文件事实上,*
 from __future__ import annotations
 
 import asyncio
+import base64
 import filecmp
 import glob
+import hashlib
 import ipaddress
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
 from typing import Any, Optional
+from dataclasses import dataclass
 
 from ..errors import BUSY, NOT_READY, TARGET_NOT_FOUND, TIMEOUT, WaError
 from ..logfmt import get_logger
@@ -93,36 +98,62 @@ def display_name_collisions(talker: str, name: str, rows: list[dict[str, Any]]) 
 
 
 def _row_epoch_s(row: dict[str, Any]) -> Optional[float]:
-    v = row.get("time") if row.get("time") is not None else row.get("createTime")
-    if isinstance(v, (int, float)):
-        return float(v) / (1000 if v > 1e11 else 1)
-    if isinstance(v, str) and v:
-        import datetime as _dt
+    from ..wechat_read_page import chatlog_timestamp
+    value = row.get("time") if row.get("time") is not None else row.get("createTime")
+    return chatlog_timestamp(value)
+
+
+@dataclass(frozen=True)
+class ReadbackBaseline:
+    account_id: str
+    talker: str
+    max_seq: int
+    seen_ids: frozenset[str]
+    captured_at_s: float
+
+
+def pick_readback(rows: list[dict[str, Any]], *, text: Optional[str], image: bool, since_s: float,
+                  baseline: Optional[ReadbackBaseline] = None, account_id: Optional[str] = None,
+                  used_ids: frozenset[str] = frozenset()) -> Optional[dict[str, Any]]:
+    """Only a unique, fresh, exact native observation can confirm this attempt."""
+    from ..wechat_read_page import sequence
+    if (baseline is None or not baseline.account_id or account_id != baseline.account_id
+            or not baseline.talker or type(baseline.max_seq) is not int or baseline.max_seq < 0
+            or (not baseline.seen_ids and baseline.max_seq != 0) or not math.isfinite(baseline.captured_at_s)
+            or baseline.captured_at_s <= 0 or not math.isfinite(since_s)
+            or since_s < int(baseline.captured_at_s) or image or not isinstance(text, str) or not text):
+        return None
+    candidates: dict[str, dict[str, Any]] = {}
+    observed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("talker") != baseline.talker:
+            continue
         try:
-            return _dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-        except ValueError:
+            seq = sequence(row)
+        except WaError:
             return None
-    return None
-
-
-def pick_readback(rows: list[dict[str, Any]], *, text: Optional[str], image: bool, since_s: float) -> Optional[dict[str, Any]]:
-    """发送读回:自己发的(``isSelf``)、发送时刻之后、文本含原文 / 图片 type=3;取 seq 最大的那条。"""
-    best: Optional[dict[str, Any]] = None
-    for r in rows:
-        is_self = r.get("isSelf") if "isSelf" in r else r.get("is_self")
-        if not is_self:
+        ext = f"{baseline.talker}:{seq}"
+        if row.get("ext_msg_id") not in (None, ext):
+            return None
+        if ext in observed and observed[ext] != row:
+            return None
+        observed[ext] = row
+        stamp = _row_epoch_s(row)
+        if seq <= baseline.max_seq:
+            if ext not in baseline.seen_ids:
+                return None  # The sequence space changed or was reset.
             continue
-        ts = _row_epoch_s(r)
-        if ts is not None and ts < since_s:
+        if ext in baseline.seen_ids or ext in used_ids:
             continue
-        body = str(r.get("content") if r.get("content") is not None else r.get("text") or "")
-        if text and not image and text not in body:
+        own = row.get("isSelf") if "isSelf" in row else row.get("is_self")
+        if own is not True or stamp is None or stamp < since_s or stamp > time.time() + 1:
             continue
-        if image and str(r.get("type")) not in ("3", "49") and not (text and text in body):
+        if type(row.get("type")) is not int or row["type"] != 1:
             continue
-        if best is None or int(r.get("seq") or 0) > int(best.get("seq") or 0):
-            best = r
-    return best
+        body = row.get("content") if row.get("content") is not None else row.get("text")
+        if body == text and isinstance(body, str):
+            candidates[ext] = row
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
 
 
 class WeChatWindowError(ValueError):
@@ -352,6 +383,9 @@ class WinWeChat:
         from ..wechat_read_page import ResumableReads
         self._read_progress = ResumableReads()
         self._read_anchor: Optional[float] = None
+        self._send_lock = asyncio.Lock()
+        self._send_used_ids: dict[tuple, set[str]] = {}
+        self._server_account: Optional[tuple[str, str]] = None
         self._cls = main_wnd_class
         self._grace = process_close_grace_s
         self._wechat_pid: Optional[int] = None
@@ -948,18 +982,28 @@ class WinWeChat:
             raise RuntimeError("chatlog.json 里两把钥不全,不能起 server(先完成取钥)")
         loc = self.locate() or {}
         wxid = self.current_wxid()
+        if not isinstance(wxid, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", wxid) is None:
+            raise RuntimeError("Current WeChat resource account is not verified")
         data_dir = discover_chatlog_data_dir(loc.get("data_root"), wxid)
         if not data_dir:
             raise RuntimeError("找不到当前微信消息库目录，请核对微信数据位置")
-        work = os.path.join(self._work_dir, "decrypted", wxid or "default")
+        # DB discovery verifies the account's data; resource paths start at its parent account root.
+        account_root = os.path.realpath(os.path.join(loc["data_root"], "xwechat_files", wxid))
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", wxid or "")
+                or os.path.commonpath([account_root, os.path.realpath(data_dir)]) != account_root):
+            raise RuntimeError("Current WeChat resource root is not verified")
+        resource_identity = os.path.normcase(os.path.realpath(account_root))
+        namespace = "resource-" + hashlib.sha256(resource_identity.encode("utf-8")).hexdigest()[:24]
+        work = os.path.join(self._work_dir, "decrypted", wxid, namespace)
         os.makedirs(work, exist_ok=True)
-        cfg = build_server_config(data_dir=data_dir, work_dir=work, keys=keys, addr=f"127.0.0.1:{self._port}")
+        cfg = build_server_config(data_dir=account_root, work_dir=work, keys=keys, addr=f"127.0.0.1:{self._port}")
         cfg_dir = os.path.join(os.path.expanduser("~"), ".chatlog")
         os.makedirs(cfg_dir, exist_ok=True)
         tmp = os.path.join(cfg_dir, "chatlog-server.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
         os.replace(tmp, os.path.join(cfg_dir, "chatlog-server.json"))
+        self._server_account = (wxid, os.path.normcase(account_root)) if wxid else None
         return os.path.join(self._chatlog_dir, "chatlog.exe")
 
     def chatlog_status(self) -> dict[str, Any]:
@@ -1004,7 +1048,62 @@ class WinWeChat:
         return dirs[0] if dirs else None
 
     # ---------------------------------------------------------------- 读写
-    def _get_items(self, path: str, query: dict[str, Any], *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+    def _metadata_body(self, url: str, *, deadline: float) -> bytes:
+        """Interrupt this request's socket at the absolute metadata deadline."""
+        import http.client
+        import socket
+        import threading
+        import urllib.error
+        import urllib.parse
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Metadata deadline expired")
+        connection = http.client.HTTPConnection("127.0.0.1", self._port, timeout=remaining)
+        response = None
+        timer = None
+        try:
+            connection.connect()
+            owned_socket = connection.sock
+
+            def interrupt() -> None:
+                try:
+                    owned_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                finally:
+                    owned_socket.close()
+
+            timer = threading.Timer(max(0.0, deadline - time.monotonic()), interrupt)
+            timer.start()
+            parsed = urllib.parse.urlsplit(url)
+            connection.request("GET", parsed.path + "?" + parsed.query)
+            response = connection.getresponse()
+            if response.status >= 400:
+                raise urllib.error.HTTPError(url, response.status, "Chatlog HTTP error", response.headers, None)
+            raw = response.read(4 * 1024 * 1024 + 1)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Metadata deadline expired")
+            return raw
+        except (OSError, http.client.HTTPException) as error:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Metadata deadline expired") from None
+            if isinstance(error, http.client.HTTPException):
+                raise WaError(NOT_READY, "wechat_read_transport_error; stored keys unchanged",
+                              reason="wechat_read_transport_error", retryable=True) from None
+            raise
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()
+
+    def _get_items(self, path: str, query: dict[str, Any], *, timeout_s: float = 10.0,
+                   deadline: Optional[float] = None) -> list[dict[str, Any]]:
         import socket
         import urllib.error
         import urllib.parse
@@ -1012,9 +1111,14 @@ class WinWeChat:
         from ..errors import RESOURCE_EXHAUSTED
         url = f"http://127.0.0.1:{self._port}{path}?" + urllib.parse.urlencode({**query, "format": "json"})
         try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(url, timeout=timeout_s) as response:
-                raw = response.read(4 * 1024 * 1024 + 1)
+            if deadline is None:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(url, timeout=timeout_s) as response:
+                    raw = response.read(4 * 1024 * 1024 + 1)
+                    if len(raw) > 4 * 1024 * 1024:
+                        raise WaError(RESOURCE_EXHAUSTED, "Chatlog HTTP page too large", reason="wechat_read_response_too_large")
+            else:
+                raw = self._metadata_body(url, deadline=deadline)
                 if len(raw) > 4 * 1024 * 1024:
                     raise WaError(RESOURCE_EXHAUSTED, "Chatlog HTTP page too large", reason="wechat_read_response_too_large")
         except urllib.error.HTTPError as error:
@@ -1089,22 +1193,153 @@ class WinWeChat:
         - ``close_weixin`` 上游默认「任务结束关闭微信」⇒ 必须显式 False,否则每发一条关一次主窗口;
           ``search_pages=0`` 走顶部搜索栏,不靠会话列表可见范围。"""
         require_windows("pyweixin 发送")
+        if self._send_lock.locked():
+            raise WaError(BUSY, "Another native send is active", reason="wechat_send_busy")
+        async with self._send_lock:
+            return await self._send_with_baseline(session_name=session_name, text=text, image_path=image_path,
+                                                  confirm_timeout_ms=confirm_timeout_ms)
+
+    def _send_identity(self) -> tuple[str, int, float, int, float, str]:
+        """Bind the managed reader to the existing process holding this account's DB."""
+        import psutil
+        binding = self._server_account
+        state, server_pid = self._server_listener_state()
+        if (binding is None or state != "occupied" or server_pid is None
+                or not self._server_process_matches(server_pid)):
+            raise WaError(NOT_READY, "Native account reader identity is unavailable",
+                          reason="wechat_send_identity_unverified")
+        wxid, data_dir = binding
+        pid, created = self._key_target()
+        try:
+            files = psutil.Process(pid).open_files()
+            matched = any(os.path.normcase(os.path.realpath(item.path)).startswith(data_dir + os.sep)
+                          and item.path.lower().endswith((".db", ".db-wal", ".db-shm")) for item in files)
+        except psutil.Error:
+            matched = False
+        if not matched or not self._target_alive((pid, created)):
+            raise WaError(NOT_READY, "Current WeChat process does not prove the reader account",
+                          reason="wechat_send_identity_unverified")
+        return wxid, pid, created, server_pid, self._chatlog_created, data_dir
+
+    async def _send_with_baseline(self, *, session_name: str, text: Optional[str],
+                                  image_path: Optional[str], confirm_timeout_ms: int) -> dict[str, Any]:
+        from ..wechat_read_page import sequence
         name = await asyncio.to_thread(self._resolve_send_target, session_name)
-        started = time.time()
+        identity = await asyncio.to_thread(self._send_identity)
+        before = await asyncio.to_thread(self._readback_rows, session_name, None)
+        if any(row.get("talker") != session_name or _row_epoch_s(row) is None for row in before):
+            raise WaError(NOT_READY, "A complete native conversation baseline is unavailable",
+                          reason="wechat_send_baseline_unavailable")
+        seqs = [sequence(row) for row in before]
+        if len(set(seqs)) != len(seqs):
+            raise WaError(NOT_READY, "Native baseline identities are ambiguous",
+                          reason="wechat_send_baseline_unavailable")
+        baseline = ReadbackBaseline(identity[0], session_name, max(seqs, default=0),
+                                    frozenset(f"{session_name}:{seq}" for seq in seqs), time.time())
+        anchor_row = next((row for row in before if sequence(row) == baseline.max_seq), None)
+        anchor = None
+        if anchor_row is not None:
+            body = anchor_row.get("content") if anchor_row.get("content") is not None else anchor_row.get("text")
+            anchor = {"seq": sequence(anchor_row), "time_s": _row_epoch_s(anchor_row),
+                      "text_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()
+                      if isinstance(body, str) else None}
         await asyncio.to_thread(self._require_foreground)
+        if await asyncio.to_thread(self._send_identity) != identity:
+            raise WaError(NOT_READY, "Native account changed before input",
+                          reason="wechat_send_identity_changed")
+        started = time.time()
         if image_path:
             await self._pyweixin_send(name, text, image_path)
         else:
-            await asyncio.to_thread(self._keyboard_send_text, name, text or "")
+            await _blocking(self._keyboard_send_text, name, text or "", session_name.endswith("@chatroom"))
+        completed = time.time()
         deadline = asyncio.get_running_loop().time() + confirm_timeout_ms / 1000
+        used = self._send_used_ids.setdefault(identity, set())
+        reason, trusted_snapshot = "confirm_timeout", False
         while asyncio.get_running_loop().time() < deadline:
-            rows = await asyncio.to_thread(self._readback_rows, session_name, text)
-            hit = pick_readback(rows, text=text, image=bool(image_path), since_s=started - 2)
+            snapshot_timeout = None
+            try:
+                remaining = deadline - asyncio.get_running_loop().time()
+                snapshot_timeout = asyncio.timeout(remaining)
+                async with snapshot_timeout:
+                    current, rows = await self._read_send_snapshot(session_name)
+                if current != identity:
+                    reason = "identity_changed"
+                    break
+                if anchor is not None:
+                    current_anchor = next((row for row in rows
+                                           if row.get("talker") == session_name and sequence(row) == anchor["seq"]), None)
+                    body = (current_anchor.get("content") if current_anchor.get("content") is not None
+                            else current_anchor.get("text")) if current_anchor else None
+                    if (current_anchor is None or _row_epoch_s(current_anchor) != anchor["time_s"]
+                            or (anchor["text_sha256"] is not None
+                                and (not isinstance(body, str) or hashlib.sha256(body.encode("utf-8")).hexdigest()
+                                     != anchor["text_sha256"]))):
+                        reason = "anchor_changed"
+                        break
+                previous, candidates = -1, 0
+                for row in rows:
+                    seq, stamp = sequence(row), _row_epoch_s(row)
+                    ext = f"{session_name}:{seq}"
+                    if (row.get("talker") != session_name or seq <= previous
+                            or row.get("ext_msg_id") not in (None, ext) or stamp is None
+                            or stamp > time.time() + 1
+                            or (seq <= baseline.max_seq and ext not in baseline.seen_ids)):
+                        reason = "invalid_snapshot"
+                        break
+                    previous = seq
+                    own = row.get("isSelf") if "isSelf" in row else row.get("is_self")
+                    body = row.get("content") if row.get("content") is not None else row.get("text")
+                    if (seq > baseline.max_seq and own is True and type(row.get("type")) is int
+                            and row["type"] == 1 and body == text and stamp >= int(started)):
+                        candidates += 1
+                if reason == "invalid_snapshot":
+                    break
+                if candidates > 1:
+                    reason = "ambiguous_candidate"
+                    break
+                trusted_snapshot = True
+                hit = pick_readback(rows, text=text, image=bool(image_path), since_s=int(started),
+                                    baseline=baseline, account_id=current[0], used_ids=frozenset(used))
+            except asyncio.TimeoutError:
+                reason = ("confirm_timeout" if trusted_snapshot and snapshot_timeout is not None
+                          and snapshot_timeout.expired() else "read_failed")
+                break
+            except WaError as error:
+                reason = "identity_changed" if error.reason == "wechat_send_identity_changed" else "read_failed"
+                break
+            except Exception:  # Input completed; a read failure never proves it did not send.
+                reason = "read_failed"
+                break
             if hit is not None:
-                return {"ok": True, "code": "DELIVERED", "ext_msg_id": f"{session_name}:{hit.get('seq')}",
-                        "confirm_ms": int((time.time() - started) * 1000)}
-            await asyncio.sleep(1)
-        return {"ok": False, "code": "SEND_FAILED", "ext_msg_id": None, "confirm_ms": confirm_timeout_ms}
+                ext = f"{session_name}:{sequence(hit)}"
+                used.add(ext)
+                log.info("wechat confirmation exit=confirmed")
+                return {"ok": True, "code": "DELIVERED", "ext_msg_id": ext,
+                        "confirm_ms": int((time.time() - started) * 1000), "confirmation_reason": "confirmed"}
+            await asyncio.sleep(min(1, max(0, deadline - asyncio.get_running_loop().time())))
+        result = {"ok": False, "code": "SEND_FAILED", "ext_msg_id": None,
+                  "confirm_ms": confirm_timeout_ms, "confirmation_reason": reason}
+        if (reason == "confirm_timeout" and trusted_snapshot and not image_path
+                and isinstance(text, str) and text and (anchor is None or anchor["text_sha256"] is not None)):
+            result["confirmation_proof"] = {
+                "version": 1, "self_uid": baseline.account_id, "native_pid": identity[1],
+                "talker": baseline.talker, "max_seq": baseline.max_seq, "anchor": anchor,
+                "captured_at_s": baseline.captured_at_s, "send_started_at_s": started,
+                "action_completed_at_s": completed, "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+        log.info("wechat confirmation exit=%s proof=%s baseline_at=%s max_seq=%s started_at=%s completed_at=%s text_sha256=%s",
+                 reason, "confirmation_proof" in result, baseline.captured_at_s, baseline.max_seq, started, completed,
+                 hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) else None)
+        return result
+
+    async def _read_send_snapshot(self, talker: str) -> tuple[tuple, list[dict[str, Any]]]:
+        identity = await asyncio.to_thread(self._send_identity)
+        rows = await asyncio.to_thread(self._readback_rows, talker, None)
+        if await asyncio.to_thread(self._send_identity) != identity:
+            raise WaError(NOT_READY, "Native account changed during readback",
+                          reason="wechat_send_identity_changed")
+        return identity, rows
 
     async def _pyweixin_send(self, name: str, text: Optional[str], image_path: Optional[str]) -> None:
         import pyweixin                                                          # type: ignore[import-not-found]
@@ -1121,13 +1356,13 @@ class WinWeChat:
             await asyncio.to_thread(Messages.send_messages_to_friend, friend=name, messages=[text or ""],
                                     search_pages=0, close_weixin=False)
 
-    def _keyboard_send_text(self, name: str, text: str) -> None:
+    def _keyboard_send_text(self, name: str, text: str, expected_group: bool = False) -> None:
         """先把唯一微信主窗口调到前台，再通过唯一 UIA 控件搜索目标并发送。
 
         微信 4 的 Ctrl+F 打开「搜一搜」，不会切到目标会话，所以不走那个快捷键。
         对象唯一性在 ``_resolve_send_target`` 已拒绝重名。是否写进该会话，由随后的 chatlog 读回判定。"""
         hwnd = self._require_foreground()
-        _click_send_in_open_wechat(hwnd, name, text)
+        _click_send_in_open_wechat(hwnd, name, text, expected_group=expected_group)
 
     def _require_foreground(self) -> int:
         """当前活跃窗口不是微信时，先把唯一的微信主窗口调成前台。切不成就不返回。"""
@@ -1145,27 +1380,177 @@ class WinWeChat:
             raise WaError(NOT_READY, str(exc), reason=exc.reason) from exc
 
     def _readback_rows(self, talker: str, text: Optional[str]) -> list[dict[str, Any]]:
-        """读回只看「今天 + 该会话 + 正文正则命中」:此前 ``limit=5`` 取到的是当天**最早** 5 条,忙会话永远读不到。"""
-        import re as _re
-        q: dict[str, Any] = {"time": chatlog_time_range(1), "talker": talker, "limit": 50}
-        if text:
-            q["keyword"] = _re.escape(text[:60])
-        return self._get_items("/api/v1/chatlog", q)
+        """Read a complete bounded conversation; a partial page is never a watermark."""
+        from datetime import date
+        from ..wechat_read_page import FETCH_ROWS, MAX_SCANNED_ROWS, sequence
+        rows: list[dict[str, Any]] = []
+        previous = -1
+        deadline = time.monotonic() + 10
+        while len(rows) < MAX_SCANNED_ROWS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WaError(NOT_READY, "Native baseline scan exceeded its budget",
+                              reason="wechat_send_baseline_unavailable")
+            query = {"time": f"1970-01-01~{date.today().isoformat()}", "talker": talker,
+                     "limit": FETCH_ROWS, "offset": len(rows)}
+            batch = self._get_items("/api/v1/chatlog", query, timeout_s=remaining)
+            for row in batch:
+                seq = sequence(row)
+                if (row.get("talker") != talker or seq <= previous or _row_epoch_s(row) is None
+                        or _row_epoch_s(row) > time.time() + 1):
+                    raise WaError(NOT_READY, "Native conversation scan is not a trustworthy sequence",
+                                  reason="wechat_send_baseline_unavailable")
+                previous = seq
+            rows.extend(batch)
+            if len(batch) < FETCH_ROWS:
+                return rows
+        raise WaError(NOT_READY, "Native conversation exceeds the baseline scan limit",
+                      reason="wechat_send_baseline_unavailable")
 
     async def list_sessions(self, *, keyword: Optional[str], limit: int) -> list[dict[str, Any]]:
         q = {k: v for k, v in (("keyword", keyword), ("limit", limit)) if v}
-        return await asyncio.to_thread(self._get_items, "/api/v1/session", q)
+        sessions = await asyncio.to_thread(self._get_items, "/api/v1/session", q)
+        if not sessions:
+            return sessions
+        # Metadata is optional enrichment within the existing directory timeout.
+        deadline = time.monotonic() + 2.0
+
+        def metadata(path: str) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            page_size = 1000
+            for page in range(20):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch = self._get_items(path, {"limit": page_size, "offset": page * page_size},
+                                            timeout_s=remaining, deadline=deadline)
+                except WaError as error:
+                    log.warning("WeChat directory metadata unavailable", extra={"code": error.code})
+                    break
+                ids = {_f(row, "UserName", "Name") for row in batch} - {""}
+                if not ids - seen:
+                    break
+                rows.extend(batch)
+                seen.update(ids)
+                if len(batch) < page_size:
+                    break
+            return rows
+
+        sources = await asyncio.gather(
+            _blocking(metadata, "/api/v1/contact"),
+            _blocking(metadata, "/api/v1/chatroom"),
+            return_exceptions=True,
+        )
+        for source in sources:
+            if isinstance(source, BaseException):
+                raise source
+        contacts, rooms = sources
+        names: dict[str, str] = {}
+        # Remarks take precedence across both sources; blank contact rows cannot hide rooms.
+        for field in ("Remark", "NickName"):
+            for rows, keys in ((contacts, ("UserName",)), (rooms, ("Name", "UserName"))):
+                for row in rows:
+                    native = _f(row, *keys)
+                    name = _f(row, field).strip()
+                    if native and name:
+                        names.setdefault(native, name)
+        result = []
+        for row in sessions:
+            native = _f(row, "UserName", "Talker", "Native_id", "Id")
+            fallback = native
+            if not native.endswith("@chatroom"):
+                fallback = _f(row, "Remark", "NickName", "Name").strip() or native
+            result.append({**row, "display_name": names.get(native, fallback)})
+        return result
 
     async def media(self, key: str) -> bytes:
+        import io
+        import ntpath
+        import urllib.error
+        import urllib.parse
         import urllib.request
+        import warnings
+        from PIL import Image
+
+        if not isinstance(key, str) or not key or len(key) > 2048:
+            raise ValueError("Invalid native image reference")
+        expected_uid, relative = None, None
+        if key.startswith("wximage-v1."):
+            encoded = key.split(".", 1)[1]
+            if re.fullmatch(r"[A-Za-z0-9_-]+", encoded) is None:
+                raise ValueError("Invalid native image reference")
+            try:
+                raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+                if base64.urlsafe_b64encode(raw).decode().rstrip("=") != encoded:
+                    raise ValueError()
+                def unique_fields(pairs):
+                    values = dict(pairs)
+                    if len(values) != len(pairs):
+                        raise ValueError()
+                    return values
+                descriptor = json.loads(raw, object_pairs_hook=unique_fields)
+                if not isinstance(descriptor, dict) or set(descriptor) != {"uid", "md5", "path"}:
+                    raise ValueError()
+                expected_uid, key, relative = descriptor["uid"], descriptor["md5"], descriptor["path"]
+                if not isinstance(expected_uid, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", expected_uid) is None:
+                    raise ValueError()
+            except (ValueError, UnicodeError, TypeError) as error:
+                raise ValueError("Invalid native image reference") from error
+        elif "," in key:
+            key, relative = key.split(",", 1)
+        if not isinstance(key, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key) is None:
+            raise ValueError("Invalid native image key")
+        if relative is not None:
+            if not isinstance(relative, str) or not relative or len(relative) > 1024:
+                raise ValueError("Invalid native image path")
+            relative = relative.replace("/", "\\")
+            parts = relative.split("\\")
+            if (ntpath.isabs(relative) or ntpath.splitdrive(relative)[0]
+                    or any(part in ("", ".", "..") or part.endswith((".", " ")) for part in parts)
+                    or any(ord(ch) < 32 or ch in ':<>"|?*%,' for ch in relative)):
+                raise ValueError("Invalid native image path")
+        identity = await asyncio.to_thread(self._send_identity)
+        if expected_uid is not None and expected_uid != identity[0]:
+            raise WaError(NOT_READY, "Image reference belongs to another account", reason="wechat_media_identity_changed")
+        if relative is not None:
+            root = os.path.normcase(os.path.realpath(identity[5]))
+            candidate = os.path.join(root, *relative.split("\\"))
+            for suffix in ("", ".dat", "_h.dat", "_t.dat"):
+                resolved = os.path.normcase(os.path.realpath(candidate + suffix))
+                if os.path.commonpath([root, resolved]) != root:
+                    raise ValueError("Native image path escapes its account")
+            key += "," + relative
 
         def go() -> bytes:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self._port}/image/{key}", timeout=10) as r:
-                data = r.read(20 * 1024 * 1024 + 1)             # 20MB 上限(与 ChatlogClient.download_image 同)
-                if len(data) > 20 * 1024 * 1024:
-                    raise ValueError("媒体超过 20MB 上限")
-                return data
-        return await asyncio.to_thread(go)
+            address = f"http://127.0.0.1:{self._port}/image/" + urllib.parse.quote(key, safe="")
+            try:
+                with urllib.request.urlopen(address, timeout=10) as response:
+                    data = response.read(20 * 1024 * 1024 + 1)
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    raise WaError(TARGET_NOT_FOUND, "Native image resource was not found", reason="wechat_media_not_found") from error
+                raise WaError(NOT_READY, "Native image read failed", reason="wechat_media_read_failed", retryable=True) from error
+            if len(data) > 20 * 1024 * 1024:
+                raise ValueError("Native image exceeds the media limit")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(io.BytesIO(data)) as picture:
+                        picture.verify()
+                    with Image.open(io.BytesIO(data)) as picture:
+                        picture.load()
+                        if picture.width < 1 or picture.height < 1:
+                            raise ValueError()
+            except Exception as error:
+                raise WaError(NOT_READY, "Native media is not a complete decoded image", reason="wechat_media_invalid_image") from error
+            return data
+
+        data = await asyncio.to_thread(go)
+        if await asyncio.to_thread(self._send_identity) != identity:
+            raise WaError(NOT_READY, "Image account changed during read", reason="wechat_media_identity_changed")
+        return data
 
     async def screenshot(self) -> bytes:
         require_windows("窗口截图")
@@ -1300,7 +1685,8 @@ def _search_popup_entries(win) -> list[tuple[object, str]]:
     return _wechat_ui_call("search_snapshot", read, retry_read=True)
 
 
-def _verify_wechat_chat_header(win, composer, target_control, expected_name: str) -> None:
+def _verify_wechat_chat_header(win, composer, target_control, expected_name: str, *,
+                               expected_group: bool = False) -> None:
     """Verify the recipient in the composer's own message page, never in its draft."""
     def unverified():
         raise WaError(NOT_READY, "WeChat conversation identity could not be verified",
@@ -1317,7 +1703,7 @@ def _verify_wechat_chat_header(win, composer, target_control, expected_name: str
     root_id, root_info = identity(win)
     if (root_info.class_name != "mmui::MainWindow"
             or not isinstance(root_info.handle, int) or root_info.handle <= 0
-            or not expected_name):
+            or not expected_name or type(expected_group) is not bool):
         unverified()
     root_pid, root_handle = root_info.process_id, root_info.handle
 
@@ -1372,25 +1758,34 @@ def _verify_wechat_chat_header(win, composer, target_control, expected_name: str
               if ctrl.element_info.control_type == "Text"
               and ctrl.element_info.class_name == "mmui::XTextView"
               and ctrl.is_visible() and not ctrl.children()]
-    if len(titles) != 1:
+    if len(titles) != 1 and not (expected_group and len(titles) == 2):
         unverified()
-    title = titles[0]
-    title_page, title_chain = page_for(title)
-    if (identity(title_page)[0] != page_id
-            or sum(identity(node)[0] == master_id for node in title_chain) != 1):
-        unverified()
-    inside(title, master)
+    title_ids, labels = set(), []
+    for title in titles:
+        title_page, title_chain = page_for(title)
+        title_id = identity(title)[0]
+        if (identity(title_page)[0] != page_id or title_id in title_ids
+                or sum(identity(node)[0] == master_id for node in title_chain) != 1):
+            unverified()
+        title_ids.add(title_id)
+        inside(title, master)
+        labels.append(title.window_text())
     if identity(page_for(target_control)[0])[0] != page_id:
         unverified()
     if identity(win)[0] != root_id or win.element_info.process_id != root_pid:
         unverified()
-    if title.window_text() != expected_name:
+    if expected_name not in labels:
         raise WaError(NOT_READY, "Current WeChat conversation does not match the recipient",
                       reason="wechat_session_mismatch")
+    if labels.count(expected_name) != 1:
+        unverified()
+    for label in labels:
+        if label != expected_name and re.fullmatch(r"(?:\([1-9][0-9]*\)|（[1-9][0-9]*）)", label) is None:
+            unverified()
 
 
 def _unique_wechat_control(win, role: str, *, require_enabled: bool = True,
-                           expected_name: str | None = None):
+                           expected_name: str | None = None, expected_group: bool = False):
     """只接受主窗口内唯一可见的实际控件；不能定位时不向猜测的位置输入。"""
     def read():
         controls = win.descendants()
@@ -1425,12 +1820,12 @@ def _unique_wechat_control(win, role: str, *, require_enabled: bool = True,
         composer = unique("composer", True) if expected_name is not None else None
         ctrl = composer if role == "composer" and composer is not None else unique(role, require_enabled)
         if expected_name is not None:
-            _verify_wechat_chat_header(win, composer, ctrl, expected_name)
+            _verify_wechat_chat_header(win, composer, ctrl, expected_name, expected_group=expected_group)
         return ctrl
     return _wechat_ui_call(f"{role}_control", read, retry_read=True)
 
 
-def _click_send_in_open_wechat(hwnd: int, name: str, text: str) -> None:
+def _click_send_in_open_wechat(hwnd: int, name: str, text: str, *, expected_group: bool = False) -> None:
     """点左侧搜索框，只打开「功能 / 联系人 / 群聊」里的同名项，再把正文贴进输入区并点绿色发送按钮。"""
     import ctypes
     import time
@@ -1447,7 +1842,8 @@ def _click_send_in_open_wechat(hwnd: int, name: str, text: str) -> None:
 
     def control(role: str, *, enabled: bool = True):
         return _unique_wechat_control(win, role, require_enabled=enabled,
-                                      expected_name=name if role != "search" else None)
+                                      expected_name=name if role != "search" else None,
+                                      expected_group=expected_group)
 
     def foreground():
         return _wechat_ui_call("foreground", lambda: _ensure_wechat_foreground(hwnd))
@@ -1566,8 +1962,8 @@ def _claim_foreground(hwnd: int) -> bool:
     return win32gui.GetForegroundWindow() == hwnd
 
 
-def _verified_wechat_window_class(hwnd: int, pid: int, native_class: str) -> str:
-    """Read only: generic Qt classes are not evidence of a logged-in main window."""
+def _verified_wechat_window_class(hwnd: int, pid: int, native_class: str, *, defer_hidden_generic: bool = False) -> str:
+    """Verify UIA identity; a deferred generic class never proves a main window."""
     try:
         from pywinauto import Desktop
 
@@ -1575,13 +1971,14 @@ def _verified_wechat_window_class(hwnd: int, pid: int, native_class: str) -> str
         if int(info.handle) != hwnd or int(info.process_id) != pid:
             raise ValueError("UIA window identity mismatch")
         kind = info.class_name
-        if kind not in {"mmui::MainWindow", "mmui::LoginWindow", "mmui::XHBoxView"}:
+        deferred_generic = defer_hidden_generic and native_class == kind == "Qt51514QWindowIcon"
+        if kind not in {"mmui::MainWindow", "mmui::LoginWindow", "mmui::XHBoxView"} and not deferred_generic:
             raise ValueError("UIA window class is unknown")
         if native_class != "Qt51514QWindowIcon" and native_class != kind:
             raise ValueError("Win32 and UIA window classes conflict")
         return kind
     except Exception as exc:
-        # Never ignore an unverified candidate and call the remaining window unique.
+        # Identity/read failures and unknown classes cannot be deferred.
         raise WeChatWindowError("wechat_window_unverified", "WeChat window could not be safely identified") from exc
 
 
@@ -1610,6 +2007,16 @@ def _visible_window_rows() -> list[tuple[int, str, str]]:
     # Classify hidden WeChat candidates as well, so restore never launches a process.
     main_pids: set[int] = set()
     hidden_auxiliary_pids: set[int] = set()
+    verified_main_hwnds: set[int] = set()
+    visible_main_rows: list[tuple[int, int, str, str]] = []
+    deferred_generic_rows: list[tuple[int, int, str, str]] = []
+
+    def unchanged(row: tuple[int, int, str, str], visible: bool) -> bool:
+        hwnd, pid, native_class, exe = row
+        return (bool(win32gui.IsWindowVisible(hwnd)) == visible
+                and win32process.GetWindowThreadProcessId(hwnd)[1] == pid
+                and win32gui.GetClassName(hwnd) == native_class
+                and exe_of(pid).lower() == exe.lower())
 
     def visit(hwnd: int, _: object) -> bool:
         visible = bool(win32gui.IsWindowVisible(hwnd))
@@ -1623,18 +2030,24 @@ def _visible_window_rows() -> list[tuple[int, str, str]]:
         if not visible and not wechat:
             return True
         if wechat and kind in candidates:
-            verified_kind = _verified_wechat_window_class(int(hwnd), pid, kind)
+            native_row = (int(hwnd), pid, kind, exe)
+            verified_kind = _verified_wechat_window_class(int(hwnd), pid, kind,
+                                                        defer_hidden_generic=not visible)
             if verified_kind == "mmui::XHBoxView" and visible:
                 raise WeChatWindowError("wechat_window_unverified", "Visible WeChat auxiliary window is not verified")
             # A recycled or changed candidate invalidates the entire uniqueness proof.
-            if (bool(win32gui.IsWindowVisible(hwnd)) != visible
-                    or win32process.GetWindowThreadProcessId(hwnd)[1] != pid
-                    or win32gui.GetClassName(hwnd) != kind
-                    or exe_of(pid).lower() != exe.lower()):
+            if not unchanged(native_row, visible):
                 raise WeChatWindowError("wechat_window_unverified", "WeChat window identity changed during verification")
+            if verified_kind == "Qt51514QWindowIcon":
+                # Not a verified auxiliary: decide only after all main proofs exist.
+                deferred_generic_rows.append(native_row)
+                return True
             kind = verified_kind
             if kind == "mmui::MainWindow":
                 main_pids.add(pid)
+                verified_main_hwnds.add(int(hwnd))
+                if visible:
+                    visible_main_rows.append(native_row)
             elif kind == "mmui::XHBoxView":
                 hidden_auxiliary_pids.add(pid)
         rows.append((int(hwnd), kind, exe))
@@ -1644,6 +2057,13 @@ def _visible_window_rows() -> list[tuple[int, str, str]]:
     # The one observed auxiliary class is safe only beside a proven main of that PID.
     if hidden_auxiliary_pids - main_pids:
         raise WeChatWindowError("wechat_window_unverified", "Hidden WeChat auxiliary window has no verified main")
+    if deferred_generic_rows:
+        if len(visible_main_rows) != 1 or len(verified_main_hwnds) != 1:
+            raise WeChatWindowError("wechat_window_unverified", "Hidden generic Qt window has no unique visible verified main")
+        main = visible_main_rows[0]
+        if (not unchanged(main, True)
+                or any(row[1] != main[1] or not unchanged(row, False) for row in deferred_generic_rows)):
+            raise WeChatWindowError("wechat_window_unverified", "Hidden generic Qt window proof changed or belongs to another process")
     return rows
 
 

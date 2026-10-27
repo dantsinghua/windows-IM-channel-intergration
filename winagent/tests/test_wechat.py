@@ -388,18 +388,22 @@ def test_display_name_collisions_blocks_ambiguous_target():
 
 
 def test_pick_readback_needs_self_after_send_and_text_match():
-    from qtrade_winagent.win.wechat import pick_readback
+    from qtrade_winagent.win.wechat import pick_readback, ReadbackBaseline
     t0 = 1_790_000_000.0
     rows = [{"seq": 5, "isSelf": True, "content": "求个 ofr", "time": t0 - 60},      # 发送前的旧消息
             {"seq": 6, "isSelf": False, "content": "求个 ofr", "time": t0 + 1},      # 对方发的
             {"seq": 7, "isSelf": True, "content": "求个 ofr", "time": "2026-09-21T22:13:21+08:00"}]
-    assert pick_readback(rows, text="求个 ofr", image=False, since_s=t0 - 2) is None or \
-        pick_readback(rows, text="求个 ofr", image=False, since_s=t0 - 2)["seq"] == 7
+    baseline = ReadbackBaseline("wxid_test", "peer", 7, frozenset({"peer:5", "peer:6", "peer:7"}), t0)
+    for row in rows:
+        row.update(talker="peer", type=1)
+    assert pick_readback(rows, text="求个 ofr", image=False, since_s=t0, baseline=baseline, account_id="wxid_test") is None
     rows2 = [{"seq": 9, "isSelf": True, "content": "求个 ofr", "time": t0 + 3}]
-    assert pick_readback(rows2, text="求个 ofr", image=False, since_s=t0 - 2)["seq"] == 9
-    assert pick_readback(rows2, text="别的话", image=False, since_s=t0 - 2) is None
+    rows2[0].update(talker="peer", type=1)
+    assert pick_readback(rows2, text="求个 ofr", image=False, since_s=t0, baseline=baseline, account_id="wxid_test")["seq"] == 9
+    assert pick_readback(rows2, text="别的话", image=False, since_s=t0, baseline=baseline, account_id="wxid_test") is None
     img = [{"seq": 11, "isSelf": True, "type": 3, "content": "", "time": (t0 + 2) * 1000}]
-    assert pick_readback(img, text=None, image=True, since_s=t0 - 2)["seq"] == 11
+    img[0].update(talker="peer")
+    assert pick_readback(img, text=None, image=True, since_s=t0, baseline=baseline, account_id="wxid_test") is None
 
 
 def test_only_weixin_process_counts_as_wechat_window():
@@ -512,7 +516,7 @@ def test_send_switches_to_wechat_before_clicking():
     import inspect
     from qtrade_winagent.win import wechat as winwx
     keyboard = inspect.getsource(winwx.WinWeChat._keyboard_send_text)
-    send = inspect.getsource(winwx.WinWeChat.send)
+    send = inspect.getsource(winwx.WinWeChat._send_with_baseline)
     assert keyboard.index("_require_foreground") < keyboard.index("_click_send_in_open_wechat")
     assert send.index("_require_foreground") < send.index("_pyweixin_send")
     assert send.index("_require_foreground") < send.index("_keyboard_send_text")
@@ -543,7 +547,8 @@ def test_send_no_longer_uses_nonexistent_weixinclient():
     """回归:上游 pyweixin 没有 WeixinClient;必须走 Messages/Files,显式 close_weixin=False,且先解析显示名。"""
     import inspect
     from qtrade_winagent.win import wechat as winwx
-    src = inspect.getsource(winwx.WinWeChat.send) + inspect.getsource(winwx.WinWeChat._pyweixin_send)
+    src = (inspect.getsource(winwx.WinWeChat.send) + inspect.getsource(winwx.WinWeChat._send_with_baseline)
+           + inspect.getsource(winwx.WinWeChat._pyweixin_send))
     assert "WeixinClient" not in src.split('"""', 2)[-1]
     assert "send_messages_to_friend" in src and "send_files_to_friend" in src
     assert src.count("close_weixin=False") >= 2 and "_resolve_send_target" in src

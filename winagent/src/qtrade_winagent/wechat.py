@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -917,8 +918,17 @@ class WeChatSession:
                           reason="ui_tree_invisible")
         out = await self._wx.send(session_name=session_name, text=text, image_path=image_path,
                                   confirm_timeout_ms=confirm_timeout_ms or self._cfg.confirm_timeout_ms)
-        return {"ok": bool(out.get("ok")), "code": out.get("code"), "ext_msg_id": out.get("ext_msg_id"),
-                "confirm_ms": out.get("confirm_ms"), "idempotency_key": idempotency_key}
+        result = {"ok": bool(out.get("ok")), "code": out.get("code"), "ext_msg_id": out.get("ext_msg_id"),
+                  "confirm_ms": out.get("confirm_ms"), "idempotency_key": idempotency_key}
+        if out.get("confirmation_reason") in {
+                "confirmed", "confirm_timeout", "identity_changed", "anchor_changed",
+                "ambiguous_candidate", "invalid_snapshot", "read_failed"}:
+            result["confirmation_reason"] = out["confirmation_reason"]
+        proof = out.get("confirmation_proof")
+        if (out.get("ok") is False and out.get("code") == "SEND_FAILED" and out.get("ext_msg_id") is None
+                and not image_path and _valid_backend_proof(proof, session_name=session_name, text=text)):
+            result["confirmation_proof"] = {**proof, "idempotency_key": idempotency_key}
+        return result
 
     async def read(self, *, talker: Optional[str] = None, since_seq: Optional[int] = None,
                    limit: Optional[int] = None) -> dict[str, Any]:
@@ -981,3 +991,30 @@ class WeChatSession:
                 fn()
             except Exception as e:                                   # noqa: BLE001
                 log.warning("微信后端预热失败(忽略)", extra={"op": "wechat.warmup", "code": "WARMUP_FAILED", "error": repr(e)})
+
+
+def _valid_backend_proof(proof: Any, *, session_name: str, text: Optional[str]) -> bool:
+    """Only the minimal backend evidence may cross the service boundary."""
+    fields = {"version", "self_uid", "native_pid", "talker", "max_seq", "anchor",
+              "captured_at_s", "send_started_at_s", "action_completed_at_s", "text_sha256"}
+    if (not isinstance(proof, dict) or set(proof) != fields or type(proof["version"]) is not int
+            or proof["version"] != 1 or not isinstance(proof["self_uid"], str) or not proof["self_uid"]
+            or proof["talker"] != session_name or not isinstance(text, str) or not text
+            or proof["text_sha256"] != hashlib.sha256(text.encode("utf-8")).hexdigest()
+            or type(proof["native_pid"]) is not int or proof["native_pid"] <= 0
+            or type(proof["max_seq"]) is not int or proof["max_seq"] < 0):
+        return False
+    captured, started, completed = (proof[key] for key in
+        ("captured_at_s", "send_started_at_s", "action_completed_at_s"))
+    if (any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+            for value in (captured, started, completed)) or not captured <= started <= completed):
+        return False
+    anchor = proof["anchor"]
+    if anchor is None:
+        return proof["max_seq"] == 0
+    return (isinstance(anchor, dict) and set(anchor) == {"seq", "time_s", "text_sha256"}
+            and type(anchor["seq"]) is int and anchor["seq"] == proof["max_seq"]
+            and type(anchor["time_s"]) in (int, float) and math.isfinite(anchor["time_s"])
+            and 0 < anchor["time_s"] <= captured + 1
+            and isinstance(anchor["text_sha256"], str) and len(anchor["text_sha256"]) == 64
+            and all(char in "0123456789abcdef" for char in anchor["text_sha256"]))

@@ -23,6 +23,7 @@ export const useSessionStore = defineStore('session', () => {
   const localStatus = ref<RecoveryStatus | null>(null)
   const localServiceBusy = ref(false)
   const localServiceMessage = ref('')
+  let localServiceStartVerified = false
   const canStartLocalService = computed(() => !!window.qt?.localService)
   const localStateText = (state: string | undefined) => state === 'online' ? '在线' : state === 'offline' ? '离线' : '未知'
   const serviceStateText = computed(() => localStateText(localStatus.value?.service))
@@ -41,10 +42,12 @@ export const useSessionStore = defineStore('session', () => {
   async function startLocalService(): Promise<void> {
     if (localServiceBusy.value || !window.qt?.localService) return
     localServiceBusy.value = true
+    localServiceStartVerified = false
     localServiceMessage.value = '正在启动 WinAgent；需要时 Windows 会请求管理员确认。'
     try {
       const result = await window.qt.localService.start()
       localStatus.value = result.status
+      localServiceStartVerified = result.ok
       const failure: Record<string, string> = {
         UAC_CANCELLED: '已取消管理员确认，未完成启动。',
         SERVICE_NOT_INSTALLED: '未找到已安装的 QTradeWinAgent 服务。',
@@ -53,10 +56,10 @@ export const useSessionStore = defineStore('session', () => {
         STARTING: '启动请求已执行，但服务或会话代理尚未核验就绪，请检查状态。',
       }
       localServiceMessage.value = result.ok
-        ? `WinAgent 服务与会话代理已核验在线。采集 API ${localStateText(result.status.api)}。`
+        ? 'WinAgent 服务与会话代理已完成启动核验。'
         : failure[result.code] ?? `启动未完成（${result.code}），请检查服务与安装状态。`
       if (result.ok) { await window.qt.auth.refresh(); await refreshAuth(); await pingAgent() }
-    } catch { localServiceMessage.value = '启动操作失败，尚未确认服务已启动。' }
+    } catch { localServiceStartVerified = false; localServiceMessage.value = '启动操作失败，尚未确认服务已启动。' }
     finally { localServiceBusy.value = false }
   }
   /**
@@ -123,6 +126,10 @@ export const useSessionStore = defineStore('session', () => {
     try {
       const h = await systemApi.health()
       agentReachable.value = true
+      if (localServiceStartVerified) {
+        localServiceMessage.value = ''
+        localServiceStartVerified = false
+      }
       agentDownReason.value = null
       winagentOnline.value = typeof h.winagent === 'object' ? h.winagent.online : !!h.winagent
       userAgentOnline.value = typeof h.winagent === 'object' ? h.winagent.user_agent : h.user_agent ?? null

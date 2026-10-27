@@ -20,7 +20,9 @@ from typing import Callable, Optional
 from ...alerts import QIDIAN_DB_UNAVAILABLE, QIDIAN_MSG_GAP, QIDIAN_TABLE_DECODE_STUCK, Alerts
 from ...config import AgentConfig
 from ...events import Events, message_payload
+from ...timing import timing_span
 from ...store import CursorUpdate, Store
+from ..base import Account
 from .maindb import MainDb, MainDbError, db_path_for
 from .msgdata import MessageFactory
 from .xor import xor_hex
@@ -65,14 +67,14 @@ def _native_id_and_kind(peer: str, istroop: int) -> tuple[str, str]:
 
 class QidianPoller:
     def __init__(self, *, store: Store, events: Events, alerts: Alerts, cfg: AgentConfig,
-                 h13_firing: Callable[[], bool], clock: Callable[[], int], maindb_factory: Callable[[str], MainDb]):
+                 h13_firing: Callable[[], bool], clock: Callable[[], int], maindb_factory: Callable[[str, Account | QidianAccountView], MainDb]):
         self.store = store
         self.events = events
         self.alerts = alerts
         self.cfg = cfg
         self.h13_firing = h13_firing
         self.clock = clock
-        self.maindb_factory = maindb_factory      # self_uid → MainDb
+        self.maindb_factory = maindb_factory      # (self_uid, account) → MainDb
         self.states: dict[str, AccountPollState] = {}
 
     def state_of(self, account_id: str) -> AccountPollState:
@@ -97,7 +99,7 @@ class QidianPoller:
         log.info("qidian poll fail account=%s reason=%s rounds=%d/%d", acct.id, reason, st.db_fail_rounds, threshold)
 
     # ------------------------------------------------------------------ poll_maindb
-    def poll_maindb(self, acct: QidianAccountView, only_sessions: Optional[list[str]] = None) -> None:
+    def poll_maindb(self, acct: Account | QidianAccountView, only_sessions: Optional[list[str]] = None) -> None:
         st = self.state_of(acct.id)
         full = only_sessions is None
         subject = self._subject(acct)
@@ -115,7 +117,7 @@ class QidianPoller:
         if st.factory is None or st.factory.self_uid != acct.self_uid or st.factory.self_nick != nick:
             st.factory = MessageFactory(acct.id, acct.self_uid, nick)
 
-        db = self.maindb_factory(acct.self_uid)
+        db = self.maindb_factory(acct.self_uid, acct)
         try:
             if not db.exists():
                 if full:
@@ -223,8 +225,9 @@ class QidianPoller:
                         m._native_account_uid = acct.self_uid
                         msgs.append(m)
                 now_ms = self.clock()
-                results = self.store.ingest_batch(
-                    msgs, CursorUpdate(acct.id, "qidian_rowid:" + nid, rows[-1].id, json.dumps({"last_uniseq": rows[-1].uniseq}), native_account_uid=acct.self_uid), now_ms=now_ms)
+                with timing_span("collector.message.ingest", account_id=acct.id):
+                    results = self.store.ingest_batch(
+                        msgs, CursorUpdate(acct.id, "qidian_rowid:" + nid, rows[-1].id, json.dumps({"last_uniseq": rows[-1].uniseq}), native_account_uid=acct.self_uid), now_ms=now_ms)
                 for inserted, changed, msg in results:
                     if (inserted or changed) and msg.dir == "in":
                         log.info(
@@ -235,8 +238,9 @@ class QidianPoller:
                         origin = None
                         if msg.dir == "out":
                             origin = "rpa" if self._sent_by_us(msg) else "external"
-                        self.events.emit("message", payload=message_payload(msg, late_after_s=self.cfg.messages.late_after_s, origin=origin),
-                                         account_id=acct.id, channel="qidian", trace_id=msg.trace_id, now_ms=now_ms)
+                        with timing_span("collector.message.publish", account_id=acct.id, trace_id=msg.trace_id) as timing:
+                            timing["event_id"] = self.events.emit("message", payload=message_payload(msg, late_after_s=self.cfg.messages.late_after_s, origin=origin),
+                                                                account_id=acct.id, channel="qidian", trace_id=msg.trace_id, now_ms=now_ms)
             if gated or n_unknown:
                 log.info("qidian poll counters account=%s gated=%d n_unknown=%d", acct.id, gated, n_unknown)
                 if gated and self.clock() - boot.value_int > GATED_WARN_AFTER_MS:
@@ -268,14 +272,14 @@ class QidianPoller:
         return any(norm_text(o["text"]) == n for o in others)
 
     # ------------------------------------------------------------------ check_group_gaps
-    def check_group_gaps(self, acct: QidianAccountView) -> None:
+    def check_group_gaps(self, acct: Account | QidianAccountView) -> None:
         st = self.state_of(acct.id)
         subject = self._subject(acct)
         if acct.state not in ("running", "degraded") or not st.table_map:
             return                                  # 未登录 / 进程刚重启、全量轮还没重建映射:既不产出也不 resolve
         if self.h13_firing():
             return                                  # 时钟漂移中:窗口起点不可信,本轮不判
-        db = self.maindb_factory(acct.self_uid or "")
+        db = self.maindb_factory(acct.self_uid or "", acct)
         since = self.clock() // 1000 - self.cfg.qidian.gap_window_days * 86400
         gaps = []
         try:

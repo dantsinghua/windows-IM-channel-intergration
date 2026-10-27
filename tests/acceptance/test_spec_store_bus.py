@@ -498,7 +498,7 @@ class QidianRig:
         self.events = Events(store)
         self.alerts = Alerts(self.events, clock=clock)
         self.poller = QidianPoller(store=store, events=self.events, alerts=self.alerts, cfg=self.cfg, h13_firing=lambda: False,
-                                   clock=clock, maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path))
+                                   clock=clock, maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path))
         self.adapter = QidianAdapter(self.poller, sender=self._sender, store=store)
         self.bus = Bus(store=store, events=self.events, adapters={"qidian": self.adapter}, cfg=self.cfg, clock=clock)
         self.sent: list[tuple[str, str]] = []      # 通道里实际出现的消息(点了几次发送键)

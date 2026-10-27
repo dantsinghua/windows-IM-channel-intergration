@@ -4,10 +4,10 @@
  * 不做本地持久化;`GET /messages` 重拉后消失是预期行为(R6-49,00 §7.4)。
  */
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
-import { messagesApi, type MessageQuery } from '@/api/client'
+import { computed, ref, watch } from 'vue'
+import { commandsApi, messagesApi, type MessageQuery } from '@/api/client'
 import { normalizeSession } from '@/api/types'
-import type { Message, QtEvent, SessionRow } from '@/api/types'
+import type { CommandResult, Message, QtEvent, SessionRow } from '@/api/types'
 import { useEventsStore } from './events'
 
 export interface EventFlags {
@@ -36,6 +36,88 @@ export const useMessagesStore = defineStore('messages', () => {
   const eventFlags = ref<Record<string, EventFlags>>({})
   const mediaUrls = ref<Record<string, string>>({})
   const exportJobId = ref<string | null>(null)
+  const messageResults = ref<Record<string, CommandResult>>({})
+  const messageSeq = new Map<string, number>()
+  const messageRevision = new Map<string, number>()
+  const refreshRequests = new Map<string, number>()
+  const resultRequests = new Map<string, number>()
+  const completedTraces = new Map<string, number>()
+  const canonicalMessages = new Map<string, string>()
+  let revision = 0
+  let searchRequest = 0
+  let eventsBound = false
+
+  function queryKey(): string {
+    return JSON.stringify([filter.value, selectedSessionId.value])
+  }
+
+  function traceKey(m: Pick<Message, 'account_id' | 'trace_id'>): string {
+    return `${m.account_id}\u0000${m.trace_id ?? ''}`
+  }
+
+  function nativeKey(m: Message): string | null {
+    return m.channel === 'wechat' && m.ext_msg_id ? `${m.account_id}\u0000${m.ext_msg_id}` : null
+  }
+
+  function isMergedNative(m: Message): boolean {
+    const key = nativeKey(m)
+    return Boolean(key && !m.trace_id && canonicalMessages.has(key) && canonicalMessages.get(key) !== m.id)
+  }
+
+  function deduplicateNative(rows: Message[]): Message[] {
+    for (const m of rows) {
+      const key = nativeKey(m)
+      if (key && m.trace_id && m.state === 'DELIVERED' && m.confirmed_by) canonicalMessages.set(key, m.id)
+    }
+    return rows.filter((m) => {
+      if (!isMergedNative(m)) return true
+      if (selectedId.value === m.id) selectedId.value = canonicalMessages.get(nativeKey(m)!)!
+      delete eventFlags.value[m.id]
+      return false
+    })
+  }
+
+  async function loadResult(m: Message): Promise<void> {
+    if (!m.trace_id || m.dir !== 'out') return
+    const request = (resultRequests.get(m.id) ?? 0) + 1
+    resultRequests.set(m.id, request)
+    try {
+      const r = await commandsApi.get(m.account_id, m.trace_id)
+      if (resultRequests.get(m.id) === request && r.result) messageResults.value[m.id] = r.result
+    } catch {
+      // A missing command result is not evidence of delivery or failure.
+    }
+  }
+
+  /** #49 is authoritative; command codes never supply a message state. */
+  async function refreshMessage(m: Message, seq = useEventsStore().lastSeq): Promise<void> {
+    const context = queryKey()
+    const request = (refreshRequests.get(m.id) ?? 0) + 1
+    refreshRequests.set(m.id, request)
+    const version = ++revision
+    messageRevision.set(m.id, version)
+    messageSeq.set(m.id, Math.max(messageSeq.get(m.id) ?? 0, seq, useEventsStore().lastSeq))
+    try {
+      const fresh = await messagesApi.get(m.id)
+      if (queryKey() !== context || refreshRequests.get(m.id) !== request || messageRevision.get(m.id) !== version) return
+      if (fresh.id !== m.id || fresh.account_id !== m.account_id || fresh.session.id !== m.session.id) return
+      if (isMergedNative(fresh)) return
+      const index = items.value.findIndex((row) => row.id === m.id)
+      if (!matchesFilter(fresh, index >= 0)) return
+      if (index >= 0) items.value[index] = fresh
+      else {
+        items.value.unshift(fresh)
+        newCount.value += 1
+      }
+      items.value = deduplicateNative(items.value)
+      messageRevision.set(m.id, ++revision)
+      void loadResult(fresh)
+    } catch (e) {
+      if (queryKey() === context && refreshRequests.get(m.id) === request) {
+        error.value = e instanceof Error ? e.message : String(e)
+      }
+    }
+  }
 
   const selected = computed(() => items.value.find((m) => m.id === selectedId.value) ?? null)
   /** UI 提示「关键字至少 3 个字」(02-P8 FTS trigram) */
@@ -67,6 +149,10 @@ export const useMessagesStore = defineStore('messages', () => {
   }
 
   async function search(reset = true): Promise<void> {
+    const request = ++searchRequest
+    const context = queryKey()
+    const version = revision
+    const seq = useEventsStore().lastSeq
     loading.value = true
     error.value = null
     try {
@@ -74,22 +160,44 @@ export const useMessagesStore = defineStore('messages', () => {
       if (selectedSessionId.value) q.session_id = selectedSessionId.value
       if (!reset && nextCursor.value) q.cursor = nextCursor.value
       const r = await messagesApi.list(q)
-      items.value = reset ? r.items : [...items.value, ...r.items]
+      if (request !== searchRequest || queryKey() !== context) return
+      const current = new Map(items.value.map((m) => [m.id, m]))
+      const rows = r.items.map((m) => {
+        if ((messageRevision.get(m.id) ?? 0) > version && current.has(m.id)) return current.get(m.id)!
+        messageSeq.set(m.id, Math.max(messageSeq.get(m.id) ?? 0, seq))
+        messageRevision.set(m.id, ++revision)
+        return m
+      })
+      const ids = new Set(rows.map((m) => m.id))
+      const keep = reset
+        ? items.value.filter((m) => !ids.has(m.id) && (messageRevision.get(m.id) ?? 0) > version && matchesFilter(m))
+        : items.value.filter((m) => !ids.has(m.id))
+      if (reset) items.value = [...keep, ...rows]
+      else {
+        const updates = new Map(rows.map((m) => [m.id, m]))
+        items.value = [...items.value.map((m) => updates.get(m.id) ?? m), ...rows.filter((m) => !current.has(m.id))]
+      }
+      items.value = deduplicateNative(items.value)
       nextCursor.value = r.nextCursor
       if (reset) {
         newCount.value = 0
         // 重拉即丢事件标志:字段不落库(00 §7.4)
         eventFlags.value = {}
       }
+      for (const m of rows) {
+        if (m.state === 'FAILED' || m.state === 'UNCONFIRMED') void loadResult(m)
+        const doneSeq = completedTraces.get(traceKey(m))
+        if (doneSeq !== undefined && m.state === 'SENDING') void refreshMessage(m, doneSeq)
+      }
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
+      if (request === searchRequest && queryKey() === context) error.value = e instanceof Error ? e.message : String(e)
     } finally {
-      loading.value = false
+      if (request === searchRequest) loading.value = false
     }
   }
 
   /** 命中当前筛选才前插 */
-  function matchesFilter(m: Message): boolean {
+  function matchesFilter(m: Message, existing = false): boolean {
     const f = filter.value
     if (f.account_id && m.account_id !== f.account_id) return false
     if (selectedSessionId.value && m.session.id !== selectedSessionId.value) return false
@@ -97,7 +205,7 @@ export const useMessagesStore = defineStore('messages', () => {
     if (f.type && m.type !== f.type) return false
     if (f.needs_review && !m.needs_review) return false
     // 全文匹配交给后端；查询中不前插未经同一 FTS 规则验证的事件。
-    if (f.q?.trim()) return false
+    if (f.q?.trim() && !existing) return false
     const at = Date.parse(m.ts)
     if (f.since && (!Number.isFinite(at) || at < Date.parse(f.since))) return false
     if (f.until && (!Number.isFinite(at) || at > Date.parse(f.until))) return false
@@ -105,22 +213,58 @@ export const useMessagesStore = defineStore('messages', () => {
   }
 
   function applyMessageEvent(ev: QtEvent<{ message?: Message } & Message>): void {
-    const raw = (ev.payload as { message?: Message }).message ?? (ev.payload as unknown as Message)
-    if (!raw?.id) return
-    if (!matchesFilter(raw)) return
+    const incoming = (ev.payload as { message?: Message }).message ?? (ev.payload as unknown as Message)
+    if (!incoming?.id || isMergedNative(incoming)) return
+    const index = items.value.findIndex((m) => m.id === incoming.id)
+    const raw = index >= 0 ? { ...items.value[index], ...incoming } : incoming
+    if (!matchesFilter(raw, index >= 0)) return
+    const seq = Number.isSafeInteger(ev.seq) && ev.seq > 0 ? ev.seq : undefined
+    if (seq !== undefined && seq <= (messageSeq.get(raw.id) ?? 0)) return
+    const doneSeq = completedTraces.get(traceKey(raw))
+    if (seq === undefined || (doneSeq !== undefined && (seq <= doneSeq || raw.state === 'SENDING'))
+        || (raw.dir === 'out' && raw.state === 'DELIVERED' && raw.trace_id && !raw.confirmed_by)) {
+      void refreshMessage(raw, Math.max(seq ?? 0, doneSeq ?? 0, useEventsStore().lastSeq))
+      return
+    }
+    messageSeq.set(raw.id, seq)
+    messageRevision.set(raw.id, ++revision)
     const flags: EventFlags = {}
     if (raw.lag_s !== undefined) flags.lag_s = raw.lag_s
     if (raw.late !== undefined) flags.late = raw.late
     if (raw.origin !== undefined) flags.origin = raw.origin
     eventFlags.value[raw.id] = flags
-    if (!items.value.some((m) => m.id === raw.id)) {
+    if (index >= 0) items.value[index] = raw
+    else {
       items.value.unshift(raw)
       newCount.value += 1
+    }
+    items.value = deduplicateNative(items.value)
+    if (raw.state === 'FAILED' || raw.state === 'UNCONFIRMED') void loadResult(raw)
+  }
+
+  function applyCommandDone(ev: QtEvent<{ trace_id?: string }>): void {
+    const traceId = ev.payload?.trace_id ?? ev.trace_id
+    if (!traceId || !ev.account_id) return
+    const key = traceKey({ account_id: ev.account_id, trace_id: traceId })
+    const seq = Number.isSafeInteger(ev.seq) && ev.seq > 0 ? ev.seq : useEventsStore().lastSeq
+    if (seq <= (completedTraces.get(key) ?? -1)) return
+    completedTraces.set(key, seq)
+    for (const m of items.value) {
+      if (traceKey(m) === key) void refreshMessage(m, seq)
     }
   }
 
   function bindEvents(): void {
-    useEventsStore().on('message', (ev) => applyMessageEvent(ev as QtEvent<Message>))
+    if (eventsBound) return
+    eventsBound = true
+    const events = useEventsStore()
+    events.on('message', (ev) => applyMessageEvent(ev as QtEvent<Message>))
+    events.on('command_done', (ev) => applyCommandDone(ev as QtEvent<{ trace_id?: string }>))
+    watch(() => events.connected, (connected, wasConnected) => {
+      if (connected && !wasConnected) {
+        for (const m of items.value) void refreshMessage(m)
+      }
+    })
   }
 
   function flagsOf(id: string): EventFlags {
@@ -141,8 +285,8 @@ export const useMessagesStore = defineStore('messages', () => {
 
   return {
     sessions, sessionsCursor, sessionKeyword, selectedSessionId, filter, items, nextCursor, loading, error,
-    newCount, selectedId, eventFlags, mediaUrls, exportJobId,
+    newCount, selectedId, eventFlags, mediaUrls, exportJobId, messageResults,
     selected, qTooShort, filteredSessions,
-    loadSessions, search, applyMessageEvent, bindEvents, flagsOf, lateText, isExternal, matchesFilter,
+    loadSessions, search, applyMessageEvent, applyCommandDone, refreshMessage, loadResult, bindEvents, flagsOf, lateText, isExternal, matchesFilter,
   }
 })

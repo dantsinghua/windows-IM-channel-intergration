@@ -73,8 +73,27 @@ class WechatLoginFlow:
         aid, ls = account_id, login_session_id
         deadline = self._clock() + self.cfg.accounts.qr_max_wait_s * 1000
         self._enter_starting(aid)
-        if (self._store.get_account_full(aid) or {}).get("login_mode") == "manual":
+        row = self._store.get_account_full(aid) or {}
+        if row.get("login_mode") == "manual":
             return await self._resume_existing(aid, ls)
+        if row.get("wxid"):
+            try:
+                status = await self._client.status()
+                wx = status.get("wechat") if isinstance(status, dict) else None
+                logged_out = (isinstance(status, dict) and status.get("enabled") is True
+                              and isinstance(wx, dict) and type(wx.get("running")) is bool
+                              and wx.get("logged_in") is False)
+                if not logged_out:
+                    # A bound, still logged-in reader is not a new key workflow.
+                    # Unknown state or an identity mismatch must never fall back.
+                    self._existing_identity(aid, status)
+                    return await self._resume_existing(aid, ls)
+            except asyncio.CancelledError:
+                await self._slot.release_pending(aid, reason="existing_login_cancelled",
+                                                actor="system:wechat_login", purge=False)
+                raise
+            except (WeChatNotReady, WeChatCallFailed, _BindRetry) as error:
+                return await self._existing_unavailable(aid, ls, error)
         try:
             await self._client.login_start(account_id=aid, login_session_id=ls)
         except (WeChatNotReady, WeChatCallFailed) as e:
@@ -139,46 +158,55 @@ class WechatLoginFlow:
                 last_code = self._set_state(aid, "login_required", code, ls, last_code, prompt=self._prompt(code, st))
             await self._sleep(self._status_interval_s)
 
+    def _existing_identity(self, aid: str, status: dict[str, Any]) -> str:
+        if not isinstance(status, dict):
+            raise _BindRetry("当前微信读取状态不完整")
+        wechat, chatlog = status.get("wechat"), status.get("chatlog")
+        if not isinstance(wechat, dict) or not isinstance(chatlog, dict):
+            raise _BindRetry("当前微信读取状态不完整")
+        if any(value is not True for value in (status.get("enabled"), wechat.get("running"),
+                wechat.get("logged_in"), chatlog.get("running"), chatlog.get("key_ok"))):
+            raise _BindRetry("当前微信尚未登录或已有密钥读取服务不可用")
+        wxid = wechat.get("wxid")
+        if not isinstance(wxid, str) or not wxid.strip():
+            raise _BindRetry("无法核实当前微信身份")
+        row = self._store.get_account_full(aid) or {}
+        if any(row.get(key) and row[key] != wxid for key in ("wxid", "self_uid")):
+            raise _BindRetry("当前微信身份与账号绑定不一致")
+        return wxid
+
     async def _resume_existing(self, aid: str, ls: str) -> str:
         """手动接入只复用已经可读的登录，不拥有既有 hook 或密钥。"""
-        def identity(status: dict[str, Any]) -> str:
-            wechat, chatlog = status.get("wechat"), status.get("chatlog")
-            if not isinstance(wechat, dict) or not isinstance(chatlog, dict):
-                raise _BindRetry("当前微信读取状态不完整")
-            if any(value is not True for value in (status.get("enabled"), wechat.get("running"),
-                    wechat.get("logged_in"), chatlog.get("running"), chatlog.get("key_ok"))):
-                raise _BindRetry("当前微信尚未登录或已有密钥读取服务不可用")
-            wxid = wechat.get("wxid")
-            if not isinstance(wxid, str) or not wxid.strip():
-                raise _BindRetry("无法核实当前微信身份")
-            row = self._store.get_account_full(aid) or {}
-            if any(row.get(key) and row[key] != wxid for key in ("wxid", "self_uid")):
-                raise _BindRetry("当前微信身份与账号绑定不一致")
-            return wxid
-
         try:
             before = await self._client.status()
-            wxid = identity(before)
+            wxid = self._existing_identity(aid, before)
             phase = (await self._client.login_status()).get("phase")
             if phase not in ("idle", "ready"):
                 raise _BindRetry("已有微信登录流程尚未结束，未接管该流程")
             await self._client.read(limit=1)
             after = await self._client.status()
-            if identity(after) != wxid:
+            if self._existing_identity(aid, after) != wxid:
                 raise _BindRetry("读取期间微信身份发生变化")
             if (await self._client.login_status()).get("phase") not in ("idle", "ready"):
                 raise _BindRetry("读取期间已有微信登录流程发生变化")
             final_id = await self._identify_and_bind(aid, ls,
                 {"wxid": wxid, "nickname": after["wechat"].get("nickname")})
             return await self._ready(final_id, ls, {"wxid": wxid}, existing=True)
-        except (WeChatNotReady, WeChatCallFailed, _BindRetry) as error:
-            # 此分支没有启动临时 hook；只释放本次登记，保留正在运行的读取服务。
-            target = (self._store.get_account_full(aid) or {}).get("merged_into") or aid
-            await self._slot.release_pending(target, reason="existing_login_unavailable",
+        except asyncio.CancelledError:
+            await self._slot.release_pending(aid, reason="existing_login_cancelled",
                                             actor="system:wechat_login", purge=False)
-            self._transition(target, "stopped", state_reason=f"接入已有微信失败：{error}；未重新登录或取钥",
-                             login_session_id=ls, desired_state="stopped")
-            return "stopped"
+            raise
+        except (WeChatNotReady, WeChatCallFailed, _BindRetry) as error:
+            return await self._existing_unavailable(aid, ls, error)
+
+    async def _existing_unavailable(self, aid: str, ls: str, error: Exception) -> str:
+        # No temporary hook belongs to this attempt; preserve cached readers.
+        target = (self._store.get_account_full(aid) or {}).get("merged_into") or aid
+        await self._slot.release_pending(target, reason="existing_login_unavailable",
+                                        actor="system:wechat_login", purge=False)
+        self._transition(target, "stopped", state_reason=f"接入已有微信失败：{error}；未重新登录或取钥",
+                         login_session_id=ls, desired_state="stopped")
+        return "stopped"
 
     def _renew_pending(self, target: str) -> None:
         """T-11(`.omc/handoffs/wechat-channel.md`,总控裁决草案 R6-58 (l) 取「登录流在世期间续期」):

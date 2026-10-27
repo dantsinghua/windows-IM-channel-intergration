@@ -52,7 +52,7 @@ test('P-ACCT-DETAIL 移除须确认数据保留，退役的彻底删除不再呈
 test('P-MAIL 待确认与发件标签分别保留执行/丢弃确认', async ({ page }) => {
   await installQtStub(page)
   await page.goto('/#/mail')
-  await expect(page.getByText('邮箱连接', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '网络联通', exact: true })).toBeVisible()
   await page.getByRole('tab', { name: /^待确认/ }).click()
   const approve = page.getByTestId('qt-mail-danger-row-0-approve')
   await expect(approve).toBeEnabled()

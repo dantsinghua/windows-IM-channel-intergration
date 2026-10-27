@@ -1,8 +1,9 @@
-"""Late native self echoes reconcile one immutable send, never trigger a resend."""
+"""P0: only persisted exact native evidence reconciles an immutable send, never text alone."""
 from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -144,9 +145,26 @@ class LateRig:
     def placeholder(self):
         return dict(self.store.con.execute("SELECT * FROM messages WHERE trace_id IS NOT NULL").fetchone())
 
-    async def late_poll(self, *, text=TEXT, peer=PEER, is_self=True):
+    def expect_exact_readback(self):
+        # WinAgent identified this native row; Agent read has not observed it yet.
+        self.fake.send_result = {"ok": True, "code": "DELIVERED",
+                                 "ext_msg_id": f"{PEER}:31", "confirm_ms": 3}
+
+    def pending_readback(self):
+        idem, _ = self.original()
+        record = self.store.settings_get("wechat.readback." + idem["trace_id"])
+        assert record["status"] == "pending"
+        assert record["account_id"] == "wx01" and record["self_uid"] == self.binding.account_uid
+        assert record["identity_epoch"] == self.command["account_epoch"]
+        assert record["native"] == PEER and record["ext"] == f"{PEER}:31"
+        assert record["text_sha256"] == hashlib.sha256(TEXT.encode()).hexdigest()
+        command = self.store.get_command(idem["trace_id"])
+        assert command["idempotency_key"] == self.command["command_id"]
+        return record
+
+    async def late_poll(self, *, text=TEXT, peer=PEER, is_self=True, seq=31):
         self.clock.offset += 12000
-        row = self.fake.add_row(talker=peer, content=text, is_self=is_self, seq=31, ts_ms=self.clock())
+        row = self.fake.add_row(talker=peer, content=text, is_self=is_self, seq=seq, ts_ms=self.clock())
         await self.adapter.poll(self.bus._load_account("wx01"))
         return f"{peer}:{row['seq']}"
 
@@ -164,7 +182,8 @@ async def rig(tmp_path):
         await r.close()
 
 
-async def test_native_confirmation_timeout_stays_unknown_and_preserves_trace_for_late_echo(rig):
+async def test_exact_native_receipt_waits_for_real_late_read_before_confirming(rig):
+    rig.expect_exact_readback()
     first = await rig.run("command", "first")
     assert first["status"] == "unknown"
     idem, result = rig.original()
@@ -174,6 +193,7 @@ async def test_native_confirmation_timeout_stays_unknown_and_preserves_trace_for
     placeholder = rig.placeholder()
     assert placeholder["state"] == "UNCONFIRMED"
     assert placeholder["ext_msg_id"] is None
+    rig.pending_readback()
     native = await rig.late_poll()
     confirmed = rig.store.confirmed_outbound_for_trace(idem["trace_id"])
     assert confirmed["id"] == placeholder["id"] and confirmed["ext_msg_id"] == native
@@ -187,14 +207,18 @@ async def test_native_confirmation_timeout_stays_unknown_and_preserves_trace_for
 
 
 async def test_restart_and_duplicate_command_or_query_never_resubmit_native_action(rig):
+    rig.expect_exact_readback()
     assert (await rig.run("command", "first"))["status"] == "unknown"
     assert rig.store.idem_get("wx01", rig.command["command_id"])["status"] == "DONE"
+    before = rig.pending_readback()
     await rig.close()
     rig.open()
+    assert rig.pending_readback() == before
     assert (await rig.run("command", "duplicate-after-restart"))["status"] == "unknown"
     assert (await rig.run("query", "query-before-late"))["status"] == "unknown"
     native = await rig.late_poll()
-    assert (await rig.run("query", "query-after-late"))["native_id"] == native
+    outcome = await rig.run("query", "query-after-late")
+    assert outcome["status"] == "sent" and outcome["native_id"] == native
     assert rig.http_sends == len(rig.fake.sent) == rig.bus_submits == 1
 
 
@@ -209,11 +233,12 @@ async def test_done_unknown_idempotency_replay_never_calls_native_send_again(rig
     assert rig.http_sends == len(rig.fake.sent) == 1
 
 
-@pytest.mark.parametrize("change", ["peer", "text", "incoming"])
+@pytest.mark.parametrize("change", ["peer", "text", "incoming", "native_id"])
 async def test_unrelated_late_native_rows_never_confirm_original_trace(rig, change):
+    rig.expect_exact_readback()
     assert (await rig.run("command", "first"))["status"] == "unknown"
     options = {"peer": {"peer": "another-peer"}, "text": {"text": "Different synthetic message"},
-               "incoming": {"is_self": False}}[change]
+               "incoming": {"is_self": False}, "native_id": {"seq": 32}}[change]
     await rig.late_poll(**options)
     assert rig.store.confirmed_outbound_for_trace(rig.original()[0]["trace_id"]) is None
     assert (await rig.run("query", "query-unrelated"))["status"] == "unknown"
@@ -222,6 +247,7 @@ async def test_unrelated_late_native_rows_never_confirm_original_trace(rig, chan
 
 @pytest.mark.parametrize("change", ["account_uid", "owner_user_id", "workbench_id", "peer", "text", "epoch"])
 async def test_reconcile_requires_exact_command_identity_epoch_peer_and_text(rig, change):
+    rig.expect_exact_readback()
     await rig.run("command", "first")
     await rig.late_poll()
     assert rig.port.native_reconcile(rig.command)["status"] == "sent"
@@ -254,9 +280,14 @@ async def test_explicit_preinput_not_ready_is_failed_and_never_late_confirmable(
     assert rig.placeholder()["state"] == "FAILED"
 
 
-@pytest.mark.parametrize("mutation", ["reason", "retryable", "needs_human", "source", "channel",
-                                       "code-NOT_READY", "code-GATE_BLOCKED", "code-LOGIN_REQUIRED"])
-async def test_untrusted_failure_markers_and_other_channels_keep_failed_state(rig, monkeypatch, mutation):
+@pytest.mark.parametrize("mutation, expected_state", [
+    ("reason", "UNCONFIRMED"), ("retryable", "UNCONFIRMED"),
+    ("needs_human", "UNCONFIRMED"), ("source", "UNCONFIRMED"),
+    ("channel", "FAILED"), ("code-NOT_READY", "FAILED"),
+    ("code-GATE_BLOCKED", "FAILED"), ("code-LOGIN_REQUIRED", "FAILED"),
+])
+async def test_failure_state_requires_definite_preinput_or_other_channel_evidence(
+        rig, monkeypatch, mutation, expected_state):
     error = CommandError("Synthetic refusal", reason="send_outcome_unknown", retryable=False, needs_human=True)
     source = "chatlog"
     if mutation == "reason":
@@ -281,15 +312,44 @@ async def test_untrusted_failure_markers_and_other_channels_keep_failed_state(ri
                       idempotency_key="untrusted-marker", timeout_ms=1000)
     outcome = await rig.bus.submit(command)
     assert not outcome.ok
-    assert rig.placeholder()["state"] == "FAILED"
+    assert rig.placeholder()["state"] == expected_state
+    if expected_state == "UNCONFIRMED":
+        assert outcome.error.reason == "send_outcome_unknown"
+        assert not outcome.error.retryable and outcome.error.needs_human
+        assert rig.store.idem_get(account, command.idempotency_key)["status"] == "DONE"
+        replay = await rig.bus.submit(command)
+        assert replay.code == "IDEMPOTENT_REPLAY" and replay.trace_id == outcome.trace_id
+        rig.adapter.send.assert_awaited_once()
     assert rig.http_sends == 0
 
 
-async def test_bus_confirmation_loop_timeout_also_remains_mergeable_without_retry(rig):
-    rig.fake.send_result = {"ok": True, "code": "OK"}
+@pytest.mark.parametrize("native_result", [
+    {"ok": False, "code": "SEND_FAILED", "ext_msg_id": None, "confirm_ms": 3},
+    {"ok": True, "code": "OK"},
+], ids=["send-failed-no-ext", "ok-no-ext"])
+@pytest.mark.parametrize("restart", [False, True], ids=["same-process", "after-restart"])
+async def test_no_exact_receipt_keeps_same_text_unbound_without_retry(rig, native_result, restart):
+    rig.fake.send_result = native_result
     assert (await rig.run("command", "first"))["status"] == "unknown"
-    assert rig.placeholder()["state"] == "UNCONFIRMED"
-    assert rig.original()[0]["status"] == "DONE"
+    original = rig.placeholder()
+    idem, _ = rig.original()
+    assert original["state"] == "UNCONFIRMED" and idem["status"] == "DONE"
+    assert rig.store.settings_get("wechat.readback." + idem["trace_id"]) is None
+    if restart:
+        await rig.close()
+        rig.open()
     native = await rig.late_poll()
-    assert (await rig.run("query", "after-confirm-loop"))["native_id"] == native
+    assert rig.placeholder()["id"] == original["id"]
+    assert rig.placeholder()["state"] == "UNCONFIRMED"
+    assert rig.placeholder()["ext_msg_id"] is None
+    assert rig.store.confirmed_outbound_for_trace(idem["trace_id"]) is None
+    rows = rig.store.list_messages("wx01")
+    assert len(rows) == 2
+    collected = next(row for row in rows if row["ext_msg_id"] == native)
+    assert collected["trace_id"] is None and collected["state"] == "DELIVERED"
+    assert collected["text"] == TEXT and collected["source"] == "chatlog"
+    assert (await rig.run("query", "after-late"))["status"] == "unknown"
+    assert (await rig.run("command", "duplicate-after-late"))["status"] == "unknown"
+    await rig.adapter.poll(rig.bus._load_account("wx01"))
+    assert rig.store.count_messages("wx01") == 2
     assert rig.http_sends == len(rig.fake.sent) == rig.bus_submits == 1

@@ -11,19 +11,23 @@
   **写类拒 `NOT_READY`**(pywinauto 拿不到前台窗口)——与 ``KEY_FAIL`` 的「读写都拒」不同。
 - **不做自动重登(D-2)**:没有 ``relogin()``;``start()`` 只建连,发现未登录即回 ``login_required``;
   运行期检测到主窗口消失/进程退出只置 ``login_required(LOGGED_OUT)`` + 发事件,**不自动拉起微信、不自动登回**。
-- ``send``:走 #38(WinAgent 内 pyweixin 写 + 临时加速 chatlog 读回),回 ``DELIVERED`` 时把读回行按
-  06 §2.12 构造成 ``dir=out, self=true, source='chatlog'`` 的行喂给 ``store.ingest`` —— 合并进 ``bus`` 先落的
-  ``SENDING`` 行(``confirmed_by='chatlog'``),``bus`` 在队列外等那一行翻 ``DELIVERED``;
+- ``send``:走 #38，返回可信原生 ID 后持久保存精确读回证据；再经 #39 取真实原生行，按 trace 绑定
+  ``bus`` 先落的 ``SENDING`` 行。可信超时仅保留发送前证明，后续完整原生读取核验后才绑定。
   ``[bus] confirm_timeout_wechat_ms=10000`` 内没等到 ⇒ ``SEND_FAILED``(C.4.2 微信口径)。
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import hashlib
+import math
+from datetime import datetime
 from typing import Any, Optional
 
 from ...models import Command, CommandError, CommandResult
+from ...events import message_payload
 from ...store import Store
-from ...text import norm
 from ..base import Account
 from .client import WeChatCallFailed, WeChatNotReady, WeChatWinAgent
 from .normalize import to_message
@@ -41,7 +45,10 @@ _DESKTOP_FAULTS = {
     "wechat_window_missing": (WECHAT_NOT_RUNNING_CODE, WECHAT_NOT_RUNNING_MESSAGE),
     "wechat_window_ambiguous": (WECHAT_AMBIGUOUS_CODE, WECHAT_AMBIGUOUS_MESSAGE),
 }
-PROBE_LOOKBACK_SEQ = 50            # confirm_probe 回看的 seq 余量(02 §2.2.3:微信查 chatlog 同分钟同文本,P-14)
+
+
+class _ReadbackInvalidated(ValueError):
+    """An observed contradiction permanently fences this original proof."""
 
 
 class WechatAdapter:
@@ -101,7 +108,7 @@ class WechatAdapter:
     def key_retry_required(self, account_id: str) -> bool:
         return self._key_retry_needed.get(account_id, False)
 
-    async def probe_state(self, acct: Account) -> tuple[str, Optional[str], str]:
+    async def probe_state(self, acct: Account, *, require_identity: bool = False) -> tuple[str, Optional[str], str]:
         """返回 ``(state, state_code, state_reason)``。判定顺序(实现口径,已登记 handoff「建议裁决」):
         会话代理/模块不可用 → 微信未登录 → **取钥失败优先于锁屏**(前者读写都拒、比后者严格)→ 锁屏 → running。"""
         self._key_retry_needed[acct.id] = False
@@ -115,16 +122,20 @@ class WechatAdapter:
             return "degraded", "WINAGENT_USER_OFFLINE", "winagent.toml [wechat] enabled=false(未启用微信模块)"
         wx = st.get("wechat") or {}
         chatlog = st.get("chatlog") or {}
-        self._key_retry_needed[acct.id] = chatlog.get("key_ok") is False
         count = wx.get("window_count")
         # 只有明确报了 0 个窗口才是「号在跑、桌面没窗」。没报 window_count 且进程不在，仍是登出。
         if count == 0:
             return "stopped", WECHAT_NOT_RUNNING_CODE, WECHAT_NOT_RUNNING_MESSAGE
         if isinstance(count, int) and count > 1:
             return "stopped", WECHAT_AMBIGUOUS_CODE, WECHAT_AMBIGUOUS_MESSAGE
-        if not wx.get("running") or not wx.get("logged_in"):
-            # 主窗口消失 / Weixin.exe 退出 ⇒ login_required(LOGGED_OUT);槽位 holder 保持为它(它仍是「该在线的那个」)
+        if type(wx.get("running")) is not bool or type(wx.get("logged_in")) is not bool:
+            return "degraded", "WECHAT_READ_FAILED", "微信登录探测信息不完整，暂不能确认收发状态；不自动重新登录或取钥"
+        if not wx["running"] or not wx["logged_in"]:
+            # Only an explicit native negative observation is a logout.
             return "login_required", "LOGGED_OUT", "微信已退出登录,请点「登录」重新扫码"
+        if require_identity and (not acct.self_uid or wx.get("wxid") != acct.self_uid):
+            return "degraded", "WECHAT_READ_FAILED", "无法确认当前微信与原绑定账号一致，保留原状态，不自动重新绑定"
+        self._key_retry_needed[acct.id] = chatlog.get("key_ok") is False
         if chatlog.get("key_ok") is False:
             return "degraded", "KEY_FAIL", KEY_FAIL_MESSAGE
         if chatlog.get("key_ok") is not True:
@@ -222,17 +233,31 @@ class WechatAdapter:
         return data
 
     async def send(self, acct: Account, cmd: Command) -> CommandResult:
-        """#38 写 + WinAgent 侧读回;``DELIVERED`` 时把读回行喂 ``store.ingest`` 合并进 ``SENDING`` 行(06 §2.12)。"""
+        """#38 写后，仅以 #39 真实行和持久精确 trace/原生 ID 证据绑定发送占位。"""
         trace = cmd.trace_id or ""
         blocked = self.write_guard(acct)
         if blocked is not None:
             return _with_trace(blocked, trace)
         native = self._native(acct, cmd.args["session"])
         self._poller.note_send(acct.id)                    # 05 §2.4.4 ⑦:发送确认期把拉取周期加密到 1 s
+        request_key = cmd.idempotency_key or trace
+        confirm_timeout_ms = self._poller.cfg.bus.confirm_timeout_wechat_ms
+        send_started = self._poller.clock()
+        identity_epoch = self._store.native_identity(acct.id).get("epoch", 0)
         try:
-            res = await self._client.send(session_name=native, text=cmd.args.get("text"),
-                                          idempotency_key=cmd.idempotency_key or trace,
-                                          confirm_timeout_ms=self._poller.cfg.bus.confirm_timeout_wechat_ms)
+            identity = await self._readback_identity(acct)
+            if identity is None:
+                return _with_trace(_not_ready("无法验证当前微信账号，已拒绝发送", "wechat_send_identity_unverified"), trace)
+            try:
+                res = await self._client.send(session_name=native, text=cmd.args.get("text"),
+                                              idempotency_key=request_key,
+                                              confirm_timeout_ms=confirm_timeout_ms)
+            except (WeChatNotReady, WeChatCallFailed):
+                raise
+            except Exception:
+                return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog",
+                                     error=CommandError("微信发送调用结果未知，请核对原生会话；禁止自动补发",
+                                                        reason="send_outcome_unknown", retryable=False, needs_human=True))
         except WeChatNotReady as e:
             fault = _DESKTOP_FAULTS.get(e.reason)
             if fault is not None:
@@ -248,58 +273,342 @@ class WechatAdapter:
                                      error=CommandError(str(err.get("message") or "微信会话不存在或无法唯一定位"),
                                                         reason=str(err.get("reason") or "target_not_found"), retryable=False))
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog",
-                                 error=CommandError(str(err.get("message") or f"WinAgent 发送失败 status={e.status}"), retryable=True))
-        if res.get("code") == "DELIVERED" and res.get("ext_msg_id"):
-            self._ingest_readback(acct, native, str(res["ext_msg_id"]), cmd.args.get("text"), res.get("confirm_ms"))
-            return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog",
-                                 data={"ext_msg_id": res["ext_msg_id"], "confirm_ms": res.get("confirm_ms")})
-        if res.get("code") == "SEND_FAILED":
+                                 error=CommandError(str(err.get("message") or f"WinAgent 发送失败 status={e.status}"),
+                                                    reason="send_outcome_unknown", retryable=False, needs_human=True))
+        if not isinstance(res, dict):
             return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog",
+                                 error=CommandError("微信发送响应无法验证，请核对原生会话；禁止自动补发",
+                                                    reason="send_outcome_unknown", retryable=False, needs_human=True))
+        reason = res.get("confirmation_reason")
+        diagnostic = ({"native_confirmation_reason": reason}
+                      if isinstance(reason, str) and reason in {
+                          "confirmed", "confirm_timeout", "identity_changed", "anchor_changed",
+                          "ambiguous_candidate", "invalid_snapshot", "read_failed"} else {})
+        if res.get("ok") is True and res.get("code") == "DELIVERED" and res.get("ext_msg_id"):
+            try:
+                current = await self._readback_identity(acct)
+            except (WeChatNotReady, WeChatCallFailed):
+                current = None
+            ext = res["ext_msg_id"]
+            if current == identity and isinstance(ext, str) and trace:
+                record = {"version": 1, "account_id": acct.id, "self_uid": identity[0],
+                          "identity_epoch": self._store.native_identity(acct.id).get("epoch", 0),
+                          "native": native, "ext": ext, "started_ms": send_started,
+                          "text_sha256": hashlib.sha256(cmd.args["text"].encode("utf-8")).hexdigest(),
+                          "status": "pending"}
+                key = "wechat.readback." + trace
+                old = self._store.settings_get(key)
+                if old is None:
+                    self._store.settings_set(key, record, actor="system:wechat_adapter", now_ms=self._poller.clock())
+                elif not isinstance(old, dict) or any(old.get(k) != record[k] for k in record if k != "status"):
+                    return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native, **diagnostic})
+                if await self._ingest_readback(acct, trace, old or record):
+                    return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog",
+                                         data={"ext_msg_id": ext, "confirm_ms": res.get("confirm_ms"), **diagnostic})
+            return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native, **diagnostic})
+        if res.get("code") == "SEND_FAILED":
+            try:
+                now = self._poller.clock()
+            except Exception:
+                now = None
+            submitted = cmd.submitted_at_ms
+            if (res.get("ok") is False and res.get("ext_msg_id") is None
+                    and type(confirm_timeout_ms) is int and confirm_timeout_ms > 0
+                    and type(res.get("confirm_ms")) is int and res["confirm_ms"] == confirm_timeout_ms
+                    and request_key and res.get("idempotency_key") == request_key
+                    and type(submitted) is int and type(now) is int and 0 < submitted <= now
+                    and type(cmd.timeout_ms) is int and cmd.timeout_ms > 0
+                    and now + confirm_timeout_ms < submitted + cmd.timeout_ms + confirm_timeout_ms):
+                proof = res.get("confirmation_proof")
+                if trace and _valid_confirmation_proof(proof, native=native, self_uid=identity[0],
+                        text_sha256=hashlib.sha256(cmd.args["text"].encode("utf-8")).hexdigest(),
+                        request_key=request_key, started_ms=send_started, now_ms=now):
+                    try:
+                        current = await self._readback_identity(acct)
+                    except (WeChatNotReady, WeChatCallFailed):
+                        current = None
+                    if (current == identity and proof["native_pid"] == identity[1]
+                            and identity_epoch == self._store.native_identity(acct.id).get("epoch", 0)):
+                        record = {"version": 2, "account_id": acct.id, "self_uid": identity[0],
+                                  "identity_epoch": identity_epoch, "native": native, "started_ms": send_started,
+                                  "text_sha256": proof["text_sha256"], "proof": proof, "status": "pending"}
+                        key = "wechat.readback." + trace
+                        if self._store.settings_get(key) is None:
+                            self._store.settings_set(key, record, actor="system:wechat_adapter",
+                                                     now_ms=self._poller.clock())
+                # Preserve the existing extra window; only an original proof enables later attribution.
+                return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native, **diagnostic})
+            return CommandResult(ok=False, code="SEND_FAILED", trace_id=trace, source="chatlog", data=diagnostic,
                                  error=CommandError("微信 10 秒内未在聊天记录读到(C.4.2)",
                                                     reason="send_outcome_unknown", retryable=False, needs_human=True))
         # WinAgent 只回了「点完了」:读回确认交给 poll 的 ingest 合并,bus 在队列外等那一行翻 DELIVERED
-        return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native})
+        return CommandResult(ok=True, code="OK", trace_id=trace, source="chatlog", data={"native_id": native, **diagnostic})
 
-    def _ingest_readback(self, acct: Account, native: str, ext: str, text: Optional[str], confirm_ms: Optional[Any]) -> None:
-        """#38 已经替我们读回了那一行:按 06 §2.12 构造 ``dir=out, self=true, source='chatlog'`` 交给 ``ingest`` 合并。
-        ``ext_msg_id`` 形态仍是 ``{talker}:{seq}``(06 §2.9.2),故下一轮 ``poll`` 再拉到同一行会按唯一键幂等跳过。"""
-        seq = ext.rsplit(":", 1)[-1]
-        row = {"talker": native, "seq": int(seq) if seq.isdigit() else 0, "content": text, "isSelf": True,
-               "type": 1, "time": self._poller.clock()}
+    async def _readback_identity(self, acct: Account) -> Optional[tuple[str, int]]:
+        status = await self._client.status()
+        native = status.get("wechat") if isinstance(status, dict) else None
+        if not isinstance(native, dict):
+            return None
+        wxid, pid = native.get("wxid"), native.get("pid")
+        if (not acct.self_uid or wxid != acct.self_uid or native.get("logged_in") is not True
+                or native.get("running") is not True or type(pid) is not int or pid <= 0):
+            return None
+        return wxid, pid
+
+    def _readback_record_current(self, acct: Account, trace: str, record: dict[str, Any]) -> bool:
+        if record.get("status") != "pending" or self._store.settings_get("wechat.readback." + trace) != record:
+            return False
+        if (type(record.get("version")) is not int or record["version"] not in (1, 2) or record.get("account_id") != acct.id
+                or not acct.self_uid or record.get("self_uid") != acct.self_uid
+                or record.get("identity_epoch") != self._store.native_identity(acct.id).get("epoch", 0)):
+            return False
+        command = self._store.get_command(trace)
+        if (command is None or command["account_id"] != acct.id or command["op"] != "send_text"
+                or command.get("identity_epoch") != record["identity_epoch"]):
+            return False
+        key = command.get("idempotency_key")
+        if key:
+            idem = self._store.idem_get(acct.id, key)
+            if not idem or idem.get("trace_id") != trace or idem.get("status") == "IDENTITY_FENCED":
+                return False
+        if record["version"] == 2:
+            try:
+                args = json.loads(command["args_json"])
+                native = self._native(acct, args["session"])
+                digest = record.get("text_sha256")
+                # Commands deliberately retain only sha8; Store.bind checks the placeholder's full hash.
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)
+                        or args.get("text_sha8") != digest[:8]):
+                    return False
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            if (record.get("native") != native
+                    or not _valid_confirmation_proof(record.get("proof"), native=native, self_uid=acct.self_uid,
+                        text_sha256=digest, request_key=key or trace, started_ms=record.get("started_ms"),
+                        now_ms=self._poller.clock())):
+                return False
+        return True
+
+    async def _proof_readback(self, native: str, proof: dict[str, Any]) -> list[dict[str, Any]]:
+        """A short page may be byte-truncated: require the final empty page."""
+        watermark, anchor = proof["max_seq"], proof["anchor"]
+        since = watermark - 1 if watermark > 0 else None
+        previous = since if since is not None else -1
+        anchor_seen, hits = anchor is None, []
+        for _ in range(4):
+            rows = await self._client.read(talker=native, since_seq=since, limit=500)
+            if not isinstance(rows, list) or len(rows) > 500:
+                return []
+            if not rows:
+                return hits if anchor_seen and len(hits) == 1 else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    return []
+                value = row.get("seq")
+                if (type(value) not in (int, str) or not str(value).isascii()
+                        or not str(value).isdecimal() or str(int(value)) != str(value)):
+                    return []
+                seq = int(value)
+                stamp = _readback_seconds(row)
+                body = row.get("content") if row.get("content") is not None else row.get("text")
+                digest = hashlib.sha256(body.encode("utf-8")).hexdigest() if isinstance(body, str) else None
+                if (seq <= previous or row.get("talker") != native
+                        or row.get("ext_msg_id") not in (None, f"{native}:{seq}")
+                        or stamp is None or stamp > self._poller.clock() / 1000 + 1):
+                    return []
+                previous = seq
+                if anchor is not None and seq == watermark:
+                    if stamp != anchor["time_s"] or digest != anchor["text_sha256"]:
+                        raise _ReadbackInvalidated("anchor_changed")
+                    anchor_seen = True
+                own = row.get("isSelf") if "isSelf" in row else row.get("is_self")
+                if (seq > watermark and own is True and type(row.get("type")) is int and row["type"] == 1
+                        and digest == proof["text_sha256"] and stamp >= math.floor(proof["send_started_at_s"])
+                        and stamp <= proof["action_completed_at_s"] + 1):
+                    hits.append(row)
+                    if len(hits) > 1:
+                        raise _ReadbackInvalidated("ambiguous_candidate")
+            since = previous
+        return []  # A bounded prefix is not proof of a unique candidate.
+
+    async def _ingest_readback(self, acct: Account, trace: str, record: dict[str, Any]) -> bool:
+        """Fetch the exact native ID; request bodies and current time are never evidence."""
+        if not self._readback_record_current(acct, trace, record):
+            return False
+        native, ext = record.get("native"), record.get("ext")
+        started_ms = record.get("started_ms")
+        if not isinstance(native, str) or type(started_ms) is not int:
+            return False
         try:
-            self._store.ingest(to_message(acct.id, row, self_uid=acct.self_uid, self_nick=acct.self_nick), now_ms=self._poller.clock())
-        except Exception as e:                              # 合并失败不该把发送判成失败(poll 下一轮还会再合并一次)
-            log.warning("微信读回行合并失败 account=%s ext=%s: %s", acct.id, ext, e)
+            identity = await self._readback_identity(acct)
+            if identity is None:
+                return False
+            if record["version"] == 2:
+                proof = record["proof"]
+                if identity != (proof["self_uid"], proof["native_pid"]):
+                    return False
+                rows = await asyncio.wait_for(self._proof_readback(native, proof),
+                    timeout=self._poller.cfg.bus.confirm_timeout_wechat_ms / 1000)
+                if len(rows) != 1:
+                    return False
+                raw_seq = str(rows[0]["seq"])
+                ext = f"{native}:{raw_seq}"
+            else:
+                if not isinstance(ext, str):
+                    return False
+                prefix, _, raw_seq = ext.rpartition(":")
+                if prefix != native or not raw_seq.isdigit() or str(int(raw_seq)) != raw_seq or int(raw_seq) <= 0:
+                    return False
+                rows = await self._client.read(talker=native, since_seq=int(raw_seq) - 1, limit=2)
+            if await self._readback_identity(acct) != identity:
+                return False
+            hits = []
+            for row in rows:
+                own = row.get("isSelf") if "isSelf" in row else row.get("is_self")
+                native_seq = row.get("seq")
+                if (row.get("talker") != native or type(native_seq) is bool
+                        or not isinstance(native_seq, (int, str)) or str(native_seq) != raw_seq
+                        or row.get("ext_msg_id") not in (None, ext) or own is not True
+                        or type(row.get("type")) is not int or row["type"] != 1):
+                    continue
+                body = row.get("content") if row.get("content") is not None else row.get("text")
+                if (not isinstance(body, str)
+                        or hashlib.sha256(body.encode("utf-8")).hexdigest() != record.get("text_sha256")):
+                    continue
+                stamp = row.get("time") if row.get("time") is not None else row.get("createTime")
+                if isinstance(stamp, bool) or stamp is None:
+                    continue
+                if isinstance(stamp, str):
+                    seconds = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                elif isinstance(stamp, (int, float)):
+                    seconds = float(stamp) / (1000 if stamp > 1e11 else 1)
+                else:
+                    continue
+                if (not math.isfinite(seconds) or seconds <= 0 or seconds < started_ms // 1000
+                        or seconds > self._poller.clock() / 1000 + 1):
+                    continue
+                hits.append(row)
+            if len(hits) != 1 or not self._readback_record_current(acct, trace, record):
+                return False
+            msg = to_message(acct.id, hits[0], self_uid=acct.self_uid, self_nick=acct.self_nick)
+            msg._native_account_uid = identity[0]
+            already = self._store.confirmed_outbound_for_trace(trace)
+            bound = self._store.bind_wechat_readback(trace, msg, now_ms=self._poller.clock(),
+                                                     readback_record=record)
+            if bound is None:
+                return False
+            if not already:
+                persisted = self._store.get_message(bound)
+                msg.text = persisted["text"]
+                msg.fingerprint = persisted["fingerprint"]
+                payload = message_payload(msg, late_after_s=self._poller.cfg.messages.late_after_s, origin="rpa")
+                payload.update(trace_id=trace, confirmed_by=persisted["confirmed_by"],
+                               confirmed_ms=persisted["confirmed_ms"], text_len=persisted["text_len"])
+                self._poller.events.emit("message", payload=payload, account_id=acct.id, channel="wechat",
+                                         trace_id=trace, now_ms=self._poller.clock())
+            return True
+        except _ReadbackInvalidated as error:
+            key = "wechat.readback." + trace
+            if record.get("status") == "pending":
+                self._store.settings_swap(key, json.dumps(record, ensure_ascii=False),
+                                          {**record, "status": "invalidated", "reason": str(error)},
+                                          actor="system:wechat_adapter", now_ms=self._poller.clock())
+            log.info("wechat late confirmation exit=%s", error)
+            return False
+        except (WeChatNotReady, WeChatCallFailed, ValueError, TypeError, OverflowError, OSError, asyncio.TimeoutError):
+            return False
 
     async def confirm_probe(self, acct: Account, cmd: Command) -> bool:
-        """幂等 ``SENDING`` 态复核(02 §2.2.3:微信查 chatlog 同分钟同文本,P-14)。先查本库(可能已被 poll 合并),
-        再回看 chatlog 一小段 seq;两侧比较一律过 ``norm()``(06 §2.12)。"""
-        native = self._native(acct, cmd.args["session"])
-        session_id = f"{acct.id}:{native}"
-        text = cmd.args.get("text") or ""
-        window = self._poller.cfg.bus.out_merge_window_s * 1000
-        ts = cmd.submitted_at_ms or self._poller.clock()
-        if self._store.find_out_by_text(acct.id, session_id, text, window, ts) is not None:
-            return True
-        want = norm(text)
-        if not want:
-            return False
-        since = max(0, self._poller.cursor_seq(acct.id, native) - PROBE_LOOKBACK_SEQ)
-        try:
-            rows = await self._client.read(talker=native, since_seq=since, limit=PROBE_LOOKBACK_SEQ)
-        except (WeChatNotReady, WeChatCallFailed):
-            return False                                    # 问不到就当没发出去:宁可重发也不误判已发(微信侧本就有幂等键)
-        for r in rows:
-            if not bool(r.get("isSelf") or r.get("is_self")):
-                continue
-            m = to_message(acct.id, r, self_uid=acct.self_uid, self_nick=acct.self_nick)
-            if norm(m.text) == want and abs(m.ts_ms - ts) <= window:
-                return True
-        return False
+        """Only an immutable trace already bound to native evidence can confirm replay."""
+        trace = cmd.trace_id or ""
+        if cmd.idempotency_key:
+            idem = self._store.idem_get(acct.id, cmd.idempotency_key)
+            if idem is None or idem.get("status") == "IDENTITY_FENCED":
+                return False
+            trace = idem.get("trace_id") or ""
+        row = self._store.confirmed_outbound_for_trace(trace) if trace else None
+        return bool(row and row["account_id"] == acct.id and row["source"] == "chatlog"
+                    and row["confirmed_by"] == "chatlog"
+                    and row["session_id"] == f"{acct.id}:{self._native(acct, cmd.args['session'])}"
+                    and row["text"] == cmd.args.get("text"))
 
     async def poll(self, acct: Account, *, only_sessions: Optional[list[str]] = None) -> None:
         await self._poller.poll(self._view(acct), only_sessions)
+        pending = []
+        for entry in self._store.settings_list_prefix("wechat.readback."):
+            record = entry["value"]
+            if (not isinstance(record, dict) or record.get("status") != "pending"
+                    or record.get("account_id") != acct.id):
+                continue
+            trace = entry["key"][len("wechat.readback."):]
+            if self._readback_record_current(acct, trace, record):
+                pending.append(entry)
+        if not pending:
+            return
+        cursor_key = "wechat.readback_cursor." + acct.id
+        epoch = self._store.native_identity(acct.id).get("epoch", 0)
+        cursor = self._store.settings_get(cursor_key)
+        last_key, end_key = "", pending[-1]["key"]
+        if (isinstance(cursor, dict) and cursor.get("self_uid") == acct.self_uid
+                and cursor.get("identity_epoch") == epoch
+                and isinstance(cursor.get("last_key"), str) and isinstance(cursor.get("end_key"), str)):
+            last_key, end_key = cursor["last_key"], cursor["end_key"]
+        # A fixed round boundary prevents new arrivals from postponing the wrap forever.
+        remaining = [entry for entry in pending if last_key < entry["key"] <= end_key]
+        if not remaining:
+            remaining = pending
+            end_key = pending[-1]["key"]
+        for entry in remaining[:4]:
+            # Persist scheduling before I/O so a restart resumes after this attempt.
+            self._store.settings_set(cursor_key, {"self_uid": acct.self_uid, "identity_epoch": epoch,
+                                                  "last_key": entry["key"], "end_key": end_key},
+                                     actor="system:wechat_adapter", now_ms=self._poller.clock())
+            await self._ingest_readback(acct, entry["key"][len("wechat.readback."):], entry["value"])
 
+
+
+def _readback_seconds(row: dict[str, Any]) -> Optional[float]:
+    value = row.get("time") if row.get("time") is not None else row.get("createTime")
+    try:
+        if isinstance(value, str):
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        elif type(value) in (int, float):
+            stamp = float(value) / (1000 if value > 1e11 else 1)
+        else:
+            return None
+        return stamp if math.isfinite(stamp) and stamp > 0 else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _valid_confirmation_proof(proof: Any, *, native: str, self_uid: str, text_sha256: str,
+                              request_key: str, started_ms: int, now_ms: int) -> bool:
+    fields = {"version", "self_uid", "native_pid", "talker", "max_seq", "anchor",
+              "captured_at_s", "send_started_at_s", "action_completed_at_s", "text_sha256", "idempotency_key"}
+    if (not isinstance(proof, dict) or set(proof) != fields or type(proof["version"]) is not int
+            or proof["version"] != 1 or proof["self_uid"] != self_uid or proof["talker"] != native
+            or proof["text_sha256"] != text_sha256 or not request_key or proof["idempotency_key"] != request_key
+            or type(proof["native_pid"]) is not int or proof["native_pid"] <= 0
+            or type(proof["max_seq"]) is not int or proof["max_seq"] < 0
+            or type(started_ms) is not int or type(now_ms) is not int or started_ms <= 0):
+        return False
+    captured, started, completed = (proof[key] for key in
+        ("captured_at_s", "send_started_at_s", "action_completed_at_s"))
+    if (any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+            for value in (captured, started, completed))
+            or not started_ms / 1000 - 1 <= captured <= started <= completed <= now_ms / 1000 + 1
+            or now_ms / 1000 - captured > 12 * 3600):
+        return False
+    anchor = proof["anchor"]
+    if anchor is None:
+        return proof["max_seq"] == 0
+    return (isinstance(anchor, dict) and set(anchor) == {"seq", "time_s", "text_sha256"}
+            and type(anchor["seq"]) is int and anchor["seq"] == proof["max_seq"]
+            and type(anchor["time_s"]) in (int, float) and math.isfinite(anchor["time_s"])
+            and 0 < anchor["time_s"] <= captured + 1
+            and isinstance(anchor["text_sha256"], str) and len(anchor["text_sha256"]) == 64
+            and all(char in "0123456789abcdef" for char in anchor["text_sha256"]))
 
 def _png_size(png: bytes) -> Optional[tuple[int, int]]:
     """PNG 的 IHDR 头给 ``width``/``height``(``result_schema`` 的两个整数键);不是合法 PNG 头就不给这两键。"""

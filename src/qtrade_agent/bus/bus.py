@@ -21,6 +21,7 @@ from ..maintenance import DiskFullError
 from ..models import Command, CommandError, CommandResult, RESULT_CODES, Message, Session, json_safe
 from ..settings_secrets import redact as redact_secrets
 from ..store import Store
+from ..timing import timing_context, timing_event, timing_span
 from .validate import validate_args
 from .native_guard import NativePermissionChanged, native_send_guard, require_native_permission
 
@@ -62,6 +63,9 @@ class _Job:
     acct: Account
     done: "asyncio.Future[CommandResult]"
     msg_id: Optional[str] = None      # send_* 的 SENDING 行
+    native_ext_msg_id: Optional[str] = None
+    native_confirmation_reason: Optional[str] = None
+    native_inflight: bool = False
 
 
 class Bus:
@@ -113,7 +117,12 @@ class Bus:
         self._queues.clear()
         for job in list(self._jobs.values()):
             if not job.done.done():
-                self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Agent stopped; execution outcome requires review", reason="shutdown_outcome_unknown", needs_human=True)))
+                if job.acct.channel == "wechat" and job.msg_id:
+                    self.store.mark_out_state(job.msg_id, "UNCONFIRMED")
+                    self._finalize(job, CommandResult(ok=False, code="SEND_FAILED", trace_id=job.cmd.trace_id or "", source="chatlog",
+                                                     error=CommandError("Agent stopped after send began; review the original conversation without resending", reason="send_outcome_unknown", retryable=False, needs_human=True)))
+                else:
+                    self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Agent stopped; execution outcome requires review", reason="shutdown_outcome_unknown", needs_human=True)))
         self._jobs.clear()
 
     async def _consume(self, account_id: str, q: asyncio.Queue) -> None:
@@ -138,7 +147,12 @@ class Bus:
             except Exception as e:                      # 单条指令的异常不杀消费者
                 log.exception("bus consumer error account=%s: %s", account_id, e)
                 if isinstance(item, _Job) and not item.done.done():
-                    self._finalize(item, _err_result("INTERNAL", item.cmd.trace_id or "", CommandError("Command execution failed; consult its trace", needs_human=bool(item.msg_id))))
+                    if item.acct.channel == "wechat" and item.msg_id:
+                        self.store.mark_out_state(item.msg_id, "UNCONFIRMED")
+                        self._finalize(item, CommandResult(ok=False, code="SEND_FAILED", trace_id=item.cmd.trace_id or "", source="chatlog",
+                                                         error=CommandError("Send outcome is unknown after execution was interrupted; review the original conversation", reason="send_outcome_unknown", retryable=False, needs_human=True)))
+                    else:
+                        self._finalize(item, _err_result("INTERNAL", item.cmd.trace_id or "", CommandError("Command execution failed; consult its trace", needs_human=bool(item.msg_id))))
             finally:
                 q.task_done()
 
@@ -149,6 +163,30 @@ class Bus:
             return None
         return Account(id=row["id"], channel=row["channel"], state=row["state"], self_uid=row.get("self_uid"),
                        self_nick=row.get("self_nick"), state_code=row.get("state_code"), app_version=row.get("runtime_app_version"))
+
+    def _confirmed_wechat_replay(self, acct: Account, idem: dict[str, Any]) -> Optional[CommandResult]:
+        if acct.channel != "wechat":
+            return None
+        # A short transaction gives all connections the same identity/evidence snapshot; no rows are written.
+        with self.store._tx():
+            m = self.store.confirmed_outbound_for_trace(idem["trace_id"])
+            if not m or m["account_id"] != acct.id or not m["ext_msg_id"] or m["confirmed_by"] != "chatlog":
+                return None
+            if idem["status"] == "DONE":
+                current = self._load_account(acct.id)
+                original = self.store.get_command(idem["trace_id"])
+                key = self.store.idem_get(acct.id, idem["idem_key"])
+                if (current is None or current.channel != "wechat" or current.self_uid != acct.self_uid
+                        or not original or not key or key["status"] == "IDENTITY_FENCED"
+                        or original["account_id"] != acct.id or original["idempotency_key"] != idem["idem_key"]
+                        or key["trace_id"] != idem["trace_id"] or m["trace_id"] != idem["trace_id"]
+                        or original["op"] != idem["op"] or key["op"] != idem["op"] or key["args_hash"] != idem["args_hash"]
+                        or not (idem["identity_epoch"] == key["identity_epoch"] == original["identity_epoch"] == m["identity_epoch"])
+                        or m["channel"] != "wechat" or m["source"] != "chatlog" or m["dedup_kind"] != "native"):
+                    return None
+            return CommandResult(ok=True, code="IDEMPOTENT_REPLAY", trace_id=idem["trace_id"],
+                                 data={"message_id": m["id"], "ext_msg_id": m["ext_msg_id"], "confirmed_by": m["confirmed_by"]},
+                                 source=m["source"])
 
     async def submit(self, cmd: Command) -> CommandResult:
         """同步语义:等到确认结束(或超时)才返回;等待期间不占账号队列(R6-38)。"""
@@ -194,6 +232,9 @@ class Bus:
                 if row["op"] != cmd.op or row["args_hash"] != args_hash:
                     return _err_result("INVALID_ARGS", tid, CommandError("幂等键已被使用且参数不同", reason="idempotency_args_mismatch"))
                 if row["status"] == "DONE":
+                    confirmed = self._confirmed_wechat_replay(acct, row)
+                    if confirmed is not None:
+                        return confirmed
                     prev = self.store.get_command_result(row["trace_id"]) or {}
                     error = None if prev.get("ok") else CommandError(prev.get("error_message") or "Previous execution failed", retryable=bool(prev.get("error_retryable")), needs_human=bool(prev.get("error_needs_human")))
                     return CommandResult(ok=bool(prev.get("ok")), code="IDEMPOTENT_REPLAY", trace_id=row["trace_id"], data=prev.get("data", {}),
@@ -208,6 +249,15 @@ class Bus:
                         return CommandResult(ok=res.ok, code="IDEMPOTENT_REPLAY", trace_id=res.trace_id, data=res.data, source=res.source, error=res.error)
                     row = dict(row, status="ABANDONED")
                 if row["status"] == "ABANDONED":
+                    if acct.channel == "wechat":
+                        # A crashed send may already have reached WeChat. Only the original trace can prove it.
+                        confirmed = self._confirmed_wechat_replay(acct, row)
+                        if confirmed is not None:
+                            self.store.backfill_confirm_from_message(row["trace_id"])
+                            self.store.idem_finish(account_id=acct.id, key=key, status="DONE", result_code="DELIVERED", now_ms=now)
+                            return confirmed
+                        return CommandResult(ok=False, code="SEND_FAILED", trace_id=row["trace_id"], source="chatlog",
+                                             error=CommandError("上次发送结果尚未确认；请核对原会话，禁止自动补发", reason="send_outcome_unknown", retryable=False, needs_human=True))
                     if await adapter.confirm_probe(acct, cmd):        # 上次其实已发(只查本库:出向行是否已被 ingest 合并成 DELIVERED)
                         self.store.idem_finish(account_id=acct.id, key=key, status="DONE", result_code="DELIVERED", now_ms=now)
                         # B-08:command_results.confirmed_by 由 probe 回填——回填到**首次**那条 trace(从 messages.confirmed_by 派生,code 不改写)
@@ -243,7 +293,7 @@ class Bus:
         loop = asyncio.get_running_loop()
         job = _Job(cmd=cmd, acct=acct, done=loop.create_future())
         self._jobs[tid] = job
-        job.done.add_done_callback(lambda _: self._jobs.pop(tid, None))
+        job.done.add_done_callback(lambda _: self._jobs.pop(tid, None) if not job.native_inflight else None)
         if key:
             self._inflight[(acct.id, key)] = job.done
         q = self._queue(acct.id)
@@ -254,7 +304,13 @@ class Bus:
         try:
             return await asyncio.wait_for(asyncio.shield(job.done), timeout=cmd.timeout_ms / 1000 + self.cfg.confirm_timeout_ms(acct.channel) / 1000)
         except asyncio.TimeoutError:
-            res = _err_result("TIMEOUT", tid, CommandError("超过 timeout_ms"))
+            if job.acct.channel == "wechat" and job.msg_id:
+                self.store.mark_out_state(job.msg_id, "UNCONFIRMED")
+                res = CommandResult(ok=False, code="SEND_FAILED", trace_id=tid, source="chatlog",
+                                    error=CommandError("等待发送结果超时；原生任务可能仍在执行，请核对原会话，禁止自动补发",
+                                                       reason="send_outcome_unknown", retryable=False, needs_human=True))
+            else:
+                res = _err_result("TIMEOUT", tid, CommandError("超过 timeout_ms"))
             self._finalize(job, res)
             return res
 
@@ -310,25 +366,43 @@ class Bus:
                           trace_id=cmd.trace_id, idempotency_key=cmd.idempotency_key)
             r = self.store.ingest(out, now_ms=started)          # 出向先落库(经 store.ingest,先 upsert sessions)
             job.msg_id = r.id
+            job.native_inflight = acct.channel == "wechat"
             try:
-                with native_send_guard(native_guard):
+                with timing_context(cmd.trace_id, acct.id), timing_span("collector.native.send"), native_send_guard(native_guard):
                     res = await adapter.send(acct, cmd)         # 点完即返回、让出队列
             except NativePermissionChanged:
                 self.store.mark_out_state(job.msg_id, 'FAILED')
                 self._finalize(job, _err_result('GATE_BLOCKED', cmd.trace_id or '',
                     CommandError('Native send permission changed', reason='xunjia_native_permission_changed')))
                 return
+            finally:
+                if job.native_inflight:
+                    job.native_inflight = False
+                    if job.done.done():
+                        self._jobs.pop(cmd.trace_id, None)
+            if (acct.channel == "wechat" and res.source == "chatlog"
+                    and isinstance(res.data.get("ext_msg_id"), str) and res.data["ext_msg_id"]):
+                job.native_ext_msg_id = res.data["ext_msg_id"]
+            if acct.channel == "wechat":
+                reason = res.data.get("native_confirmation_reason")
+                if isinstance(reason, str) and reason in (
+                        "confirmed", "confirm_timeout", "identity_changed", "anchor_changed",
+                        "ambiguous_candidate", "invalid_snapshot", "read_failed"):
+                    job.native_confirmation_reason = reason
             if not res.ok:
+                code = res.code if res.code in ("NOT_READY", "GATE_BLOCKED", "LOGIN_REQUIRED", "TARGET_NOT_FOUND") else "SEND_FAILED"
+                explicit_not_attempted = (res.data.get("native_action_attempted") is False and res.error is not None
+                                          and isinstance(res.error.reason, str) and bool(res.error.reason.strip())
+                                          and res.error.reason != "send_outcome_unknown")
+                uncertain_readback = acct.channel == "wechat" and code == "SEND_FAILED" and not explicit_not_attempted
+                if uncertain_readback:
+                    res.error = CommandError(res.error.message if res.error else "发送结果未知；请核对原会话，禁止自动补发",
+                                             reason="send_outcome_unknown", retryable=False, needs_human=True,
+                                             details=res.error.details if res.error else [])
                 if job.msg_id:
-                    # Only a trusted readback timeout after adapter.send remains mergeable.
-                    uncertain_readback = (acct.channel == "wechat" and res.code == "SEND_FAILED"
-                                          and res.source == "chatlog" and res.error is not None
-                                          and res.error.reason == "send_outcome_unknown"
-                                          and res.error.retryable is False and res.error.needs_human is True)
                     self.store.mark_out_state(job.msg_id, "UNCONFIRMED" if uncertain_readback else "FAILED")
                 # 适配器给出的明确不可重试码(NOT_READY / GATE_BLOCKED / LOGIN_REQUIRED)不得抹成 SEND_FAILED:
                 # 抹掉后上层按「可重试」处理,而规格要的是明确告诉人「现在不能发」(05 §2.4.7 / §2.5.4)。
-                code = res.code if res.code in ("NOT_READY", "GATE_BLOCKED", "LOGIN_REQUIRED") else "SEND_FAILED"
                 retryable, needs_human = RESULT_CODES.get(code, (True, False))
                 self._finalize(job, CommandResult(ok=False, code=code, trace_id=cmd.trace_id, source=res.source, data=res.data,
                                                   error=(res.error or CommandError("发送动作失败", retryable=retryable, needs_human=needs_human)),
@@ -354,6 +428,10 @@ class Bus:
             await asyncio.sleep(wait / 1000)
 
     async def _confirm(self, job: _Job, native_id: str, started: int, source: str) -> None:
+        with timing_context(job.cmd.trace_id, job.acct.id), timing_span("collector.native.confirm"):
+            await self._confirm_guarded(job, native_id, started, source)
+
+    async def _confirm_guarded(self, job: _Job, native_id: str, started: int, source: str) -> None:
         # 🔴 这一路是 `create_task` 出去的,**不在 `_consume` 的兜底里**:确认窗内的写(加速 poll 的
         # `ingest` / `mark_out_state`)若因盘满抛 `DiskFullError` 而没人接,`job.done` 永远不完成 ⇒
         # `submit` 只能等到 `asyncio.TimeoutError` 回 `TIMEOUT`(**retryable=true**),又成了 §2.8.8 禁止的自动重试。
@@ -367,7 +445,12 @@ class Bus:
             raise
         except Exception:
             log.exception("Confirmation task failed trace=%s", job.cmd.trace_id)
-            self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Send outcome is unknown; manual review required", reason="confirmation_error", needs_human=True)))
+            if job.acct.channel == "wechat" and job.msg_id:
+                self.store.mark_out_state(job.msg_id, "UNCONFIRMED")
+                self._finalize(job, CommandResult(ok=False, code="SEND_FAILED", trace_id=job.cmd.trace_id or "", source="chatlog",
+                                                 error=CommandError("Send outcome is unknown; manual review required", reason="send_outcome_unknown", retryable=False, needs_human=True)))
+            else:
+                self._finalize(job, CommandResult(ok=False, code="INTERNAL", trace_id=job.cmd.trace_id or "", error=CommandError("Send outcome is unknown; manual review required", reason="confirmation_error", needs_human=True)))
 
     async def _confirm_loop(self, job: _Job, native_id: str, started: int, source: str) -> None:
         cmd, acct = job.cmd, job.acct
@@ -412,10 +495,17 @@ class Bus:
             return
         cmd, acct = job.cmd, job.acct
         now = self.clock()
+        if acct.channel == "wechat" and job.native_ext_msg_id:
+            res.data = {"message_id": job.msg_id, "ext_msg_id": job.native_ext_msg_id, "confirmed_by": None, **res.data}
+        if acct.channel == "wechat" and job.msg_id:
+            res.data = {key: value for key, value in res.data.items() if key != "native_confirmation_reason"}
+            if job.native_confirmation_reason is not None:
+                res.data["native_confirmation_reason"] = job.native_confirmation_reason
         err = res.error
         self.store.finish_command(trace_id=cmd.trace_id, ok=res.ok, code=res.code, data=json_safe(res.data), cost_ms=res.cost_ms, source=res.source,
                                   error_message=err.message if err else None, retryable=err.retryable if err else None,
                                   needs_human=err.needs_human if err else None, confirmed_by=confirmed_by, confirm_ms=confirm_ms, now_ms=now)
+        timing_event("collector.command.result", status=res.code, trace_id=cmd.trace_id, account_id=acct.id)
         if cmd.idempotency_key:
             self._inflight.pop((acct.id, cmd.idempotency_key), None)
             if err is not None and err.reason == "send_outcome_unknown":

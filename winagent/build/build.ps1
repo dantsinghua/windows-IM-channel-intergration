@@ -89,7 +89,8 @@ Invoke-Native "升级 pip/wheel" { & $py -m pip install --upgrade pip wheel }
 #    干净机器上第 3 步必炸 `No module named pytest`(2026-09-21 首次在真 Windows 上跑本脚本时踩到)。
 Invoke-Native "装 windows+dev 依赖与 pyinstaller" { & $py -m pip install -e ".[windows,dev]" pyinstaller }
 # 会话代理侧的 UI 自动化栈(不进 pyproject 的硬依赖:Linux 上装不了)
-Invoke-Native "装 pywinauto/pillow" { & $py -m pip install pywinauto pillow }
+Invoke-Native "install pywinauto" { & $py -m pip install pywinauto }
+Invoke-Native "verify Pillow image codecs" { & $py -c "import io; from PIL import Image, ImageGrab; raw=bytes.fromhex('89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c6360f8cf0000020201007b0981780000000049454e44ae426082'); image=Image.open(io.BytesIO(raw)); image.load(); assert image.size == (1,1)" }
 # R6-92: pyweixin is REQUIRED (the WeChat send path). It is vendored in winagent/vendor/pyweixin as a wheel
 # built from upstream github.com/Hello-Mr-Crab/pywechat @ 8589baa; the sha256 below must match, otherwise stop.
 $pyweixinWheel = Join-Path $root "vendor\pyweixin\pywechat127-1.9.8-py3-none-any.whl"

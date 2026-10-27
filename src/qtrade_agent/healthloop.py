@@ -164,21 +164,37 @@ class HealthLoop:
         self._clear_false_wechat_offline()
         for row in self._store.list_accounts(channel="wechat", include_deleted=True):
             aid = row["id"]
-            if row.get("deleted_ms") or row["state"] not in ("running", "degraded") or self._accounts.busy(aid):
+            recovering = (row["state"] == "login_required"
+                          and row.get("state_code") in ("LOGGED_OUT", "KICKED", "TOKEN_EXPIRED", "LOGIN_TIMEOUT")
+                          and bool(row.get("self_uid")) and row.get("desired_state") == "running"
+                          and bool(row.get("auto_recover")))
+            if (row.get("deleted_ms") or not row.get("enabled")
+                    or (row["state"] not in ("running", "degraded") and not recovering)
+                    or self._accounts.busy(aid)):
                 continue
             acct = Account(id=aid, channel="wechat", state=row["state"], self_uid=row.get("self_uid"),
                            self_nick=row.get("self_nick"), state_code=row.get("state_code"))
             try:
-                state, code, reason = await ad.probe_state(acct)
+                # Observe an already restored same-account session; never launch,
+                # log in, bind, or retry keys on this passive recovery path.
+                state, code, reason = (await ad.probe_state(acct, require_identity=True)
+                                       if recovering else await ad.probe_state(acct))
             except Exception as e:                       # 会话代理抖动:本轮不判,下轮再看
                 log.info("微信健康探测未取到 account=%s: %s", aid, e)
                 continue
             current = self._store.get_account_full(aid)
             if (not current or current.get("deleted_ms") or not current.get("enabled")
-                    or current["state"] not in ("running", "degraded") or self._accounts.busy(aid)
+                    or current["state"] != row["state"] or self._accounts.busy(aid)
+                    or current.get("state_code") != row.get("state_code")
+                    or current.get("self_uid") != row.get("self_uid")
+                    or (recovering and not current.get("auto_recover"))
                     or current.get("desired_state") != row.get("desired_state")):
                 continue
             self.last["WECHAT"][aid] = {"state": state, "state_code": code, "checked_ms": now}
+            if recovering:
+                if state != "running":
+                    continue
+                self._accounts.transition(aid, "logging_in")
             if state != row["state"] or (code or "") != (row.get("state_code") or ""):
                 self._accounts.transition(aid, state, state_code=code, state_reason=reason)
             # R6-91:只对「曾经取钥成功、跑起来过」的号自动试钥(self_uid 已回填)。首登没走完的号自动 key/retry 毫无意义

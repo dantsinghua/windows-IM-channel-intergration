@@ -51,6 +51,7 @@ def test_default_configure_ignores_removed_version_and_environment_switches(monk
     async def create(cls, settings, **kw):
         assert kw['legacy_inbox_disabled']() is True
         assert callable(kw['presence_provider'])
+        assert callable(kw['capture_refresher'])
         calls.append('construct')
         return host
     monkeypatch.setattr(InstitutionCollectorHost, 'from_settings', classmethod(create))
@@ -58,7 +59,7 @@ def test_default_configure_ignores_removed_version_and_environment_switches(monk
         store=None, bus=None, data_dir='synthetic', clock=lambda: NOW * 1000,
         _xunjia_institution_friends=lambda _: [], _xunjia_v22_contacts=lambda _: {},
         _xunjia_institution_history_source=lambda _: None, _xunjia_institution_presence=lambda _: None,
-        _xunjia_institution_media=lambda _: {})
+        _xunjia_institution_media=lambda _: {}, _capture_wechat_media_refresher=lambda *args: None)
     asyncio.run(AgentApp._configure_xunjia_v22(app))
     assert app.xunjia_v22_host is host and calls == ['construct', 'start']
 

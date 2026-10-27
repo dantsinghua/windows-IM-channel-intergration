@@ -18,6 +18,7 @@ dependencies = [
   "websockets>=12",
   "aiosqlite>=0.20",
   "cryptography>=50.0.2",
+  "pyjks==20.0.0",
 ]
 
 [project.optional-dependencies]

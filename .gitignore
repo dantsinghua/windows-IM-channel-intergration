@@ -29,3 +29,12 @@ qb_tap.user.js
 .codex/handoffs/
 .codex/
 .agents/
+
+# Local diagnostic artifacts, private captures, and editor backups.
+/.tmp_*
+/.workbuddy/
+/outputs/
+/NUL
+/*.rp
+/demo/pic/filehelper-*
+*.session-reset-before

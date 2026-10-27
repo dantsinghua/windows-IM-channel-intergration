@@ -101,10 +101,21 @@ def test_current_refresh_failure_preserves_last_successful_org_and_original_time
         s.host.organization_provider=broken
     s.now[0]+=60
     s.host.publisher.request_sync("3000000001",True)
+    pending=s.host.publisher.pending_sync()
     s.host.metadata_once()
-    assert s.publications()==[before]
-    assert [entry for entry in s.uploaded if entry[0]==ORGANIZATION_PATH]==previous_uploads
+    expected_code={"unreported":"ORG_CREDENTIALS_NOT_CONFIGURED",
+        "bad-data":"ORG_SOURCE_DECRYPT_OR_SCHEMA_ERROR",
+        "unexpected-provider":"ORGANIZATION_REFRESH_FAILED"}[failure]
+    publications=s.publications()
+    assert publications[0]==before and len(publications)==2
+    failed=publications[-1]["payload"]
+    assert failed["state"]==("unreported" if failure=="unreported" else "error")
+    assert failed["error_code"]==expected_code and "org" not in failed
+    organization_uploads=[entry for entry in s.uploaded if entry[0]==ORGANIZATION_PATH]
+    assert organization_uploads[:-1]==previous_uploads and len(organization_uploads)==len(previous_uploads)+1
     assert s.host.publisher.last("organization:organization")==stamp
-    assert s.host.errors["contacts:3000000001"] in ("ValueError","RuntimeError")
+    assert s.host.publisher.last("organization-error:organization")==s.now[0]
+    assert s.host.errors["contacts:3000000001"]==expected_code
     assert "synthetic-private-detail" not in json.dumps(s.host.errors)
-    assert len(s.host.publisher.pending_sync())==1
+    assert "synthetic-private-detail" not in json.dumps(publications)
+    assert s.host.publisher.pending_sync()==pending and len(pending)==1

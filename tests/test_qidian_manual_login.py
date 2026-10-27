@@ -281,7 +281,7 @@ def test_degraded_account_reads_new_messages_through_the_real_poller(store, cloc
     events = Events(store)
     poller = QidianPoller(store=store, events=events, alerts=Alerts(events, clock=clock), cfg=AgentConfig(),
                           h13_firing=lambda: False, clock=clock,
-                          maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path))
+                          maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path))
     account = QidianAccountView("qd01", "degraded", maindb.self_uin)
     poller.poll_maindb(account)  # 初次只建立历史水位。
     clock.advance(1000)
@@ -300,7 +300,7 @@ def test_non_online_states_still_do_not_open_any_main_database(store, clock, sta
     from qtrade_agent.config import AgentConfig
     from qtrade_agent.events import Events
 
-    def never_read(uid):
+    def never_read(uid, acct):
         pytest.fail("未在线的账号不允许读取遗留主库")
 
     events = Events(store)
@@ -400,7 +400,7 @@ async def test_manual_login_readback_enables_actual_incoming_ingestion_while_pre
     ui = QidianUi(adb=adb)
     database = FakeMainDb(str(tmp_path / "test-only-main.db"), self_uin=UID)
     monkeypatch.setattr(rig.agent.accounts, "_login_probe_fn", ui.login_probe_fn())
-    monkeypatch.setattr(rig.agent.poller, "maindb_factory", lambda uid: LocalSqliteMainDb(database.path))
+    monkeypatch.setattr(rig.agent.poller, "maindb_factory", lambda uid, acct: LocalSqliteMainDb(database.path))
     rig.agent.accounts.note_default_profile("qd01", "test-only-unknown-version")
 
     await rig.agent.scheduler.run_once("qidian_login_probe")

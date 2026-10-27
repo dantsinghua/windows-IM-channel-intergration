@@ -54,7 +54,7 @@ def test_media_gives_reference_not_bytes_and_no_sha256():
     """06 §2.9.1:媒体给 ``/image/<md5>`` 引用由 Agent 经 #40 拉;这里不下载、不算 sha256
     ⇒ fingerprint 的 media_sha256s 为空(06 §2.9.2 公式)。"""
     m = to_message("wx01", {"talker": "t", "seq": 1, "type": 3, "time": 1, "md5": "abc123"})
-    assert m.media == [{"kind": "image", "key": "abc123", "ref": "/wa/v1/wechat/media/abc123"}]
+    assert m.media == [{"kind": "image", "key": "abc123", "wa_path": "/wa/v1/wechat/media/abc123"}]
     assert all("sha256" not in x for x in m.media)
     assert to_message("wx01", {"talker": "t", "seq": 2, "type": 1, "time": 1, "content": "a"}).media == []
 

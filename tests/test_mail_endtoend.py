@@ -29,7 +29,7 @@ async def rig(store, clock, maindb, tmp_path):
     events = Events(store)
     alerts = Alerts(events, clock=clock)
     poller = QidianPoller(store=store, events=events, alerts=alerts, cfg=cfg, h13_firing=lambda: False, clock=clock,
-                          maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path))
+                          maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path))
     adapter = QidianAdapter(poller, sender=FakeSender(maindb, clock), store=store)
     bus = Bus(store=store, events=events, adapters={"qidian": adapter}, cfg=cfg, clock=clock)
     maindb.insert_text(PEER, "历史", time_s=clock.now_s - 3600)

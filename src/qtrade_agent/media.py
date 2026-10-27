@@ -16,6 +16,7 @@ import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
@@ -72,6 +73,15 @@ class Fetched:
     data: bytes = b""
     reason: str = ""
     declared_size: Optional[int] = None
+    retryable: bool = False
+
+
+class MediaFetchError(RuntimeError):
+    """A fixed download reason and an explicit transient/permanent decision."""
+    def __init__(self, reason: str, *, retryable: bool = False):
+        super().__init__(reason)
+        self.reason = reason
+        self.retryable = retryable
 
 
 class Downloader(Protocol):
@@ -115,13 +125,27 @@ class UrllibDownloader:
 
     async def fetch(self, ref: dict[str, Any], *, max_bytes: int) -> Fetched:
         import asyncio
-        if ref.get("wa_path"):
+        wa_path = ref.get("wa_path") or ref.get("ref")
+        if wa_path:
+            prefix = "/wa/v1/wechat/media/"
+            if not isinstance(wa_path, str) or not wa_path.startswith(prefix):
+                return Fetched(False, reason="invalid_winagent_ref")
+            encoded_key = wa_path[len(prefix):]
+            key = urllib.parse.unquote(encoded_key)
+            if (not encoded_key or len(encoded_key) > 4096
+                    or any(ch in encoded_key for ch in "/\\?#")
+                    or any(ord(ch) < 32 or ch in "/%?#:" for ch in key)
+                    or any(part in ("", ".", "..") for part in key.split("\\"))):
+                return Fetched(False, reason="invalid_winagent_ref")
             if self._wa_raw is None:
                 return Fetched(False, reason="winagent_not_wired")
             try:
-                data = await self._wa_raw(str(ref["wa_path"]))
+                data = await self._wa_raw(wa_path)
+            except MediaFetchError as error:
+                return Fetched(False, reason=error.reason, retryable=error.retryable)
             except Exception as e:                       # 会话代理不在线 / chatlog 挂
-                return Fetched(False, reason=f"winagent:{e!r}"[:180])
+                transient = isinstance(e, (OSError, TimeoutError)) or getattr(e, "reason", None) == "unreachable"
+                return Fetched(False, reason="winagent:" + type(e).__name__, retryable=transient)
             if len(data) > max_bytes:
                 return Fetched(False, reason="oversize", declared_size=len(data))
             return Fetched(True, data=data, declared_size=len(data))
@@ -138,8 +162,13 @@ class UrllibDownloader:
                 if declared and declared > max_bytes:
                     return Fetched(False, reason="oversize", declared_size=declared)
                 data = resp.read(max_bytes + 1)          # 多读一个字节:没有 Content-Length 时也能判超限
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            return Fetched(False, reason=repr(e)[:180])
+        except urllib.error.HTTPError as error:
+            return Fetched(False, reason=f"http_{error.code}",
+                           retryable=error.code in (408, 429) or 500 <= error.code <= 599)
+        except (urllib.error.URLError, OSError) as error:
+            return Fetched(False, reason="network:" + type(error).__name__, retryable=True)
+        except ValueError:
+            return Fetched(False, reason="invalid_download_response")
         if len(data) > max_bytes:
             return Fetched(False, reason="oversize", declared_size=len(data))
         return Fetched(True, data=data, declared_size=len(data))
@@ -160,6 +189,11 @@ class MediaStore:
     ``disk_allows()`` 由装配方接 ``maintenance.media_downloads_allowed``(high 水位起转 lazy);
     ``ingest_allows()`` 接 ``maintenance.ingest_allowed``(critical 起连元数据都不写)。
     """
+
+    MAX_AUTO_ATTEMPTS = 5
+    RETRY_BASE_MS = 30000
+    RETRY_MAX_MS = 300000
+    DOWNLOAD_LEASE_MS = 120000
 
     def __init__(self, store, *, media_dir: str, downloader: Optional[Downloader] = None,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000),
@@ -200,13 +234,19 @@ class MediaStore:
         if not self._ingest_allows():
             log.warning("磁盘 critical 水位:media 行不写(§2.8.8)")
             return None
-        import json
         now = now_ms or self._clock()
         with self._store._tx() as c:
-            cur = c.execute("INSERT INTO media(kind, status, origin_json, first_message_id, ref_count, first_seen_ms) "
-                            "VALUES (?,?,?,?,0,?)",
-                            (kind_of(kind), status, json.dumps(origin, ensure_ascii=False), message_id, now))
-            return int(cur.lastrowid)
+            return self._note_in_transaction(c, kind=kind, origin=origin, message_id=message_id,
+                                             status=status, now_ms=now)
+
+    @staticmethod
+    def _note_in_transaction(connection, *, kind: str, origin: dict[str, Any],
+                             message_id: Optional[str], status: str, now_ms: int) -> int:
+        import json
+        cur = connection.execute("INSERT INTO media(kind, status, origin_json, first_message_id, ref_count, first_seen_ms) "
+                                 "VALUES (?,?,?,?,0,?)",
+                                 (kind_of(kind), status, json.dumps(origin, ensure_ascii=False), message_id, now_ms))
+        return int(cur.lastrowid)
 
     # ------------------------------------------------------------------ 落盘
     def put_bytes(self, data: bytes, *, kind: str, origin: dict[str, Any], message_id: Optional[str] = None,
@@ -266,7 +306,8 @@ class MediaStore:
             os.replace(tmp, final)
 
     # ------------------------------------------------------------------ 下载(#96 懒加载 / eager 策略)
-    async def fetch_into(self, media_id: int, *, now_ms: Optional[int] = None) -> dict[str, Any]:
+    async def fetch_into(self, media_id: int, *, now_ms: Optional[int] = None,
+                         _automatic: bool = False) -> dict[str, Any]:
         """把一条 ``pending`` 的 media 行下载落盘。磁盘 high 水位起**不下载**(只回当前态,不算失败)。"""
         import json
         row = self.get(media_id)
@@ -279,34 +320,121 @@ class MediaStore:
         if self._dl is None:
             return {"media_id": media_id, "status": "pending", "fail_reason": "downloader_not_wired"}
         now = now_ms or self._clock()
+        with self._store._tx() as c:
+            current = c.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+            if current is None:
+                return {"media_id": media_id, "status": "failed", "fail_reason": "not_found"}
+            row = dict(current)
+            if row["status"] in ("ready", "skipped_oversize"):
+                return {"media_id": media_id, "status": row["status"], "sha256": row["sha256"]}
+            if _automatic and (self.policy_for(row["kind"]) != "eager"
+                    or row["attempts"] >= self.MAX_AUTO_ATTEMPTS
+                    or (row["next_attempt_ms"] is not None and row["next_attempt_ms"] > now)
+                    or (row["status"] == "failed" and row["next_attempt_ms"] is None)):
+                return {"media_id": media_id, "status": row["status"], "fail_reason": row["fail_reason"]}
+            attempt = int(row["attempts"]) + 1
+            lease_until = now + self.DOWNLOAD_LEASE_MS
+            c.execute("UPDATE media SET status='pending',attempts=?,next_attempt_ms=? WHERE id=?",
+                      (attempt, lease_until, media_id))
+
+        def owns_download(current):
+            return (current is not None and current["status"] == "pending"
+                    and current["attempts"] == attempt and current["next_attempt_ms"] == lease_until
+                    and self._clock() < lease_until)
+
+        def current_result(current):
+            if current is None:
+                return {"media_id": media_id, "status": "failed", "fail_reason": "not_found"}
+            return {"media_id": media_id, "status": current["status"], "sha256": current["sha256"],
+                    "fail_reason": current["fail_reason"], "next_attempt_ms": current["next_attempt_ms"]}
+
         origin = json.loads(row["origin_json"] or "{}")
         k = kind_of(row["kind"])
-        got = await self._dl.fetch(origin, max_bytes=MAX_BYTES[k])
+        try:
+            got = await self._dl.fetch(origin, max_bytes=MAX_BYTES[k])
+        except MediaFetchError as error:
+            got = Fetched(False, reason=error.reason, retryable=error.retryable)
+        except Exception as error:
+            got = Fetched(False, reason="downloader:" + type(error).__name__,
+                          retryable=isinstance(error, (OSError, TimeoutError)))
         if not got.ok:
             status = "skipped_oversize" if got.reason == "oversize" else "failed"
+            next_attempt = None
+            if (status == "failed" and getattr(got, "retryable", False) is True
+                    and attempt < self.MAX_AUTO_ATTEMPTS):
+                next_attempt = self._clock() + min(self.RETRY_MAX_MS, self.RETRY_BASE_MS * (2 ** (attempt - 1)))
             with self._store._tx() as c:
-                c.execute("UPDATE media SET status=?, fail_reason=?, attempts=attempts+1, size=COALESCE(?, size) WHERE id=?",
-                          (status, got.reason[:200], got.declared_size, media_id))
-            return {"media_id": media_id, "status": status, "fail_reason": got.reason}
+                current = c.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+                if not owns_download(current):
+                    return current_result(current)
+                c.execute("UPDATE media SET status=?, fail_reason=?, next_attempt_ms=?, size=COALESCE(?, size) "
+                          "WHERE id=? AND attempts=? AND status='pending' AND next_attempt_ms=?",
+                          (status, got.reason[:200], next_attempt, got.declared_size, media_id, attempt, lease_until))
+            return {"media_id": media_id, "status": status, "fail_reason": got.reason,
+                    "next_attempt_ms": next_attempt}
         # 🔴 **就地把这一行标 ready**,不能再走 `put_bytes` 建新行 —— `media.sha256` 上有唯一索引,
         # 同一内容插第二行会 `UNIQUE constraint failed`(而 `pending` 行的 sha256 是 NULL,查不到自己)。
         sha = hashlib.sha256(got.data).hexdigest()
-        dup = self.by_sha256(sha)
-        if dup is not None and int(dup["id"]) != media_id:
-            # 别的账号早下过同一张图:本行不再占一份文件,直接指向它并把自己删掉(去重按 sha256,P-17)
-            self.add_ref(int(dup["id"]), now_ms=now)
-            with self._store._tx() as c:
-                c.execute("DELETE FROM media WHERE id=?", (media_id,))
-            return {"media_id": int(dup["id"]), "sha256": sha, "status": "ready", "rel_path": dup["rel_path"],
-                    "mime": dup["mime"], "size": dup["size"], "deduped": True}
-        rel = self.rel_path_for(sha, now_ms=now)
-        self._write_file(rel, got.data)
         mime = sniff_mime(got.data[:16])
-        with self._store._tx() as c:
-            c.execute("UPDATE media SET sha256=?, mime=?, size=?, rel_path=?, status='ready', ready_ms=?, "
-                      "ref_count=ref_count+1, last_ref_ms=? WHERE id=?",
-                      (sha, mime, len(got.data), rel, now, now, media_id))
-        return {"media_id": media_id, "sha256": sha, "status": "ready", "rel_path": rel, "mime": mime, "size": len(got.data)}
+        staged_path = None
+        while True:
+            with self._store._tx() as c:
+                current = c.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+                if not owns_download(current):
+                    return current_result(current)
+                duplicate = c.execute("SELECT * FROM media WHERE sha256=? AND id<>?", (sha, media_id)).fetchone()
+                dup = dict(duplicate) if duplicate is not None else None
+                cached = dup is not None and dup["status"] == "ready" and self.read_file(int(dup["id"])) is not None
+                if cached or staged_path is not None:
+                    target_id = int(dup["id"]) if dup is not None else media_id
+                    rel = dup["rel_path"] if cached else staged_path
+                    completed_at = self._clock()
+                    if completed_at >= lease_until:
+                        return current_result(current)
+                    linked = self._ready_message_links(c, media_id, target_id, sha, mime, len(got.data))
+                    extra_refs = max(linked, int(current["ref_count"] or 0), 1) if dup is not None else 1
+                    c.execute("UPDATE media SET sha256=?, mime=?, size=?, rel_path=?, status='ready', ready_ms=?, "
+                              "ref_count=ref_count+?, last_ref_ms=?, fail_reason=NULL, next_attempt_ms=NULL WHERE id=?",
+                              (sha, mime, len(got.data), rel, completed_at, extra_refs, completed_at, target_id))
+                    if dup is not None:
+                        c.execute("DELETE FROM media WHERE id=? AND attempts=? AND status='pending' AND next_attempt_ms=?",
+                                  (media_id, attempt, lease_until))
+                    result = {"media_id": target_id, "sha256": sha, "status": "ready", "rel_path": rel,
+                              "mime": mime, "size": len(got.data)}
+                    if dup is not None:
+                        result["deduped"] = True
+                    return result
+            # File writes and disk-full cleanup stay outside the Store transaction.
+            # The next transaction rechecks the lease before any attachment or row changes.
+            staged_path = self.rel_path_for(sha, now_ms=self._clock())
+            self._write_file(staged_path, got.data)
+
+    @staticmethod
+    def _ready_message_links(connection, previous_id: int, media_id: int, sha: str,
+                             mime: str, size: int) -> int:
+        """Keep message references and content deduplication in one transaction."""
+        import json
+        rows = connection.execute(
+            "SELECT id,media_json FROM messages WHERE media_json LIKE ? OR media_json LIKE ?",
+            ('%"media_id": ' + str(previous_id) + '%', '%"media_id":' + str(previous_id) + '%')).fetchall()
+        linked = 0
+        for row in rows:
+            try:
+                items = json.loads(row["media_json"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(items, list):
+                continue
+            changed = False
+            for item in items:
+                if isinstance(item, dict) and type(item.get("media_id")) is int and item["media_id"] == previous_id:
+                    item.update(media_id=media_id, state="ready", sha256=sha, mime=mime, size=size)
+                    linked += 1
+                    changed = True
+            if changed:
+                connection.execute("UPDATE messages SET media_json=? WHERE id=?",
+                                   (json.dumps(items, ensure_ascii=False), row["id"]))
+        return linked
 
     # ------------------------------------------------------------------ 从 messages.media_json 建行(eager/lazy 策略的落点)
     #: 02 §7.1 ``[media] policy``:per-kind 的 ``eager|lazy``(账号/会话级 ``media_policy_json`` 可覆盖;本期只用全局)
@@ -321,32 +449,45 @@ class MediaStore:
         import json
         now = now_ms or self._clock()
         rows = self._store.con.execute(
-            "SELECT id, account_id, media_json FROM messages WHERE media_json IS NOT NULL AND media_json <> '[]' "
-            "AND media_json NOT LIKE '%\"media_id\"%' ORDER BY ts_ms DESC LIMIT ?", (limit,)).fetchall()
+            "SELECT id FROM messages m WHERE media_json IS NOT NULL AND media_json <> '[]' "
+            "AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(m.media_json) THEN m.media_json ELSE '[]' END) item "
+            "WHERE item.type='object' AND CASE WHEN item.type='object' THEN json_extract(item.value,'$.media_id') END IS NULL) "
+            "ORDER BY ts_ms DESC LIMIT ?", (limit,)).fetchall()
         created: list[int] = []
-        for r in rows:
-            try:
-                items = json.loads(r["media_json"] or "[]")
-            except ValueError:
-                continue
-            if not isinstance(items, list):
-                continue
-            changed = False
-            for item in items:
-                if not isinstance(item, dict) or item.get("media_id") is not None:
+        for selected in rows:
+            added: list[int] = []
+            stopped = False
+            with self._store._tx() as c:
+                r = c.execute("SELECT id,account_id,media_json FROM messages WHERE id=?", (selected["id"],)).fetchone()
+                if r is None:
                     continue
-                origin = {k: item[k] for k in ("url", "wa_path", "file", "ref", "sha256") if item.get(k)}
-                origin["account_id"] = r["account_id"]
-                mid = self.note(kind=item.get("kind") or "other", origin=origin, message_id=r["id"], now_ms=now)
-                if mid is None:
-                    return created                      # 磁盘 critical:本轮到此为止
-                item["media_id"], item["state"] = mid, "pending"
-                created.append(mid)
-                changed = True
-            if changed:
-                with self._store._tx() as c:
-                    c.execute("UPDATE messages SET media_json=? WHERE id=?",
-                              (json.dumps(items, ensure_ascii=False), r["id"]))
+                try:
+                    items = json.loads(r["media_json"] or "[]")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict) or item.get("media_id") is not None:
+                        continue
+                    if not self._ingest_allows():
+                        log.warning("磁盘 critical 水位:media 行不写(§2.8.8)")
+                        stopped = True
+                        break
+                    origin = {k: item[k] for k in ("url", "wa_path", "file", "ref", "sha256") if item.get(k)}
+                    origin["account_id"] = r["account_id"]
+                    mid = self._note_in_transaction(c, kind=item.get("kind") or "other", origin=origin,
+                                                    message_id=r["id"], status="pending", now_ms=now)
+                    item["media_id"], item["state"] = mid, "pending"
+                    added.append(mid)
+                if added:
+                    changed = c.execute("UPDATE messages SET media_json=? WHERE id=? AND media_json=?",
+                                        (json.dumps(items, ensure_ascii=False), r["id"], r["media_json"]))
+                    if changed.rowcount != 1:
+                        raise ValueError("media_reference_revision_changed")
+            created.extend(added)
+            if stopped:
+                return created
         return created
 
     def policy_for(self, kind: str) -> str:
@@ -354,14 +495,27 @@ class MediaStore:
 
     async def fetch_eager(self, *, limit: int = 20) -> dict[str, int]:
         """把 ``policy=eager`` 的 ``pending`` 行下一轮(§2.8.2「默认立即下载」);``lazy`` 的等 #96 触发。"""
-        rows = self._store.con.execute(
-            "SELECT id, kind FROM media WHERE status='pending' ORDER BY id LIMIT ?", (limit * 4,)).fetchall()
+        now = self._clock()
         done = {"fetched": 0, "failed": 0, "skipped": 0}
+        eager_kinds = tuple(kind for kind in KINDS if self.policy_for(kind) == "eager")
+        if not eager_kinds:
+            return done
+        eager_placeholders = ",".join("?" for _ in eager_kinds)
+        # An interrupted final attempt keeps its row and ends in an explicit failure.
+        with self._store._tx() as c:
+            c.execute("UPDATE media SET status='failed',fail_reason='download_interrupted',next_attempt_ms=NULL "
+                      "WHERE status='pending' AND attempts>=? AND next_attempt_ms<=? AND kind IN (" + eager_placeholders + ")",
+                      (self.MAX_AUTO_ATTEMPTS, now, *eager_kinds))
+        rows = self._store.con.execute(
+            "SELECT id, kind FROM media WHERE attempts<? AND ((status='pending' AND "
+            "(next_attempt_ms IS NULL OR next_attempt_ms<=?)) OR (status='failed' AND next_attempt_ms<=?)) "
+            "AND kind IN (" + eager_placeholders + ") ORDER BY id LIMIT ?",
+            (self.MAX_AUTO_ATTEMPTS, now, now, *eager_kinds, limit * 4)).fetchall()
         for r in rows:
             if self.policy_for(r["kind"]) != "eager":
                 done["skipped"] += 1
                 continue
-            out = await self.fetch_into(int(r["id"]))
+            out = await self.fetch_into(int(r["id"]), _automatic=True)
             done["fetched" if out.get("status") == "ready" else "failed"] += 1
             if done["fetched"] >= limit:
                 break
@@ -385,5 +539,5 @@ class MediaStore:
             return None
 
 
-__all__ = ["Downloader", "FakeDownloader", "Fetched", "KINDS", "MAX_BYTES", "MediaStore", "UrllibDownloader",
+__all__ = ["Downloader", "FakeDownloader", "Fetched", "KINDS", "MAX_BYTES", "MediaFetchError", "MediaStore", "UrllibDownloader",
            "kind_of", "ref_key", "sniff_mime"]

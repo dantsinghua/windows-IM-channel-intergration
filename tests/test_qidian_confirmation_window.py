@@ -54,7 +54,7 @@ async def confirmation_rig(store, clock, maindb):
     poller = QidianPoller(
         store=store, events=events, alerts=Alerts(events, clock=clock),
         cfg=cfg, h13_firing=lambda: False, clock=clock,
-        maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path),
+        maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path),
     )
     sender = SlowUiSender(clock)
     adapter = ObservedQidianAdapter(poller, sender=sender, store=store, clock=clock)

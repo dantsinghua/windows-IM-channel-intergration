@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+import time
 
 from qtrade_winagent.config import WechatConfig
 from qtrade_winagent.errors import NOT_READY, WaError
@@ -14,6 +15,7 @@ class NativeSendRig:
 
     def __init__(self, monkeypatch, *, visible=True, minimized=False, reason=None):
         self.events = []
+        self.group_flags = []
         self.running = True
         self.window = {"exists": True, "visible": visible, "minimized": minimized,
                        "pid": 71, "class_name": "mmui::MainWindow"}
@@ -30,6 +32,7 @@ class NativeSendRig:
         monkeypatch.setattr(self.backend, "_keyboard_send_text", self.fake_text_input)
         monkeypatch.setattr(self.backend, "_pyweixin_send", self.fake_image_input)
         monkeypatch.setattr(self.backend, "_readback_rows", self.fake_readback)
+        monkeypatch.setattr(self.backend, "_send_identity", lambda: ("wxid_synthetic", 71, 1.0, 72, 2.0, "synthetic-data"))
         self.session = WeChatSession(self.backend, WechatConfig(enabled=True), clock=lambda: 12345)
 
     async def forbidden_launch(self):
@@ -47,7 +50,9 @@ class NativeSendRig:
         self.events.append("ui-tree")
         return True
 
-    def fake_text_input(self, _name, _text):
+    def fake_text_input(self, _name, _text, expected_group=False):
+        assert type(expected_group) is bool
+        self.group_flags.append(expected_group)
         self.events.append("fake-text-input")
 
     async def fake_image_input(self, _name, _text, _image_path):
@@ -55,7 +60,11 @@ class NativeSendRig:
 
     def fake_readback(self, _talker, text):
         self.events.append("fake-readback")
-        return [{"isSelf": True, "seq": 1, "content": text, "type": 3}]
+        baseline = {"talker": _talker, "isSelf": True, "seq": 1, "content": "Earlier native text", "type": 1, "time": 1_700_000_000}
+        if "fake-text-input" in self.events or "fake-image-input" in self.events:
+            return [baseline, {"talker": _talker, "isSelf": True, "seq": 2, "content": "QA synthetic only",
+                "type": 3 if "fake-image-input" in self.events else 1, "time": time.time()}]
+        return [baseline]
 
 
 @pytest.mark.parametrize("visible,minimized", [(True, False), (True, True)],
@@ -64,15 +73,16 @@ class NativeSendRig:
 async def test_send_reuses_existing_window_without_launch(monkeypatch, visible, minimized, image):
     rig = NativeSendRig(monkeypatch, visible=visible, minimized=minimized)
     result = await rig.session.send(session_name="synthetic-peer", text="QA synthetic only",
-                                    image_path="synthetic-image.png" if image else None)
-    assert result["ok"] is True
-    assert result["code"] == "DELIVERED"
+                                    image_path="synthetic-image.png" if image else None, confirm_timeout_ms=100)
+    assert result["ok"] is (not image)
+    assert result["code"] == ("SEND_FAILED" if image else "DELIVERED")
     assert rig.events[0] == "prepare-existing"
     assert "launch" not in rig.events
     assert rig.window["pid"] == 71
     assert rig.window["visible"] and not rig.window["minimized"]
     input_event = "fake-image-input" if image else "fake-text-input"
     assert rig.events.count(input_event) == 1
+    assert rig.group_flags == ([] if image else [False])
     if image:
         assert rig.events.index("prepare-existing") < rig.events.index("ui-tree")
         assert rig.events.index("ui-tree") < rig.events.index(input_event)

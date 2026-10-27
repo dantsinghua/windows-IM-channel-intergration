@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Optional
 from ...alerts import QIDIAN_PROFILE_FALLBACK
 from ...bus.native_guard import require_native_permission
 from ...text import has_control_chars
+from ...timing import timing_span
 from ...workflow.yaml_min import YamlError, safe_load
 from ..base import Account
 
@@ -679,22 +680,28 @@ class QidianUi:
             p = self.profile_for(acct)
         except ProfileError as e:
             return SendOutcome(False, reason=f"profile_unavailable:{e}")
-        if not await self.ensure_ime(acct, p):
+        with timing_span("qidian.prepare_ime", account_id=acct.id):
+            ime_ready = await self.ensure_ime(acct, p)
+        if not ime_ready:
             return SendOutcome(False, reason="adbkeyboard_not_default")            # 输入法没就位就不许打字
         expect = self._expected_title(acct, native_id)
-        opened = await self._open_chat(acct, p, native_id, expect)
+        with timing_span("qidian.open_chat", account_id=acct.id):
+            opened = await self._open_chat(acct, p, native_id, expect)
         if not opened.ok:
             return opened
         expect = opened.evidence.get("expect_title") or expect
-        gate1 = await self._assert_session(acct, p, native_id, expect, where="before_input")
+        with timing_span("qidian.verify_before_input", account_id=acct.id):
+            gate1 = await self._assert_session(acct, p, native_id, expect, where="before_input")
         if not gate1.ok:
             return gate1                                                           # 闸门1:不是目标会话,连字都不打
-        if not await self._tap_anchor(acct, p, "chat_input"):
-            return SendOutcome(False, reason="anchor_not_found:chat_input")
-        await self._clear_text(acct, p)
-        await self._input_text(acct, p, text)
+        with timing_span("qidian.input_text", account_id=acct.id):
+            if not await self._tap_anchor(acct, p, "chat_input"):
+                return SendOutcome(False, reason="anchor_not_found:chat_input")
+            await self._clear_text(acct, p)
+            await self._input_text(acct, p, text)
         if p.verify_input:
-            back = await self._read_input(acct, p)
+            with timing_span("qidian.verify_input", account_id=acct.id):
+                back = await self._read_input(acct, p)
             # 控件树把换行留在 text 里。期望值换成空格后，回读也换一次再比；两边换完仍不同才拒发。
             if back is None or attr_normalize(back) != attr_normalize(text):
                 trace = {"back_is_none": back is None, "expect_len": len(text),
@@ -704,10 +711,13 @@ class QidianUi:
                     acct.id, native_id, trace["back_is_none"], trace["expect_len"], trace["back_len"],
                 )
                 return SendOutcome(False, reason="input_readback_mismatch", evidence={"trace": trace})
-        gate2 = await self._assert_session(acct, p, native_id, expect, where="before_send")
+        with timing_span("qidian.verify_before_send", account_id=acct.id):
+            gate2 = await self._assert_session(acct, p, native_id, expect, where="before_send")
         if not gate2.ok:
             return gate2                                                           # 闸门2:打完字到点发送之间会话被切走
-        if not await self._tap_anchor(acct, p, "chat_send"):
+        with timing_span("qidian.tap_send", account_id=acct.id):
+            tapped = await self._tap_anchor(acct, p, "chat_send")
+        if not tapped:
             return SendOutcome(False, reason="anchor_not_found:chat_send")
         # 🔴 点完即返回并让出队列(R6-38):确认 = poll 的 ingest 合并,bus 在队列外等,这里**不** scrape。
         return SendOutcome(True, evidence={"native_id": native_id, "title": expect})
@@ -845,74 +855,87 @@ class QidianUi:
 
     async def _open_chat(self, acct: Account, p: Profile, native_id: str, expect: Optional[str]) -> SendOutcome:
         """已在目标会话 ⇒ 原地返回;否则 主界面 → 搜索 → 首条结果 → 名片页(校 ``native_id``)→ 发消息。"""
-        if (await self._assert_session(acct, p, native_id, expect, where="preflight")).ok:
+        with timing_span("qidian.open_chat.preflight", account_id=acct.id) as timing:
+            matched = (await self._assert_session(acct, p, native_id, expect, where="preflight")).ok
+            timing["outcome"] = "matched" if matched else "navigate"
+        if matched:
             return SendOutcome(True, evidence={"expect_title": expect, "reused": True})
-        await self._launch(acct, p)                                                # 回主界面(比连点 BACK 确定)
-        prepared = await self._prepare_search_home(acct, p)
+        with timing_span("qidian.open_chat.launch", account_id=acct.id):
+            await self._launch(acct, p)                                            # 回主界面(比连点 BACK 确定)
+        with timing_span("qidian.open_chat.prepare_home", account_id=acct.id):
+            prepared = await self._prepare_search_home(acct, p)
         if not prepared.ok:
             return prepared
-        if (not await self._tap_anchor(acct, p, "search_entry")
-                and not await self._open_contacts_search(acct, p)):
-            pkg, activity = await self._foreground(acct)
+        with timing_span("qidian.open_chat.search_entry", account_id=acct.id):
+            if (not await self._tap_anchor(acct, p, "search_entry")
+                    and not await self._open_contacts_search(acct, p)):
+                pkg, activity = await self._foreground(acct)
+                try:
+                    current_nodes = await self._dump(acct, p)
+                except ValueError:
+                    current_nodes = []
+                if (pkg != p.package or not re.search(p.activities["chat"], activity)
+                        or find_node(current_nodes, p.anchor("chat_input")) is None
+                        or await self._foreground(acct) != (pkg, activity)):
+                    return SendOutcome(False, reason="anchor_not_found:search_entry")
+                # Prefer the verified chat toolbar: a hardware BACK may only hide
+                # the IME and leave this same chat open. Never use fixed coordinates.
+                if not await self._tap_anchor(acct, p, "chat_back", current_nodes):
+                    await self._shell(acct, "input keyevent 4")
+                await self._sleep(p.timeout("ui_settle_s", 0.5))
+                if not await self._wait_search_entry(acct, p):
+                    return SendOutcome(False, reason="anchor_not_found:search_entry")
+            if prepared.evidence.get("normalized_search"):
+                package, activity = await self._foreground(acct)
+                if package != p.package or not re.search(p.activities["search"], activity):
+                    return SendOutcome(False, reason="search_context_unverified")
+        with timing_span("qidian.open_chat.search_clear", account_id=acct.id):
+            await self._clear_text(acct, p)
+        with timing_span("qidian.open_chat.search_input", account_id=acct.id):
+            await self._input_text(acct, p, search_key(native_id))
+        with timing_span("qidian.open_chat.search_results", account_id=acct.id):
+            search_budget = max(0.1, p.timeout("search_s", 10.0))
+            search_deadline = self._clock() + int(search_budget * 1000)
+            result_title = None
             try:
-                current_nodes = await self._dump(acct, p)
-            except ValueError:
-                current_nodes = []
-            if (pkg != p.package or not re.search(p.activities["chat"], activity)
-                    or find_node(current_nodes, p.anchor("chat_input")) is None
-                    or await self._foreground(acct) != (pkg, activity)):
-                return SendOutcome(False, reason="anchor_not_found:search_entry")
-            # Prefer the verified chat toolbar: a hardware BACK may only hide
-            # the IME and leave this same chat open. Never use fixed coordinates.
-            if not await self._tap_anchor(acct, p, "chat_back", current_nodes):
-                await self._shell(acct, "input keyevent 4")
-            await self._sleep(p.timeout("ui_settle_s", 0.5))
-            if not await self._wait_search_entry(acct, p):
-                return SendOutcome(False, reason="anchor_not_found:search_entry")
-        if prepared.evidence.get("normalized_search"):
-            package, activity = await self._foreground(acct)
-            if package != p.package or not re.search(p.activities["search"], activity):
-                return SendOutcome(False, reason="search_context_unverified")
-        await self._clear_text(acct, p)
-        await self._input_text(acct, p, search_key(native_id))
-        search_budget = max(0.1, p.timeout("search_s", 10.0))
-        search_deadline = self._clock() + int(search_budget * 1000)
-        result_title = None
-        try:
-            async with asyncio.timeout(search_budget):
-                while True:
-                    try:
-                        search_nodes = await self._dump(acct, p)
-                    except ValueError:
-                        search_nodes = []
-                    result = find_node(search_nodes, p.anchor("search_result_first"))
-                    if result is not None:
-                        x1, y1, x2, y2 = result.bounds
-                        inside = [n for n in search_nodes if x1 <= n.bounds[0] <= n.bounds[2] <= x2
-                                  and y1 <= n.bounds[1] <= n.bounds[3] <= y2]
-                        label = find_node(inside, p.anchor("chat_title"))
-                        result_title = (label.text if label else result.text) or None
-                    if await self._tap_anchor(acct, p, "search_result_first", search_nodes):
-                        break
-                    remaining = (search_deadline - self._clock()) / 1000
-                    if remaining <= 0:
-                        return SendOutcome(False, reason="anchor_not_found:search_result_first")
-                    await self._sleep(min(max(0.05, p.timeout("poll_interval_s", 1.0)), remaining))
-        except TimeoutError:
-            return SendOutcome(False, reason="anchor_not_found:search_result_first")
-        try:
-            nodes = await self._dump(acct, p)
-        except ValueError as e:
-            return SendOutcome(False, reason=f"card_tree_unavailable:{e}")
-        ident = find_node(nodes, p.anchor("card_identity"))
-        blob = "\n".join(n.text + "\u0000" + n.desc for n in nodes)
-        key = search_key(native_id)
-        identity_text = ident.text + "\u0000" + ident.desc if ident is not None else blob
-        if not re.search(r"(?<!\d)" + re.escape(key) + r"(?!\d)", identity_text):
-            return SendOutcome(False, reason="card_identity_mismatch", evidence={"want": key})
-        title = result_title or expect or (find_node(nodes, p.anchor("chat_title")).text if find_node(nodes, p.anchor("chat_title")) else None)
-        if not await self._tap_anchor(acct, p, "card_send_msg", nodes):
-            return SendOutcome(False, reason="anchor_not_found:card_send_msg")
+                async with asyncio.timeout(search_budget):
+                    while True:
+                        try:
+                            search_nodes = await self._dump(acct, p)
+                        except ValueError:
+                            search_nodes = []
+                        result = find_node(search_nodes, p.anchor("search_result_first"))
+                        if result is not None:
+                            x1, y1, x2, y2 = result.bounds
+                            inside = [n for n in search_nodes if x1 <= n.bounds[0] <= n.bounds[2] <= x2
+                                      and y1 <= n.bounds[1] <= n.bounds[3] <= y2]
+                            label = find_node(inside, p.anchor("chat_title"))
+                            result_title = (label.text if label else result.text) or None
+                        if await self._tap_anchor(acct, p, "search_result_first", search_nodes):
+                            break
+                        remaining = (search_deadline - self._clock()) / 1000
+                        if remaining <= 0:
+                            return SendOutcome(False, reason="anchor_not_found:search_result_first")
+                        await self._sleep(min(max(0.05, p.timeout("poll_interval_s", 1.0)), remaining))
+            except TimeoutError:
+                return SendOutcome(False, reason="anchor_not_found:search_result_first")
+        with timing_span("qidian.open_chat.card_identity", account_id=acct.id) as timing:
+            try:
+                nodes = await self._dump(acct, p)
+            except ValueError as e:
+                return SendOutcome(False, reason=f"card_tree_unavailable:{e}")
+            ident = find_node(nodes, p.anchor("card_identity"))
+            blob = "\n".join(n.text + "\u0000" + n.desc for n in nodes)
+            key = search_key(native_id)
+            identity_text = ident.text + "\u0000" + ident.desc if ident is not None else blob
+            if not re.search(r"(?<!\d)" + re.escape(key) + r"(?!\d)", identity_text):
+                timing["outcome"] = "rejected"
+                return SendOutcome(False, reason="card_identity_mismatch", evidence={"want": key})
+            timing["outcome"] = "verified"
+            title = result_title or expect or (find_node(nodes, p.anchor("chat_title")).text if find_node(nodes, p.anchor("chat_title")) else None)
+        with timing_span("qidian.open_chat.enter_chat", account_id=acct.id):
+            if not await self._tap_anchor(acct, p, "card_send_msg", nodes):
+                return SendOutcome(False, reason="anchor_not_found:card_send_msg")
         return SendOutcome(True, evidence={"expect_title": title})
 
     async def _wait_search_entry(self, acct: Account, p: Profile) -> bool:

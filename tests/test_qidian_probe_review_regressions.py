@@ -39,7 +39,7 @@ async def test_unknown_version_is_degraded_from_real_probe_fact_and_still_reads(
     rig = manual_rig
     _, adb = bind_probe(rig, monkeypatch, state_code=state_code)
     db = FakeMainDb(str(tmp_path / "isolated-review-main.db"), self_uin=UID)
-    monkeypatch.setattr(rig.agent.poller, "maindb_factory", lambda uid: LocalSqliteMainDb(db.path))
+    monkeypatch.setattr(rig.agent.poller, "maindb_factory", lambda uid, acct: LocalSqliteMainDb(db.path))
 
     await probe_tick(rig)  # 新进程内无pending标志，由真正profile选择产生事实。
 

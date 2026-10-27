@@ -293,21 +293,22 @@ class OrgReadError(RuntimeError):
 
 
 def read_account_org(source, account_uid, config_file, *, cache=None, clock=None):
-    """Read only this account's established org source and protected key reference.
+    """Read this account's current organization without changing native data.
 
-    No account operation or key capture occurs here. Missing credentials remain
-    distinguishable from a successfully read empty organization.
+    Native sources derive material from their current verified APK/keystore;
+    local file sources use their explicit protected-key reference.
     """
     import json
     import os
     import re
-    import shlex
-    import subprocess
     import time
     clock = time.time if clock is None else clock
     uid = str(account_uid)
     if not re.fullmatch(r'[0-9]+', uid) or Path(str(source.path)).name != uid + '.db':
         raise OrgReadError('ORG_ACCOUNT_MISMATCH')
+    if all(hasattr(source, key) for key in ('adb', 'serial', 'server_port', '_shell')):
+        from .org_native import read_native_org
+        return read_native_org(source, uid, cache=cache, clock=clock)
     try:
         cfg_path = Path(config_file)
         if cfg_path.stat().st_size > 16384:
@@ -336,24 +337,8 @@ def read_account_org(source, account_uid, config_file, *, cache=None, clock=None
     except (OSError, ValueError, TypeError, AttributeError):
         raise OrgReadError('ORG_CREDENTIALS_UNAVAILABLE') from None
     paths = [str(source.path)[:-3] + suffix for suffix in ('-org.db', '-org-member.db')]
-    remote = all(hasattr(source, key) for key in ('adb', 'serial', 'server_port', '_shell'))
-
     def metadata():
-        if remote:
-            rows = source._shell('stat -c %s:%Y ' + ' '.join(shlex.quote(p) for p in paths)).splitlines()
-            if len(rows) != 2 or any(not re.fullmatch(r'[0-9]+:[0-9]+', row) for row in rows):
-                raise OrgReadError('ORG_SOURCE_UNAVAILABLE')
-            return tuple(tuple(int(v) for v in row.split(':')) for row in rows)
         return tuple((Path(p).stat().st_size, Path(p).stat().st_mtime_ns) for p in paths)
-
-    def read(path):
-        if not remote:
-            return Path(path).read_bytes()
-        proc = subprocess.run([source.adb, '-P', str(source.server_port), '-s', source.serial,
-                               'exec-out', 'cat', path], capture_output=True, timeout=max(source.timeout_s, 30), check=False)
-        if proc.returncode:
-            raise OrgReadError('ORG_SOURCE_UNAVAILABLE')
-        return proc.stdout
 
     try:
         before = metadata()
@@ -363,7 +348,7 @@ def read_account_org(source, account_uid, config_file, *, cache=None, clock=None
         previous = (cache or {}).get(uid)
         if previous and previous['fingerprint'] == fingerprint:
             return dict(previous['result'])
-        blobs = [read(path) for path in paths]
+        blobs = [Path(path).read_bytes() for path in paths]
         if tuple(len(blob) for blob in blobs) != tuple(size for size, _ in before) or metadata() != before:
             raise OrgReadError('ORG_SOURCE_CHANGED')
         if all(blob.startswith(b'SQLite format 3\x00') for blob in blobs):

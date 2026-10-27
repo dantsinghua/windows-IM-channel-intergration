@@ -287,6 +287,7 @@ export const messagesApi = {
   }) => request<SessionRow>(`/accounts/${accountId}/sessions/${sessionId}`, { method: 'PATCH', body }),
 
   list: (q: MessageQuery) => requestList<Message>('/messages', { query: q as Record<string, unknown> }),
+  get: (id: string) => request<Message>(`/messages/${encodeURIComponent(id)}`),
 
   /** #55 取媒体一律按 sha256,`ref` 只用于显示 */
   media: (sha256: string) => requestBinary(`/media/${sha256}`),

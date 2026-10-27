@@ -21,6 +21,14 @@ def publication_error(exc):
     return code+(f" (HTTP {status})" if type(status) is int and 100<=status<=599 else "")
 
 
+class OrganizationPublicationError(ValueError):
+    def __init__(self, code=None, *, state="error"):
+        self.code=(code if isinstance(code,str) and re.fullmatch(r"ORG_[A-Z0-9_]{1,75}",code)
+                   else "ORGANIZATION_REFRESH_FAILED")
+        self.state="unreported" if state=="unreported" else "error"
+        super().__init__(self.code)
+
+
 class SnapshotPublisher:
     def __init__(self, root, keys, workbench, name, client, *, clock=time.time):
         from relay.protocol import token
@@ -41,7 +49,7 @@ class SnapshotPublisher:
         try:
             with db: yield db
         finally: db.close()
-    def publish(self, kind, uid, operation, path, payload, *, channel="qidian"):
+    def publish(self, kind, uid, operation, path, payload, *, channel="qidian", stamp_key=None):
         from relay.gateway_paths import CONTRACT,HISTORY_SECONDS
         from relay.protocol import Codec,envelope,canonical,digest
         key=operation+":"+self.account_key(uid,channel)
@@ -55,7 +63,7 @@ class SnapshotPublisher:
         blob=Codec(binding,clock=self.clock).pack(env)
         self.client(path).upload("xj-"+digest([self.workbench,key,revision])+".bin",blob)
         with self.db() as db:
-            db.execute("INSERT INTO publication VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET stamp=excluded.stamp,fingerprint=excluded.fingerprint",(key,now,digest(payload)))
+            db.execute("INSERT INTO publication VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET stamp=excluded.stamp,fingerprint=excluded.fingerprint",(stamp_key or key,now,digest(payload)))
         return env
     def directory(self, accounts):
         from relay.gateway_paths import DIRECTORY_PATH
@@ -73,10 +81,28 @@ class SnapshotPublisher:
         return self.publish("contacts",uid,"friends",account_paths(self.workbench,uid,channel=channel)["friends_path"],payload,channel=channel)
     def organization(self, book):
         from relay.gateway_paths import ORGANIZATION_PATH
-        if book.get("org_state") not in ("ready","empty"): raise ValueError("ORGANIZATION_SOURCE_NOT_READY")
+        from relay.protocol import digest
+        book=book if isinstance(book,dict) else {}
         org=book.get("org")
-        if not isinstance(org,dict) or not isinstance(org.get("departments"),list) or not isinstance(org.get("members"),list): raise ValueError("ORGANIZATION_SOURCE_INVALID")
-        return self.publish("manifest","organization","organization",ORGANIZATION_PATH,{"state":book["org_state"],"org":org})
+        error_key="organization-error:organization"
+        with self.lock:
+            if (book.get("org_state") not in ("ready","empty") or not isinstance(org,dict)
+                    or not isinstance(org.get("departments"),list) or not isinstance(org.get("members"),list)):
+                failure=OrganizationPublicationError(book.get("org_error"),state=book.get("org_state"))
+                payload={"state":failure.state,"error_code":failure.code}
+                with self.db() as db:
+                    previous=db.execute("SELECT stamp,fingerprint FROM publication WHERE k=?",(error_key,)).fetchone()
+                if not (previous and previous["fingerprint"]==digest(payload) and 0<=self.clock()-previous["stamp"]<60):
+                    try:
+                        self.publish("manifest","organization","organization",ORGANIZATION_PATH,payload,stamp_key=error_key)
+                    except Exception:
+                        # A failed upload is not a published error; preserve the source code.
+                        raise failure from None
+                # Metadata must retain the pending sync even after reporting the failure.
+                raise failure
+            result=self.publish("manifest","organization","organization",ORGANIZATION_PATH,{"state":book["org_state"],"org":org})
+            with self.db() as db:db.execute("DELETE FROM publication WHERE k=?",(error_key,))
+            return result
     def request_sync(self, uid, organization=False):
         with self.db() as db:
             db.execute("INSERT INTO sync_request(uid,organization,requested,generation) VALUES(?,?,?,1) ON CONFLICT(uid) DO UPDATE SET organization=MAX(organization,excluded.organization),requested=excluded.requested,generation=sync_request.generation+1",(uid,int(organization),self.clock()))
@@ -91,6 +117,25 @@ class SnapshotPublisher:
             row=db.execute("SELECT stamp FROM publication WHERE k=?",(key,)).fetchone()
         return row[0] if row else 0
 
+class _ActiveNativeAccounts:
+    """Give the native port the same live source set as host reconciliation.
+
+    Resolve on every read so stopped historical slots cannot shadow their
+    replacement. Keep duplicate active identities for the port to reject,
+    and delegate persistence and epoch checks to the original Store.
+    """
+    def __init__(self, store):
+        self._store = store
+
+    def list_accounts(self, **kwargs):
+        return [row for row in self._store.list_accounts(**kwargs)
+                if row.get("enabled", True) and not row.get("deleted_ms")
+                and row.get("state") in ("running", "degraded")]
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
 class InstitutionAccountHost(XunjiaV22Host):
     def permission(self, command):
         return self.online_guard() and super().permission(command)
@@ -101,7 +146,7 @@ class InstitutionAccountHost(XunjiaV22Host):
 
 class InstitutionCollectorHost:
     def __init__(self, *, store,bus,loop,keys,config,settings,data_dir,legacy_inbox_disabled,
-                 friends_provider,organization_provider,clock=time.time,client_factory=None,host_factory=None,history_provider=None,presence_provider=None,media_provider=None):
+                 friends_provider,organization_provider,clock=time.time,client_factory=None,host_factory=None,history_provider=None,presence_provider=None,media_provider=None,capture_refresher=None):
         from relay.file_gateway_connection import connection_client
         from relay.file_gateway import GatewayAuth
         self.store,self.bus,self.loop=store,bus,loop; self.keys=keys; self.config=config
@@ -117,6 +162,7 @@ class InstitutionCollectorHost:
         self.media_provider=media_provider
         self.history_provider=history_provider; self.histories={}; self._history_wake=asyncio.Event(); self._history_next=0
         self.presence_provider=presence_provider;self.presence={};self._presence_wake=asyncio.Event();self._identity_candidates={}
+        self.capture_refresher=capture_refresher;self.capture=None
     @classmethod
     async def from_settings(cls,settings,**kwargs):
         from relay.file_gateway import GatewayAuth
@@ -137,8 +183,9 @@ class InstitutionCollectorHost:
             result.append(row)
         return result
     def online(self, aid, uid):
-        rows=[r for r in self.rows() if r["id"]==aid and str(r["self_uid"])==uid]
-        if rows:rows=[r for r in self.rows() if r["channel"]==rows[0]["channel"] and str(r["self_uid"])==uid]
+        candidates=[r for r in self.rows() if r["state"] in ("running","degraded")]
+        rows=[r for r in candidates if r["id"]==aid and str(r["self_uid"])==uid]
+        if rows:rows=[r for r in candidates if r["channel"]==rows[0]["channel"] and str(r["self_uid"])==uid]
         native=self.presence.get((aid,uid),{})
         confirmed=(self.presence_provider is None or (native.get("state")=="online" and 0<=self.clock()-native.get("confirmed_at",0)<60))
         return bool(confirmed and self.active and len(rows)==1 and rows[0]["id"]==aid and rows[0]["state"] in ("running","degraded"))
@@ -158,7 +205,7 @@ class InstitutionCollectorHost:
         ledger=ReceiverLedger(root/"receiver.sqlite3",binding,clock=self.clock)
         adapter=InstitutionTransport(binding,self.client(paths["downlink_path"]),self.client(paths["uplink_path"]),root/"publication.sqlite3",role="collector",institution_owner=self.keys.owner_id,clock=self.clock)
         adapter.manifest_handler=lambda data:self._sync_request(uid,data,channel=channel)
-        port=QTradeNativePort(binding=binding,store=self.store,bus=self.bus,loop=self.loop,legacy_inbox_disabled=self.legacy_inbox_disabled,execution_permission=ledger.permission,identity_epoch=identity.get("epoch",0))
+        port=QTradeNativePort(binding=binding,store=_ActiveNativeAccounts(self.store),bus=self.bus,loop=self.loop,legacy_inbox_disabled=self.legacy_inbox_disabled,execution_permission=ledger.permission,identity_epoch=identity.get("epoch",0))
         bridge=CollectorBridge(ledger=ledger,adapters={"oss":adapter},native_send=port.native_send,native_reconcile=port.native_reconcile)
         host=InstitutionAccountHost(store=self.store,bus=self.bus,loop=self.loop,binding=binding,bridge=bridge,port=port,state_path=root/"host.sqlite3",legacy_inbox_disabled=self.legacy_inbox_disabled,media_provider=self.media_provider)
         host.online_guard=lambda:self.online(row["id"],uid)
@@ -185,13 +232,28 @@ class InstitutionCollectorHost:
         self.publisher.request_sync(SnapshotPublisher.account_key(uid,channel),p.get("organization",False))
         self.loop.call_soon_threadsafe(self._contacts_wake.set)
     async def reconcile_accounts(self):
-        rows=self.rows(); wanted={(r["id"],str(r["self_uid"])):r for r in rows}
+        rows=self.rows(); groups={}
+        for row in rows:
+            if row["state"] in ("running","degraded"):
+                groups.setdefault((row["channel"],str(row["self_uid"])),[]).append(row)
+        wanted={(group[0]["id"],str(group[0]["self_uid"])):group[0] for group in groups.values() if len(group)==1}
+        blocked=set()
         for pair in list(self.hosts):
             if pair not in wanted:
-                host=self.hosts.pop(pair); await host.stop()
-                self.histories.pop(pair,None)
+                host=self.hosts[pair]
+                channel=getattr(getattr(getattr(host,"ledger",None),"binding",None),"channel",None)
+                if channel is None:
+                    channel=next((r["channel"] for r in rows if (r["id"],str(r["self_uid"]))==pair),None)
+                try:await host.stop()
+                except Exception as exc:
+                    self.errors[pair[0]]=type(exc).__name__;blocked.add((channel,pair[1]))
+                    continue
+                if self.hosts.get(pair) is host:
+                    self.hosts.pop(pair);self.histories.pop(pair,None);self.errors.pop(pair[0],None)
+                else:blocked.add((channel,pair[1]))
         for pair,row in wanted.items():
-            if pair in self.hosts or not self.online(*pair):continue
+            if (pair in self.hosts or (row["channel"],pair[1]) in blocked
+                    or (None,pair[1]) in blocked or not self.online(*pair)):continue
             try:
                 host=self._make_host(row); await host.start(); self.hosts[pair]=host
                 self.publisher.request_sync(SnapshotPublisher.account_key(pair[1],row["channel"]),False); self.errors.pop(pair[0],None)
@@ -202,8 +264,9 @@ class InstitutionCollectorHost:
         for row in self.rows():groups.setdefault((row["channel"],str(row["self_uid"])),[]).append(row)
         result=[]
         for (channel,uid),rows in sorted(groups.items()):
-            row=sorted(rows,key=lambda r:r["id"])[0];host=self.hosts.get((row["id"],uid))
-            online=bool(len(rows)==1 and self.online(row["id"],uid) and host and host._active and host._intake_ok)
+            active=[r for r in rows if r["state"] in ("running","degraded")]
+            row=sorted(active or rows,key=lambda r:r["id"])[0];host=self.hosts.get((row["id"],uid))
+            online=bool(len(active)==1 and self.online(row["id"],uid) and host and host._active and host._intake_ok)
             result.append({"account_id":row["id"],"account_uid":uid,"channel":channel,
                 "account_nick":row.get("self_nick") or row.get("label") or uid,"online":online,
                 "capabilities":["negotiation-v22-watermark","negotiation-v22-session-reset","negotiation-v22-fresh-context"] if online else [],
@@ -259,7 +322,9 @@ class InstitutionCollectorHost:
                 if request or self.clock()-self.publisher.last("friends:"+key)>=10:
                     self.publisher.friends(uid,self.friends_provider(row),channel=channel)
                 if channel=="qidian" and (org_due or need_org):
-                    self.publisher.organization(self.organization_provider(row));org_due=False
+                    try:book=self.organization_provider(row)
+                    except Exception as exc:book={"org_state":getattr(exc,"state","error"),"org_error":getattr(exc,"code",None)}
+                    self.publisher.organization(book);org_due=False
                 if request:self.publisher.complete_sync(key,request["requested"],request["generation"])
                 self.errors.pop("contacts:"+uid,None)
             except Exception as exc:self.errors["contacts:"+uid]=publication_error(exc)
@@ -353,6 +418,15 @@ class InstitutionCollectorHost:
             except Exception as exc:self.errors["metadata"]=type(exc).__name__
             try:await asyncio.wait_for(self._contacts_wake.wait(),timeout=10)
             except asyncio.TimeoutError:pass
+    async def _capture_loop(self):
+        while self.active:
+            try:
+                await asyncio.to_thread(self.capture.tick)
+                if self.capture.error:self.errors["capture"]=self.capture.error
+                else:self.errors.pop("capture",None)
+            except Exception as exc:self.errors["capture"]=type(exc).__name__
+            # Capture has its own durable outbox; no receiver/control wakeups.
+            if self.active:await asyncio.sleep(2)
     async def start(self):
         if self.active:return
         if not self.legacy_inbox_disabled():raise RuntimeError("legacy_xunjia_inbox_must_be_disabled")
@@ -365,6 +439,11 @@ class InstitutionCollectorHost:
             self._tasks=[asyncio.create_task(self._presence_loop(),name="institution-presence"),asyncio.create_task(self._contacts_loop(),name="institution-contacts")]
             if self.history_provider is not None:self._tasks.append(asyncio.create_task(self._history_loop(),name="institution-native-history"))
             if self.presence_provider is not None:self._tasks.append(asyncio.create_task(self._native_presence_loop(),name="institution-native-presence"))
+            import os
+            if os.environ.get("QTRADE_WECHAT_CAPTURE_GRANTS"):
+                from .capture import WechatCaptureCoordinator
+                self.capture=WechatCaptureCoordinator(self,refresher=self.capture_refresher)
+                self._tasks.append(asyncio.create_task(self._capture_loop(),name="institution-wechat-capture"))
             saved=self.settings.saved();self.applied_revision=saved["revision"] if saved else None
             self.settings.state="running";self.settings.applied_revision=self.applied_revision
         except BaseException:
@@ -381,11 +460,14 @@ class InstitutionCollectorHost:
         if self._lease:self._lease.__exit__(None,None,None);self._lease=None
         self.settings.state="stopped"
     def status(self):
-        channels = {row["id"]: row["channel"] for row in self.rows()}
+        current = {row["id"]: row for row in self.rows()}
+        channels = {aid: row["channel"] for aid, row in current.items()}
         return {"contract":self.config["contract"],"active":self.active,"workbench_id":self.workbench,
                 "applied_revision":self.applied_revision,"last_directory_at":self.last_directory_at,
                 "account_workers":len(self.hosts),"errors":dict(self.errors),
                 "history":{uid:h.status() for (_,uid),h in self.histories.items()},
-                "native_presence":{SnapshotPublisher.account_key(uid,channels.get(aid,"qidian")):
-                    {**value,"channel":channels.get(aid,"qidian"),"account_uid":uid}
-                    for (aid,uid),value in self.presence.items()}}
+                **({"capture":self.capture.status()} if getattr(self,"capture",None) is not None else {}),
+                "native_presence":{SnapshotPublisher.account_key(uid,channels[aid]):
+                    {**value,"channel":channels[aid],"account_uid":uid}
+                    for (aid,uid),value in self.presence.items()
+                    if aid in current and str(current[aid].get("self_uid") or "") == uid}}

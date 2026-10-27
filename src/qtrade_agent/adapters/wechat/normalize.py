@@ -15,8 +15,13 @@
 """
 from __future__ import annotations
 
+import base64
+import json
+import ntpath
+import re
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import quote
 
 from ...models import Message, MsgType, Session
 
@@ -58,13 +63,40 @@ def _ts_ms(raw: Any) -> int:
     raise ValueError(f"无法解析的 time: {raw!r}")
 
 
-def _media_of(row: dict[str, Any], mtype: MsgType) -> list[dict[str, Any]]:
+def _media_of(row: dict[str, Any], mtype: MsgType, self_uid: Optional[str] = None) -> list[dict[str, Any]]:
     if mtype not in MEDIA_TYPES:
         return []
     key = _first(row, "md5", "MD5", "key", "imgMd5")
+    contents = row.get("contents")
+    path = None
+    if mtype == "image" and isinstance(contents, dict):
+        nested_key = _first(contents, "md5", "MD5", "key", "imgMd5")
+        if key and nested_key and key != nested_key:
+            raise ValueError("ambiguous native media key")
+        key = key or nested_key
+        path = contents.get("path")
     if not key:
         return []
-    return [{"kind": mtype, "key": str(key), "ref": f"/wa/v1/wechat/media/{key}"}]     # #40 由 Agent 代拉
+    if not isinstance(key, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key) is None:
+        raise ValueError("invalid native media key")
+    if path is not None:
+        if not isinstance(path, str) or not path or len(path) > 1024:
+            raise ValueError("invalid native media path")
+        path = path.replace("/", "\\")
+        parts = path.split("\\")
+        if (ntpath.isabs(path) or ntpath.splitdrive(path)[0]
+                or any(part in ("", ".", "..") or part.endswith((".", " ")) for part in parts)
+                or any(ord(ch) < 32 or ch in ':<>"|?*%,' for ch in path)):
+            raise ValueError("invalid native media path")
+    if mtype == "image" and self_uid:
+        if not isinstance(self_uid, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self_uid) is None:
+            raise ValueError("invalid native media account")
+        descriptor = {"uid": self_uid, "md5": key, "path": path}
+        encoded = base64.urlsafe_b64encode(json.dumps(descriptor, separators=(",", ":")).encode()).decode().rstrip("=")
+        key = "wximage-v1." + encoded
+    elif path:
+        key += "," + path
+    return [{"kind": mtype, "key": key, "wa_path": "/wa/v1/wechat/media/" + quote(key, safe="")}]
 
 
 def to_message(account_id: str, row: dict[str, Any], *, self_uid: Optional[str] = None,
@@ -96,7 +128,7 @@ def to_message(account_id: str, row: dict[str, Any], *, self_uid: Optional[str] 
         sender_name=str(sender_name) if sender_name is not None else None,
         self=is_self,
         state="DELIVERED",                                     # 读回行已在聊天记录里;入向行 store 恒置 DELIVERED
-        media=_media_of(row, mtype),
+        media=_media_of(row, mtype, self_uid),
         revoked=revoked,
         raw_ref=raw_ref,
     )

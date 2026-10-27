@@ -5,6 +5,7 @@ import json
 
 from qtrade_agent.adapters.wechat import CURSOR_PREFIX, WechatAccountView
 from qtrade_agent.adapters.wechat.poll import READ_FAIL_STREAK
+from qtrade_agent.adapters.wechat.normalize import to_message
 from qtrade_agent.models import Message, Session
 from tests.test_wechat_rig import make_wechat_rig
 
@@ -77,8 +78,8 @@ async def test_accelerated_round_only_asks_target_talker(tmp_path):
     rig.store.close()
 
 
-async def test_self_row_merges_into_sending_row_and_confirms(tmp_path):
-    """06 §2.12 微信行:``self=true`` 的读回行合并进 ``SENDING`` 行 ⇒ ``DELIVERED`` + ``confirmed_by='chatlog'``,不插第二行。"""
+async def test_self_row_requires_exact_binding_then_merges_and_confirms(tmp_path):
+    """P0:普通同文轮询不确认；精确原生证据绑定后合并，保持游标、计数与去重。"""
     rig = make_wechat_rig(tmp_path)
     out = Message(account_id="wx01", channel="wechat", session=Session("wx01", "wxid_peer", "private"), dir="out",
                   type="text", text="报价 3.05", ts_ms=T0, source="chatlog", self=True, state="SENDING", trace_id="TR1")
@@ -86,8 +87,31 @@ async def test_self_row_merges_into_sending_row_and_confirms(tmp_path):
     rig.fake.add_row(talker="wxid_peer", content="报价 3.05", seq=3, ts_ms=T0 + 2000, is_self=True)
     assert await rig.poller.poll(view(rig)) == 1
     st = rig.store.message_state(sending_id)
+    assert st["state"] == "SENDING" and st["ext_msg_id"] is None
+    assert rig.store.confirmed_outbound_for_trace("TR1") is None
+    assert rig.store.count_messages("wx01") == 2
+    cursor = rig.store.cursor_get("wx01", CURSOR_PREFIX + "wxid_peer")
+    assert cursor.value_int == 3
+    assert rig.store.list_sessions(account_id="wx01")[0]["msg_count"] == 2
+    # Obtain the actual row through the read boundary, then use the approved exact binder.
+    rows = await rig.client.read(talker="wxid_peer", since_seq=2, limit=2)
+    assert len(rows) == 1 and rows[0]["seq"] == 3
+    native = to_message("wx01", rows[0], self_uid="wxid_demo01")
+    native._native_account_uid = "wxid_demo01"
+    assert rig.store.bind_wechat_readback("TR1", native, now_ms=T0 + 3000) == sending_id
+    st = rig.store.message_state(sending_id)
     assert st["state"] == "DELIVERED" and st["ext_msg_id"] == "wxid_peer:3" and st["confirmed_by"] == "chatlog"
     assert rig.store.count_messages("wx01") == 1
+    assert rig.store.list_sessions(account_id="wx01")[0]["msg_count"] == 1
+    assert rig.store.cursor_get("wx01", CURSOR_PREFIX + "wxid_peer") == cursor
+    assert rig.store.bind_wechat_readback("TR1", native, now_ms=T0 + 4000) == sending_id
+    event_count = len(rig.store.list_events(event="message"))
+    rig.store.cursor_set("wx01", CURSOR_PREFIX + "wxid_peer", 0)
+    assert await rig.poller.poll(view(rig)) == 0
+    assert rig.store.count_messages("wx01") == 1
+    assert rig.store.list_sessions(account_id="wx01")[0]["msg_count"] == 1
+    assert rig.store.cursor_get("wx01", CURSOR_PREFIX + "wxid_peer").value_int == 3
+    assert len(rig.store.list_events(event="message")) == event_count
     rig.store.close()
 
 

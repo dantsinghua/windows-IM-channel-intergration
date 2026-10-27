@@ -120,7 +120,7 @@ async function submitPassword(): Promise<void> {
 async function runStateAction(action: string): Promise<void> {
   switch (action) {
     case 'login':
-      if (a.value?.channel === 'wechat') await act(() => accountsApi.start(id.value), '已重新发起微信登录与取钥')
+      if (a.value?.channel === 'wechat') await act(() => accountsApi.start(id.value), '已请求启动或恢复微信采集，请按账号状态提示操作。')
       else await act(() => accountsApi.login(id.value, {}), '已重新发起登录')
       break
     case 'password': passwordPurpose.value = 'login'; pwModal.value = true; break
@@ -134,7 +134,7 @@ async function runStateAction(action: string): Promise<void> {
       break
     case 'key-retry':
       // R6-91:没回填过 wxid 的号(首登没走完)要重跑登录流才能回填/绑定;跑起来过的号才单独重取钥
-      if (!a.value?.self_uid && !a.value?.wxid) await act(() => accountsApi.start(id.value), '已重新发起微信登录与取钥')
+      if (!a.value?.self_uid && !a.value?.wxid) await act(() => accountsApi.start(id.value), '已请求启动或恢复微信采集，请按账号状态提示操作。')
       else if (!window.qt?.wa) message.info('请在机器人采集终端重新取钥')
       else await act(() => window.qt!.wa.invoke('wechat.key.retry', {}), '已请求重新取钥')
       break

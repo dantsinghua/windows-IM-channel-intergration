@@ -22,7 +22,7 @@ def env(store, clock, maindb):
     alerts = Alerts(events, clock=clock)
     h13 = {"firing": False}
     poller = QidianPoller(store=store, events=events, alerts=alerts, cfg=AgentConfig(), h13_firing=lambda: h13["firing"],
-                          clock=clock, maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path if uid == maindb.self_uin else maindb.path + ".missing"))
+                          clock=clock, maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path if uid == maindb.self_uin else maindb.path + ".missing"))
     return {"store": store, "clock": clock, "maindb": maindb, "events": events, "alerts": alerts, "poller": poller, "h13": h13}
 
 
@@ -168,7 +168,7 @@ def test_h13_blocks_bootstrap_and_relogin_switch_uin_audits_once(env):
     assert json.loads(identity_audit[0]["detail_json"])=={
         "old_uid":"3007373675","new_uid":"77777","identity_epoch":1,"account_id":"qd01"}
     # 让「新 uin」的库存在:把同一文件当新号的库
-    p.maindb_factory = lambda uid: LocalSqliteMainDb(db.path)
+    p.maindb_factory = lambda uid, acct: LocalSqliteMainDb(db.path)
     for _ in range(12):
         p.poll_maindb(acct(uid="77777"))
     assert st.cursor_get("qd01", "qidian_bootstrap") is None

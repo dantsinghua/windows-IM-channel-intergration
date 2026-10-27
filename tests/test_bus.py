@@ -57,7 +57,7 @@ async def rig(store, clock, maindb, cfg):
     events = Events(store)
     alerts = Alerts(events, clock=clock)
     poller = QidianPoller(store=store, events=events, alerts=alerts, cfg=cfg, h13_firing=lambda: False, clock=clock,
-                          maindb_factory=lambda uid: LocalSqliteMainDb(maindb.path))
+                          maindb_factory=lambda uid, acct: LocalSqliteMainDb(maindb.path))
     sender = FakeSender(maindb, clock)
     adapter = QidianAdapter(poller, sender=sender, store=store)
     bus = Bus(store=store, events=events, adapters={"qidian": adapter}, cfg=cfg, clock=clock)

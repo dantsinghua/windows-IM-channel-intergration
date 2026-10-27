@@ -26,6 +26,23 @@ def selfcheck() -> int:
             importlib.import_module(name)
         except Exception as e:                      # noqa: BLE001 —— 冒烟门要把所有失败都列出来
             bad.append(f"{name}: {type(e).__name__}: {e}")
+    try:
+        from io import BytesIO
+        from PIL import Image
+        # Decode real bytes in the frozen runtime, without opening a desktop.
+        raw = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c6360f8cf0000020201007b0981780000000049454e44ae426082")
+        with Image.open(BytesIO(raw)) as source:
+            source.load()
+            for image_format in ("JPEG", "PNG", "GIF", "WEBP"):
+                stream = BytesIO()
+                source.convert("RGB").save(stream, format=image_format)
+                stream.seek(0)
+                with Image.open(stream) as decoded:
+                    decoded.load()
+                    if decoded.size != (1, 1):
+                        raise RuntimeError("image codec selfcheck failed")
+    except Exception as exc:
+        bad.append(f"Pillow codecs: {type(exc).__name__}: {exc}")
     out = sys.stdout or sys.stderr
     if out is not None:
         out.write(("SELFCHECK FAIL\n" + "\n".join(bad) + "\n") if bad

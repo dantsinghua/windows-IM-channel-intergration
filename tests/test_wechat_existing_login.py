@@ -196,6 +196,7 @@ async def test_manual_bind_failure_never_promotes_or_destroys_existing_keys(exis
 
 async def test_qrcode_retains_original_login_and_key_phase_flow(existing):
     rig = existing
+    rig.fake.wechat["logged_in"] = False
     rig.store.con.execute("UPDATE accounts SET login_mode='qrcode' WHERE id='wx01'")
     rig.fake.phases_script = [{"phase": "keytry", "key": {"stage": "img"}},
                               {"phase": "keytry", "key": {"stage": "relogin"}},
