@@ -71,7 +71,7 @@ def test_version_headers_and_426(rig):
     r = c.get("/api/v1/system/version", headers=H())
     assert r.status_code == 200 and r.headers["X-QT-Api-Version"] == "1.0" and r.headers["X-QT-Agent-Version"]
     body = r.json()
-    assert body["api_version"] == "1.0" and body["schema_version"] == rig['store'].schema_version() == 2 and body["capabilities_version"]
+    assert body["api_version"] == "1.0" and body["schema_version"] == rig['store'].schema_version() == 3 and body["capabilities_version"]
     r = c.get("/api/v1/system/version", headers=H(**{"X-QT-Api-Min": "2.0"}))
     assert r.status_code == 426 and r.json()["code"] == "UPGRADE_REQUIRED" and r.headers["X-QT-Api-Version"] == "1.0"
     r = c.get("/api/v1/system/version", headers=H(**{"X-QT-Api-Min": "1.0"}))

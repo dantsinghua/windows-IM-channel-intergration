@@ -18,6 +18,21 @@ import time
 
 log = logging.getLogger('qtrade.ossbox.xunjia_v22')
 
+REPLY_WIRE_KEYS = ('state', 'text', 'source_text', 'source_direction', 'sender_id', 'ts', 'source_ext_msg_id')
+REPLY_SOURCE_TEXT_MAX = 4000
+_reply_warned = set()
+
+
+def _reply_warn_once(reason):
+    # Reason codes only: quote text and source text must never reach the log.
+    if reason not in _reply_warned:
+        _reply_warned.add(reason)
+        log.warning('Qidian reply omitted from V2.2 event: %s', reason)
+
+
+def _optional_str(value):
+    return value if isinstance(value, str) else None
+
 
 class XunjiaV22Host:
     def __init__(self, *, store, bus, loop, binding, bridge, port, state_path,
@@ -158,6 +173,8 @@ class XunjiaV22Host:
                         or message.get('dir') != row.get('dir') or message.get('session_id') != row.get('session_id')):
                     return
             data = self.port.normalize_native_message(row, live=not historical)
+            if self.port.channel == 'qidian':
+                data['reply'] = self._wire_reply(payload, row, bound)
             native_key = json.dumps([data['peer_id'], data['direction'], data['ext_msg_id']])
             text_hash = hashlib.sha256(data['text'].encode()).hexdigest()
             revoked = int(bool(row.get('revoked')))
@@ -192,6 +209,58 @@ class XunjiaV22Host:
             self._intake_ok = False
             log.error('V2.2 native intake failed; automatic native sending blocked')
             raise
+
+    def _wire_reply(self, payload, row, bound):
+        """Wire form of a Qidian event's quote (06 2.9.5, R6-117); None on any anomaly, never raises.
+
+        The result is not part of text_hash, native_key or event_id.
+        """
+        try:
+            reply = payload.get('reply')
+            if reply is None:
+                return None
+            if not isinstance(reply, dict):
+                _reply_warn_once('not_object')
+                return None
+            state = reply.get('state')
+            if state not in ('ok', 'unparsed'):
+                _reply_warn_once('bad_state')
+                return None
+            wire = dict.fromkeys(REPLY_WIRE_KEYS)
+            wire['state'] = state
+            if state == 'unparsed':
+                return wire
+            sender = reply.get('sender')
+            wire.update(text=_optional_str(reply.get('text')),
+                        sender_id=_optional_str(sender.get('id')) if isinstance(sender, dict) else None,
+                        ts=_optional_str(reply.get('ts')),
+                        source_ext_msg_id=_optional_str(reply.get('source_ext_msg_id')))
+            source = self._reply_source(reply.get('resolved_message_id'), row)
+            if source is not None:
+                text = source.get('text')
+                wire['source_text'] = text[:REPLY_SOURCE_TEXT_MAX] if isinstance(text, str) and text else None
+                wire['source_direction'] = source['dir']
+            elif wire['sender_id'] is not None:
+                wire['source_direction'] = 'out' if wire['sender_id'] == str(bound['self_uid']) else 'in'
+            return wire
+        except Exception as exc:
+            _reply_warn_once('error:' + type(exc).__name__)
+            return None
+
+    def _reply_source(self, resolved_message_id, row):
+        """The quoted message row, only via resolved_message_id within the event's account/session/epoch."""
+        if not isinstance(resolved_message_id, str) or not resolved_message_id:
+            return None
+        lookup = getattr(self.store, 'get_message', None)
+        if not callable(lookup):
+            return None
+        source = lookup(resolved_message_id)
+        if (not isinstance(source, dict) or source.get('account_id') != row['account_id']
+                or source.get('session_id') != row['session_id']
+                or source.get('identity_epoch', 0) != row['identity_epoch']
+                or source.get('dir') not in ('in', 'out')):
+            return None
+        return source
 
     def _replay(self):
         if not hasattr(self.store, 'con'):

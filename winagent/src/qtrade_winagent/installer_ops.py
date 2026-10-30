@@ -120,7 +120,8 @@ class InstallerOps:
 
     # ---------------------------------------------------------------- 混合端点:两半编排 + 失败合并
     async def _mixed(self, *, action: str, svc_steps: list[tuple[str, Callable[[], Any]]],
-                     user_calls: list[tuple[str, str, dict[str, Any], float]], trace_id: Optional[str]) -> dict[str, Any]:
+                     user_calls: list[tuple[str, str, dict[str, Any] | Callable[[], dict[str, Any]], float]],
+                     trace_id: Optional[str]) -> dict[str, Any]:
         """按固定顺序串起服务半与管道半;任一半失败即整端点失败,带 ``stage``/``partial`` 抛出(R3-15)。"""
         partial: list[str] = []
         for name, fn in svc_steps:
@@ -142,6 +143,7 @@ class InstallerOps:
             raise WaError("NOT_READY", "服务未接管道,无法下发会话代理", reason="no_pipe", stage="svc", partial=partial)
         for name, method, params, timeout_s in user_calls:
             try:
+                params = params() if callable(params) else params
                 results[name] = await self._hub.call(method, params, timeout_s=timeout_s, trace_id=trace_id, target=action)  # type: ignore[union-attr]
             except WaError as e:
                 e.stage = e.stage or "user"
@@ -181,7 +183,7 @@ class InstallerOps:
             out = await self._mixed(
                 action="wsl.kernel.apply",
                 svc_steps=[("stage_kernel", _stage), ("history_begin", lambda: self.history(to_state="KERNEL_APPLYING", actor="console"))],
-                user_calls=[("apply", "wsl.kernel.apply", {"kernel_path": staged.get("path"), "confirm_shutdown": True},
+                user_calls=[("apply", "wsl.kernel.apply", lambda: {"kernel_path": staged["path"], "confirm_shutdown": True},
                              WSL_TIMEOUT_S * 3)],
                 trace_id=trace_id)
         except WaError:

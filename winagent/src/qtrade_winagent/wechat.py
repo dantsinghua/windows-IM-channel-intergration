@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import hashlib
 import math
 import os
@@ -59,6 +61,15 @@ MATRIX_SOURCE = ("bundled", "runtime", "manual")
 
 HOSTS_BLOCK_IP = "0.0.0.0"
 H21 = "H21_WECHAT_HOSTS_BLOCK_FAILED"
+
+# R6-118(05 §2.4.10):chatlog server 回收
+RECYCLE_CRITERIA = {"copy_bytes": "a", "max_uptime": "b", "min_free": "c"}
+RECYCLE_BUDGET_S = 45.0                    # 停(优雅退出 ≈6 s + 兜底)+ 清扫 + 重拉(5 s)
+RECYCLE_SWEEP_BUDGET_S = 15.0
+STARTUP_SWEEP_BUDGET_S = 2.0               # 首次拉起前的清扫不得拖垮 ensure_server 的 5 s 预算
+RECYCLE_BUSY_RETRIES = 3
+RECYCLE_BUSY_WAIT_S = 10.0
+RECYCLE_COOLDOWN_CAP_S = 3600              # 附录 E:效果退避翻倍的封顶(基础间隔配得更大时以基础间隔为准)
 
 
 def _sha256_file(path: str) -> str:
@@ -338,6 +349,20 @@ class WeChatSession:
         self._narrator_snapshot = False
         self._cleanup_error = False
         self._supported_versions: tuple[str, ...] = ()
+        # R6-118:回收状态(05 §2.4.10)
+        self._server_started_ms: Optional[int] = None
+        self._startup_swept = False
+        self._recycle_need: Optional[tuple[str, int]] = None   # (判据, 首次判定时刻 ms)
+        self._recycling = False
+        self._reads_in_flight = 0
+        self._reads_idle = asyncio.Event()
+        self._reads_idle.set()
+        self._maintain_wakeup = asyncio.Event()
+        # 附录 E:冷却与效果退避,进程内状态,会话代理重启即复位
+        self._recycle_done_ms: Optional[int] = None
+        self._recycle_cooldown_s: Optional[int] = None
+        self._recycle_effect_pending = False
+        self._recycle_effect: Optional[str] = None     # 最近一次回收的效果:pending | effective | low
 
     async def _probe(self, fn, *args):
         """阻塞探测退场前不释放变更操作所有权；心跳和快照不等待它。"""
@@ -406,14 +431,14 @@ class WeChatSession:
                 except asyncio.CancelledError:
                     # 阻塞线程已由 _probe/后端等待退场，锁内只清理本对象持有的子进程。
                     if self._operation_claimed:
-                        await self._cleanup_chatlog()
+                        await self._cleanup_after_failure(name)
                     raise
                 except Exception as exc:
                     error = exc if isinstance(exc, WaError) else WaError(
                         NOT_READY, "微信辅助操作失败，请检查安装文件、权限及用户代理日志", reason="wechat_operation_failed")
                     self._failure(error, asyncio.current_task())
                     if self._operation_claimed:
-                        await self._cleanup_chatlog()
+                        await self._cleanup_after_failure(name)
                     raise error from (None if error is exc else exc)
                 finally:
                     if self._operation_task is asyncio.current_task():
@@ -424,7 +449,8 @@ class WeChatSession:
 
         task = asyncio.create_task(run(), name=f"wechat-{name}")
         self._operation_task, self._operation_name = task, name
-        self._operation_session = None if name == "start" else self.session
+        # 回收失败不是取钥失败:不能把登录会话打成 key_failed(R6-118 不判 KEY_FAIL)
+        self._operation_session = None if name in ("start", "recycle") else self.session
         self._operation_claimed = False
         task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
         try:
@@ -606,6 +632,7 @@ class WeChatSession:
         """R6-91:两钥落盘 ⇒ 停 ``key`` 进程、起 ``chatlog server``(:5030)再进 ready。此前取钥成了也没人起 server,
         读消息 / H09 / 发送读回全部失败,账号恒 KEY_FAIL。起不来不假装 ready,判 key_failed 并给出原因。"""
         await self._cleanup_chatlog()
+        await self._startup_sweep()
         try:
             self._operation_claimed = True
             await self._wx.chatlog_serve()
@@ -614,7 +641,7 @@ class WeChatSession:
             s.key_error = f"已取到密钥,但 chatlog 读服务没起来:{e}"
             self._set_phase(s, "key_failed", KEY_FAIL)
             return
-        self._serve_tried_ms = self._clock()
+        self._serve_tried_ms = self._server_started_ms = self._clock()
         self._set_phase(s, "ready", None)
 
     async def ensure_server(self) -> bool:
@@ -622,21 +649,40 @@ class WeChatSession:
             return False
         return bool(await self._operation("ensure_server", self._ensure_server, budget=5.0))
 
-    async def _ensure_server(self) -> bool:
+    def _login_flow_active(self) -> bool:
+        s = self.session
+        return s is not None and not s.cancelled and s.phase not in ("ready", "idle", "key_failed")
+
+    async def _ensure_server(self, *, force: bool = False) -> bool:
         """自愈:模块启用 + 两钥在 + 微信已登录 + chatlog 没在跑 ⇒ 拉起 server(30 s 节流)。覆盖开机 / 会话代理重启 /
-        chatlog 崩溃三种情形 —— 否则全新机器每次重启后账号都卡在 KEY_FAIL,只能人工重取钥。登录流进行中不插手。"""
+        chatlog 崩溃三种情形 —— 否则全新机器每次重启后账号都卡在 KEY_FAIL,只能人工重取钥。登录流进行中不插手。
+
+        R6-118:chatlog 在跑时顺带做回收判据检查(需回收就唤醒维护循环,回收本身不占本调用的 5 s 预算;
+        冷却期内不唤醒,附录 E);
+        ``force`` 只给回收后的**首次**重拉用,不受 30 s 节流(T6),之后失败照常节流。"""
         if not self._cfg.enabled:
             return False
-        s = self.session
-        if s is not None and not s.cancelled and s.phase not in ("ready", "idle", "key_failed"):
+        if self._login_flow_active():
             return False
-        if (await self._probe(self._wx.chatlog_status)).get("running") or not (await self._probe(self._wx.key_state)).get("ok"):
+        if (await self._probe(self._wx.chatlog_status)).get("running"):
+            if not force:
+                try:
+                    if await self._recycle_check() is not None:
+                        self._maintain_wakeup.set()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:                              # noqa: BLE001 —— 判据取不到不影响 #28 状态
+                    log.warning("chatlog 回收判据检查失败", extra={"op": "wechat.recycle", "code": "CHECK_FAILED",
+                                                              "kv": {"err": type(error).__name__}})
+            return False
+        if not (await self._probe(self._wx.key_state)).get("ok"):
             return False
         if not await self._probe(self._wx.current_wxid):
             return False
         now = self._clock()
-        if now - getattr(self, "_serve_tried_ms", -10**12) < 30_000:
+        if not force and now - getattr(self, "_serve_tried_ms", -10**12) < 30_000:
             return False
+        await self._startup_sweep()
         self._serve_tried_ms = now
         try:
             self._operation_claimed = True
@@ -645,7 +691,307 @@ class WeChatSession:
             await self._cleanup_chatlog()
             log.warning("自愈拉起 chatlog server 失败", extra={"op": "wechat.serve", "code": "SERVE_FAILED", "error": repr(e)})
             return False
+        self._server_started_ms = self._clock()
         return True
+
+    # ---------------------------------------------------------------- R6-118 chatlog server 回收(05 §2.4.10)
+    async def _startup_sweep(self) -> None:
+        """首次拉起 server 之前清扫本实例与已知上一实例前缀的残留副本(限时;没清完的留给下一次回收)。"""
+        if self._startup_swept:
+            return
+        try:
+            result = await self._probe(functools.partial(self._wx.chatlog_sweep_copies,
+                                                         budget_s=STARTUP_SWEEP_BUDGET_S))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                                      # noqa: BLE001 —— 清扫失败不挡读取服务
+            log.warning("chatlog 启动前清扫失败", extra={"op": "wechat.sweep", "code": "SWEEP_FAILED",
+                                                       "kv": {"err": type(error).__name__}})
+            self._startup_swept = True
+            return
+        self._startup_swept = True
+        log.info("chatlog 启动前清扫临时副本", extra={"op": "wechat.sweep", "code": "STARTUP_SWEEP", "kv": {
+            "before_bytes": result.get("before_bytes"), "freed_bytes": result.get("freed_bytes"),
+            "failed": result.get("failed"), "complete": result.get("complete")}})
+
+    def _recycle_reason(self, facts: dict[str, Any]) -> Optional[str]:
+        """判据 (c) 卷空闲 > (a) 副本总量 > (b) 运行时长;只认本代理拉起、归属核验通过的 server 模式进程。"""
+        if not facts.get("running") or facts.get("mode") != "server" or not facts.get("owned"):
+            return None
+        cfg = self._cfg
+        copy_bytes = int(facts.get("copy_bytes") or 0)
+        has_copies = copy_bytes > 0 or int(facts.get("copy_files") or 0) > 0
+        free = facts.get("temp_free_bytes")
+        if isinstance(free, int) and not isinstance(free, bool) and free < cfg.chatlog_recycle_min_free_bytes and has_copies:
+            return "min_free"
+        if cfg.chatlog_recycle_copy_bytes > 0 and copy_bytes >= cfg.chatlog_recycle_copy_bytes:
+            return "copy_bytes"
+        started = self._server_started_ms
+        if (cfg.chatlog_recycle_max_uptime_s > 0 and started is not None
+                and self._clock() - started >= cfg.chatlog_recycle_max_uptime_s * 1000):
+            return "max_uptime"
+        return None
+
+    def _recycle_cooldown_left_ms(self) -> int:
+        done, cooldown_s = self._recycle_done_ms, self._recycle_cooldown_s
+        if done is None or not cooldown_s:
+            return 0
+        return max(0, done + cooldown_s * 1000 - self._clock())
+
+    def _next_cooldown_s(self, effective: bool) -> int:
+        """附录 E②:有效 ⇒ 复位为基础值;低效 ⇒ 当前间隔翻倍(封顶)。"""
+        base = max(0, int(self._cfg.chatlog_recycle_min_interval_s))
+        if effective:
+            return base
+        cur = base if self._recycle_cooldown_s is None else max(base, self._recycle_cooldown_s)
+        return min(cur * 2, max(base, RECYCLE_COOLDOWN_CAP_S))
+
+    def _note_recycle_done(self, freed_bytes: Any, *, reason: Optional[str] = None) -> int:
+        """回收完成即起算最小间隔,返回当前下一次最小间隔(秒)。(a)/(b) 及中途失败按释放量定效果;
+        (c) 按 E7 等下一次维护检查的卷空闲定效果,此前先沿用当前间隔。"""
+        self._recycle_done_ms = self._clock()
+        if reason == "min_free":
+            base = max(0, int(self._cfg.chatlog_recycle_min_interval_s))
+            self._recycle_cooldown_s = base if self._recycle_cooldown_s is None else max(base, self._recycle_cooldown_s)
+            self._recycle_effect_pending, self._recycle_effect = True, "pending"
+            return self._recycle_cooldown_s
+        freed = freed_bytes if isinstance(freed_bytes, int) and not isinstance(freed_bytes, bool) else 0
+        effective = freed >= self._cfg.chatlog_recycle_min_freed_bytes
+        self._recycle_effect_pending, self._recycle_effect = False, "effective" if effective else "low"
+        self._recycle_cooldown_s = self._next_cooldown_s(effective)
+        return self._recycle_cooldown_s
+
+    def _settle_recycle_effect(self, facts: dict[str, Any]) -> None:
+        """E7:(c) 回收并重拉后的下一次检查,临时卷空闲 ≥ ``chatlog_recycle_min_free_bytes`` 为有效,否则低效。"""
+        if not self._recycle_effect_pending:
+            return
+        free = facts.get("temp_free_bytes")
+        if not isinstance(free, int) or isinstance(free, bool):
+            return
+        effective = free >= self._cfg.chatlog_recycle_min_free_bytes
+        self._recycle_cooldown_s = self._next_cooldown_s(effective)
+        self._recycle_effect_pending, self._recycle_effect = False, "effective" if effective else "low"
+        log.info("chatlog 回收效果已判定", extra={"op": "wechat.recycle", "code": "RECYCLE_EFFECT", "kv": {
+            "criterion": "c", "temp_free_bytes": free, "effective": effective,
+            "cooldown_s": self._recycle_cooldown_s}})
+
+    async def _recycle_check(self, *, log_cooldown: bool = False) -> Optional[str]:
+        """记下「需回收」及首次判定时刻;登录流或取钥中一律不回收(R6-96:hook 中的 chatlog 不得被强杀)。
+        冷却期内判据成立也返回 None(不回收、不唤醒);``log_cooldown`` 只给维护循环用,每周期记一行,
+        (c) 回收的效果也只在维护循环这一路判定。"""
+        if self._login_flow_active():
+            self._recycle_need = None
+            return None
+        facts = await self._probe(self._wx.chatlog_recycle_facts)
+        if log_cooldown:
+            self._settle_recycle_effect(facts)
+        reason = self._recycle_reason(facts)
+        if reason is None:
+            self._recycle_need = None
+            return None
+        left_ms = self._recycle_cooldown_left_ms()
+        if left_ms > 0:
+            self._recycle_need = None
+            if log_cooldown:
+                log.info("chatlog 回收冷却中,本周期不回收", extra={"op": "wechat.recycle", "code": "COOLDOWN", "kv": {
+                    "reason": reason, "criterion": RECYCLE_CRITERIA.get(reason),
+                    "remaining_s": -(-left_ms // 1000), "cooldown_s": self._recycle_cooldown_s}})
+            return None
+        self._recycle_need = (reason, self._recycle_need[1] if self._recycle_need else self._clock())
+        return reason
+
+    async def wait_maintain(self, timeout_s: float) -> None:
+        """维护循环的节拍:到点或被 ``ensure_server`` 路径唤醒(发现需回收)即返回。"""
+        try:
+            await asyncio.wait_for(self._maintain_wakeup.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        self._maintain_wakeup.clear()
+
+    async def maintain(self) -> Optional[dict[str, Any]]:
+        """周期检查(会话代理维护循环,≤ 60 s):需回收且不在冷却期 ⇒ 等读取空闲(最多 ``chatlog_recycle_idle_wait_s``,
+        判据 (c) 不等)⇒ 回收。返回回收结果;无需回收或冷却中为 None。"""
+        if not self._cfg.enabled or self._closing:
+            self._recycle_need = None
+            return None
+        reason = await self._recycle_check(log_cooldown=True)
+        if reason is None or self._recycle_need is None:
+            return None
+        if reason != "min_free":
+            loop = asyncio.get_running_loop()
+            waited_s = max(0.0, (self._clock() - self._recycle_need[1]) / 1000)
+            deadline = loop.time() + max(0.0, self._cfg.chatlog_recycle_idle_wait_s - waited_s)
+            while self._reads_in_flight > 0:
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._reads_idle.wait(), timeout=left)
+                except asyncio.TimeoutError:
+                    break
+        return await self._run_recycle(reason, forced=self._reads_in_flight > 0)
+
+    async def _run_recycle(self, reason: str, *, forced: bool) -> Optional[dict[str, Any]]:
+        for _ in range(RECYCLE_BUSY_RETRIES):
+            active = self._operation_task
+            if active is not None and not active.done():
+                await asyncio.wait({active}, timeout=RECYCLE_BUSY_WAIT_S)
+                continue
+            entered = False
+
+            async def action() -> dict[str, Any]:
+                nonlocal entered
+                entered = True
+                return await self._recycle(reason, forced=forced)
+
+            # 判定空闲与置「回收中」之间不让出事件循环:此后新到的读取一律按未就绪返回
+            self._recycling = True
+            try:
+                return await self._operation("recycle", action, budget=RECYCLE_BUDGET_S)
+            except WaError as error:
+                if not entered:
+                    self._recycling = False
+                    if error.reason == "wechat_operation_busy":
+                        continue
+                    raise
+                # 已进入回收(含 45 s 预算超时、清扫失败):冷却与标记由 _recycle/收尾负责,不外抛拖停维护循环(E9)
+                log.warning("chatlog 回收未完成", extra={"op": "wechat.recycle", "code": "RECYCLE_FAILED",
+                                                       "kv": {"reason": reason, "criterion": RECYCLE_CRITERIA.get(reason),
+                                                              "err_code": error.code, "err_reason": error.reason,
+                                                              "cooldown_s": self._recycle_cooldown_s}})
+                return {"recycled": False, "error": error.reason or error.code, "reason": reason,
+                        "criterion": RECYCLE_CRITERIA.get(reason), "forced": forced,
+                        "cooldown_s": self._recycle_cooldown_s}
+            except BaseException:
+                if not entered:
+                    self._recycling = False
+                raise
+        return None
+
+    async def _recycle(self, reason: str, *, forced: bool) -> dict[str, Any]:
+        """停本代理的 chatlog(先 CTRL_BREAK,超时才结束)→ 清扫本实例与已知上一实例前缀 → 经 ensure_server 同一路径重拉。
+        不重登微信、不取钥;回收原因只进日志(T11)。"""
+        started = time.monotonic()
+        acted = noted = False
+        try:
+            if self._login_flow_active():
+                return {"recycled": False, "skipped": "login_in_progress"}
+            if self._recycle_cooldown_left_ms() > 0:
+                self._recycle_need = None
+                return {"recycled": False, "skipped": "cooldown"}
+            facts = await self._probe(self._wx.chatlog_recycle_facts)
+            if self._recycle_reason(facts) is None:
+                self._recycle_need = None
+                return {"recycled": False, "skipped": "not_needed"}
+            self._operation_claimed = True
+            acted = True
+            try:
+                await self._cleanup_chatlog()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:                                  # noqa: BLE001 —— E9:停不掉不得卡死会话代理
+                noted = True
+                return await self._recycle_stop_failed(reason, forced, error, started)
+            self._server_started_ms = None
+            sweep = await self._probe(functools.partial(self._wx.chatlog_sweep_copies,
+                                                        budget_s=RECYCLE_SWEEP_BUDGET_S))
+            self._startup_swept = True
+            self._recycle_need = None
+            restart_error: Optional[BaseException] = None
+            try:
+                restarted = await self._ensure_server(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:                                  # noqa: BLE001 —— E8 边界:仅重拉失败交既有自愈
+                restarted, restart_error = False, error
+                log.warning("回收后重拉 chatlog server 失败", extra={"op": "wechat.recycle", "code": "RESTART_FAILED",
+                                                              "kv": {"err": type(error).__name__}})
+            # 重拉失败后收尾停那个拉起一半的进程又失败:不改判效口径(第 9 条),只是不能粘住清理中标记
+            cleanup_failed = self._cleanup_error
+            if cleanup_failed:
+                self._release_recycle_cleanup("restart", restart_error)
+            cooldown_s = self._note_recycle_done(sweep.get("freed_bytes"), reason=reason)
+            noted = True
+            out = {"recycled": True, "reason": reason, "criterion": RECYCLE_CRITERIA.get(reason), "forced": forced,
+                   "copy_bytes": int(facts.get("copy_bytes") or 0), "before_bytes": sweep.get("before_bytes"),
+                   "freed_bytes": sweep.get("freed_bytes"), "failed": sweep.get("failed"),
+                   "complete": sweep.get("complete"), "restarted": restarted, "cleanup_failed": cleanup_failed,
+                   "cooldown_s": cooldown_s, "effect": self._recycle_effect,
+                   "cost_ms": int((time.monotonic() - started) * 1000)}
+            log.info("chatlog 读取服务已回收", extra={"op": "wechat.recycle", "code": "RECYCLED",
+                                                    "cost_ms": out["cost_ms"],
+                                                    "kv": {k: v for k, v in out.items() if k not in ("recycled", "cost_ms")}})
+            return out
+        finally:
+            if acted and not noted:                 # 中途失败/被取消:按零释放计入冷却,不让下一周期立刻重来
+                self._note_recycle_done(0)
+            self._recycling = False
+
+    def _release_recycle_cleanup(self, stage: str, error: Optional[BaseException]) -> None:
+        """E9:回收流程里收尾停进程失败 ⇒ 记日志、复位清理中标记,会话代理不得因此持续 ``wechat_cleanup_pending``。
+        残留的 chatlog 若仍在跑,读取照常;已退出则交 ``ensure_server`` 自愈;冷却期满允许再次回收。"""
+        self._cleanup_error = False
+        self._operation_claimed = False
+        log.warning("chatlog 回收收尾停进程失败,已复位清理中标记", extra={
+            "op": "wechat.recycle", "code": "CLEANUP_FAILED",
+            "kv": {"stage": stage, "err": type(error).__name__ if error is not None else None}})
+
+    async def _cleanup_after_failure(self, name: str) -> None:
+        """``_operation`` 出错/超时/取消后的收尾。回收操作停进程失败按 E9 复位标记、不外抛;其它操作沿用既有粘住语义。"""
+        if name != "recycle":
+            await self._cleanup_chatlog()
+            return
+        try:
+            await self._cleanup_chatlog()
+        except asyncio.CancelledError:
+            if self._cleanup_error:
+                self._release_recycle_cleanup("cancel", None)
+            raise
+        except Exception as error:                                      # noqa: BLE001
+            self._release_recycle_cleanup("cancel", error)
+
+    async def _recycle_stop_failed(self, reason: str, forced: bool, error: BaseException,
+                                   started: float) -> dict[str, Any]:
+        """E9:停进程失败 ⇒ 记日志、复位清理中标记(不再持续 ``wechat_cleanup_pending``)、不重试清理;
+        按 E8 释放 0 判低效翻倍冷却,冷却期满允许再试。chatlog 若仍在跑,读取照常;已退出则交 ``ensure_server`` 自愈。"""
+        self._cleanup_error = False
+        self._operation_claimed = False
+        self._recycle_need = None
+        cooldown_s = self._note_recycle_done(0)
+        try:
+            running = bool((await self._probe(self._wx.chatlog_status)).get("running"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                               # noqa: BLE001
+            running = None
+        out = {"recycled": False, "error": "stop_failed", "reason": reason, "criterion": RECYCLE_CRITERIA.get(reason),
+               "forced": forced, "freed_bytes": 0, "running": running, "cooldown_s": cooldown_s,
+               "effect": self._recycle_effect, "cost_ms": int((time.monotonic() - started) * 1000)}
+        log.warning("chatlog 回收停进程失败,已按低效计入冷却", extra={
+            "op": "wechat.recycle", "code": "STOP_FAILED", "cost_ms": out["cost_ms"],
+            "kv": {"err": type(error).__name__, **{k: v for k, v in out.items() if k not in ("recycled", "cost_ms")}}})
+        return out
+
+    def _begin_read(self, *, gate: bool = True) -> None:
+        if gate and self._recycling:
+            raise WaError(NOT_READY, "微信读取服务正在重启,请稍后重试;密钥未变",
+                          reason="wechat_read_connection_refused", retryable=True)
+        self._reads_in_flight += 1
+        self._reads_idle.clear()
+
+    def _end_read(self) -> None:
+        self._reads_in_flight = max(0, self._reads_in_flight - 1)
+        if self._reads_in_flight == 0:
+            self._reads_idle.set()
+
+    @contextlib.asynccontextmanager
+    async def _reading(self, *, gate: bool = True):
+        """读取非空闲 = 进行中的 #39 read / #41 sessions / 发送读回确认(05 §2.4.10 ②)。"""
+        self._begin_read(gate=gate)
+        try:
+            yield
+        finally:
+            self._end_read()
 
     async def _after_narrator_stopped(self, s: LoginSession) -> None:
         """05 §2.4.3 ④:讲述人已关 ⇒ 重新探可见性;可见进取钥,不可见按轮次上限再做一次或判 WAIT_UI_TREE。
@@ -916,8 +1262,9 @@ class WeChatSession:
             raise WaError(NOT_READY,
                           "微信界面控件树不可见,图片发送不可用;文字发送改走快捷键,读消息与取钥不受影响",
                           reason="ui_tree_invisible")
-        out = await self._wx.send(session_name=session_name, text=text, image_path=image_path,
-                                  confirm_timeout_ms=confirm_timeout_ms or self._cfg.confirm_timeout_ms)
+        async with self._reading(gate=False):
+            out = await self._wx.send(session_name=session_name, text=text, image_path=image_path,
+                                      confirm_timeout_ms=confirm_timeout_ms or self._cfg.confirm_timeout_ms)
         result = {"ok": bool(out.get("ok")), "code": out.get("code"), "ext_msg_id": out.get("ext_msg_id"),
                   "confirm_ms": out.get("confirm_ms"), "idempotency_key": idempotency_key}
         if out.get("confirmation_reason") in {
@@ -936,7 +1283,8 @@ class WeChatSession:
         self._require_key()
         from .wechat_read_page import checked_limit, message_page
         page_limit = checked_limit(self._cfg.page_limit if limit is None else limit)
-        rows = await self._wx.read_messages(talker=talker, since_seq=since_seq, limit=page_limit)
+        async with self._reading():
+            rows = await self._wx.read_messages(talker=talker, since_seq=since_seq, limit=page_limit)
         msgs = message_page(rows, page_limit)
         return {"messages": msgs, "next_seq": msgs[-1]["seq"] if msgs else since_seq,
                 "lookback_overlap_s": self._cfg.lookback_overlap_s}
@@ -949,7 +1297,8 @@ class WeChatSession:
             raise WaError(TARGET_NOT_FOUND, f"媒体 {key} 不存在", reason="media_not_found") from e
 
     async def sessions(self, *, keyword: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
-        return await self._wx.list_sessions(keyword=keyword, limit=limit)
+        async with self._reading():
+            return await self._wx.list_sessions(keyword=keyword, limit=limit)
 
     async def screenshot(self, *, screen_locked: bool = False) -> bytes:
         """#42:微信主窗口截图 PNG;**锁屏时 ``NOT_READY``**(锁屏后是安全桌面,UI 自动化触达不到)。"""

@@ -104,9 +104,9 @@ if ($StageRoot) {
     }
 }
 
-if (-not $StageRoot -and $Step -eq 'bootstrap') {
+if ((-not $StageRoot -and $Step -eq 'bootstrap') -or $Step -eq 'verify-kernel') {
     $resumeState = Read-QtInstallState -Path $paths.StateFile
-    $resumeMode = [string](Get-QtOpt 'mode' 'install')
+    $resumeMode = if ($Step -eq 'verify-kernel') { 'verify-kernel' } else { [string](Get-QtOpt 'mode' 'install') }
     if ($resumeMode -in @('install', 'upgrade') -or $null -eq $resumeState) {
         Write-QtStepResult -Ok $false -Reason 'FULL_INSTALLER_REQUIRED' -ExitName 'E_INSTALL_WAIT_USER' `
             -Message 'Run the complete installer. An installed engine is only for resuming its own interrupted installation.'
@@ -152,6 +152,7 @@ try {
             # §2.6.6 不变量②:引擎启动时顺手清理残留 kcheck
             # Cleanup is owned by the verified clean-reinstall transaction.
             $next = Get-QtResumeStep -State ([string]$state.state)
+            if ($state.substate -eq 'wslconfig_writing') { $next = 'KERNEL_VERIFIED' }
             # §2.13 首句:新版本 EXE 检测到 `install_state.state=DONE` 且 `package_version <` 自身即进 upgrade 模式;
             # `>` 则拒绝降级(122)。这里只**建议**模式,真正切换由 .iss 决定。
             $selfVersion = [string](Get-QtOpt -Name 'package_version' -Default '0.0.0')
@@ -914,6 +915,10 @@ try {
 
         # ── DONE(§2.11 第 5 项)──────────────────────────────────────────────
         'DONE' {
+            $preferencesAcl = Set-QtConsoleConfigAcl -Path (Join-Path $paths.Root 'config\console') -InstallSid ([string]$state.env.install_user_sid)
+            if (-not $preferencesAcl.Ok) {
+                Write-QtStepResult -Ok $false -State ([string]$state.state) -Reason 'ACL_HARDEN_FAILED' -ExitName 'E_INSTALL_ACL_HARDEN_FAILED' -Message 'Console preferences permissions could not be established.'
+            }
             Clear-QtRunOnce -State $state | Out-Null
             $shortcuts = Install-QtConsoleShortcuts -ConsoleDir $paths.Console -LauncherPath (Join-Path (Split-Path -Parent $paths.EngineExe) 'launch-installed.ps1')
             # A-6:删暂存 rootfs.tar,**不询问**
@@ -987,7 +992,7 @@ try {
                 Write-QtInstallState -State $r.State -Path $livePaths.StateFile | Out-Null
             }
             Write-QtStepResult -Ok $true -State ([string]$r.State.state) -Message 'Verified payload is ready for installation.' `
-                -Data ([ordered]@{ resumed = $r.Resumed })
+                -Data ([ordered]@{ resumed = $r.Resumed; resume_step = $(if ($r.State.substate -eq 'wslconfig_writing') { 'KERNEL_VERIFIED' } else { Get-QtResumeStep -State ([string]$r.State.state) }) })
         }
 
         'upgrade' {

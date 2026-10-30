@@ -88,6 +88,41 @@ class WinSys:
         except Exception:
             return bool(self.processes(("LogonUI.exe",)))              # 备用判据(04 §2.2 S13)
 
+    def current_session_locked(self) -> Optional[bool]:
+        """Inspect this user's desktop, never the physical console or another RDP session."""
+        require_windows("Current session desktop")
+        import ctypes
+        import os
+        from ctypes import wintypes
+
+        try:
+            import win32ts
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            session = wintypes.DWORD()
+            if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)) or not session.value:
+                return None
+            state = win32ts.WTSQuerySessionInformation(None, session.value, win32ts.WTSConnectState)
+            if state != win32ts.WTSActive:
+                return None
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            user32.OpenInputDesktop.restype = wintypes.HANDLE
+            user32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+            desktop = user32.OpenInputDesktop(0, False, 0x0001)
+            if not desktop:
+                return None
+            try:
+                name, needed = ctypes.create_unicode_buffer(256), wintypes.DWORD()
+                if not user32.GetUserObjectInformationW(desktop, 2, name, ctypes.sizeof(name), ctypes.byref(needed)):
+                    return None
+                return name.value.casefold() != "default"
+            finally:
+                user32.CloseDesktop(desktop)
+        except Exception:
+            return None
+
     def active_session(self) -> Optional[dict[str, Any]]:
         require_windows("WTS 会话枚举")
         import win32ts

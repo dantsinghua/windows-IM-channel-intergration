@@ -173,6 +173,80 @@ function Assert-QtCleanMarker {
     }
 }
 
+function Assert-QtResumeEvidenceAcl {
+    param([Parameter(Mandatory)][string] $Path)
+    foreach ($ace in (Get-QtAcl -Path $Path).Access) {
+        if ($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        $owner = ConvertTo-QtAclSid -Identity $ace.IdentityReference
+        if ($owner -notin @('S-1-5-18', 'S-1-5-32-544') -and
+            ([int]$ace.FileSystemRights -band (-bnot [int]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)))) {
+            throw 'STAGE_ACL_FAILED'
+        }
+    }
+}
+
+function Find-QtResumeStage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $StageRoot, [Parameter(Mandatory)][string] $LiveRoot,
+        [Parameter(Mandatory)][string] $ManifestHash, [Parameter(Mandatory)][string] $InstallSid)
+    $parent = Split-Path -Parent $StageRoot
+    $candidates = @()
+    $liveMarkerPath = Join-Path $LiveRoot '.qtrade-clean-owner.json'
+    $liveMarker = $null
+    if (Test-QtPath -Path $liveMarkerPath) {
+        if (-not (Test-QtStagePath -Path $liveMarkerPath)) { throw 'REPARSE_POINT_REFUSED' }
+        Assert-QtResumeEvidenceAcl -Path $liveMarkerPath
+        $liveMarker = Read-QtTextFile -Path $liveMarkerPath | ConvertFrom-Json -ErrorAction Stop
+    }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop)) {
+        if ($directory.FullName -eq $StageRoot -or $directory.Name -notmatch '\A[0-9a-fA-F-]{32,36}\z') { continue }
+        if (-not (Test-QtStagePath -Path $directory.FullName)) { throw 'REPARSE_POINT_REFUSED' }
+        $journalPath = Join-Path $directory.FullName 'install\clean-reinstall.json'
+        if (-not (Test-QtPath -Path $journalPath)) { continue }
+        if (-not (Test-QtStagePath -Path $journalPath)) { throw 'REPARSE_POINT_REFUSED' }
+        if (-not (Test-QtInstallRootAcl -Acl (Get-QtAcl -Path $directory.FullName)).Ok) { throw 'STAGE_ACL_FAILED' }
+        # Descendant evidence may inherit the protected root, but must not grant writes.
+        foreach ($evidence in @((Split-Path -Parent $journalPath), $journalPath)) {
+            Assert-QtResumeEvidenceAcl -Path $evidence
+        }
+        $journal = Read-QtTextFile -Path $journalPath | ConvertFrom-Json -ErrorAction Stop
+        if ($journal.live_root -ne $LiveRoot) { continue }
+        if ($null -ne $liveMarker -and $journal.cleanup_id -cne $liveMarker.cleanup_id) { continue }
+        $installed = Read-QtInstallState -Path (Get-QtPaths -Root $LiveRoot).StateFile
+        if ($journal.phase -eq 'prepared' -and $null -ne $installed -and $installed.state -eq 'DONE') { continue }
+        if ($journal.manifest_sha256 -ne $ManifestHash -or $journal.install_sid -ne $InstallSid) { throw 'STAGE_IDENTITY_MISMATCH' }
+        $oldManifest = Join-Path $directory.FullName 'install\manifest.json'
+        if (-not (Test-QtStagePath -Path $oldManifest) -or (Get-QtFileHash -Path $oldManifest) -ne $ManifestHash) { throw 'STAGE_IDENTITY_MISMATCH' }
+        Assert-QtResumeEvidenceAcl -Path $oldManifest
+        if ($journal.phase -notin @('cleaning', 'removing', 'root_empty', 'copying', 'prepared')) { throw 'STAGE_PHASE_INVALID' }
+        $marker = Join-Path $LiveRoot '.qtrade-clean-owner.json'
+        if (Test-QtPath -Path $LiveRoot) {
+            if (-not (Test-QtInstallRootAcl -Acl (Get-QtAcl -Path $LiveRoot)).Ok) { throw 'STAGE_ACL_FAILED' }
+            Assert-QtCleanRootIdentity -Journal $journal
+        } elseif ($journal.phase -notin @('root_empty', 'copying', 'cleaning')) { throw 'CLEAN_ROOT_IDENTITY_CHANGED' }
+        if (-not (Test-QtPath -Path $marker)) { $marker = Join-Path $directory.FullName 'install\clean-owner.json' }
+        if (-not (Test-QtStagePath -Path $marker)) { throw 'REPARSE_POINT_REFUSED' }
+        Assert-QtResumeEvidenceAcl -Path $marker
+        Assert-QtCleanMarker -Journal $journal -Path $marker
+        $candidates += $journalPath
+    }
+    if ($candidates.Count -gt 1) { throw 'STAGE_RESUME_AMBIGUOUS' }
+    if ($candidates.Count -eq 1) { return $candidates[0] }
+    if ($null -ne $liveMarker) {
+        $installed = Read-QtInstallState -Path (Get-QtPaths -Root $LiveRoot).StateFile
+        if ($null -eq $installed -or $installed.state -ne 'DONE') { throw 'CLEAN_RECOVERY_EVIDENCE_MISSING' }
+    }
+    return ''
+}
+
+function Write-QtCleanMarker {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Journal, [Parameter(Mandatory)][string] $Path)
+    $marker = [ordered]@{}
+    foreach ($key in @('cleanup_id', 'manifest_sha256', 'install_sid', 'live_root', 'root_created_ticks')) { $marker[$key] = $Journal.$key }
+    Write-QtStageJournal -Journal $marker -Path $Path
+}
+
 function Invoke-QtCleanReinstall {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $StageRoot, [Parameter(Mandatory)][string] $LiveRoot,
@@ -192,6 +266,10 @@ function Invoke-QtCleanReinstall {
         $livePaths = Get-QtPaths -Root $id.LiveRoot
         $old = Read-QtInstallState -Path $livePaths.StateFile
         $journal = $null
+        if (-not (Test-QtPath -Path $id.Journal)) {
+            $previousJournal = Find-QtResumeStage -StageRoot $id.StageRoot -LiveRoot $id.LiveRoot -ManifestHash $hash -InstallSid $sid
+            if ($previousJournal) { $id.Journal = $previousJournal }
+        }
         if (Test-QtPath -Path $id.Journal) {
             $journal = Read-QtTextFile -Path $id.Journal | ConvertFrom-Json
             if ($journal.manifest_sha256 -ne $hash -or $journal.install_sid -ne $sid -or
@@ -220,6 +298,7 @@ function Invoke-QtCleanReinstall {
                 cleanup_id = [guid]::NewGuid().ToString('N')
                 root_created_ticks = $(if ($ownership.Exists) { [string](Get-Item -LiteralPath $id.LiveRoot -Force -ErrorAction Stop).CreationTimeUtc.Ticks } else { '' }) }
             Write-QtStageJournal -Journal $journal -Path $id.Journal
+            Write-QtCleanMarker -Journal $journal -Path (Join-Path (Split-Path -Parent $id.Journal) 'clean-owner.json')
         }
         if ($journal.phase -eq 'cleaning') {
             # Revalidate all targets before the first effect on every retry.
@@ -277,6 +356,15 @@ function Invoke-QtCleanReinstall {
                 Assert-QtCleanRootIdentity -Journal $journal
                 $markerPath = Join-Path $id.LiveRoot '.qtrade-clean-owner.json'
                 if (Test-QtPath -Path $markerPath) {
+                    $existingMarker = Read-QtTextFile -Path $markerPath | ConvertFrom-Json -ErrorAction Stop
+                    if ($existingMarker.cleanup_id -cne $journal.cleanup_id -and $null -ne $old -and $old.state -eq 'DONE') {
+                        if ($existingMarker.install_sid -cne $sid -or $existingMarker.live_root -cne $id.LiveRoot -or
+                            $existingMarker.root_created_ticks -cne $journal.root_created_ticks -or
+                            -not (Test-QtHasProperty $old 'package_manifest_sha256') -or
+                            $existingMarker.manifest_sha256 -cne $old.package_manifest_sha256) { throw 'CLEAN_MARKER_MISMATCH' }
+                        # Replace only the completed installation marker after clean consent.
+                        Write-QtCleanMarker -Journal $journal -Path $markerPath
+                    }
                     Assert-QtCleanMarker -Journal $journal -Path $markerPath
                 } else {
                     $marker = [ordered]@{}
@@ -341,9 +429,16 @@ function Invoke-QtCleanReinstall {
                 throw 'PARTIAL_COPY_IN_USE'
             }
         }
+        $creatingRoot = -not (Test-QtPath -Path $id.LiveRoot)
         New-QtDirectory -Path $id.LiveRoot | Out-Null
         $acl = Set-QtInstallRootAcl -Path $id.LiveRoot
         if (-not $acl.Ok) { throw 'LIVE_ACL_FAILED' }
+        if ($creatingRoot) {
+            $journal.root_created_ticks = [string](Get-Item -LiteralPath $id.LiveRoot -Force -ErrorAction Stop).CreationTimeUtc.Ticks
+            Write-QtStageJournal -Journal $journal -Path $id.Journal
+            Write-QtCleanMarker -Journal $journal -Path (Join-Path $id.LiveRoot '.qtrade-clean-owner.json')
+            Write-QtCleanMarker -Journal $journal -Path (Join-Path (Split-Path -Parent $id.Journal) 'clean-owner.json')
+        }
         Write-QtInstallState -State $fresh -Path $livePaths.StateFile | Out-Null
         foreach ($entry in $verified.Entries) {
             $relative = [string]$entry.path -replace '/', '\'
@@ -365,4 +460,4 @@ function Invoke-QtCleanReinstall {
 }
 
 Export-ModuleMember -Function Test-QtStagePath, Get-QtStageIdentity, Get-QtCleanTask, Get-QtCleanOwnership,
-    Write-QtStageJournal, Invoke-QtCleanReinstall
+    Write-QtStageJournal, Find-QtResumeStage, Invoke-QtCleanReinstall

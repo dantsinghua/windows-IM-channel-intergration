@@ -3,7 +3,7 @@
 BeforeAll {
     $modules = $env:QT_REMAINING_TEST_MODULES
     if (-not $modules) { $modules = Join-Path $PSScriptRoot '..\engine\modules' }
-    foreach ($name in @('Native','State','Distro','WinAgent','Firewall','Console')) {
+    foreach ($name in @('Native','State','Distro','WinAgent','Firewall','Console','Acl')) {
         Import-Module (Join-Path $modules ('QTrade.' + $name + '.psm1')) -DisableNameChecking
     }
     $tokens = $null; $errors = $null
@@ -100,10 +100,16 @@ Describe 'Firewall policy warning survives completion and is not a failure' {
     BeforeEach {
         $script:paths = Get-QtPaths -Root (Join-Path $TestDrive 'done')
         $script:state = New-QtInstallState -PackageVersion '1.0.2'
+        $script:state.env | Add-Member -NotePropertyName install_user_sid -NotePropertyValue 'S-1-5-21-1-2-3-1001' -Force
         $script:state.env | Add-Member -NotePropertyName docker_cidr -NotePropertyValue '10.213.0.0/16' -Force
         $script:Result = $null
         $script:Summary = $null
         Mock Clear-QtRunOnce { }
+        Mock Set-QtConsoleConfigAcl {
+            $InstallSid | Should -Be 'S-1-5-21-1-2-3-1001'
+            $Path | Should -Be (Join-Path $script:paths.Root 'config\console')
+            [pscustomobject]@{ Ok = $true; Problems = @() }
+        }
         Mock Install-QtConsoleShortcuts { [pscustomobject]@{ Created = @() } }
         Mock Remove-QtStagedRootfs { [pscustomobject]@{ FreedBytes = 0 } }
         Mock Write-QtInstallSummary { $script:Summary = $Summary }

@@ -467,18 +467,25 @@ function Get-QtInteractiveUserSid {
     <#
     .SYNOPSIS
         本会话 explorer.exe 的所有者 SID(docs/03 §2.4.1「提权账号≠登录账号」、§2.15)。
-        取不到回 $null(无桌面会话,如无人值守)。
+        Return null only when no desktop exists; query failures throw.
     #>
     [CmdletBinding()][OutputType([string])]
     param()
     $mySession = (Get-Process -Id $PID).SessionId
-    $exp = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $mySession })
+    $exp = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -eq 'explorer' -and $_.SessionId -eq $mySession })
     if ($exp.Count -eq 0) { return $null }
     try {
-        $owner = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $exp[0].Id) -ErrorAction Stop
-        $r = Invoke-CimMethod -InputObject $owner -MethodName GetOwnerSid -ErrorAction Stop
-        return [string]$r.Sid
-    } catch { return $null }
+        $sids = @(@(foreach ($process in $exp) {
+            $owner = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $process.Id) -ErrorAction Stop
+            $r = Invoke-CimMethod -InputObject $owner -MethodName GetOwnerSid -ErrorAction Stop
+            if ($r.ReturnValue -ne 0 -or [string]$r.Sid -notmatch '\AS-1-(?:5-21|12-1)(?:-\d+){4}\z') {
+                throw 'INTERACTIVE_USER_SID_QUERY_FAILED'
+            }
+            [string]$r.Sid
+        }) | Select-Object -Unique)
+        if ($sids.Count -ne 1) { throw 'INTERACTIVE_USER_SID_AMBIGUOUS' }
+        return $sids[0]
+    } catch { throw 'INTERACTIVE_USER_SID_QUERY_FAILED' }
 }
 
 function Get-QtEnvironmentPath {
@@ -563,7 +570,7 @@ function Register-QtScheduledTask {
     $action = New-ScheduledTaskAction -Execute $Execute
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
     $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 

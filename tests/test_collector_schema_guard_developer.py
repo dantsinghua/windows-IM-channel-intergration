@@ -25,7 +25,7 @@ def test_missing_baseline_mail_column_rejected_without_mutating_existing_databas
         baseline_database(path)
     else:
         Store(str(path)).open().close()
-        assert code_schema_version() == 2
+        assert code_schema_version() == 3
     with sqlite3.connect(path) as db:
         db.execute('ALTER TABLE mail_outbox DROP COLUMN render_notes')
     db.close()
@@ -40,8 +40,8 @@ def test_valid_baseline_database_still_upgrades_to_identity_epoch_schema(tmp_pat
     baseline_database(path)
     store = Store(str(path)).open()
     try:
-        assert store.schema_version() == code_schema_version() == 2
+        assert store.schema_version() == code_schema_version() == 3
         assert 'render_notes' in {row[1] for row in store.con.execute('PRAGMA table_info(mail_outbox)')}
-        assert 'identity_epoch' in {row[1] for row in store.con.execute('PRAGMA table_info(messages)')}
+        assert {'identity_epoch', 'reply_json'} <= {row[1] for row in store.con.execute('PRAGMA table_info(messages)')}
     finally:
         store.close()

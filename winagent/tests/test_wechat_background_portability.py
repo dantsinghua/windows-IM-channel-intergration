@@ -68,26 +68,39 @@ async def test_pid_stop_preserves_timeout_failure(monkeypatch):
 
 
 @pytest.mark.parametrize("still_running", [False, True])
-async def test_narrator_stop_keeps_confirmation_and_uses_hidden_bounded_cli(monkeypatch, still_running):
+async def test_narrator_stop_keeps_confirmation_and_uses_owned_handle(monkeypatch, still_running):
+    from qtrade_winagent.win import narrator
     pretend_windows(monkeypatch)
     call = fake_cli(monkeypatch)
     monkeypatch.setattr(wechat.asyncio, "sleep", AsyncMock())
     adapter = wechat.WinWeChat()
     adapter._narrator_pid = 732
+    target = {"pid": 732, "sid": "S-1-5-21-1-2-3-1001", "session_id": 7,
+              "created": "fixture-created", "exe": r"c:\windows\system32\narrator.exe"}
+    adapter._narrator_target = dict(target)
+    stop = Mock(return_value=not still_running)
+    monkeypatch.setattr(narrator, "current_owner", lambda: {"sid": target["sid"], "session_id": 7})
+    monkeypatch.setattr(narrator, "stop_owned", stop)
     monkeypatch.setattr(adapter, "narrator_running", lambda: still_running)
     assert await adapter.narrator_stop() is (not still_running)
     assert adapter._narrator_pid == (732 if still_running else None)
-    assert_hidden_bounded(call, ["taskkill", "/IM", "Narrator.exe", "/F"])
+    assert adapter._narrator_target == (target if still_running else None)
+    stop.assert_called_once_with(target, owner_sid=target["sid"], owner_session_id=7)
+    call.assert_not_called()
 
 
 @pytest.mark.parametrize("still_running", [False, True])
-def test_elevated_narrator_stop_keeps_confirmation_and_uses_hidden_bounded_cli(monkeypatch, still_running):
+def test_elevated_narrator_stop_keeps_confirmation_and_uses_owned_handle(monkeypatch, still_running):
+    from qtrade_winagent.win import narrator
     pretend_windows(monkeypatch)
     call = fake_cli(monkeypatch)
-    monkeypatch.setattr(proc.WinProc, "find", lambda self, name: [SimpleNamespace(pid=732)] if still_running else [])
-    monkeypatch.setattr(wechat.time, "sleep", lambda _: None)
-    assert wechat.WinWeChat.kill_narrator_elevated() is (not still_running)
-    assert_hidden_bounded(call, ["taskkill", "/IM", "Narrator.exe", "/F"])
+    target = {"pid": 732, "sid": "S-1-5-21-1-2-3-1001", "session_id": 7,
+              "created": "fixture-created", "exe": r"c:\windows\system32\narrator.exe"}
+    stop = Mock(return_value=not still_running)
+    monkeypatch.setattr(narrator, "stop_owned", stop)
+    assert wechat.WinWeChat.kill_narrator_elevated(target, owner_sid=target["sid"], owner_session_id=7) is (not still_running)
+    stop.assert_called_once_with(target, owner_sid=target["sid"], owner_session_id=7)
+    call.assert_not_called()
 
 
 @pytest.mark.parametrize("windows", [False, True])

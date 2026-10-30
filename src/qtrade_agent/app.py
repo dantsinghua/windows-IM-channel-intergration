@@ -65,6 +65,14 @@ from .workflow import WorkflowEngine
 
 log = logging.getLogger("qtrade.app")
 
+
+def _app_lock(app: Any, name: str) -> asyncio.Lock:
+    lock = getattr(app, name, None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(app, name, lock)
+    return lock
+
 H02_INTERVAL_S = 30         # 04 H02:每 30 s ping(离线后按 [winagent] probe_interval_s 重探)
 H03_INTERVAL_S = 30         # 04 H03:dockerd 每 30 s
 WEBHOOK_TICK_S = 0.5        # 02 §2.2.7 字面:投递器每 500 ms 一轮
@@ -203,6 +211,8 @@ class AgentApp:
         self._recovery_enabled = False
         self._recovery_waiting = False
         self._recovery_task: Optional[asyncio.Task] = None
+        self._collector_retry_at: Optional[float] = None
+        self._collector_retry_delay = 5.0
 
     # ------------------------------------------------------------------ 装配
     def open(self) -> "AgentApp":
@@ -384,6 +394,7 @@ class AgentApp:
             log.warning("Collector seed metadata unavailable; local configuration remains editable")
         self.collector_reporting_settings = CollectorReportingSettings(self.store, self.vault, seed=seed)
         self.xunjia_v22_host = None
+        self.scheduler.register("collector_reporting_recovery", 5, self._collector_recovery_tick)
         return self
 
     async def _wa_media_raw(self, path: str) -> bytes:
@@ -891,14 +902,16 @@ class AgentApp:
 
     # ------------------------------------------------------------------ 生命周期
     async def start(self, *, recover: bool = True) -> None:
-        if not self._started:
-            await self._configure_xunjia_v22()
-            await self.scheduler.start()
-            self._started = True
-            self._recovery_enabled = recover
-            self._recovery_waiting = recover
-            if recover:
-                self._schedule_recovery()
+        async with _app_lock(self, "_lifecycle_lock"):
+            if not self._started:
+                self._collector_stopping = False
+                await self._configure_xunjia_v22()
+                await self.scheduler.start()
+                self._started = True
+                self._recovery_enabled = recover
+                self._recovery_waiting = recover
+                if recover:
+                    self._schedule_recovery()
 
     def _schedule_recovery(self) -> None:
         if not (self._started and self._recovery_enabled and self._recovery_waiting):
@@ -1158,7 +1171,26 @@ class AgentApp:
             future.cancel()
             raise
 
+    async def _collector_recovery_tick(self) -> None:
+        # Scheduler owns cancellation and prevents overlapping attempts.
+        due = self._collector_retry_at
+        if self._started and due is not None and self.clock() / 1000 >= due:
+            await self._configure_xunjia_v22()
+
     async def _configure_xunjia_v22(self) -> None:
+        # Save, retry, and shutdown share this lock; a late factory cannot
+        # replace the sole live host or escape shutdown's cleanup reference.
+        async with _app_lock(self, "_collector_lock"):
+            if getattr(self, "_collector_stopping", False):
+                return
+            if getattr(self, "_collector_configured", False) and self.xunjia_v22_host is not None:
+                return
+            # Keep the applied revision and its public/secret configuration
+            # consistent while a simultaneous save waits for initialization.
+            async with _app_lock(self.collector_reporting_settings, "_lock"):
+                await AgentApp._configure_collector_locked(self)
+
+    async def _configure_collector_locked(self) -> None:
         from .ossbox.institution import InstitutionCollectorHost
         try:
             if self.xunjia_v22_host is not None and not isinstance(self.xunjia_v22_host,InstitutionCollectorHost):
@@ -1173,16 +1205,32 @@ class AgentApp:
                     capture_refresher=self._capture_wechat_media_refresher,
                     clock=lambda:self.clock()/1000)
             await self.xunjia_v22_host.start()
+            self._collector_configured = True
             self.oss_start_error=""
+            self._collector_retry_at = None
+            self._collector_retry_delay = 5.0
         except Exception as exc:
             self.oss_start_error=getattr(exc,"reason","institution_collector_configuration_unavailable")
             self.collector_reporting_settings.state="error"
+            retryable = isinstance(exc, (OSError, TimeoutError)) or self.oss_start_error == "vault_unavailable"
+            if retryable:
+                delay = getattr(self, "_collector_retry_delay", 5.0)
+                self._collector_retry_at = self.clock() / 1000 + delay
+                self._collector_retry_delay = min(delay * 2, 60.0)
+            else:
+                self._collector_retry_at = None
             log.error("Institution collector unavailable")
 
     async def stop(self) -> None:
         """与 ``open``/``start`` 对称地收:先停计时(不再起新轮)→ 停投递器/工作流 → 断适配器连接 → 关总线 → 关库。"""
+        async with _app_lock(self, "_lifecycle_lock"):
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        self._collector_stopping = True
         self._recovery_enabled = False
         self._recovery_waiting = False
+        self._collector_retry_at = None
         if self._recovery_task is not None:
             self._recovery_task.cancel()
             await asyncio.gather(self._recovery_task, return_exceptions=True)
@@ -1190,9 +1238,12 @@ class AgentApp:
         if self._started:
             await self.scheduler.stop()
             self._started = False
-        host = getattr(self, "xunjia_v22_host", None)
-        if host is not None:
-            await host.stop()
+        async with _app_lock(self, "_collector_lock"):
+            host = getattr(self, "xunjia_v22_host", None)
+            self._collector_configured = False
+            if host is not None:
+                await host.stop()
+            self.xunjia_v22_host = None
         await self._stop_quietly(self.webhooks.stop(), "webhook 投递器")
         for run_id, t in list(getattr(self.workflows, "tasks", {}).items()):
             t.cancel()

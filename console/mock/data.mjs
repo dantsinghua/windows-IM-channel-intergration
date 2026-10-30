@@ -171,6 +171,32 @@ export const CAPABILITIES = [
     args_schema: { type: 'object', properties: {} } },
 ]
 
+/** 00 §7.4 `reply`:对象内九个取值键恒在;`unparsed` 时其余全 null;id 类一律字符串 */
+function mockReply(i, channel) {
+  if (channel !== 'qidian') return null
+  const unparsed = {
+    state: 'unparsed', text: null, sender: { id: null, name: null }, ts: null,
+    source_msg_seq: null, source_msg_uid: null, source_ext_msg_id: null, resolved_message_id: null,
+  }
+  if (i === 2) {
+    return {
+      state: 'ok', text: '第 5 条报价:3M 1.65\n(摘要)', sender: { id: '10001', name: '张三' },
+      ts: new Date(Date.now() - 5 * 60000).toISOString(),
+      source_msg_seq: '12345', source_msg_uid: '90071992547409930',
+      source_ext_msg_id: 'qd:5', resolved_message_id: 'msg_mock0005',
+    }
+  }
+  if (i === 8) return unparsed
+  if (i === 11) {
+    return {
+      state: 'ok', text: null, sender: { id: '10002', name: null }, ts: null,
+      source_msg_seq: '12346', source_msg_uid: '90071992547409931',
+      source_ext_msg_id: null, resolved_message_id: null,
+    }
+  }
+  return null
+}
+
 export function makeMessages(n = 40) {
   // 🔴 裁决②:最后消息时间字段名 = `last_msg_at`(ISO),**不是** `last_ts`
   const sessions = [
@@ -209,6 +235,8 @@ export function makeMessages(n = 40) {
       source: i % 11 === 0 ? 'screenshot' : s.channel === 'wechat' ? 'chatlog' : s.channel === 'qq' ? 'onebot' : 'qidian_db',
       revoked: i % 17 === 0,
       raw_ref: i % 5 === 0 ? `raw/${i}` : null,
+      // R6-116:键恒在;只有企点会出现引用对象,QQ/微信恒 null
+      reply: mockReply(i, s.channel),
       // 🔴 02 #48 的出参列**不含** `needs_review`(S-13);出向行带 confirmed_by/trace_id
       ...(i % 3 === 0 ? { confirmed_by: 'ingest_merge', trace_id: `01TRACEMSG${i}` } : {}),
     })

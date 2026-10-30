@@ -19,10 +19,14 @@ dependencies = [
   "aiosqlite>=0.20",
   "cryptography>=50.0.2",
   "pyjks==20.0.0",
+  "xunjia-collector-runtime==2.2.12",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+
+[tool.uv.sources]
+xunjia-collector-runtime = { path = "vendor/xunjia_collector_runtime-2.2.12-py3-none-any.whl" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

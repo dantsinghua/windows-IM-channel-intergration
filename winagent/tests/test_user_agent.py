@@ -280,13 +280,21 @@ async def test_settings_wechat_put_persists_to_toml(tmp_path):
     rig.db.close()
 
 
-async def test_service_kills_narrator_when_user_agent_cannot(tmp_path):
+async def test_service_kills_narrator_when_user_agent_cannot(tmp_path, monkeypatch):
     """R6-89 服务半:#33 响应带 `narrator.stop_pending` ⇒ 服务调提权 killer、记审计,并把本次响应改为已停。"""
     from tests.conftest import AGENT_TOKEN
     rig = build_rig(tmp_path, cfg=WinAgentConfig().with_wechat(narrator_ritual="always"))   # R6-93:仪式只在 always 下
     rig.wechat.ui_visible = False
     rig.wechat.narrator_unkillable = True
-    rig.deps.narrator_killer = rig.wechat.kill_narrator_elevated
+    target = {"pid": 5202, "sid": "S-1-5-21-1111-2222-3333-1001", "session_id": 7,
+              "created": "fixture-created", "exe": r"c:\windows\system32\narrator.exe"}
+    monkeypatch.setattr(rig.wechat, "narrator_stop_target", lambda: dict(target), raising=False)
+    received = []
+    def kill_owned(received_target):
+        assert received_target == target
+        received.append(received_target)
+        return rig.wechat.kill_narrator_elevated()
+    rig.deps.narrator_killer = kill_owned
     await attach_user_agent(rig)
     async with client(rig, token=AGENT_TOKEN) as c:
         r = await c.post("/wa/v1/wechat/login/start", json={"account_id": "wx01"})
@@ -298,6 +306,8 @@ async def test_service_kills_narrator_when_user_agent_cannot(tmp_path):
     assert b.get("narrator"), b
     assert b["narrator"]["stop_pending"] is False and b["narrator"]["state"] == "stopped"
     assert "narrator_kill_elevated" in rig.wechat.calls
+    assert received == [target]
+    assert "_narrator_target" not in b
     assert any(a["action"] == "wechat.narrator_stop" and a["result"] == "OK" for a in rig.deps.audit.page(limit=100)["items"])
     await rig.deps.hub.stop()
     rig.db.close()

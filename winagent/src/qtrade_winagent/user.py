@@ -18,6 +18,7 @@ import os
 import time
 from typing import Any, Callable, Optional
 
+from . import tempvol
 from .backends import PipeBackend, PowerBackend, WeChatBackend, WslBackend
 from .config import WinAgentConfig
 from .errors import NOT_READY, WaError
@@ -28,6 +29,7 @@ from .wslctl import WslCtl
 
 log = get_logger("user")
 WSL_RETRY_S = 60.0
+WECHAT_MAINTAIN_S = 30.0                  # R6-118:chatlog 回收周期检查(≤ 60 s)
 
 
 class UserAgent:
@@ -36,13 +38,18 @@ class UserAgent:
     def __init__(self, cfg: WinAgentConfig, *, pipe: PipeBackend, wsl: WslBackend,
                  wechat: Optional[WeChatBackend] = None, power: Optional[PowerBackend] = None,
                  session_id: str = "1", user_sid: str = "", version: str = "0.1.0", pid: Optional[int] = None,
-                 backup_dir: Optional[str] = None, clock: Callable[[], int] = lambda: int(time.time() * 1000)):
+                 backup_dir: Optional[str] = None, clock: Callable[[], int] = lambda: int(time.time() * 1000),
+                 temp_probe: Optional[Callable[[], dict[str, Any]]] = None,
+                 session_locked: Optional[Callable[[], Optional[bool]]] = None):
         self.cfg = cfg
         self._clock = clock
         self.wslctl = WslCtl(wsl, cfg.wsl, backup_dir=backup_dir, clock=clock)
         self.wechat = WeChatSession(wechat, cfg.wechat, clock=clock) if wechat is not None else None
         self._power = power
+        self._temp_probe = temp_probe or tempvol.sample
+        self._session_locked = session_locked
         self._wsl_task: asyncio.Task | None = None
+        self._wechat_task: asyncio.Task | None = None
         modules = ("wslctl",) + (("wechat",) if (wechat is not None and cfg.wechat.enabled) else ())
         self.link = UserAgentLink(pipe, cfg.ipc, pipe_name=cfg.api.pipe_user, session_id=session_id,
                                   user_sid=user_sid, version=version, pid=pid or os.getpid(), modules=modules,
@@ -67,6 +74,7 @@ class UserAgent:
         self.link.on("wsl.distro.repair", self._distro_repair)
         self.link.on("power.display", self._power_display)
         self.link.on("metrics.deployment-volumes", self._deployment_volumes)
+        self.link.on("metrics.temp-volume", self._temp_volume)
         self.link.on("wechat.module", self._wechat_module)
         for method, fn in (("wechat.status", self._wechat_status), ("wechat.locate", self._wechat_locate),
                            ("wechat.login.start", self._wechat_login_start),
@@ -88,6 +96,8 @@ class UserAgent:
             await self._wechat_module({"enabled": bool(welcome["wechat_enabled"])})
         if self._wsl_task is None:
             self._wsl_task = asyncio.create_task(self._maintain_wsl(), name="ua-wsl-lifecycle")
+        if self.wechat is not None and self._wechat_task is None:
+            self._wechat_task = asyncio.create_task(self._maintain_wechat(), name="ua-wechat-maintain")
         if self.cfg.wechat.enabled:
             self._warm_wechat()
         return welcome
@@ -105,6 +115,31 @@ class UserAgent:
                                                             "kv": {"err": type(e).__name__,
                                                                    "detail": detail}})
             await asyncio.sleep(WSL_RETRY_S)
+
+    async def _maintain_wechat(self) -> None:
+        """R6-118:周期检查 chatlog 回收判据(05 §2.4.10);``ensure_server`` 路径发现需回收时提前唤醒。"""
+        while self.wechat is not None:
+            wx = self.wechat
+            await wx.wait_maintain(WECHAT_MAINTAIN_S)
+            if not self.cfg.wechat.enabled:
+                continue
+            try:
+                await wx.maintain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("chatlog 回收检查失败,下个周期重试", extra={
+                    "op": "wechat.recycle", "code": getattr(e, "code", "FAILED"),
+                    "kv": {"err": type(e).__name__, "reason": getattr(e, "reason", "")}})
+
+    async def _temp_volume(self, p: dict[str, Any]) -> dict[str, Any]:
+        """R6-118 T4:本会话代理(chatlog 继承同一环境)的 ``%TEMP%`` 所在卷空闲量,交服务产生 ``WINAGENT_TEMP_DISK_LOW``。"""
+        try:
+            out = await asyncio.to_thread(self._temp_probe)
+        except OSError:
+            raise WaError(NOT_READY, "Temporary directory volume unavailable", reason="temp_volume_unavailable",
+                          retryable=True) from None
+        return {"volume": out.get("volume"), "free_bytes": out.get("free_bytes")}
 
     def _warm_wechat(self) -> None:
         """微信后端预热放线程、不等待(全新机器首次导入 pywinauto/comtypes 可达十几秒,别让第一次 #28 撞超时)。"""
@@ -134,6 +169,11 @@ class UserAgent:
             await self.link.stop()
         finally:
             try:
+                maintain = getattr(self, "_wechat_task", None)
+                if maintain is not None:
+                    maintain.cancel()
+                    await asyncio.gather(maintain, return_exceptions=True)
+                    self._wechat_task = None
                 if self.wechat is not None:
                     await self.wechat.close()
             finally:
@@ -161,16 +201,19 @@ class UserAgent:
         if not await self._managed_distro_running():
             return {"guest_ip": None}
         backend, distro = self.wslctl._wsl, self.cfg.wsl.distro
+        mode = await self._wsl_networking_mode()
+        if mode == "mirrored":
+            return {"networking_mode": "mirrored", "guest_ip": "127.0.0.1"}
         rc, text = await backend.exec(distro, ["ip", "-j", "-4", "route", "show", "default"])
         if rc:
             return {"guest_ip": None}
         try:
             routes = json.loads(text)
             devices = {r.get("dev") for r in routes if isinstance(r.get("dev"), str)}
-            if len(devices) != 1:
+            if len(devices) > 1 or (routes and not devices):
                 return {"guest_ip": None}
-            device = devices.pop()
-            rc, text = await backend.exec(distro, ["ip", "-j", "-4", "address", "show", "dev", device,
+            dev_args = ["dev", devices.pop()] if devices else []
+            rc, text = await backend.exec(distro, ["ip", "-j", "-4", "address", "show", *dev_args,
                                                  "scope", "global"])
             addresses = json.loads(text) if rc == 0 else []
             ips = {private_ipv4(info.get("local")) for row in addresses
@@ -180,11 +223,22 @@ class UserAgent:
         except (ValueError, TypeError, AttributeError):
             return {"guest_ip": None}
 
+    async def _wsl_networking_mode(self) -> Optional[str]:
+        try:
+            rc, output = await self.wslctl._wsl.exec(
+                self.cfg.wsl.distro, ["/usr/bin/wslinfo", "--networking-mode"])
+            mode = output.strip().lower() if rc == 0 else ""
+            return mode if mode in ("nat", "mirrored", "virtioproxy", "none") else None
+        except Exception:
+            return None
+
     async def _wsl_host_update(self, p: dict[str, Any]) -> dict[str, Any]:
         from .netprobe import private_ipv4
         if not await self._managed_distro_running():
             return {"written": False}
         host = private_ipv4(p.get("host_ip"))
+        if p.get("host_ip") == "127.0.0.1" and await self._wsl_networking_mode() == "mirrored":
+            host = "127.0.0.1"
         if not host:
             return {"written": False}
         # Only the fixed public discovery data is accepted; never execute a
@@ -215,6 +269,8 @@ class UserAgent:
         return (await self.wslctl.kernel_verify()).view()
 
     async def _kernel_apply(self, p: dict[str, Any]) -> Any:
+        if not isinstance(p.get("kernel_path"), str) or not p["kernel_path"].strip():
+            raise WaError("INVALID_ARGS", "Kernel apply requires a staged path", reason="kernel_missing", stage="user")
         return await self.wslctl.kernel_write_and_restart(kernel_path=p.get("kernel_path"),
                                                           confirm_shutdown=bool(p.get("confirm_shutdown")))
 
@@ -261,7 +317,18 @@ class UserAgent:
         wx = self._wx()
         if p.get("advance") is True:
             await wx.ensure_server()
-        return await wx.read_status(screen_locked=bool(p.get("screen_locked")))
+        out = await wx.read_status(screen_locked=await self._screen_locked())
+        # Slow UI probes are shared; their old lock snapshot must not overwrite
+        # this request's current session fact after a lock/unlock transition.
+        return {**out, "screen_locked": await self._screen_locked()}
+
+    async def _screen_locked(self) -> bool:
+        # Only facts from this installing-user process can prove an unlocked desktop.
+        try:
+            locked = await asyncio.to_thread(self._session_locked) if self._session_locked else None
+        except Exception:
+            locked = None
+        return locked is not False
 
     async def _wechat_locate(self, p: dict[str, Any]) -> Any:
         """服务侧 #29 version-match 的事实来源(R6-86 承接):``wechat_install`` 没行时按本机实际安装算,不再假定「未安装」。"""
@@ -275,11 +342,20 @@ class UserAgent:
                                             supported_versions=tuple(p.get("supported_versions") or ()))
 
     async def _wechat_login_cancel(self, p: dict[str, Any]) -> Any:
-        return await self._wx().login_cancel(login_session_id=p.get("login_session_id"))
+        wx = self._wx()
+        return self._with_narrator_target(wx, await wx.login_cancel(login_session_id=p.get("login_session_id")))
 
     async def _wechat_login_status(self, p: dict[str, Any]) -> Any:
         wx = self._wx()
-        return await wx.poll() if p.get("advance") is True else wx.login_status()
+        out = await wx.poll() if p.get("advance") is True else wx.login_status()
+        return self._with_narrator_target(wx, out)
+
+    @staticmethod
+    def _with_narrator_target(wx: WeChatSession, out: dict[str, Any]) -> dict[str, Any]:
+        get_target = getattr(wx._wx, "narrator_stop_target", None)
+        if get_target is not None:
+            out["_narrator_target"] = get_target()
+        return out
 
     async def _wechat_bind(self, p: dict[str, Any]) -> Any:
         wx = self._wx()
@@ -318,7 +394,7 @@ class UserAgent:
         return {"sessions": await self._wx().sessions(keyword=p.get("keyword"), limit=int(p.get("limit") or 100))}
 
     async def _wechat_screenshot(self, p: dict[str, Any]) -> Any:
-        raw = await self._wx().screenshot(screen_locked=bool(p.get("screen_locked")))
+        raw = await self._wx().screenshot(screen_locked=await self._screen_locked())
         return {"b64": base64.b64encode(raw).decode("ascii"), "content_type": "image/png"}
 
     async def _wechat_reinstall(self, p: dict[str, Any]) -> Any:

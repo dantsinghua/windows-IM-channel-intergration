@@ -262,14 +262,16 @@ function Test-QtElevatedUserMatchesLogon {
     <#
     .SYNOPSIS
         docs/03 §2.4.1「提权账号≠登录账号」:比提权进程 SID 与本会话 explorer.exe 所有者 SID。
-        取不到交互 SID(无人值守、无桌面)视为**一致**(不拦静默安装)。
+        A missing desktop permits unattended setup; identity query failures fail closed.
     .OUTPUTS
         {Ok, ElevatedSid, LogonSid}
     #>
     [CmdletBinding()]
     param()
     $elevated = Get-QtCurrentUserSid
-    $logon = Get-QtInteractiveUserSid
+    try { $logon = Get-QtInteractiveUserSid } catch {
+        return [pscustomobject]@{ Ok = $false; ElevatedSid = $elevated; LogonSid = ''; Reason = 'INTERACTIVE_USER_SID_QUERY_FAILED' }
+    }
     if ([string]::IsNullOrWhiteSpace($logon)) {
         return [pscustomobject]@{ Ok = $true; ElevatedSid = $elevated; LogonSid = '' }
     }
@@ -370,7 +372,10 @@ function Invoke-QtPreflight {
     $ids = Test-QtElevatedUserMatchesLogon
     $env.elevated_user_sid = $ids.ElevatedSid
     $env.install_user_sid = if ($ids.LogonSid) { $ids.LogonSid } else { $ids.ElevatedSid }
-    if (-not $ids.Ok) { return [pscustomobject]@{ Ok = $false; Reason = 'ELEVATED_AS_OTHER_USER'; Env = $env; Warnings = $warnings } }
+    if (-not $ids.Ok) {
+        if (Test-QtHasProperty $ids 'Reason') { $env['interactive_user_sid_error'] = $ids.Reason }
+        return [pscustomobject]@{ Ok = $false; Reason = 'ELEVATED_AS_OTHER_USER'; Env = $env; Warnings = $warnings }
+    }
 
     if (-not (Get-QtVirtualizationOk)) {
         $env.virt = 'VIRT_DISABLED'
@@ -383,7 +388,7 @@ function Invoke-QtPreflight {
     $block = Get-QtPolicyBlock -Facts ([pscustomobject]@{
             CustomKernelForbidden = $pol.CustomKernelForbidden
             FeaturePayloadRemoved = ($vmpState -eq 'DisabledWithPayloadRemoved' -or $wslState -eq 'DisabledWithPayloadRemoved')
-            WsusBlocksFod         = $pol.WsusBlocksFod
+            WsusBlocksFod         = ($pol.WsusBlocksFod -and ($vmpState -notin @('Enabled', 'EnablePending') -or $wslState -notin @('Enabled', 'EnablePending')))
             AppLockerBlocked      = $false
         })
     $env.policy = $block

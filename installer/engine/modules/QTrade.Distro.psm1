@@ -19,18 +19,32 @@ function Get-QtAgentBaseUrl {
     [CmdletBinding()][OutputType([string])]
     param([string] $DistroName = 'qtrade', [int] $TimeoutSec = 30)
     if ($DistroName -cne $script:QtDistroName) { return '' }
+    # Mirrored mode does not require hostAddressLoopback for exact loopback.
+    # Never infer it from a LAN address or change the host networking policy.
+    $mode = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', '/usr/bin/wslinfo', '--networking-mode') -TimeoutSec ([Math]::Min($TimeoutSec, 5))
+    if ($null -ne $mode -and -not $mode.TimedOut -and $mode.ExitCode -eq 0 -and
+        ([string]$mode.StdOut).Trim() -ceq 'mirrored') { return 'http://127.0.0.1:17600' }
     # The route lookup sends no packets. Use its source, never the host gateway.
     $r = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'ip', '-j', '-4', 'route', 'get', '1.1.1.1') -TimeoutSec $TimeoutSec
-    if ($r.TimedOut -or $r.ExitCode -ne 0) { return '' }
     try {
-        # PS 5.1 emits a JSON array as one pipeline object. Unwrap after parsing.
-        $parsed = $r.StdOut | ConvertFrom-Json
-        if ($parsed -isnot [array]) { return '' }
-        $routes = @($parsed)
-        if ($routes.Count -ne 1) { return '' }
         $source = ''
-        foreach ($key in @('prefsrc', 'src')) {
-            if (Test-QtHasProperty -Object $routes[0] -Name $key) { $source = [string]$routes[0].$key; break }
+        if (-not $r.TimedOut -and $r.ExitCode -eq 0) {
+            $parsed = $r.StdOut | ConvertFrom-Json
+            if ($parsed -is [array] -and @($parsed).Count -eq 1) {
+                foreach ($key in @('prefsrc', 'src')) {
+                    if (Test-QtHasProperty -Object $parsed[0] -Name $key) { $source = [string]$parsed[0].$key; break }
+                }
+            }
+        }
+        if (-not $source) {
+            # Offline NAT guests still have a local eth0 address. Never scan peers.
+            $local = Invoke-QtWsl -WslArgs @('-d', $DistroName, '--user', 'root', '--exec', 'ip', '-j', '-4', 'addr', 'show', 'dev', 'eth0', 'scope', 'global') -TimeoutSec $TimeoutSec
+            if ($local.TimedOut -or $local.ExitCode -ne 0) { return '' }
+            $interfaces = $local.StdOut | ConvertFrom-Json
+            if ($interfaces -isnot [array] -or @($interfaces).Count -ne 1 -or $interfaces[0].ifname -cne 'eth0') { return '' }
+            $addresses = @($interfaces[0].addr_info | Where-Object { $_.family -eq 'inet' -and $_.scope -eq 'global' })
+            if ($addresses.Count -ne 1) { return '' }
+            $source = [string]$addresses[0].local
         }
         $ip = $null
         if (-not [Net.IPAddress]::TryParse($source, [ref]$ip)) { return '' }

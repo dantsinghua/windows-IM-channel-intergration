@@ -1,5 +1,5 @@
 /**
- * `console.toml`(01 §7)—— `%ProgramData%\QTrade\config\console.toml`,机器级偏好。
+ * Machine preferences: %ProgramData%\QTrade\config\console\console.toml.
  * 控制台没有业务配置(基线 §5),这里只有偏好与本地行为。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -25,14 +25,16 @@ export const DEFAULT_CONFIG: TomlDoc = {
 
 export function configPath(): string {
   const programData = process.env.PROGRAMDATA || process.env.QT_STATE_DIR || join(process.env.HOME ?? '.', '.qtrade')
-  return join(programData, 'QTrade', 'config', 'console.toml')
+  return join(programData, 'QTrade', 'config', 'console', 'console.toml')
 }
 
 let cache: TomlDoc | null = null
 
 export function readConfig(): TomlDoc {
   if (cache) return cache
-  const p = configPath()
+  const current = configPath()
+  const legacy = join(dirname(dirname(current)), 'console.toml')
+  const p = existsSync(current) ? current : legacy
   let doc: TomlDoc = {}
   if (existsSync(p)) {
     try {

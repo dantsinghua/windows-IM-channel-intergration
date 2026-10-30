@@ -83,6 +83,22 @@ class WinPipeConn:
     def peer_sid(self) -> Optional[str]:
         return self._peer_sid
 
+    @property
+    def peer_process_identity(self) -> Optional[dict[str, Any]]:
+        """Query the connected kernel pipe peer, never trust a HELLO-supplied PID."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            from .narrator import process_identity
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetNamedPipeClientProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
+            pid = wintypes.ULONG()
+            if not kernel32.GetNamedPipeClientProcessId(int(self._h), ctypes.byref(pid)):
+                return None
+            return process_identity(pid.value)
+        except Exception:
+            return None
+
     async def send(self, frame: PipeFrame) -> None:
         await self.send_json(frame.to_wire())
 

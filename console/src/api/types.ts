@@ -334,6 +334,21 @@ export interface MessageMedia {
   state: 'pending' | 'ready' | 'skipped_oversize' | 'failed'
 }
 
+/**
+ * 企点引用回复的引用对象(00 §7.4 `reply`,R6-116)。对象内各键恒在;
+ * `state='unparsed'` 时其余全部 null。`text` 是客户端摘要,可能被截断。
+ */
+export interface MessageReply {
+  state: 'ok' | 'unparsed'
+  text: string | null
+  sender: { id: string | null; name: string | null }
+  ts: string | null
+  source_msg_seq: string | null
+  source_msg_uid: string | null
+  source_ext_msg_id: string | null
+  resolved_message_id: string | null
+}
+
 export interface Message {
   id: string
   ext_msg_id?: string
@@ -358,6 +373,8 @@ export interface Message {
   revoked: boolean
   raw_ref?: string | null
   needs_review?: boolean
+  /** 引用对象(R6-116):`GET /messages` 与 WS `message` 事件同形、落库;无引用为 null */
+  reply?: MessageReply | null
   /**
    * 事件专属、**不落库**的三字段(00 §7.4,R6-49)。
    * 只在 WS `message` 事件前插的行上存在;`GET /messages` 不带 —— 重拉后消失是预期行为。

@@ -100,7 +100,7 @@ class SvcDeps:
     config_path: Optional[str] = None
     #: R6-89:服务侧(提权/SYSTEM)结束讲述人。讲述人跑在高完整性级别,会话代理 taskkill 它是拒绝访问;
     #: #33 响应带 `narrator.stop_pending=true` / cancel 带 `narrator_stop_pending=true` 时由服务调用。None = 不具备(测试默认)
-    narrator_killer: Optional[Callable[[], bool]] = None
+    narrator_killer: Optional[Callable[[dict[str, Any]], bool]] = None
 
 
 def _client_host(request: Request) -> Optional[str]:
@@ -667,15 +667,19 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
                                  timeout_s=TIMEOUT_S["wechat_read"], request=request)
         except WaError as e:
             return fail(e, request)
+        target = out.pop("_narrator_target", None)
         if isinstance(out, dict) and out.pop("narrator_stop_pending", False):
-            await _kill_narrator_from_service(request)
+            await _kill_narrator_from_service(request, target)
         return out
 
-    async def _kill_narrator_from_service(request: Request) -> bool:
+    async def _kill_narrator_from_service(request: Request, target: Any) -> bool:
         """R6-89:会话代理停不掉讲述人 ⇒ 服务(提权)结束;记审计。没有 killer(测试/--dev)直接 False。"""
-        if d.narrator_killer is None:
-            return False
-        ok = await asyncio.to_thread(d.narrator_killer)
+        ok = False
+        if d.narrator_killer is not None and isinstance(target, dict):
+            try:
+                ok = await asyncio.to_thread(d.narrator_killer, target)
+            except Exception:
+                log.exception("Owned Narrator cleanup failed")
         d.audit.record(actor="system", action="wechat.narrator_stop", result="OK" if ok else "FAILED",
                        trace_id=getattr(request.state, "trace_id", None))
         return ok
@@ -695,8 +699,9 @@ def build_app(d: SvcDeps) -> FastAPI:                       # noqa: C901 —— 
         # 由服务落库;会话代理不碰 DB)。两个内部字段用完即弹出,不进 #33 的公开响应形状。
         just_became_ready = out.pop("just_became_ready", False)
         wechat_version = out.pop("wechat_version", None)
+        target = out.pop("_narrator_target", None)
         if advance and (out.get("narrator") or {}).get("stop_pending"):
-            if await _kill_narrator_from_service(request):
+            if await _kill_narrator_from_service(request, target):
                 out["narrator"] = {**out["narrator"], "state": "stopped", "stop_pending": False}
         if advance and just_became_ready and out.get("wxid") and out.get("account_id"):
             d.wechat_store.record_login(wxid=out["wxid"], account_id=out["account_id"],

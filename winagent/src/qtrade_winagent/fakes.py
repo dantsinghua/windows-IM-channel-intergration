@@ -503,6 +503,17 @@ class FakeWeChat:
     send_ok: bool = True
     prepare_send_error: Optional[Exception] = None
     calls: list[str] = field(default_factory=list)
+    # R6-118:回收判据的可编程事实(本实例副本量、临时卷空闲、进程归属)
+    chatlog_mode: Optional[str] = None
+    chatlog_owned: bool = True
+    copy_bytes: int = 0
+    copy_files: int = 0
+    temp_volume: str = "C:"
+    temp_free_bytes: int = 1 << 40
+    sweep_failed: int = 0
+    # 真机 chatlog server 每次拉起都会把消息库重新复制一遍(RCA §5 约 1.7 GB):chatlog_serve 成功时累加
+    serve_copy_bytes: int = 0
+    serve_copy_files: int = 0
 
     def locate(self) -> dict[str, Any]:
         return {"installed": self.installed, "path": self.path, "version": self.version, "data_root": self.data_root}
@@ -558,11 +569,13 @@ class FakeWeChat:
     async def chatlog_start(self, dll: str) -> int:
         self.calls.append(f"chatlog_start:{dll}")
         self.chatlog_pid, self.chatlog_dll = 5303, dll
+        self.chatlog_mode = "key"
         return self.chatlog_pid
 
     async def chatlog_stop(self) -> None:
         self.calls.append("chatlog_stop")
         self.chatlog_pid = None
+        self.chatlog_mode = None
 
     serve_fails: bool = False             # R6-91:模拟「取到钥但 chatlog server 起不来」
 
@@ -571,10 +584,31 @@ class FakeWeChat:
         if self.serve_fails:
             raise RuntimeError("找不到微信消息库目录")
         self.chatlog_pid = 5304
+        self.chatlog_mode = "server"
+        self.copy_bytes += self.serve_copy_bytes
+        self.copy_files += self.serve_copy_files
         return self.chatlog_pid
 
     def chatlog_status(self) -> dict[str, Any]:
         return {"running": self.chatlog_pid is not None, "http_ok": self.chatlog_http_ok, "dll": self.chatlog_dll}
+
+    def chatlog_recycle_facts(self) -> dict[str, Any]:
+        running = self.chatlog_pid is not None
+        return {"running": running, "mode": self.chatlog_mode if running else None,
+                "owned": running and self.chatlog_owned, "copy_bytes": self.copy_bytes,
+                "copy_files": self.copy_files, "temp_volume": self.temp_volume,
+                "temp_free_bytes": self.temp_free_bytes}
+
+    def chatlog_sweep_copies(self, *, budget_s: float = 15.0) -> dict[str, Any]:
+        self.calls.append("chatlog_sweep")
+        if self.chatlog_pid is not None:
+            return {"before_bytes": 0, "freed_bytes": 0, "deleted": 0, "failed": 0, "complete": False,
+                    "skipped": "chatlog_running", "instances": 0}
+        before, failed = self.copy_bytes, self.sweep_failed
+        deleted = max(0, self.copy_files - failed)
+        self.copy_bytes, self.copy_files = 0, failed
+        return {"before_bytes": before, "freed_bytes": before, "deleted": deleted, "failed": failed,
+                "complete": True, "instances": 2}
 
     def key_state(self) -> dict[str, Any]:
         """05 §2.4.4a 落盘判据:``data_key`` 与 ``img_key`` **同时非空**才算这一轮成功。"""

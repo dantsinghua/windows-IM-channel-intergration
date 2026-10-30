@@ -14,7 +14,7 @@ def user_agent(rig, monkeypatch, *, running=True, routes=None, addresses=None):
         {"name": "unrelated-distro", "running": True},
         {"name": rig.deps.cfg.wsl.distro, "running": running},
     ]))
-    outputs = [(0, json.dumps(routes if routes is not None else [{"dev": "eth0", "gateway": "172.20.0.1"}]))]
+    outputs = [(0, "nat"), (0, json.dumps(routes if routes is not None else [{"dev": "eth0", "gateway": "172.20.0.1"}]))]
     outputs += [(0, json.dumps(addresses if addresses is not None else [
         {"addr_info": [{"family": "inet", "local": "172.20.16.4"}]}]))]
     monkeypatch.setattr(rig.wsl, "exec", AsyncMock(side_effect=outputs))
@@ -30,7 +30,8 @@ async def test_guest_address_is_read_from_default_interface_not_windows_gateway(
     assert await ua._wsl_network({}) == {"guest_ip": "172.20.16.4"}
     calls = rig.wsl.exec.call_args_list
     assert all(call.args[0] == rig.deps.cfg.wsl.distro for call in calls)
-    assert calls[1].args[1] == ["ip", "-j", "-4", "address", "show", "dev", "eth0", "scope", "global"]
+    assert calls[0].args[1] == ["/usr/bin/wslinfo", "--networking-mode"]
+    assert calls[2].args[1] == ["ip", "-j", "-4", "address", "show", "dev", "eth0", "scope", "global"]
 
 
 async def test_stopped_managed_distro_is_not_started_for_discovery(rig, monkeypatch):

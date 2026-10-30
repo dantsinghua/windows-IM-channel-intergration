@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import sqlite3
@@ -17,6 +18,8 @@ from typing import Optional, Protocol
 from ...runtime.runtime import ADB_SERVER_PORT
 from .contacts import CONTACT_SQL
 from .msgdata import MainDbRow
+
+log = logging.getLogger("qtrade.adapters.qidian.maindb")
 
 MESSAGE_TABLE_GLOBS = ("mr_friend_*_New", "mr_troop_*_New")
 QIDIAN_DB_DIR = "/data/data/com.tencent.qidian/databases/"
@@ -48,6 +51,7 @@ class MainDb(Protocol):
     def last_id_uniseq(self, table: str) -> Optional[tuple[int, int]]: ...        # (_id, uniseq) of ORDER BY _id DESC LIMIT 1
     def uniseq_at(self, table: str, row_id: int) -> Optional[int]: ...
     def rows_after(self, table: str, last: int) -> list[MainDbRow]: ...
+    def reply_source_uniseqs(self, table: str, shmsgseq: int, msg_uid: int) -> list[int]: ...   # ≤ 2 个 uniseq(R6-116 确定性关联)
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]: ...
     def list_contact_source_rows(self) -> list[tuple[str, str, str, str]]: ...
 
@@ -56,6 +60,28 @@ def _q(table: str) -> str:
     if '"' in table:
         raise MainDbError("schema_mismatch", f"bad table name {table!r}")
     return f'"{table}"'
+
+
+ROW_COLS_7 = "_id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData)"
+ROW_COLS = ROW_COLS_7 + ", hex(extStr)"      # 第 8 列 = R6-116 引用对象来源
+
+_no_extstr_warned = False
+
+
+def _missing_extstr(e: MainDbError) -> bool:
+    """只认「表里没有 extStr 列」这一种报错:引用是附加信息,缺列不得拖垮正文读取(其余 schema 问题照常上抛)。"""
+    global _no_extstr_warned
+    s = str(e)
+    if e.reason != "schema_mismatch" or "no such column" not in s or "extStr" not in s:
+        return False
+    if not _no_extstr_warned:
+        _no_extstr_warned = True
+        log.warning("qidian 主库会话表缺 extStr 列:本表按无引用读取正文(每进程只告警一次)")
+    return True
+
+
+def _reply_uniseq_sql(table: str, shmsgseq: int, msg_uid: int) -> str:
+    return f"SELECT uniseq FROM {_q(table)} WHERE shmsgseq={int(shmsgseq)} AND msgUid={int(msg_uid)} LIMIT 2"
 
 
 class LocalSqliteMainDb:
@@ -102,10 +128,17 @@ class LocalSqliteMainDb:
         return int(rows[0][0]) if rows else None
 
     def rows_after(self, table: str, last: int) -> list[MainDbRow]:
-        rows = self._run(
-            f"SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData) FROM {_q(table)} "
-            f"WHERE _id > ? ORDER BY _id LIMIT 500", (last,))
-        return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5] or "", r[6] or "") for r in rows]
+        tail = f" FROM {_q(table)} WHERE _id > ? ORDER BY _id LIMIT 500"
+        try:
+            rows = self._run(f"SELECT {ROW_COLS}" + tail, (last,))
+        except MainDbError as e:
+            if not _missing_extstr(e):
+                raise
+            rows = [tuple(r) + ("",) for r in self._run(f"SELECT {ROW_COLS_7}" + tail, (last,))]
+        return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5] or "", r[6] or "", r[7] or "") for r in rows]
+
+    def reply_source_uniseqs(self, table: str, shmsgseq: int, msg_uid: int) -> list[int]:
+        return [int(r[0]) for r in self._run(_reply_uniseq_sql(table, shmsgseq, msg_uid))]
 
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]:
         rows = self._run(
@@ -172,9 +205,17 @@ class AdbMainDb:
         return int(rows[0][0]) if rows else None
 
     def rows_after(self, table: str, last: int) -> list[MainDbRow]:
-        rows = self._sql(f"SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData) FROM {_q(table)} "
-                         f"WHERE _id > {int(last)} ORDER BY _id LIMIT 500")
-        return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5], r[6]) for r in rows if len(r) == 7]
+        tail = f" FROM {_q(table)} WHERE _id > {int(last)} ORDER BY _id LIMIT 500"
+        try:
+            rows = self._sql(f"SELECT {ROW_COLS}" + tail)
+        except MainDbError as e:
+            if not _missing_extstr(e):
+                raise
+            rows = [r + [""] for r in self._sql(f"SELECT {ROW_COLS_7}" + tail) if len(r) == 7]
+        return [MainDbRow(int(r[0]), int(r[1]), int(r[2]), int(r[3]), int(r[4]), r[5], r[6], r[7]) for r in rows if len(r) == 8]
+
+    def reply_source_uniseqs(self, table: str, shmsgseq: int, msg_uid: int) -> list[int]:
+        return [int(r[0]) for r in self._sql(_reply_uniseq_sql(table, shmsgseq, msg_uid)) if r and r[0] != ""]
 
     def group_gap_stats(self, table: str, since_s: int) -> Optional[GapStats]:
         rows = self._sql(f"SELECT MIN(shmsgseq), MAX(shmsgseq), COUNT(DISTINCT shmsgseq), MIN(time), MAX(time) "

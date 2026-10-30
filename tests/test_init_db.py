@@ -42,13 +42,16 @@ def test_init_db_fresh_creates_parent_dir_and_schema(tmp_path):
     assert os.stat(db.parent).st_mode & 0o777 == 0o750
     s = Store(str(db)).open()
     try:
-        assert s.schema_version() == 2
+        assert s.schema_version() == 3
         rows = s.con.execute("SELECT version, name, checksum FROM schema_version").fetchall()
-        assert [r["version"] for r in rows] == [1,2] and rows[0]["name"] == "0001_baseline_docs02_v0.4.6"
+        assert [r["version"] for r in rows] == [1,2,3] and rows[0]["name"] == "0001_baseline_docs02_v0.4.6"
         assert rows[0]["checksum"] == hashlib.sha256(open(store_mod.SCHEMA_PATH, encoding="utf-8").read().encode()).hexdigest()
         assert rows[1]['name']=='0002_native_identity_epoch'
         migration=os.path.join(store_mod.MIGRATIONS_DIR,'0002_native_identity_epoch.sql')
         assert rows[1]['checksum']==hashlib.sha256(open(migration,encoding='utf-8').read().encode()).hexdigest()
+        assert rows[2]['name']=='0003_message_reply'
+        migration=os.path.join(store_mod.MIGRATIONS_DIR,'0003_message_reply.sql')
+        assert rows[2]['checksum']==hashlib.sha256(open(migration,encoding='utf-8').read().encode()).hexdigest()
         # 02 §2.8.4:auto_vacuum=INCREMENTAL 只在建库时能设 —— 与正常启动路径同一组 PRAGMA
         assert s.con.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
         assert s.con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -122,32 +125,33 @@ def test_existing_db_still_gets_runtime_pragmas(tmp_path):
 # ────────────────────────────────────────────── ③ 版本落后 ⇒ 跑迁移
 def test_init_db_applies_pending_migrations(tmp_path, monkeypatch):
     db = str(tmp_path / "agent.db")
-    assert init_db(AgentConfig(), db) == EXIT_OK                            # 先建到现行 v2
+    assert init_db(AgentConfig(), db) == EXIT_OK                            # 先建到现行 v3
 
     mig = tmp_path / "migrations"
     mig.mkdir()
-    sql = "CREATE TABLE demo_0003 (id INTEGER PRIMARY KEY) STRICT;\nCREATE INDEX ix_demo_0003 ON demo_0003(id);"
-    (mig / "0003_demo.sql").write_text(sql, encoding="utf-8")
-    current=os.path.join(store_mod.MIGRATIONS_DIR,'0002_native_identity_epoch.sql')
-    (mig/'0002_native_identity_epoch.sql').write_bytes(open(current,'rb').read())
+    sql = "CREATE TABLE demo_0004 (id INTEGER PRIMARY KEY) STRICT;\nCREATE INDEX ix_demo_0004 ON demo_0004(id);"
+    (mig / "0004_demo.sql").write_text(sql, encoding="utf-8")
+    for name in ('0002_native_identity_epoch.sql', '0003_message_reply.sql'):
+        current=os.path.join(store_mod.MIGRATIONS_DIR,name)
+        (mig/name).write_bytes(open(current,'rb').read())
     (mig / "0001_baseline_docs02_v0.4.6.sql").write_text("SELECT 1;", encoding="utf-8")   # 基线编号不当迁移重跑
     monkeypatch.setattr(store_mod, "MIGRATIONS_DIR", str(mig))
-    assert store_mod.code_schema_version() == 3
+    assert store_mod.code_schema_version() == 4
 
     assert init_db(AgentConfig(), db) == EXIT_OK
 
     s = Store(db).open()
     try:
-        assert s.schema_version() == 3
-        row = s.con.execute("SELECT name, checksum FROM schema_version WHERE version=3").fetchone()
-        assert row["name"] == "0003_demo" and row["checksum"] == hashlib.sha256(sql.encode()).hexdigest()
-        assert s.con.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='demo_0003'").fetchone()[0] == 1
+        assert s.schema_version() == 4
+        row = s.con.execute("SELECT name, checksum FROM schema_version WHERE version=4").fetchone()
+        assert row["name"] == "0004_demo" and row["checksum"] == hashlib.sha256(sql.encode()).hexdigest()
+        assert s.con.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='demo_0004'").fetchone()[0] == 1
     finally:
         s.close()
     assert init_db(AgentConfig(), db) == EXIT_OK                            # 迁完再跑仍幂等
     s = Store(db).open()
     try:
-        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
+        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 4
     finally:
         s.close()
 
@@ -193,8 +197,8 @@ def test_normal_open_after_init_db_creates_nothing(tmp_path):
     n = table_count(db)
     s = Store(db).open()                                                   # = AgentApp.open() 的第一步
     try:
-        assert s.schema_version() == 2
-        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 2
+        assert s.schema_version() == 3
+        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
         assert s.con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == n
         assert s.con.execute("SELECT COUNT(*) FROM settings WHERE key LIKE 'seq.%'").fetchone()[0] == 3
     finally:
@@ -208,7 +212,7 @@ def test_init_db_on_db_created_by_normal_startup(tmp_path):
     assert init_db(AgentConfig(), db) == EXIT_OK
     s = Store(db).open()
     try:
-        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 2
+        assert s.con.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
     finally:
         s.close()
 

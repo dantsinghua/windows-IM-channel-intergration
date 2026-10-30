@@ -40,6 +40,7 @@ def build_user_agent(cfg: WinAgentConfig, *, session_id: str, user_sid: str, roo
         from .win.power import WinPower
         from .win.wechat import WinWeChat
         from .win.wsl import WinWsl
+        from .win.sysinfo import WinSys
         pipe = WinPipeBackend(max_frame_kb=cfg.ipc.max_frame_kb)
         wsl = WinWsl(distro=cfg.wsl.distro)
         power = WinPower()
@@ -47,11 +48,14 @@ def build_user_agent(cfg: WinAgentConfig, *, session_id: str, user_sid: str, roo
                        chatlog_port=cfg.wechat.chatlog_port,
                        chatlog_work_dir=os.path.expandvars(cfg.wechat.chatlog_work_dir),
                        main_wnd_class=cfg.wechat.main_wnd_class,
-                       process_close_grace_s=cfg.wechat.process_close_grace_s)
+                       process_close_grace_s=cfg.wechat.process_close_grace_s,
+                       chatlog_log_max_bytes=cfg.wechat.chatlog_log_max_bytes,
+                       chatlog_log_backups=cfg.wechat.chatlog_log_backups)
     # `.wslconfig` 备份由会话代理写入;fake(``--dev``)时一律重基到 ``root`` 下,
     # 与服务侧 ``build_real_deps`` 同一条自包含口径(不靠「%ProgramData% 展不开」的巧合)。
     return UserAgent(cfg, pipe=pipe, wsl=wsl, wechat=wx, power=power, session_id=session_id,
                      user_sid=user_sid, version=__version__,
+                     session_locked=(lambda: False) if fake else WinSys().current_session_locked,
                      backup_dir=(contain if fake else expand)(cfg.wsl.backup_dir, root))
 
 

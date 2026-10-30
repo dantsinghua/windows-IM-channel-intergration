@@ -1,0 +1,37 @@
+{
+  "source_host": "files.pythonhosted.org",
+  "source_path": "/packages/82/b4/9eb026a8e62a04512435d3de25c93f7bda51c8b8c7991c1c0be70b5115a6/twofish-0.3.0.tar.gz",
+  "archive_info": {
+    "hash": "sha256=b09d8bb50d33b23ff34cafb1f9209f858f752935c6a5c901efb92a41acb830fa",
+    "hashes": {
+      "sha256": "b09d8bb50d33b23ff34cafb1f9209f858f752935c6a5c901efb92a41acb830fa"
+    }
+  },
+  "wheel_sha256": "cfec53851d499629d7db06b218db5d3c085d051696427d7cfe47406fd519557f",
+  "abi": "readelf highest GLIBC_2.4; CPython 3.12 Linux x86_64; target Ubuntu 22.04 glibc 2.35",
+  "validation": "Isolated CPython 3.12 import and upstream 128/192/256-bit self_test required; target-image validation remains a separate release gate",
+  "distribution": "QTrade compatibility repack; not an unmodified upstream artifact",
+  "version": "0.3.0",
+  "build": "1qtrade1",
+  "original_wheel_filename": "twofish-0.3.0-cp312-cp312-linux_x86_64.whl",
+  "original_wheel_sha256": "a39acd6fa6480232d159c29eb4d03025a10a794d60797250f1156c6121c66a0d",
+  "wheel_filename": "twofish-0.3.0-1qtrade1-cp312-cp312-linux_x86_64.whl",
+  "patch": {
+    "filename": "twofish-cpython312.patch",
+    "sha256": "593d3fd39355dcae11f1dc14140692c8c226c53af4536bea90f1d9854553e8c2"
+  },
+  "python_source": {
+    "before_sha256": "91ea30c606a99d032a6d2a75989dff2cc033a7a934c26d73b24e92491f76beea",
+    "after_sha256": "9780b27e8a3c1e97e972130617c5d8cc3c4f2ef3b7f0da9889f206939eda298d"
+  },
+  "preserved_members_sha256": {
+    "_twofish.cpython-312-x86_64-linux-gnu.so": "ecdc9330cd2cca64c81305e2525d0259fc96158b89147fe8d15e25397ffbbfc6",
+    "twofish-0.3.0.dist-info/licenses/LICENSE": "28e6d2e8db755fa4d5a2e6077e53f4403a5d94c443470b922b4920a7f0d0ff54",
+    "twofish-0.3.0.dist-info/METADATA": "3edbcce392bc8fffbdd022387db18a050560cefe3fe13ba2a97cdb7bd3d31d1f",
+    "twofish-0.3.0.dist-info/top_level.txt": "57c76b94d7fb4282d08845d3ae359eb2f44742e29237819c77416995f47889cc"
+  },
+  "repack_script": {
+    "filename": "twofish-repack.py",
+    "sha256": "4e64a97afb5984cbf853ac25d3807e9edc86a2fbe9339fe79dc7550dd2c00486"
+  }
+}

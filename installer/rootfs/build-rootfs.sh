@@ -89,6 +89,15 @@ AGENT_WHEEL="${wheels[0]}"
 cp -f "$AGENT_WHEEL" "$P/agent-wheel/"
 AGENT_WHEEL_NAME="$(basename "$AGENT_WHEEL")"
 
+# Local, hash-locked dependencies are release inputs, never developer imports.
+[ -d "$SOURCE_ROOT/vendor" ] || die "Missing offline vendor wheel directory"
+mkdir -p "$P/vendor"
+shopt -s nullglob
+vendor_wheels=("$SOURCE_ROOT"/vendor/*.whl)
+shopt -u nullglob
+[ ${#vendor_wheels[@]} -gt 0 ] || die "No offline vendor wheels supplied"
+cp -f "${vendor_wheels[@]}" "$P/vendor/"
+
 # 依赖锁(R-1)—— 与 Dockerfile 的 `COPY payload/requirements.lock` 对应。
 # 运行期依赖的带 hash 锁(uv pip compile 生成),Dockerfile 用 --require-hashes 安装,
 # 让「同一份 wheel 不同日期重建出的依赖集合一致、可复现」;下面登记进 contents.json。

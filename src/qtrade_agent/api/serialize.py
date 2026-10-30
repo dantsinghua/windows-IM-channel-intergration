@@ -8,7 +8,7 @@ import base64
 import json
 from typing import Any, Optional
 
-from ..events import iso8601
+from ..events import iso8601, reply_view_from_json
 from ..models import CommandResult, json_safe
 
 PORT_BASE = {"adb": 16000, "stream": 16500, "frida": 16600, "ws": 16100, "http": 16200, "webui": 16300}   # 00 §3:段基址 + NN
@@ -93,6 +93,7 @@ def message_view(row: dict[str, Any]) -> dict[str, Any]:
         "media": media, "sender": {"id": row.get("sender_id"), "name": sender_display_name(row)}, "self": bool(row.get("is_self")),
         "ts": _iso(row["ts_ms"]), "received_at": _iso(row["received_ms"]), "source": row["source"],
         "revoked": bool(row.get("revoked")), "raw_ref": row.get("raw_ref"),
+        "reply": reply_view_from_json(row.get("reply_json")),
         "confirmed_by": row.get("confirmed_by"), "trace_id": row.get("trace_id"),
     }
 

@@ -150,11 +150,12 @@ RUN chmod 0755 /opt/qtrade/platform-tools/adb /opt/qtrade/platform-tools/fastboo
 #    那个 pip 不随构建日期漂移;verify-wheels.py 顺带断言 venv 里 pip 版本 = 钉值。
 #    不装 `wheel`:发行版 venv 只**安装**预编译 .whl,不需要它;带上会把它和 `packaging` 留进
 #    venv(Agent 运行期从不 import),污染「pip freeze 与锁一致」这条自检并平白扩大供应链面。
+COPY payload/vendor/ /tmp/qtrade-build/vendor/
 RUN ${PY} -m venv /opt/qtrade/agent/venv \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
         --only-binary=:all: -r /tmp/qtrade-build/pip-bootstrap.lock \
     && /opt/qtrade/agent/venv/bin/python -m pip install --no-cache-dir --require-hashes \
-        --only-binary=:all: --report /tmp/qtrade-build/pip-report.json \
+        --only-binary=:all: --find-links /tmp/qtrade-build/vendor --report /tmp/qtrade-build/pip-report.json \
         -r /opt/qtrade/agent/requirements.lock \
     && /opt/qtrade/agent/venv/bin/python /tmp/qtrade-build/verify-wheels.py check \
         --report /tmp/qtrade-build/pip-report.json \

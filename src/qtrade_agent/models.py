@@ -55,10 +55,23 @@ class Message:
     id: Optional[str] = None                    # msg_ + ULID,入库时分配
     received_ms: Optional[int] = None           # 入库时刻,store 填
     fingerprint: Optional[str] = None           # store 入库时算一次(06 §2.9.2)
+    reply: Optional[dict[str, Any]] = None      # 引用对象存储形(REPLY_STORE_KEYS 九键;R6-116);不进 text/fingerprint
 
     @property
     def session_id(self) -> str:
         return self.session.id
+
+
+#: 06 §2.9.5「引用对象 `reply`」字段映射 = ``messages.reply_json`` 的九个键(``ts_ms`` 为整数毫秒;各 ID 为字符串)。
+REPLY_STORE_KEYS = ("state", "text", "sender_id", "sender_name", "ts_ms", "source_msg_seq", "source_msg_uid",
+                    "source_ext_msg_id", "resolved_message_id")
+
+
+def unparsed_reply() -> dict[str, Any]:
+    """失败语义:``state="unparsed"``,其余键全部 null。"""
+    out: dict[str, Any] = dict.fromkeys(REPLY_STORE_KEYS)
+    out["state"] = "unparsed"
+    return out
 
 
 @dataclass

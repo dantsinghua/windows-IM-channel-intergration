@@ -35,7 +35,7 @@ a = Analysis(
         "qtrade_winagent.win.dpapi", "qtrade_winagent.win.firewall", "qtrade_winagent.win.hosts",
         "qtrade_winagent.win.netinfo", "qtrade_winagent.win.pipes", "qtrade_winagent.win.power",
         "qtrade_winagent.win.probe", "qtrade_winagent.win.proc", "qtrade_winagent.win.sysinfo",
-        "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat",
+        "qtrade_winagent.win.wsl", "qtrade_winagent.win.wechat", "qtrade_winagent.win.narrator",
         "qtrade_winagent.main_svc", "qtrade_winagent.service_host", "qtrade_winagent.console_pipe", "qtrade_winagent.fakes",
     ],
     hookspath=[],

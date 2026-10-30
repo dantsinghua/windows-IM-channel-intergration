@@ -21,3 +21,5 @@ uvicorn>=0.30
 websockets>=12
 aiosqlite>=0.20
 cryptography>=50.0.2
+pyjks==20.0.0
+xunjia-collector-runtime==2.2.12

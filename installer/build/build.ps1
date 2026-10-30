@@ -30,7 +30,9 @@ param(
     [string] $CertThumbprint = '',
     [string] $TimestampUrl = '',
     [switch] $NoTimestamp,
-    [string] $SignToolPath = ''
+    [string] $SignToolPath = '',
+    [ValidateRange(1, 1024)][int] $BuildReserveGB = 60,
+    [ValidateRange(1, 1024)][int] $PayloadBudgetGB = 8
 )
 
 Set-StrictMode -Version Latest
@@ -395,6 +397,8 @@ if ($CheckOnly) {
 }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+Import-Module (Join-Path $BuildDir 'QTrade.BuildSpace.psm1') -DisableNameChecking
+Assert-QtBuildSpace -Path $OutDir -RequiredBytes ($PayloadBudgetGB * 4GB) -ReserveBytes ($BuildReserveGB * 1GB)
 
 # ── 签名准备(只在 -Sign 时)─────────────────────────────────────────────────
 $SignCert = $null
@@ -546,7 +550,10 @@ if (-not $AllowMissing) {
     if ($portableIssues.Count -gt 0) { throw ("PORTABLE_PAYLOAD_REJECTED: "+($portableIssues -join "; ")) }
 }
 if (-not $SevenZip) { throw "BUILD_TOOL_MISSING: 7z.exe" }
-if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
+if (Test-Path -LiteralPath $ArchivePath) { throw 'BUILD_ARCHIVE_EXISTS: inspect the previous attempt before retrying.' }
+$payloadBytes = [long](Get-ChildItem -LiteralPath $StageDir -Recurse -File | Measure-Object Length -Sum).Sum
+if ($payloadBytes -gt ($PayloadBudgetGB * 1GB)) { throw 'BUILD_PAYLOAD_BUDGET_EXCEEDED' }
+Assert-QtBuildSpace -Path $OutDir -RequiredBytes ($payloadBytes * 3) -ReserveBytes ($BuildReserveGB * 1GB)
 
 $packedEntries = @()
 $packedFile = Join-Path $StageDir 'install\.packed-entries.txt'
@@ -560,9 +567,9 @@ foreach ($p in $packedEntries) { $excludes += ('-x!' + ($p -replace '/', '\')) }
 # `.packed-entries.txt` 是**打包期中间件**(告诉本脚本哪些进第二块),不是载荷,
 # 也不在 manifest 里 —— 让它进包等于给装机现场塞一个没人校验、没人用的文件。
 $excludes += '-x!install\.packed-entries.txt'
-$argsA = @('a', '-t7z', '-mx=9', '-m0=lzma2', '-ms=on', '-mf=BCJ2', $ArchivePath, (Join-Path $StageDir '*')) + $excludes
-& $SevenZip @argsA | Out-Null
-if ($LASTEXITCODE -gt 1) { throw ('7z 第一块失败,退出码 {0}' -f $LASTEXITCODE) }
+$argsA = @('a', '-t7z', '-mx=9', '-m0=lzma2', '-ms=on', '-mf=BCJ2', '-mmt=2', $ArchivePath, (Join-Path $StageDir '*')) + $excludes
+$archiveCode = Invoke-QtBuildNative -FilePath $SevenZip -Arguments $argsA -BudgetPath $OutDir -ReserveBytes ($BuildReserveGB * 1GB)
+if ($archiveCode -gt 1) { throw ('ARCHIVE_BUILD_FAILED: ' + $archiveCode) }
 Write-Ok 'solid LZMA2 块已写入'
 
 # 第二块:已压缩件(MSI / 微信安装包 / …)—— **单独非 solid、-mx=0**(省 CI 时间且不掉体积)
@@ -570,13 +577,10 @@ $existingPacked = @($packedEntries | Where-Object { Test-Path -LiteralPath (Join
 if ($existingPacked.Count -gt 0) {
     # ⚠️ 必须**在 stage 目录里、用相对路径**调 7z:给绝对路径的话这些文件会被放进归档**根目录**,
     #    而不是 `pkg\vcredist\…` / `wsl\…` —— 解压出来路径全错,引擎按 manifest 一个也找不到。
-    Push-Location $StageDir
-    try {
-        $rel = @($existingPacked | ForEach-Object { $_ -replace '/', '\' })
-        $argsB = @('a', '-t7z', '-mx=0', '-ms=off', $ArchivePath) + $rel
-        & $SevenZip @argsB | Out-Null
-    } finally { Pop-Location }
-    if ($LASTEXITCODE -gt 1) { throw ('7z 第二块失败,退出码 {0}' -f $LASTEXITCODE) }
+    $rel = @($existingPacked | ForEach-Object { $_ -replace '/', '\' })
+    $argsB = @('a', '-t7z', '-mx=0', '-ms=off', $ArchivePath) + $rel
+    $archiveCode = Invoke-QtBuildNative -FilePath $SevenZip -Arguments $argsB -BudgetPath $OutDir -ReserveBytes ($BuildReserveGB * 1GB) -WorkingDirectory $StageDir
+    if ($archiveCode -gt 1) { throw ('ARCHIVE_BUILD_FAILED: ' + $archiveCode) }
     Write-Ok ('非 solid -mx=0 块已写入({0} 个已压缩件)' -f $existingPacked.Count)
 } else {
     Write-Warn2 '没有已压缩件可放进第二块(轻量包常见)'
@@ -632,6 +636,8 @@ $cfg = Join-Path $BuildDir $SfxConfigName
 #    ——存根和配置已经写进去了,EXE 留下一个 ~200 KB 的**残次品**,看着像出包成功。
 #    2026-09-20 首次用真载荷出包时踩到;此前只出过 1.7 MB 的轻量验证包,永远碰不到这条线。
 #    `CopyTo` 按块搬,与文件大小无关。
+Assert-QtBuildSpace -Path $OutDir -RequiredBytes ((Get-Item -LiteralPath $ArchivePath).Length + 16MB) -ReserveBytes ($BuildReserveGB * 1GB)
+if (Test-Path -LiteralPath $FinalExe) { throw 'BUILD_FINAL_EXE_EXISTS' }
 $fs = [IO.File]::Create($FinalExe)
 try {
     foreach ($part in @($SfxStub, $cfg, $ArchivePath)) {

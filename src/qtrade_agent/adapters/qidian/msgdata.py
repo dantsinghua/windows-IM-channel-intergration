@@ -16,6 +16,7 @@ from typing import Iterator, Optional
 
 from ...models import Message, Session
 from ...text import IMAGE_PLACEHOLDER, clean_text
+from .reply import decode_reply
 from .xor import decode_uin, xor_hex
 
 log = logging.getLogger("qtrade.adapters.qidian.msgdata")
@@ -32,7 +33,7 @@ IMAGE_FEATURES = (b"picplatform", b"/download?appid=", b"/gchatpic_new/")
 
 @dataclass(frozen=True)
 class MainDbRow:
-    """``SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData)`` 的一行(06 §2.9.5 ④)。"""
+    """``SELECT _id, issend, time, msgtype, uniseq, hex(senderuin), hex(msgData), hex(extStr)`` 的一行(06 §2.9.5 ④)。"""
     id: int
     issend: int
     time: int          # 秒级 Unix,明文
@@ -40,6 +41,7 @@ class MainDbRow:
     uniseq: int
     senderuin_hex: str
     msgdata_hex: str
+    extstr_hex: str = ""   # R6-116:必须带默认值(既有调用方按 7 个位置参数构造);extStr 为 NULL 时 hex() 得空串
 
 
 @dataclass
@@ -226,5 +228,6 @@ class MessageFactory:
             sender_name=self.self_nick if is_self else None,
             self=is_self,
             state="DELIVERED",
+            reply=decode_reply(r.extstr_hex, table=table, row_id=r.id),   # R6-116:不看 msgtype;失败只置 unparsed
         )
         return msg, d.unknown

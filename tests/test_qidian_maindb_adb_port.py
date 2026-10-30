@@ -74,10 +74,11 @@ def test_message_table_query_keeps_select_readonly_uri_and_result_parsing(isolat
 
 
 def test_message_row_parsing_is_unchanged_when_using_the_owned_server(isolated_adb):
-    calls = isolated_adb(stdout="7|0|1758240000|-1000|12|313233|74657374\n")
+    calls = isolated_adb(stdout="7|0|1758240000|-1000|12|313233|74657374|\n")      # 第 8 列 hex(extStr):NULL → 空串(R6-116)
 
     rows = AdbMainDb(SERIAL, UID, adb="test-only-adb").rows_after(TABLE, 6)
 
     assert len(rows) == 1
     assert (rows[0].id, rows[0].issend, rows[0].time, rows[0].msgtype, rows[0].uniseq) == (7, 0, 1758240000, -1000, 12)
-    assert "?mode=ro" in calls[0][0][6]
+    assert rows[0].extstr_hex == ""
+    assert "?mode=ro" in calls[0][0][6] and "hex(extStr)" in calls[0][0][6]

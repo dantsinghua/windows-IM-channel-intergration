@@ -102,7 +102,7 @@ class NetProbe:
     def __init__(self, db: Db, net: NetBackend, firewall: FirewallBackend, probe: ProbeBackend,
                  net_cfg: NetConfig, probe_cfg: ProbeConfig, alerts: AlertBuffer, *,
                  svc_exe: str, port: int = 17610, agent_port: int = 17600,
-                 guest_ip_provider: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+                 guest_ip_provider: Optional[Callable[[], Awaitable[Optional[str] | dict[str, Any]]]] = None,
                  clock: Callable[[], int] = lambda: int(time.time() * 1000)):
         self._db = db
         self._net = net
@@ -116,6 +116,7 @@ class NetProbe:
         self._agent_port = agent_port
         self._clock = clock
         self._guest_ip_provider = guest_ip_provider
+        self._networking_mode: Optional[str] = None
         self.state = NetState()
 
     # ---------------------------------------------------------------- VPN / 代理 / net_state
@@ -185,22 +186,31 @@ class NetProbe:
         self.state.vpn_adapters, self.state.mtu = vpns, mtu
         self.state.host_ip = wsl.ipv4 if wsl else None
         self.state.agent_base_url = await self.agent_endpoint()
+        if self._networking_mode == "mirrored":
+            self.state.host_ip, self.state.wsl_subnet = "127.0.0.1", None
 
         self._alerts.net_offline = (ns == "OFFLINE")
         if ns == "OFFLINE":
             self._alerts.firing(A.NET_OFFLINE, subject="host", evidence={"net_state": ns})
         else:
             self._alerts.resolve(A.NET_OFFLINE, subject="host")
-        if ns != old_state or subnet != old_subnet or old_endpoint != self.state.agent_base_url:
+        if ns != old_state or self.state.wsl_subnet != old_subnet or old_endpoint != self.state.agent_base_url:
             self.bump_seq()
             self._alerts.firing(A.NET_STATE_CHANGED, subject="host",
                                 evidence={"net_state": ns, "changed_from": old_state, "wsl_subnet": subnet})
         return self.state
 
     async def agent_endpoint(self) -> Optional[str]:
+        self._networking_mode = None
         if self._guest_ip_provider is not None:
             try:
-                guest = private_ipv4(await self._guest_ip_provider())
+                facts = await self._guest_ip_provider()
+                if isinstance(facts, dict):
+                    if facts.get("networking_mode") == "mirrored" and facts.get("guest_ip") == "127.0.0.1":
+                        self._networking_mode = "mirrored"
+                        return f"http://127.0.0.1:{self._agent_port}"
+                    facts = facts.get("guest_ip")
+                guest = private_ipv4(facts)
                 if guest:
                     return f"http://{guest}:{self._agent_port}"
             except Exception:
@@ -237,6 +247,8 @@ class NetProbe:
         adapter = self._net.wsl_adapter()
         self.state.wsl_subnet = wsl_subnet_cidr(adapter) if adapter else None
         self.state.host_ip = adapter.ipv4 if adapter else None
+        if self._networking_mode == "mirrored":
+            self.state.host_ip, self.state.wsl_subnet = "127.0.0.1", None
         changed_subnet = self.state.wsl_subnet
         ok = set(want) == set(actual)
         self._alerts_check_bind(want, actual)

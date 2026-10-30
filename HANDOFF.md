@@ -1,5 +1,24 @@
 # 交接入口 / HANDOFF
 
+## 2026-10-30 当前：QTrade 1.0.7 已交付，精确清理完成
+
+最终 [source 复核](outputs/windows-im-release-20261030/final-source-check.json)：**1536 个文件、0 漂移**；代码、包、交付与清理均完成。
+
+安琳，兼容修复 R6-119、本地回归/独验及最终静态实物验货已完成；完整 EXE 已复制桌面并重算 SHA，清理回执 success。当前基线为 `main` / HEAD `402e5a5c8b35cf12a27ea25b937503bd8c041ee8` 加既有 dirty，未提交/推送；最终 source-freeze 指纹 `afbd3e900584cd0d6417d62c41d4526735b13e170069ba4af078d08ee6fc1668`（1536 files），不以 HEAD 代替实际产品字节。
+
+- 包：`C:\Users\anlin\Desktop\QTrade-1.0.7-20261030\QTrade-Setup-1.0.7.exe`，2,602,028,472 bytes；SHA256 **`7efd61d9358493b0e2ac7500949c702cb0d8b9f971c32818fc37382afff4265f`**。
+- 最终静态 **ACCEPT_STATIC_PACKAGE**（session22095/exit0），3391 manifest、1437 rootfs绑定/26依赖、native/console同源、27签名/时间戳及篡改拒绝；Pester **1018 passed/0 failed/0 skipped**，Agent4296、WinAgent1572、Console690/typecheck0/lint0errors37既有warnings、PW44、归档65分别通过，不累加重叠数。
+- 清理：20,860,932,539 bytes/70,015 files，29个精确登记根（含W/L两构建根）无剩余；逐ID --no-prune删除15个本轮label镜像，共享base ID不变，无全局prune/现役stop；未WSL shutdown或虚拟盘压缩，旧共享缓存/运行账号/其他项目未动。
+- 磁盘：475次采样最低C/D **95.774/102.265 GiB**；最终 **109.279/101.982 GiB**（最终D更低，分列），均高于60GiB；测量峰值 **23.292 GiB**，加桌面副本保守上界 **约25.716 GiB** <35GiB，旧候选9.94GB单独清理不计同时峰值；payload8GiB、单工作根、7z两线程与先预算监测/定点清理继续遵守。
+
+支持目标为x64 Win10≥19044/Win11，至少8GiB内存；16GiB磁盘仅预检入口、不等于峰值；需管理员/硬件虚拟化/允许WSL自定义kernel。首次设置自己的网关和认证，不带现场秘密；不支持原地保留升级，旧安装清空须确认。**真实安装、重启及账号业务仍未验；自签根未受系统信任（0x800B0109），未改信任库。**
+
+证据仅读 E=`outputs/windows-im-release-20261030`；W/L构建根已删，勿访问重跑。见[最终交付/清理记录](outputs/windows-im-release-20261030/DELIVERY.md)、[整改报告](docs/reviews/2026-10-30-windows-compatibility-remediation.md)及[文档核验](outputs/windows-im-release-20261030/final-docs-verification.json)。保留桌面EXE/SHA256/公共CER/README、源码vendor固定输入和小证据/原字节备份；本次HANDOFF修改前原字节存 `outputs/windows-im-release-20261030/final-docs-before/HANDOFF.md`。
+
+本席文档回写完成，主控再按 `delivered-readme-before-final.json` 旧hash原子同步桌面README；这一步尚未由本席执行。后续现场验收依授权另行安排，接手仍先核实际状态和[配置变更保护机制](.codex/CONFIG_CHANGE_GUARD.md)。下方历史记录原样保留，不作为当前待办或当前包身份。
+
+---
+
 ## 2026-10-15 当前：机器无关启动与打包
 
 最新已提交基线为 f87304b。本轮说明见 [可移植性记录](docs/reviews/2026-10-15-portability.md)。STS/OSS 由另一工作流并行修改，不覆盖、不宣称已经联合验收。当前没有本轮完整安装 EXE 的跨机器验收结论；下方旧暂停、版本和测试数字均为历史，不作为当前指令。

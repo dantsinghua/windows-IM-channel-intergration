@@ -985,9 +985,26 @@ begin
   Result := True;
 end;
 
+function ResumeStepIndex(const StepName: String): Integer;
+begin
+  Result := 0;
+  if StepName = ST_WSL_FEATURE then Result := 1
+  else if StepName = ST_WSL_MSI then Result := 2
+  else if StepName = ST_KERNEL_STAGED then Result := 3
+  else if StepName = ST_WSLCONFIG_WRITTEN then Result := 4
+  else if StepName = ST_KERNEL_VERIFIED then Result := 5
+  else if StepName = ST_DISTRO_IMPORTED then Result := 6
+  else if (StepName = ST_WINAGENT_INSTALLED) or (StepName = ST_IMAGES_LOADED) then Result := 7
+  else if StepName = ST_CLIENTS_CHECKED then Result := 9
+  else if StepName = ST_SELFTEST_OK then Result := 10
+  else if StepName = ST_DONE then Result := 11;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   StateName: String;
+  ResumeStep: String;
+  ResumeIndex: Integer;
   Answer: Integer;
 begin
   if CurStep <> ssInstall then Exit;
@@ -995,6 +1012,15 @@ begin
   // 0) 引擎自检:`Global\QTradeSetup` 互斥体、清残留 kcheck、决定从哪步续跑(§2.12)
   if not RunStep('bootstrap') then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  ResumeStep := JsonStr(LastStepJson, 'resume_step');
+  // Verify a switched kernel before any write-time baseline or precheck reset.
+  if (OptStageRoot = '') and ((CompareText(OptMode, 'verify-kernel') = 0) or
+     ((CompareText(OptMode, 'resume') = 0) and (ResumeStep = ST_KERNEL_VERIFIED))) then
+  begin
+    if not RunStep('verify-kernel') then
+      FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+    ResumeStep := ST_DISTRO_IMPORTED;
+  end;
 
   if CompareText(OptMode, 'uninstall') = 0 then
   begin
@@ -1018,8 +1044,9 @@ begin
 
   // 1) PRECHECK(§2.4)——只读;失败即停,机上除 logs\ 外无落盘
   WizardForm.StatusLabel.Caption := '正在检查运行环境…';
-  if not RunStep(ST_PRECHECK) then
-    FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+  if (OptStageRoot <> '') or (ResumeStepIndex(ResumeStep) = 0) then
+    if not RunStep(ST_PRECHECK) then
+      FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
   // 2) Verify the independent stage before offering any destructive action.
   if OptStageRoot <> '' then
@@ -1039,8 +1066,18 @@ begin
       if not RunStep('clean-reinstall') then
         FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
     end;
+    ResumeStep := JsonStr(LastStepJson, 'resume_step');
+    if ResumeStep = ST_KERNEL_VERIFIED then
+    begin
+      if not RunStep('verify-kernel') then
+        FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+      ResumeStep := ST_DISTRO_IMPORTED;
+    end;
   end;
+  ResumeIndex := ResumeStepIndex(ResumeStep);
 
+  if ResumeIndex <= 1 then
+  begin
   // 3) WSL_FEATURE(§2.5.1)——需要重启则写 RunOnce 并退 3010,**不自动重启**
   WizardForm.StatusLabel.Caption := '正在启用 Windows 组件…';
   if not RunStep(ST_WSL_FEATURE) then
@@ -1059,6 +1096,10 @@ begin
     ExitProcess(E_INSTALL_REBOOT_REQUIRED);
   end;
 
+  end;
+
+  if ResumeIndex <= 2 then
+  begin
   // 4) WSL_MSI(§2.5.2)——只升不降;不调 `wsl --update`(零联网)
   WizardForm.StatusLabel.Caption := '正在安装 WSL 运行时…';
   if not RunStep(ST_WSL_MSI) then
@@ -1072,17 +1113,29 @@ begin
     ExitProcess(E_INSTALL_REBOOT_REQUIRED);
   end;
 
+  end;
+
+  if ResumeIndex <= 3 then
+  begin
   // 5) KERNEL_STAGED(§2.6.1)——落盘 + ACL + 指针 + 在**官方内核上**预导入 kcheck
   WizardForm.StatusLabel.Caption := '正在准备 QTrade 内核…';
   if not RunStep(ST_KERNEL_STAGED) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
+  end;
+
+  if ResumeIndex <= 4 then
+  begin
   // 6) 内核原子段(§2.6.3):写配置 → shutdown → 验证 →(必要时)自动回滚
   //    🔴 红线 6:静默模式必须带 /QT_ACCEPT_SHUTDOWN=1,否则停车退 10
   WizardForm.StatusLabel.Caption := '正在切换 WSL 内核并验证…';
   if not RunStep('KERNEL_SWITCH') then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
+  end;
+
+  if ResumeIndex <= 6 then
+  begin
   // 7) DISTRO_IMPORTED(§2.7)——含 §2.7.1 同名冲突的用户选择(**不改名绕过**)
   WizardForm.StatusLabel.Caption := '正在导入发行版(约 3–6 分钟)…';
   if not RunStep(ST_DISTRO_IMPORTED) then
@@ -1090,11 +1143,19 @@ begin
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
   end;
 
+  end;
+
+  if ResumeIndex <= 7 then
+  begin
   // 9) WINAGENT_INSTALLED(§2.8.3)
   WizardForm.StatusLabel.Caption := '正在安装 WinAgent…';
   if not RunStep(ST_WINAGENT_INSTALLED) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
 
+  end;
+
+  if ResumeIndex <= 8 then
+  begin
   // 8) IMAGES_LOADED(§2.7.3 末 / §2.2.1 G-10)
   WizardForm.StatusLabel.Caption := '正在加载镜像并等待 Agent 就绪…';
   if not RunStep(ST_IMAGES_LOADED) then
@@ -1111,6 +1172,10 @@ begin
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
   end;
 
+  end;
+
+  if ResumeIndex <= 9 then
+  begin
   // 10) CLIENTS_CHECKED(§2.9)——微信重装引导(红线 8:必须引导、用户确认后才动)
   WizardForm.StatusLabel.Caption := '正在检查客户端…';
   if (CompareText(OptWeChat, 'skip') <> 0) and (not IsSilentRun()) then
@@ -1162,10 +1227,16 @@ begin
       FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
   end;
 
+  end;
+
+  if ResumeIndex <= 10 then
+  begin
   // 11) SELFTEST_OK(§2.11)
   WizardForm.StatusLabel.Caption := '正在自检(启动一个临时安卓实例)…';
   if not RunStep(ST_SELFTEST_OK) then
     FailWith(LastStepExit, JsonStr(LastStepJson, 'message'));
+
+  end;
 
   // 12) DONE(§2.11 第 5 项:清 RunOnce、快捷方式、删暂存 rootfs.tar、写摘要)
   WizardForm.StatusLabel.Caption := '正在收尾…';

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -161,8 +162,20 @@ def _is_local_url(url: str) -> bool:
     return any(ip in n for n in _LOCAL_NETS)
 
 
+def wsl_networking_mode() -> Optional[str]:
+    """Read the local WSL runtime mode; never infer mirrored from a LAN route."""
+    try:
+        result = subprocess.run(["/usr/bin/wslinfo", "--networking-mode"],
+                                capture_output=True, text=True, timeout=2, check=False)
+        mode = result.stdout.strip().lower() if result.returncode == 0 else ""
+        return mode if mode in ("nat", "mirrored", "virtioproxy", "none") else None
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+
+
 def base_url_candidates(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.conf",
-                        gateway: Optional[Callable[[], Optional[str]]] = None) -> list[tuple[str, str]]:
+                        gateway: Optional[Callable[[], Optional[str]]] = None,
+                        networking_mode: Optional[Callable[[], Optional[str]]] = None) -> list[tuple[str, str]]:
     """按优先级给出 ``[(来源, base_url), …]``(去重、保序)。来源 ∈ ``url|host_json|gateway|resolv_conf``。
 
     🔴 顺序依据 **04 §2.6.3**(网络册是这条结论的 owner)与 **02 §7.1 `[winagent] url` 注**(「空=自动:先
@@ -188,6 +201,9 @@ def base_url_candidates(cfg: WinAgentConfig, *, resolv_conf: str = "/etc/resolv.
 
     if cfg.url:
         return [("url", cfg.url.rstrip("/"))]                # 显式配置就是唯一答案,不再自动发现
+    if (networking_mode or wsl_networking_mode)() == "mirrored":
+        # A mirrored default gateway/DNS belongs to the LAN, not the Windows host.
+        return [("wslinfo", f"http://127.0.0.1:{WA_PORT}")]
     add("host_json", _host_hint(cfg.host_ip_hint_file))
     gw = (gateway or default_gateway)()
     add("gateway", f"http://{gw}:{WA_PORT}" if gw else None)

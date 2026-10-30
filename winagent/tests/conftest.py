@@ -123,7 +123,7 @@ async def attach_user_agent(rig: Rig, *, session_id: str = "Console", user_sid: 
     ua = UserAgent(rig.deps.cfg, pipe=rig.pipe, wsl=rig.wsl, wechat=rig.wechat if wechat else None,
                    power=rig.power_backend, session_id=session_id, user_sid=user_sid,
                    version=version or __version__, backup_dir=rig.deps.installer._wsl_backup_dir,   # noqa: SLF001
-                   clock=rig.clock)
+                   clock=rig.clock, session_locked=rig.sys.session_locked)
     await ua.start()
     rig._tasks.append(asyncio.create_task(ua.run()))
     await asyncio.sleep(0)

@@ -291,11 +291,11 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
     hub = PipeHub(pipeb, cfg.ipc, pipe_name=cfg.api.pipe_user, install_user_sid=install_user_sid,
                   version=__version__, alerts=alerts, audit=audit)
 
-    async def guest_ip() -> Optional[str]:
+    async def guest_ip() -> Optional[dict[str, Any]]:
         if not hub.user_agent_online:
             return None
         result = await hub.call("wsl.network", {}, timeout_s=5)
-        return result.get("guest_ip") if isinstance(result, dict) else None
+        return result if isinstance(result, dict) else None
 
     netprobe = NetProbe(db, netb, fwb, probeb, cfg.net, cfg.probe, alerts,
                        svc_exe=svc_exe, port=cfg.api.port, guest_ip_provider=guest_ip)
@@ -305,7 +305,17 @@ def build_real_deps(cfg: WinAgentConfig, *, root: str, install_user_sid: str, fa
     narrator_killer = None
     if not fake:
         from .win.wechat import WinWeChat
-        narrator_killer = WinWeChat.kill_narrator_elevated                 # R6-89:讲述人只能由提权侧结束
+
+        def narrator_killer(target: dict[str, Any]) -> bool:
+            holder = hub.holder
+            if holder is None or holder.user_sid != install_user_sid:
+                return False
+            owner = getattr(holder.conn, "peer_process_identity", None)
+            if (not owner or owner.get("sid") != install_user_sid or owner.get("pid") != holder.pid
+                    or not owner.get("session_id")):
+                return False
+            return WinWeChat.kill_narrator_elevated(target, owner_sid=install_user_sid,
+                                                   owner_session_id=owner["session_id"])
     return SvcDeps(cfg=cfg, db=db, audit=audit, vault=vault, monitor=monitor, netprobe=netprobe,
                    power=Power(db, pwrb, sysb, cfg.wechat, audit=audit), hub=hub,
                    wechat_store=WeChatStore(db), hosts_block=WeChatHostsBlock(hostsb, cfg.wechat, cfg.probe),
@@ -339,6 +349,7 @@ async def periodic(d: SvcDeps, listeners: Optional[Listeners] = None) -> None:
             if now >= next_slow:
                 await asyncio.to_thread(d.monitor.sample_slow)
                 await asyncio.to_thread(d.monitor.check_disks)
+                await sync_temp_volume(d)
                 await asyncio.to_thread(d.monitor.check_pending_reboot)
                 await asyncio.to_thread(d.monitor.aggregate)
                 await d.netprobe.refresh()
@@ -361,6 +372,10 @@ async def sync_host_hint(d: SvcDeps) -> None:
         # slow probes. User-side execution is restricted to the owned distro.
         adapter = await asyncio.to_thread(d.netprobe._net.wsl_adapter)
         d.netprobe.state.host_ip = adapter.ipv4 if adapter else None
+        await d.netprobe.agent_endpoint()
+        if d.netprobe._networking_mode == "mirrored":
+            d.netprobe.state.host_ip = "127.0.0.1"
+            d.netprobe.state.wsl_subnet = None
         if d.netprobe.state.host_ip:
             try:
                 await d.hub.call("wsl.host.update", d.netprobe.host_json(), timeout_s=5)
@@ -368,6 +383,26 @@ async def sync_host_hint(d: SvcDeps) -> None:
                 if exc.code != "NOT_READY":
                     raise
                 log.info("User agent disconnected before host-hint update; retry next round", extra={"op": "wsl.host.update", "code": "NOT_READY"})
+
+
+TEMP_VOLUME_TIMEOUT_S = 5
+
+
+async def sync_temp_volume(d: SvcDeps) -> None:
+    """R6-118:会话代理采样它自己 ``%TEMP%`` 所在卷(chatlog 副本落盘处),服务据此产生/恢复 ``WINAGENT_TEMP_DISK_LOW``。
+
+    会话代理不在线或本轮取不到 ⇒ 告警状态保持不变,下一轮再取。
+    """
+    if not d.hub.user_agent_online:
+        return
+    try:
+        out = await d.hub.call("metrics.temp-volume", {}, timeout_s=TEMP_VOLUME_TIMEOUT_S)
+    except WaError as exc:
+        log.info("会话代理临时目录卷本轮未取到", extra={"op": "monitor.temp_volume", "code": exc.code})
+        return
+    if isinstance(out, dict):
+        await asyncio.to_thread(d.monitor.check_temp_volume, volume=out.get("volume"),
+                                free_bytes=out.get("free_bytes"))
 
 
 def validate_install_sid(value: str) -> bool:

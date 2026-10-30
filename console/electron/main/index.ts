@@ -233,11 +233,24 @@ function registerIpc(): void {
     app.quit()
   })
   ipcMain.handle('qt:app.setAutoLaunch', (_e, on: boolean) => {
-    app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'] })
-    patchConfig({ app: { auto_launch: !!on } })
+    const previous = app.getLoginItemSettings({ args: ['--hidden'] })
+    const entries = (previous.launchItems ?? []).filter(item =>
+      item.scope === 'user' && item.path.toLowerCase() === process.execPath.toLowerCase())
+    if (entries.length > 1) throw new Error('AUTO_LAUNCH_IDENTITY_AMBIGUOUS')
+    const entry = entries[0]
+    const restore = entry
+      ? { openAtLogin: true, name: entry.name, path: entry.path, args: entry.args, enabled: entry.enabled }
+      : { openAtLogin: previous.launchItems ? false : previous.openAtLogin, args: ['--hidden'] }
+    try {
+      app.setLoginItemSettings({ openAtLogin: !!on, args: ['--hidden'], ...(entry ? { name: entry.name } : {}) })
+      patchConfig({ app: { auto_launch: !!on } })
+    } catch (error) {
+      app.setLoginItemSettings(restore)
+      throw error
+    }
     return true
   })
-  ipcMain.handle('qt:app.getAutoLaunch', () => app.getLoginItemSettings().openAtLogin)
+  ipcMain.handle('qt:app.getAutoLaunch', () => app.getLoginItemSettings({ args: ['--hidden'] }).openAtLogin)
   ipcMain.handle('qt:app.openLogsDir', () => openLogsDir())
   ipcMain.handle('qt:app.openExternal', (_e, url: string) => openExternalAllowed(url))
   ipcMain.handle('qt:app.rss', async () => {

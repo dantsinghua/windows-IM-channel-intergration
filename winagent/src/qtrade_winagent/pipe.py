@@ -31,7 +31,8 @@ from .alerts import AlertBuffer
 from .audit import ACTOR_SVC_TO_USER, Audit
 from .backends import PipeBackend, PipeConn, PipeFrame
 from .config import IpcConfig
-from .errors import FORBIDDEN, INTERNAL, RESOURCE_EXHAUSTED, TIMEOUT, VERSION_MISMATCH, WaError, user_agent_offline
+from .errors import (FORBIDDEN, INTERNAL, RESOURCE_EXHAUSTED, TIMEOUT, VERSION_MISMATCH, WaError, default_flags,
+                     user_agent_offline)
 from .logfmt import get_logger
 
 log = get_logger("pipe")
@@ -296,8 +297,14 @@ class PipeHub:
         code = str(err.get("code") or INTERNAL)
         if self._audit:
             self._audit.record(actor=ACTOR_SVC_TO_USER, action=method, target=target, result=code, trace_id=trace_id)
-        raise WaError(code, str(err.get("message") or "会话代理返回错误"), reason=str(err.get("reason") or ""),
-                      stage="user")
+        reason = str(err.get("reason") or "")
+        retryable, needs_human = default_flags(code, reason)
+        if isinstance(err.get("retryable"), bool):
+            retryable = err["retryable"]
+        if isinstance(err.get("needs_human"), bool):
+            needs_human = err["needs_human"]
+        raise WaError(code, str(err.get("message") or "会话代理返回错误"), reason=reason,
+                      retryable=retryable, needs_human=needs_human, stage="user")
 
 
 # ---------------------------------------------------------------------- 会话代理侧

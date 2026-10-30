@@ -358,6 +358,8 @@ export const msg = {
   rowOcrReview: (id: string) => `qt-msg-row-${id}-ocr-review`,
   rowLate: (id: string) => `qt-msg-row-${id}-late`,
   rowOriginExternal: (id: string) => `qt-msg-row-${id}-origin-external`,
+  rowReply: (id: string) => `qt-msg-row-${id}-reply`,
+  rowReplyJump: (id: string) => `qt-msg-row-${id}-reply-jump`,
   newBanner: 'qt-msg-new-banner',
   detail: 'qt-msg-detail',
   mediaPreview: 'qt-msg-media-preview',

@@ -296,6 +296,12 @@ export const ALERT_CODES: Record<string, AlertCodeMeta> = {
     event: 'alert',
     zh: '微信数据盘 {partition} 剩余不足:这是你的微信数据盘,与本程序容量治理无关;满了只会影响微信收发,请自行清理。',
   },
+  // R6-118:只进铃与角标,不常驻、不进 P-RES 水位;{free}/{threshold} 由 evidence 的 free_bytes/threshold_bytes 换算为 GB
+  WINAGENT_TEMP_DISK_LOW: {
+    severity: 'warn',
+    event: 'alert',
+    zh: 'Windows 临时目录所在磁盘 {volume} 剩余空间不足(剩余 {free},低于 {threshold}):微信读取服务的临时副本可能正在占用空间,程序会在读取空闲时自动回收;若持续不恢复,请清理该磁盘。',
+  },
   H13_CLOCK_DRIFT: { severity: 'warn', event: 'alert' },
   H14_REBOOT_PENDING: { severity: 'info', event: 'alert' },
   H15_LOCALHOST_FORWARD_LOST: { severity: 'warn', event: 'alert' },

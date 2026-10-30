@@ -73,6 +73,7 @@ class MonitorConfig:
     mem_critical_mb: int = 1024
     auto_stop_on_pressure: bool = False
     pending_reboot_check_min: int = 10                                  # H14
+    temp_volume_warn_free_bytes: int = 21474836480                      # R6-118(20 GiB):会话代理 %TEMP% 卷 warn
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,16 @@ class WechatConfig:
     # R6-90:chatlog 只认 `<cwd>/lib/windows_x64/wx_key.dll`;会话代理是普通用户、pkg 只读 ⇒ 选中的 DLL 落到用户可写目录作 cwd
     chatlog_work_dir: str = "%LOCALAPPDATA%\\QTrade\\chatlog"
     chatlog_port: int = 5030
+    # ---- R6-118(05 §2.4.10 行为;02 §7.2 键值):chatlog server 回收与日志轮转
+    chatlog_recycle_copy_bytes: int = 4294967296                        # 4 GiB:本实例前缀副本总量 ⇒ 回收(a)
+    chatlog_recycle_max_uptime_s: int = 7200                            # 连续运行 ⇒ 回收(b)
+    chatlog_recycle_min_free_bytes: int = 21474836480                   # 20 GiB:%TEMP% 卷空闲且副本非空 ⇒ 回收(c),不等空闲
+    chatlog_recycle_idle_wait_s: int = 30                               # 等读取空闲的上限,超时强制回收
+    # R6-118 附录 E:任一次回收完成后的最小间隔(三判据一律适用);释放量 < 阈值则下次间隔翻倍,3600 s 封顶
+    chatlog_recycle_min_interval_s: int = 600
+    chatlog_recycle_min_freed_bytes: int = 1073741824                   # 1 GiB
+    chatlog_log_max_bytes: int = 67108864                               # 64 MiB:chatlog-server.log 单文件上限
+    chatlog_log_backups: int = 5
     wxkey_dlls: tuple[str, ...] = ("wx_key2.dll", "wx_key1.dll")        # 试钥顺序(C-43 采 05;矩阵有 verified 时优先该 DLL)
     poll_interval_s: int = 5
     lookback_overlap_s: int = 1

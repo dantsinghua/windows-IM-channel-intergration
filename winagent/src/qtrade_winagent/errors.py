@@ -31,6 +31,16 @@ HTTP_BY_CODE = {
     UPGRADE_REQUIRED: 426, TIMEOUT: 504, VERSION_MISMATCH: 409, BUSY: 409, INTERNAL: 500,
 }
 
+# 00 §8.3 的 retryable / needs_human 缺省值;表中不为「是」或未列的码一律为否
+RETRYABLE_CODES = frozenset({NOT_READY, TIMEOUT, INTERNAL})
+NEEDS_HUMAN_CODES = frozenset({DISK_FULL})
+
+
+def default_flags(code: str, reason: str = "") -> tuple[bool, bool]:
+    """按 00 §8.3 给出 ``(retryable, needs_human)``;``RESOURCE_EXHAUSTED`` + ``seq_exhausted`` 按 R6-67 ① 需人工。"""
+    needs_human = code in NEEDS_HUMAN_CODES or (code == RESOURCE_EXHAUSTED and reason == "seq_exhausted")
+    return code in RETRYABLE_CODES, needs_human
+
 # 02 §2.4.1「会话代理不在线」:逐字的中文 message
 USER_AGENT_OFFLINE_MESSAGE = "用户会话代理未运行(用户未登录或代理被结束)"
 

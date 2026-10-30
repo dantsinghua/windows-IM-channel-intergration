@@ -27,6 +27,7 @@ import uuid
 from typing import Any, Optional
 from dataclasses import dataclass
 
+from .. import tempvol
 from ..errors import BUSY, NOT_READY, TARGET_NOT_FOUND, TIMEOUT, WaError
 from ..logfmt import get_logger
 from . import require_windows, run_text
@@ -229,15 +230,204 @@ def decode_line(raw: bytes) -> str:
         return raw.decode("gbk", errors="replace")
 
 
-async def _pump_redacted(stream: "asyncio.StreamReader", log_path: str) -> None:
-    """把子进程输出逐行脱敏后追加到日志;子进程退出(EOF)即结束。"""
-    with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+LOG_REOPEN_RETRY_S = 5.0
+
+
+def _shift_backups(path: str, backups: int) -> None:
+    for index in range(backups, 1, -1):
+        source = f"{path}.{index - 1}"
+        if os.path.exists(source):
+            os.replace(source, f"{path}.{index}")
+
+
+def rotate_log(path: str, backups: int) -> None:
+    """``path`` → ``path.1``,依次后移,超出 ``backups`` 的最旧一份被覆盖删除;``backups<=0`` 直接删掉。"""
+    if backups <= 0:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    _shift_backups(path, backups)
+    if os.path.exists(path):
+        os.replace(path, f"{path}.1")
+
+
+def rotate_oversized_log(path: str, max_bytes: int, backups: int) -> bool:
+    """R6-118 ④:既有超限日志在拉起前按同一上限先行轮转 —— 只把末尾不超过 ``max_bytes`` 的整行留进 ``.1``。"""
+    if max_bytes <= 0:
+        return False
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    tail = f"{path}.tail.tmp"
+    try:
+        if backups > 0:
+            with open(path, "rb") as source, open(tail, "wb") as target:
+                source.seek(size - max_bytes)
+                first = source.read(1 << 20)
+                cut = first.find(b"\n")
+                target.write(first[cut + 1:] if cut >= 0 else first)
+                for chunk in iter(lambda: source.read(1 << 20), b""):
+                    target.write(chunk)
+            _shift_backups(path, backups)
+            os.replace(tail, f"{path}.1")
+        os.remove(path)
+    except OSError as error:
+        log.warning("chatlog 日志先行轮转失败,按原文件继续", extra={
+            "op": "chatlog.log_rotate", "code": "ROTATE_FAILED", "kv": {"err": type(error).__name__}})
+        try:
+            os.remove(tail)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+class _LogSink:
+    """按大小轮转的日志文件;任何文件错误都只丢本行,不抛给泵 —— 泵必须一直读,否则 chatlog 的输出管道会写满卡死。"""
+
+    def __init__(self, path: str, max_bytes: int = 0, backups: int = 0):
+        self._path, self._max, self._backups = path, max_bytes, backups
+        self._file = None
+        self._size = 0
+        self._retry_at = 0.0
+        self._open()
+
+    def _open(self) -> None:
+        try:
+            self._file = open(self._path, "ab")
+            self._size = self._file.tell()
+        except OSError:
+            self._file = None
+            self._retry_at = time.monotonic() + LOG_REOPEN_RETRY_S
+
+    def _rotate(self) -> None:
+        self.close()
+        try:
+            rotate_log(self._path, self._backups)
+        except OSError:
+            try:
+                with open(self._path, "wb"):
+                    pass
+            except OSError:
+                pass
+        self._open()
+
+    def write(self, data: bytes) -> None:
+        if self._max > 0 and len(data) > self._max:
+            data = data[:self._max]
+        if self._file is None:
+            if time.monotonic() < self._retry_at:
+                return
+            self._open()
+            if self._file is None:
+                return
+        if self._max > 0 and self._size > 0 and self._size + len(data) > self._max:
+            self._rotate()
+            if self._file is None:
+                return
+        try:
+            self._file.write(data)
+            self._file.flush()
+            self._size += len(data)
+        except OSError:
+            self.close()
+            self._retry_at = time.monotonic() + LOG_REOPEN_RETRY_S
+
+    def close(self) -> None:
+        f, self._file = self._file, None
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+
+async def _pump_redacted(stream: "asyncio.StreamReader", log_path: str, *, max_bytes: int = 0,
+                         backups: int = 0) -> None:
+    """把子进程输出逐行脱敏后追加到日志;子进程退出(EOF)即结束。``max_bytes>0`` 时按大小轮转(R6-118 ④)。"""
+    sink = _LogSink(log_path, max_bytes, backups)
+    try:
         while True:
-            raw = await stream.readline()
+            try:
+                raw = await stream.readline()
+            except ValueError:                                         # 超长行:缓冲已丢弃,继续读
+                continue
             if not raw:
                 break
-            f.write(redact_keys(decode_line(raw)))
-            f.flush()
+            sink.write(redact_keys(decode_line(raw)).encode("utf-8", errors="replace"))
+    finally:
+        sink.close()
+
+
+# ---------------------------------------------------------------- R6-118 filecopy 副本归属与清扫
+INSTANCE_RECORD = "chatlog-instances.json"
+INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+INSTANCE_NAMES_KEEP = 16
+INSTANCE_SEPARATOR = "_+"
+
+
+def instance_of_copy(name: str, instances: "list[str] | tuple[str, ...]") -> Optional[str]:
+    """副本名 = ``<实例名>_+<库名>_+…``;只认 ``<实例名>_+`` 整体前缀(``wxid_a`` 不命中 ``wxid_ab_+…``)。"""
+    for instance in instances:
+        if name.startswith(instance + INSTANCE_SEPARATOR):
+            return instance
+    return None
+
+
+def scan_instance_copies(directory: str, instances: "list[str] | tuple[str, ...]") -> list[tuple[str, int, str]]:
+    """只看 ``directory`` 这一层的普通文件(不递归、不跟链接),返回 ``[(路径, 字节数, 实例名)]``。"""
+    if not instances:
+        return []
+    found: list[tuple[str, int, str]] = []
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return []
+    with entries:
+        for entry in entries:
+            instance = instance_of_copy(entry.name, instances)
+            if instance is None:
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            found.append((entry.path, int(size), instance))
+    return found
+
+
+def sweep_instance_copies(directory: str, instances: "list[str] | tuple[str, ...]", *,
+                          budget_s: Optional[float] = None) -> dict[str, Any]:
+    """删除可证明归属的副本(含 ``-wal``/``-shm``);仍被占用或删不掉的只计数、跳过。超出 ``budget_s`` 停在原处。"""
+    files = scan_instance_copies(directory, instances)
+    deadline = None if budget_s is None else time.monotonic() + budget_s
+    result = {"before_bytes": sum(size for _, size, _ in files), "freed_bytes": 0, "deleted": 0, "failed": 0,
+              "complete": True}
+    for path, size, _ in files:
+        if deadline is not None and time.monotonic() >= deadline:
+            result["complete"] = False
+            break
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            result["failed"] += 1
+            continue
+        result["deleted"] += 1
+        result["freed_bytes"] += size
+    return result
+
+
+def resource_namespace(account_root: str) -> str:
+    """chatlog work_dir 末级名 = filecopy 实例名(``resource-<sha256(账号根)[:24]>``)。"""
+    identity = os.path.normcase(os.path.realpath(account_root))
+    return "resource-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def pick_wechat_root_pid(procs: list[dict[str, Any]], window_pid: Optional[int] = None) -> Optional[int]:
@@ -289,7 +479,8 @@ def parse_key_progress(text: str) -> dict[str, Any]:
     return out
 
 
-async def spawn_redacted(args: list[str], *, cwd: str, log_path: str) -> "asyncio.subprocess.Process":
+async def spawn_redacted(args: list[str], *, cwd: str, log_path: str, max_bytes: int = 0,
+                         backups: int = 0) -> "asyncio.subprocess.Process":
     """起子进程,stdout+stderr 经 ``redact_keys`` 落 ``log_path``(不再丢进 DEVNULL,也不让密钥明文落盘)。
 
     R6-96:Windows 上用 ``CREATE_NEW_PROCESS_GROUP`` 起 —— 这样 ``chatlog_stop`` 能对它发 ``CTRL_BREAK`` 让它**优雅退出、
@@ -304,7 +495,8 @@ async def spawn_redacted(args: list[str], *, cwd: str, log_path: str) -> "asynci
     p = await asyncio.create_subprocess_exec(*args, cwd=cwd, stdout=asyncio.subprocess.PIPE,
                                              stderr=asyncio.subprocess.STDOUT, creationflags=flags, **startup)
     assert p.stdout is not None
-    task = asyncio.get_running_loop().create_task(_pump_redacted(p.stdout, log_path))
+    task = asyncio.get_running_loop().create_task(_pump_redacted(p.stdout, log_path, max_bytes=max_bytes,
+                                                                 backups=backups))
     _PUMPS.add(task)
     task.add_done_callback(_PUMPS.discard)
     return p
@@ -375,11 +567,16 @@ def stage_wx_key_dll(chatlog_dir: str, work_dir: str, dll: str) -> str:
 
 class WinWeChat:
     def __init__(self, *, exe_path: str = "", chatlog_dir: str = "", chatlog_port: int = 5030,
-                 chatlog_work_dir: str = "", main_wnd_class: str = "Qt51514QWindowIcon", process_close_grace_s: int = 10):
+                 chatlog_work_dir: str = "", main_wnd_class: str = "Qt51514QWindowIcon", process_close_grace_s: int = 10,
+                 chatlog_log_max_bytes: int = 67108864, chatlog_log_backups: int = 5, temp_dir: str = ""):
         self._exe = exe_path
         self._chatlog_dir = chatlog_dir
         self._work_dir = chatlog_work_dir or os.path.join(tempfile.gettempdir(), "qtrade-chatlog")
         self._port = chatlog_port
+        self._log_max_bytes = chatlog_log_max_bytes
+        self._log_backups = chatlog_log_backups
+        self._temp_dir = temp_dir                       # 空 = chatlog 继承的用户 %TEMP%(R6-118)
+        self._namespace: Optional[str] = None           # 本次 server 的 work_dir 末级名 = filecopy 实例名
         from ..wechat_read_page import ResumableReads
         self._read_progress = ResumableReads()
         self._read_anchor: Optional[float] = None
@@ -479,49 +676,54 @@ class WinWeChat:
             return False
 
     async def narrator_start(self) -> int:
-        """2026-10-10 真机:``Narrator.exe`` 带 ``uiAccess`` 清单,普通用户进程 ``CreateProcess`` 它必报
-        ``OSError(740, 请求的操作需要提升)``;**只能走 ShellExecute**(``os.startfile``,系统替它完成 UIAccess 启动)。
-        已在跑就不再起第二个。返回 pid(ShellExecute 不给句柄,起完按映像名找;找不到回 0)。"""
-        require_windows("讲述人")
-        from .proc import WinProc
-        found = WinProc().find("Narrator.exe")
-        if not found:
-            await asyncio.to_thread(os.startfile, NARRATOR)                 # noqa: S606 —— 系统自带程序,固定映像名
-            for _ in range(20):                                             # 最多等 3 s 让进程出现
-                await asyncio.sleep(0.15)
-                found = WinProc().find("Narrator.exe")
-                if found:
-                    break
-        self._narrator_pid = found[0].pid if found else 0
+        require_windows("Narrator")
+        from . import narrator
+        # A pre-existing accessibility process belongs to the user, not this ritual.
+        existing = await asyncio.to_thread(narrator.scoped_processes)
+        if existing:
+            raise WaError(NOT_READY, "Narrator is already running in this session", reason="narrator_not_owned")
+        self._narrator_target = await asyncio.to_thread(narrator.start_owned)
+        self._narrator_pid = self._narrator_target["pid"]
         return self._narrator_pid
 
+    def narrator_stop_target(self) -> Optional[dict[str, Any]]:
+        target = getattr(self, "_narrator_target", None)
+        return dict(target) if target else None
+
     async def narrator_stop(self) -> bool:
-        """返回**是否已停**。讲述人跑在高完整性级别,普通用户进程 ``taskkill`` 它是「拒绝访问」(真机实测);
-        这里尽力一试,停不掉回 ``False``,由会话状态机把 ``stop_pending`` 带给服务,**服务(提权)去结束**。"""
-        await asyncio.to_thread(run_text, ["taskkill", "/IM", "Narrator.exe", "/F"], timeout=5)
-        await asyncio.sleep(0.3)
-        still = self.narrator_running()
-        if not still:
-            self._narrator_pid = None
-        return not still
+        from . import narrator
+        target = self.narrator_stop_target()
+        if target is None:
+            return not await asyncio.to_thread(self.narrator_running)
+        owner = await asyncio.to_thread(narrator.current_owner)
+        if not owner:
+            return False
+        stopped = await asyncio.to_thread(narrator.stop_owned, target, owner_sid=owner["sid"],
+                                          owner_session_id=owner["session_id"])
+        if stopped:
+            self._narrator_pid, self._narrator_target = None, None
+        return stopped
 
     @staticmethod
-    def kill_narrator_elevated() -> bool:
-        """**服务侧**(提权 / SYSTEM)结束讲述人;会话代理停不掉时由 #33 轮询路径调用。返回是否已停。
-
-        `taskkill /F` 发出后进程不会立刻从进程表消失,单次 `find` 会误报 False —— 短轮询到真的没了(最多 ~1.5 s)。"""
-        import time as _time
-        from .proc import WinProc
-        run_text(["taskkill", "/IM", "Narrator.exe", "/F"], timeout=5)
-        for _ in range(10):
-            if not WinProc().find("Narrator.exe"):
-                return True
-            _time.sleep(0.15)
-        return False
+    def kill_narrator_elevated(target: Optional[dict[str, Any]] = None, *, owner_sid: str = "",
+                               owner_session_id: int = 0) -> bool:
+        from . import narrator
+        return narrator.stop_owned(target, owner_sid=owner_sid, owner_session_id=owner_session_id)
 
     def narrator_running(self) -> bool:
-        from .proc import WinProc
-        return bool(WinProc().find("Narrator.exe"))
+        from . import narrator
+        target = self.narrator_stop_target()
+        try:
+            if target:
+                current = narrator.process_identity(target["pid"])
+                if current is not None:
+                    return current == target
+                from .proc import WinProc
+                return any(proc.pid == target["pid"] for proc in WinProc().find("Narrator.exe"))
+            return bool(narrator.scoped_processes())
+        except Exception:
+            # Unknown state cannot prove successful cleanup.
+            return True
 
     # ---------------------------------------------------------------- chatlog 与取钥
     def _key_preflight(self, dll: str) -> str:
@@ -590,7 +792,9 @@ class WinWeChat:
     async def _spawn_owned(self, args: list[str], log_path: str) -> asyncio.subprocess.Process:
         if self._chatlog_process is not None and self._chatlog_process.returncode is None:
             raise WaError(BUSY, "前次取钥或读取服务仍在运行", reason="wechat_operation_busy")
-        task = asyncio.create_task(spawn_redacted(args, cwd=self._work_dir, log_path=log_path))
+        limits = ((self._log_max_bytes, self._log_backups) if len(args) > 1 and args[1] == "server" else (0, 0))
+        task = asyncio.create_task(spawn_redacted(args, cwd=self._work_dir, log_path=log_path,
+                                                  max_bytes=limits[0], backups=limits[1]))
         try:
             p = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -975,7 +1179,9 @@ class WinWeChat:
 
     def _prepare_server(self) -> str:
         os.makedirs(self._work_dir, exist_ok=True)
-        with open(os.path.join(self._work_dir, "chatlog-server.log"), "ab"):
+        server_log = os.path.join(self._work_dir, "chatlog-server.log")
+        rotate_oversized_log(server_log, self._log_max_bytes, self._log_backups)
+        with open(server_log, "ab"):
             pass
         keys = read_chatlog_keys()
         if not keys:
@@ -992,8 +1198,10 @@ class WinWeChat:
         if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", wxid or "")
                 or os.path.commonpath([account_root, os.path.realpath(data_dir)]) != account_root):
             raise RuntimeError("Current WeChat resource root is not verified")
-        resource_identity = os.path.normcase(os.path.realpath(account_root))
-        namespace = "resource-" + hashlib.sha256(resource_identity.encode("utf-8")).hexdigest()[:24]
+        namespace = resource_namespace(account_root)
+        # 10-27 之前的旧布局 work_dir = decrypted\<wxid>;现役 data_dir 末级名同样是 <wxid>。两者都是本代理的实例名。
+        self._remember_instance_names([namespace, wxid])
+        self._namespace = namespace
         work = os.path.join(self._work_dir, "decrypted", wxid, namespace)
         os.makedirs(work, exist_ok=True)
         cfg = build_server_config(data_dir=account_root, work_dir=work, keys=keys, addr=f"127.0.0.1:{self._port}")
@@ -1020,6 +1228,104 @@ class WinWeChat:
             except Exception:
                 http_ok = False
         return {"running": running, "http_ok": http_ok, "dll": self._dll, "port": self._port}
+
+    # ---------------------------------------------------------------- R6-118 回收事实与副本清扫(05 §2.4.10)
+    def _filecopy_dir(self) -> str:
+        return os.path.join(self._temp_dir or tempvol.user_temp_dir(), tempvol.FILECOPY_DIRNAME)
+
+    @property
+    def _instance_record_path(self) -> str:
+        return os.path.join(self._work_dir, INSTANCE_RECORD)
+
+    def _read_instance_names(self) -> list[str]:
+        try:
+            with open(self._instance_record_path, encoding="utf-8") as f:
+                row = json.load(f)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError):
+            log.warning("chatlog 实例名记录不可读,本次只用当前实例名", extra={"op": "chatlog.sweep", "code": "RECORD_UNREADABLE"})
+            return []
+        names = row.get("names") if isinstance(row, dict) else None
+        if not isinstance(names, list):
+            return []
+        return [n for n in names if isinstance(n, str) and INSTANCE_NAME_RE.fullmatch(n)]
+
+    def _remember_instance_names(self, names: list[str]) -> None:
+        """持久化本代理用过的实例名(T7),换实例名后旧前缀的残留仍可证明归属。写失败只记日志,不挡拉起。"""
+        fresh = [n for n in names if isinstance(n, str) and INSTANCE_NAME_RE.fullmatch(n)]
+        known = self._read_instance_names()
+        merged = [n for n in known if n not in fresh] + list(dict.fromkeys(fresh))
+        merged = merged[-INSTANCE_NAMES_KEEP:]
+        if merged == known:
+            return
+        temp = self._instance_record_path + "." + uuid.uuid4().hex + ".tmp"
+        try:
+            os.makedirs(self._work_dir, exist_ok=True)
+            with open(temp, "x", encoding="utf-8") as f:
+                json.dump({"version": 1, "names": merged}, f)
+            os.replace(temp, self._instance_record_path)
+        except OSError as error:
+            log.warning("chatlog 实例名记录写入失败", extra={"op": "chatlog.sweep", "code": "RECORD_WRITE_FAILED",
+                                                          "kv": {"err": type(error).__name__}})
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+    def _current_instance_names(self) -> list[str]:
+        """当前账号对应的实例名:``resource-<hash>`` 与 ``<wxid>``;定位不到账号时退回本进程上次拉起用的,都没有为空,不猜。"""
+        cached = [self._namespace, self._server_account[0]] if self._namespace and self._server_account else []
+        try:
+            loc = self.locate() or {}
+            wxid = self.current_wxid()
+            if (not isinstance(wxid, str) or INSTANCE_NAME_RE.fullmatch(wxid) is None
+                    or not discover_chatlog_data_dir(loc.get("data_root"), wxid)):
+                return cached
+            account_root = os.path.realpath(os.path.join(loc["data_root"], "xwechat_files", wxid))
+            return list(dict.fromkeys([resource_namespace(account_root), wxid] + cached))
+        except Exception:                                              # noqa: BLE001 —— 定位失败只是少清一个前缀
+            return cached
+
+    def _counted_instance_names(self) -> list[str]:
+        """判据 (a)/(c) 的统计口径(DECISION-3 C1):已记录的上一实例名(含旧 ``<wxid>``)+ 本进程当前实例名;不定位账号。"""
+        current = [self._namespace] if self._namespace else []
+        if self._server_account:
+            current.append(self._server_account[0])
+        return list(dict.fromkeys(self._read_instance_names() + current))
+
+    def chatlog_recycle_facts(self) -> dict[str, Any]:
+        """回收判据的事实:本代理 chatlog 是否在跑、模式、归属(创建时间 + 可执行路径一致)、本实例副本量、临时卷空闲。"""
+        process = self._chatlog_process
+        running = process is not None and process.returncode is None
+        mode = self._chatlog_mode if running else None
+        owned = False
+        if running and mode == "server":
+            try:
+                owned = self._server_process_matches(process.pid)
+            except WaError:
+                owned = False
+        copies = scan_instance_copies(self._filecopy_dir(), self._counted_instance_names())
+        try:
+            volume = tempvol.sample(self._temp_dir or None)
+        except OSError:
+            volume = {"volume": None, "free_bytes": None}
+        return {"running": running, "mode": mode, "owned": owned,
+                "copy_bytes": sum(size for _, size, _ in copies), "copy_files": len(copies),
+                "temp_volume": volume["volume"], "temp_free_bytes": volume["free_bytes"]}
+
+    def chatlog_sweep_copies(self, *, budget_s: float = 15.0) -> dict[str, Any]:
+        """在 ``%TEMP%\\filecopy_chatlog`` 这一层删除本实例与已知上一实例前缀的副本;本代理的 chatlog 在跑时不动。"""
+        process = self._chatlog_process
+        if process is not None and process.returncode is None:
+            return {"before_bytes": 0, "freed_bytes": 0, "deleted": 0, "failed": 0, "complete": False,
+                    "skipped": "chatlog_running", "instances": 0}
+        current = self._current_instance_names()
+        if current:
+            self._remember_instance_names(current)
+        names = list(dict.fromkeys(self._read_instance_names() + current))
+        result = sweep_instance_copies(self._filecopy_dir(), names, budget_s=budget_s)
+        result["instances"] = len(names)
+        return result
 
     def key_state(self) -> dict[str, Any]:
         """🔴 落盘判据:``history[0].data_key`` 与 ``img_key`` **同时非空**;只看 stdout 的「获取到数据库密钥」不够。"""

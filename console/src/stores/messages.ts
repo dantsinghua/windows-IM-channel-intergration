@@ -18,6 +18,7 @@ export interface EventFlags {
 
 /** C-42 通用段字面的默认页大小(`limit=50`) */
 const PAGE_LIMIT = 50
+const REFRESH_CONCURRENCY = 4
 
 export const useMessagesStore = defineStore('messages', () => {
   const sessions = ref<SessionRow[]>([])
@@ -43,6 +44,8 @@ export const useMessagesStore = defineStore('messages', () => {
   const resultRequests = new Map<string, number>()
   const completedTraces = new Map<string, number>()
   const canonicalMessages = new Map<string, string>()
+  let activeRefreshes = 0
+  const refreshWaiters: Array<() => void> = []
   let revision = 0
   let searchRequest = 0
   let eventsBound = false
@@ -97,7 +100,12 @@ export const useMessagesStore = defineStore('messages', () => {
     const version = ++revision
     messageRevision.set(m.id, version)
     messageSeq.set(m.id, Math.max(messageSeq.get(m.id) ?? 0, seq, useEventsStore().lastSeq))
+    // Replays can contain thousands of rows. Keep browser requests bounded,
+    // and recheck the original request fences after waiting for capacity.
+    if (activeRefreshes < REFRESH_CONCURRENCY) activeRefreshes += 1
+    else await new Promise<void>((resolve) => refreshWaiters.push(resolve))
     try {
+      if (queryKey() !== context || refreshRequests.get(m.id) !== request || messageRevision.get(m.id) !== version) return
       const fresh = await messagesApi.get(m.id)
       if (queryKey() !== context || refreshRequests.get(m.id) !== request || messageRevision.get(m.id) !== version) return
       if (fresh.id !== m.id || fresh.account_id !== m.account_id || fresh.session.id !== m.session.id) return
@@ -116,6 +124,10 @@ export const useMessagesStore = defineStore('messages', () => {
       if (queryKey() === context && refreshRequests.get(m.id) === request) {
         error.value = e instanceof Error ? e.message : String(e)
       }
+    } finally {
+      const next = refreshWaiters.shift()
+      if (next) next()
+      else activeRefreshes -= 1
     }
   }
 

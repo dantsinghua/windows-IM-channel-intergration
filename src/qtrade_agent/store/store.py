@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 from ..ids import message_id, ulid
-from ..models import Message
+from ..models import REPLY_STORE_KEYS, Message, unparsed_reply
 from ..text import norm
 from .locking import LockedConnection
 
@@ -210,7 +210,7 @@ class Store:
         session = connection.execute("SELECT id,native_id,kind,name FROM sessions WHERE id=?", (row["session_id"],)).fetchone()
         if session is None:
             raise ValueError("native_capture_session_missing")
-        payload = {key: value for key, value in dict(row).items() if key != "raw_ref"}
+        payload = {key: value for key, value in dict(row).items() if key not in ("raw_ref", "reply_json")}
         payload.update(native_account_uid=account["self_uid"], session=dict(session))
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         fingerprint = hashlib.sha256(encoded.encode("utf8")).hexdigest()
@@ -967,10 +967,48 @@ class Store:
             "trace_id": msg.trace_id, "idempotency_key": msg.idempotency_key, "raw_ref": msg.raw_ref,
         }
 
+    def _reply_for_ingest(self, c: sqlite3.Connection, msg: Message) -> Optional[dict[str, Any]]:
+        """02 §2.8.1「`reply` 的写入时机」:入库这一刻的存储形;``resolved_message_id`` 只在这里确定性关联一次。
+
+        同账号 + 同会话 + 同 ``identity_epoch`` 内 ``ext_msg_id = source_ext_msg_id`` 恰 1 行才填,否则 null(禁止启发式)。
+        QQ/微信本轮恒无引用。
+        """
+        reply = msg.reply
+        if msg.channel != "qidian" or not isinstance(reply, dict):
+            return None
+        if reply.get("state") != "ok":
+            return unparsed_reply()
+        out = {k: reply.get(k) for k in REPLY_STORE_KEYS}
+        out["resolved_message_id"] = None
+        if not self.capture_text:
+            out["text"] = None
+        src = out.get("source_ext_msg_id")
+        if isinstance(src, str) and src:
+            rows = c.execute("SELECT id FROM messages WHERE account_id=? AND session_id=? AND identity_epoch=? AND ext_msg_id=? LIMIT 2",
+                             (msg.account_id, msg.session_id, self._identity_epoch(msg.account_id), src)).fetchall()
+            if len(rows) == 1:
+                out["resolved_message_id"] = rows[0]["id"]
+        else:
+            out["source_ext_msg_id"] = None
+        return out
+
+    @staticmethod
+    def _stored_reply(reply_json: Optional[str]) -> Optional[dict[str, Any]]:
+        if not reply_json:
+            return None
+        try:
+            v = json.loads(reply_json)
+        except ValueError:
+            return None
+        return v if isinstance(v, dict) else None
+
     def _insert_message(self, c: sqlite3.Connection, msg: Message, now: int, *, ext_override: Optional[str] = None) -> str:
         v = self._row_values(msg, now)
         if ext_override is not None:
             v["ext_msg_id"] = ext_override
+        reply = self._reply_for_ingest(c, msg)
+        v["reply_json"] = json.dumps(reply, ensure_ascii=False) if reply is not None else None
+        msg.reply = reply
         cols = ",".join(v.keys())
         qs = ",".join("?" for _ in v)
         c.execute(f"INSERT INTO messages({cols}) VALUES ({qs})", tuple(v.values()))
@@ -1035,10 +1073,10 @@ class Store:
         # ② 去重键:先查再插(99c C-03)
         if msg.channel == "qq":
             # QQ message_id 复用(06 §2.9.2 / R6-51):与同键族(原行 + 已有 #n 行)里 **ts 最大的那一行** 比;|ts 差| > 1h 判新、后缀 = 族行数 + 1
-            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND (ext_msg_id=? OR ext_msg_id LIKE ?) "
+            existing = c.execute("SELECT id, ts_ms, revoked, text, reply_json FROM messages WHERE account_id=? AND (ext_msg_id=? OR ext_msg_id LIKE ?) "
                                  "ORDER BY ts_ms DESC, rowid DESC LIMIT 1", (msg.account_id, msg.ext_msg_id, msg.ext_msg_id + "#%")).fetchone()
         else:
-            existing = c.execute("SELECT id, ts_ms, revoked, text FROM messages WHERE account_id=? AND ext_msg_id=? AND " + self._current_identity_sql(),
+            existing = c.execute("SELECT id, ts_ms, revoked, text, reply_json FROM messages WHERE account_id=? AND ext_msg_id=? AND " + self._current_identity_sql(),
                                  (msg.account_id, msg.ext_msg_id)).fetchone()
         if existing is not None:
             if msg.channel == "qq" and abs(msg.ts_ms - existing["ts_ms"]) > QQ_ID_REUSE_MS:
@@ -1058,6 +1096,7 @@ class Store:
             if capture_changed:
                 self._append_capture_source(c, existing["id"], now)
             msg.id = existing["id"]
+            msg.reply = self._stored_reply(existing["reply_json"])     # 已存在的行不改 reply_json;事件与库同形
             return IngestResult(False, changed, existing["id"])
 
         # ③ 入向轮询撞到自己发的(06 §2.12):只对我方出向的读回行
@@ -1066,6 +1105,11 @@ class Store:
             if cand is not None:
                 c.execute("UPDATE messages SET ext_msg_id=?, state='DELIVERED', confirmed_by=?, confirmed_ms=? WHERE id=?",
                           (msg.ext_msg_id, self._confirmed_by_for(msg.source), now, cand["id"]))
+                reply = self._reply_for_ingest(c, msg)
+                if reply is not None:       # 既有行 reply_json 为 NULL 才补写;补写本身不算 changed
+                    c.execute("UPDATE messages SET reply_json=? WHERE id=? AND reply_json IS NULL",
+                              (json.dumps(reply, ensure_ascii=False), cand["id"]))
+                msg.reply = self._stored_reply(c.execute("SELECT reply_json FROM messages WHERE id=?", (cand["id"],)).fetchone()[0])
                 msg.id = cand["id"]
                 msg.received_ms = now
                 return IngestResult(False, True, cand["id"])

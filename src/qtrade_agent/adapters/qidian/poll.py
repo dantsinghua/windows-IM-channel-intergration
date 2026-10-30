@@ -25,6 +25,7 @@ from ...store import CursorUpdate, Store
 from ..base import Account
 from .maindb import MainDb, MainDbError, db_path_for
 from .msgdata import MessageFactory
+from .reply import link_source_ext_msg_id
 from .xor import xor_hex
 
 log = logging.getLogger("qtrade.adapters.qidian.poll")
@@ -222,6 +223,7 @@ class QidianPoller:
                     if unknown:
                         n_unknown += 1
                     if m is not None:
+                        link_source_ext_msg_id(db, t, m.reply)     # R6-116 同表确定性关联;失败只置 null、不抛出
                         m._native_account_uid = acct.self_uid
                         msgs.append(m)
                 now_ms = self.clock()

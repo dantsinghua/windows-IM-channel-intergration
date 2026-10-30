@@ -26,6 +26,50 @@ def iso8601(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=TZ_SHANGHAI).isoformat(timespec="seconds")
 
 
+def _id_str(v: Any) -> Optional[str]:
+    return None if v is None or isinstance(v, bool) else str(v)
+
+
+def reply_view(reply: Any) -> Optional[dict[str, Any]]:
+    """引用对象存储形(``messages.reply_json`` 九键)→ 00 §7.4 API 视图;``GET /messages`` 与 ``message`` 事件共用这一处。
+
+    无引用 → ``None``;对象内九个取值键恒在,``sender`` 恒为对象;``state`` 不是 ``"ok"`` 一律按 unparsed(其余全 null)。
+    """
+    if not isinstance(reply, dict):
+        return None
+    if reply.get("state") != "ok":
+        return {"state": "unparsed", "text": None, "sender": {"id": None, "name": None}, "ts": None,
+                "source_msg_seq": None, "source_msg_uid": None, "source_ext_msg_id": None, "resolved_message_id": None}
+    ts_ms = reply.get("ts_ms")
+    ts = None
+    if isinstance(ts_ms, int) and not isinstance(ts_ms, bool):
+        try:
+            ts = iso8601(ts_ms)
+        except (ValueError, OverflowError, OSError):
+            ts = None
+    text, name = reply.get("text"), reply.get("sender_name")
+    return {
+        "state": "ok",
+        "text": text if isinstance(text, str) else None,
+        "sender": {"id": _id_str(reply.get("sender_id")), "name": name if isinstance(name, str) else None},
+        "ts": ts,
+        "source_msg_seq": _id_str(reply.get("source_msg_seq")),
+        "source_msg_uid": _id_str(reply.get("source_msg_uid")),
+        "source_ext_msg_id": _id_str(reply.get("source_ext_msg_id")),
+        "resolved_message_id": _id_str(reply.get("resolved_message_id")),
+    }
+
+
+def reply_view_from_json(reply_json: Any) -> Optional[dict[str, Any]]:
+    """``messages.reply_json`` 列值 → API 视图;NULL / 坏 JSON / 非对象 → ``None``。"""
+    if not reply_json:
+        return None
+    try:
+        return reply_view(json.loads(reply_json))
+    except (TypeError, ValueError):
+        return None
+
+
 def message_payload(msg: Message, *, late_after_s: int, origin: Optional[str] = None) -> dict[str, Any]:
     """00 §7.4 Message(API 视图:``ts``/``received_at`` 为 ISO 8601)+ 事件专属三字段。``origin`` 只对出向行给(``"rpa"`` / ``"external"``);入向行不带该键。"""
     received_ms = msg.received_ms if msg.received_ms is not None else msg.ts_ms
@@ -37,6 +81,7 @@ def message_payload(msg: Message, *, late_after_s: int, origin: Optional[str] = 
         "text": msg.text, "text_len": len(msg.text) if msg.text is not None else None, "fingerprint": msg.fingerprint,
         "media": msg.media, "sender": {"id": msg.sender_id, "name": msg.sender_name}, "self": msg.self,
         "ts": iso8601(msg.ts_ms), "received_at": iso8601(received_ms), "source": msg.source, "revoked": msg.revoked, "raw_ref": msg.raw_ref,
+        "reply": reply_view(msg.reply),
         "lag_s": lag_s, "late": lag_s > late_after_s,
     }
     if msg.dir == "out" and origin is not None:

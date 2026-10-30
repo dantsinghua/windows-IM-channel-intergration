@@ -456,6 +456,7 @@ async def test_wechat_send_rejected_without_key_and_ok_with(rig_with_user):
 
 
 async def test_wechat_read_and_media_and_screenshot(rig_with_user):
+    rig_with_user.user_agent._session_locked = lambda: False
     rig_with_user.wechat.data_key = rig_with_user.wechat.img_key = True
     rig_with_user.wechat.messages = [{"talker": "群A", "seq": 1, "text": "x"}]
     rig_with_user.wechat.media_blobs["abc"] = b"\xff\xd8JPEG"

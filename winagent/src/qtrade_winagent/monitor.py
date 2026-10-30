@@ -64,6 +64,7 @@ class MonitorState:
     last_aggregate_minute: int = 0
     last_aggregate_hour: int = 0
     checks: dict[str, Any] = field(default_factory=dict)
+    temp_volume: Optional[dict[str, Any]] = None        # R6-118:会话代理上报的最近一次 {subject, free_bytes, ts_ms}
 
 
 class Monitor:
@@ -349,6 +350,30 @@ class Monitor:
         self.state.checks["H12"] = level == "ok"
         return {"level": level, "worst": worst[0] if worst else None,
                 "free_mb": worst[1] if worst else None, "wechat_free_mb": wechat_free}
+
+    def check_temp_volume(self, *, volume: Any, free_bytes: Any) -> Optional[bool]:
+        """R6-118 ``WINAGENT_TEMP_DISK_LOW``(04 §2.3):会话代理采样的 ``%TEMP%`` 卷空闲 < 阈值 ⇒ warn,下一次 ≥ 阈值即 resolved。
+
+        恒 warn、不进 H12 三级水位;``evidence{free_bytes, threshold_bytes}``,无 ``hint_actions``。
+        采样无效时不改告警状态,返回 None。卷换了(临时目录迁盘)⇒ 旧卷的告警随之 resolved。
+        """
+        if (not isinstance(volume, str) or not volume.strip() or isinstance(free_bytes, bool)
+                or not isinstance(free_bytes, int) or free_bytes < 0):
+            log.warning("临时目录卷采样无效,跳过", extra={"op": "monitor.temp_volume", "code": "INVALID_SAMPLE"})
+            return None
+        subject = "volume:" + volume.strip()
+        previous = (self.state.temp_volume or {}).get("subject")
+        if previous and previous != subject:
+            self._alerts.resolve(A.WINAGENT_TEMP_DISK_LOW, subject=previous)
+        threshold = self._cfg.temp_volume_warn_free_bytes
+        ok = free_bytes >= threshold
+        if ok:
+            self._alerts.resolve(A.WINAGENT_TEMP_DISK_LOW, subject=subject)
+        else:
+            self._alerts.firing(A.WINAGENT_TEMP_DISK_LOW, subject=subject, severity="warn",
+                                evidence={"free_bytes": free_bytes, "threshold_bytes": threshold})
+        self.state.temp_volume = {"subject": subject, "free_bytes": free_bytes, "ts_ms": self._clock()}
+        return ok
 
     # ---------------------------------------------------------------- #2 health 的 host 段
     def _host_from(self, mem: dict[str, float], procs: dict[str, Any]) -> dict[str, float]:

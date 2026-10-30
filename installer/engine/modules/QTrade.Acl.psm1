@@ -255,5 +255,48 @@ function Set-QtInstallRootAcl {
     return [pscustomobject]@{ Ok = $after.Ok; Changed = $true; Path = $Path; Problems = @($after.Problems) }
 }
 
+function Set-QtConsoleConfigAcl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $InstallSid)
+    try {
+        if ($InstallSid -notmatch '\AS-1-(?:5-21|12-1)(?:-\d+){4}\z') { throw 'INSTALL_USER_SID_INVALID' }
+        $current = [IO.Path]::GetFullPath($Path)
+        while ($current) {
+            if ((Test-QtPath -Path $current) -and ((Get-Item -LiteralPath $current -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'REPARSE_POINT_REFUSED'
+            }
+            $current = Split-Path -Parent $current
+        }
+        $parent = Split-Path -Parent $Path
+        New-QtDirectory -Path $parent | Out-Null
+        if (-not (Set-QtInstallRootAcl -Path $parent).Ok) { throw 'CONFIG_ROOT_ACL_FAILED' }
+        New-QtDirectory -Path $Path | Out-Null
+        $spec = @(Get-QtInstallRootAclSpec) + @([pscustomobject]@{ Sid = $InstallSid; Rights = [Security.AccessControl.FileSystemRights]::Modify })
+        $acl = Get-QtAcl -Path $Path
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+        $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+        foreach ($item in $spec) {
+            $ace = New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier($item.Sid)), $item.Rights,
+                $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($ace)
+        }
+        Set-QtAcl -Path $Path -AclObject $acl
+        $actual = Get-QtAcl -Path $Path
+        if (-not $actual.AreAccessRulesProtected -or @($actual.Access).Count -ne $spec.Count) { throw 'CONSOLE_CONFIG_ACL_FAILED' }
+        foreach ($item in $spec) {
+            $rules = @($actual.Access | Where-Object { (ConvertTo-QtAclSid -Identity $_.IdentityReference) -eq $item.Sid })
+            if ($rules.Count -ne 1) { throw 'CONSOLE_CONFIG_ACL_FAILED' }
+            $rule = $rules[0]
+            $expected = [int]$item.Rights -bor [int][Security.AccessControl.FileSystemRights]::Synchronize
+            if ([int]$rule.FileSystemRights -ne $expected -or $rule.InheritanceFlags -ne $inherit -or
+                $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None -or
+                $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { throw 'CONSOLE_CONFIG_ACL_FAILED' }
+        }
+        return [pscustomobject]@{ Ok = $true; Problems = @() }
+    } catch { return [pscustomobject]@{ Ok = $false; Problems = @($_.Exception.Message) } }
+}
+
 Export-ModuleMember -Function Get-QtInstallRootAclSpec, Get-QtKernelFileAclSpec, ConvertTo-QtAclSid,
-Test-QtHardenedAcl, Test-QtInstallRootAcl, Test-QtKernelFileAcl, Set-QtInstallRootAcl
+Test-QtHardenedAcl, Test-QtInstallRootAcl, Test-QtKernelFileAcl, Set-QtInstallRootAcl, Set-QtConsoleConfigAcl
